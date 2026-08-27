@@ -44,12 +44,11 @@ describe("RestrictedBrowserTools", () => {
 		const store = new InMemoryJobStore();
 		await store.create(input, "2026-08-28T00:00:00.000Z");
 		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
-		const tools = new RestrictedBrowserTools(
+		const tools = await RestrictedBrowserTools.create(
 			driver,
 			store,
 			input.id,
 			"run-token-1",
-			input.targetDomain,
 			() => "2026-08-28T00:00:02.000Z",
 		);
 
@@ -67,17 +66,9 @@ describe("RestrictedBrowserTools", () => {
 		const driver = new FakeDriver();
 		const store = new InMemoryJobStore();
 		await store.create(input, "2026-08-28T00:00:00.000Z");
-		const tools = new RestrictedBrowserTools(
-			driver,
-			store,
-			input.id,
-			"run-token-1",
-			input.targetDomain,
-		);
-
-		await expect(tools.submit()).rejects.toBeInstanceOf(
-			SubmissionNotAuthorizedError,
-		);
+		await expect(
+			RestrictedBrowserTools.create(driver, store, input.id, "run-token-1"),
+		).rejects.toBeInstanceOf(SubmissionNotAuthorizedError);
 		expect(driver.submitCount).toBe(0);
 	});
 
@@ -87,12 +78,11 @@ describe("RestrictedBrowserTools", () => {
 		const store = new InMemoryJobStore();
 		await store.create(input, "2026-08-28T00:00:00.000Z");
 		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
-		const tools = new RestrictedBrowserTools(
+		const tools = await RestrictedBrowserTools.create(
 			driver,
 			store,
 			input.id,
 			"run-token-1",
-			input.targetDomain,
 			() => "2026-08-28T00:00:02.000Z",
 		);
 
@@ -107,6 +97,52 @@ describe("RestrictedBrowserTools", () => {
 		);
 		expect(driver.submitCount).toBe(1);
 	});
+
+	test("derives the domain from the persisted job and installs a network policy", async () => {
+		const driver = new FakeDriver();
+		const tools = await createTools(driver);
+
+		expect(driver.restrictedDomain).toBe(input.targetDomain);
+		await tools.navigate(input.targetUrl);
+	});
+
+	test("rejects a persisted target domain that does not match the target URL", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		await store.create(
+			{ ...input, targetDomain: "com" },
+			"2026-08-28T00:00:00.000Z",
+		);
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+
+		await expect(
+			RestrictedBrowserTools.create(driver, store, input.id, "run-token-1"),
+		).rejects.toBeInstanceOf(NavigationPolicyError);
+	});
+
+	test("does not persist a sent result for an outside form URL", async () => {
+		const driver = new FakeDriver();
+		driver.submitResult = {
+			outcome: "sent",
+			formUrl: "https://evil.test/collect",
+		};
+		const store = new InMemoryJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const tools = await RestrictedBrowserTools.create(
+			driver,
+			store,
+			input.id,
+			"run-token-1",
+		);
+
+		await expect(tools.submit()).rejects.toBeInstanceOf(
+			SubmissionResultUncertainError,
+		);
+		const persisted = await store.find(input.id);
+		expect(persisted?.status).toBe("uncertain");
+		expect(persisted?.result?.reasonCode).toBe("SUBMIT_TARGET_INVALID");
+	});
 });
 
 async function createTools(
@@ -114,17 +150,13 @@ async function createTools(
 ): Promise<RestrictedBrowserTools> {
 	const store = new InMemoryJobStore();
 	await store.create(input, "2026-08-28T00:00:00.000Z");
-	return new RestrictedBrowserTools(
-		driver,
-		store,
-		input.id,
-		"run-token-1",
-		input.targetDomain,
-	);
+	await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+	return RestrictedBrowserTools.create(driver, store, input.id, "run-token-1");
 }
 
 class FakeDriver implements RestrictedBrowserDriver {
 	url = input.targetUrl;
+	restrictedDomain: string | null = null;
 	redirectTo: string | null = null;
 	submitCount = 0;
 	submitError: Error | null = null;
@@ -132,6 +164,10 @@ class FakeDriver implements RestrictedBrowserDriver {
 		outcome: "sent",
 		formUrl: input.targetUrl,
 	};
+
+	async restrictToDomain(targetDomain: string): Promise<void> {
+		this.restrictedDomain = targetDomain;
+	}
 
 	async currentUrl(): Promise<string> {
 		return this.url;

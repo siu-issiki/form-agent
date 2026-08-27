@@ -11,8 +11,6 @@ export interface BrowserSession {
 export interface CreateBrowserOptions {
 	timeoutMinutes?: number;
 	proxyCountryCode?: string | null;
-	profileId?: string;
-	enableRecording?: boolean;
 }
 
 export type BrowserUseFetch = (
@@ -65,8 +63,8 @@ export class BrowserUseClient {
 			body: JSON.stringify({
 				timeout,
 				proxyCountryCode: options.proxyCountryCode ?? null,
-				profileId: options.profileId ?? null,
-				enableRecording: options.enableRecording ?? false,
+				profileId: null,
+				enableRecording: false,
 				allowResizing: false,
 			}),
 		});

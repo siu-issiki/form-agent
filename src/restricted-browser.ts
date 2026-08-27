@@ -14,6 +14,7 @@ export type BrowserSubmitResult =
 	  };
 
 export interface RestrictedBrowserDriver {
+	restrictToDomain(targetDomain: string): Promise<void>;
 	currentUrl(): Promise<string>;
 	navigate(url: string): Promise<void>;
 	observe(): Promise<BrowserObservation>;
@@ -48,7 +49,7 @@ export class RestrictedBrowserTools {
 	readonly #targetDomain: string;
 	#submitAttempted = false;
 
-	constructor(
+	private constructor(
 		private readonly driver: RestrictedBrowserDriver,
 		private readonly jobs: JobStore,
 		private readonly jobId: string,
@@ -57,6 +58,31 @@ export class RestrictedBrowserTools {
 		private readonly now: () => string = () => new Date().toISOString(),
 	) {
 		this.#targetDomain = normalizeTargetDomain(targetDomain);
+	}
+
+	static async create(
+		driver: RestrictedBrowserDriver,
+		jobs: JobStore,
+		jobId: string,
+		runToken: string,
+		now: () => string = () => new Date().toISOString(),
+	): Promise<RestrictedBrowserTools> {
+		const job = await jobs.find(jobId);
+		if (job?.status !== "running" || job.runToken !== runToken) {
+			throw new SubmissionNotAuthorizedError();
+		}
+
+		const targetDomain = normalizeTargetDomain(job.targetDomain);
+		assertTargetUrlMatchesDomain(job.targetUrl, targetDomain);
+		await driver.restrictToDomain(targetDomain);
+		return new RestrictedBrowserTools(
+			driver,
+			jobs,
+			jobId,
+			runToken,
+			targetDomain,
+			now,
+		);
 	}
 
 	async navigate(url: string): Promise<void> {
@@ -99,7 +125,10 @@ export class RestrictedBrowserTools {
 			this.runToken,
 			this.now(),
 		);
-		if (!authorized) {
+		if (
+			!authorized ||
+			normalizeTargetDomain(authorized.targetDomain) !== this.#targetDomain
+		) {
 			throw new SubmissionNotAuthorizedError();
 		}
 
@@ -127,6 +156,16 @@ export class RestrictedBrowserTools {
 				throw new SubmissionResultUncertainError();
 			}
 			return uncertain;
+		}
+
+		try {
+			this.#assertAllowedUrl(result.formUrl);
+		} catch {
+			await this.#recordUncertain(
+				"SUBMIT_TARGET_INVALID",
+				"The browser reported a submission target outside the allowed domain.",
+			);
+			throw new SubmissionResultUncertainError();
 		}
 
 		try {
@@ -196,4 +235,26 @@ function normalizeTargetDomain(value: string): string {
 		throw new NavigationPolicyError();
 	}
 	return normalized;
+}
+
+function assertTargetUrlMatchesDomain(
+	targetUrl: string,
+	targetDomain: string,
+): void {
+	let url: URL;
+	try {
+		url = new URL(targetUrl);
+	} catch {
+		throw new NavigationPolicyError();
+	}
+
+	const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+	if (
+		(url.protocol !== "https:" && url.protocol !== "http:") ||
+		url.username ||
+		url.password ||
+		hostname !== targetDomain
+	) {
+		throw new NavigationPolicyError();
+	}
 }
