@@ -3,13 +3,21 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit",
-    "lint": "biome check src test",
-    "test": "bun test"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.workers.json",
+    "lint": "biome check src test vitest.config.ts",
+    "test": "bun run test:unit && bun run test:workers",
+    "test:unit": "bun test test/job.test.ts",
+    "test:workers": "vitest run",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "dev": "wrangler dev"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.2.2",
+    "@cloudflare/vitest-plugin": "^1.1.1",
+    "@cloudflare/workers-types": "^5.20260827.1",
     "@types/bun": "^1.2.21",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.127.0"
   }
 }

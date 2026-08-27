@@ -8,7 +8,16 @@
     "exactOptionalPropertyTypes": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "types": ["bun"]
+    "lib": ["ES2022"],
+    "types": [
+      "@cloudflare/workers-types",
+      "@cloudflare/vitest-plugin/types",
+      "vitest/globals"
+    ]
   },
-  "include": ["src/job.ts", "test/job.test.ts", "vitest.config.ts"]
+  "include": [
+    "src/**/*.ts",
+    "test/apply-migrations.ts",
+    "test/worker.test.ts"
+  ]
 }

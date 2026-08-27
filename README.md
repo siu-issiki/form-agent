@@ -11,6 +11,8 @@ bun install
 bun run typecheck
 bun run lint
 bun run test
+bun run db:migrate:local
+bun run dev
 ```
 
-現在は、重複した Consumer からの二重実行・二重送信を防ぐジョブ状態機械を実装しています。
+ローカル開発では Miniflare 上の D1 と Queue を使用します。Queue の最大並列数はローカル実行では再現されないため、D1 の条件付き更新と重複配信テストで二重実行を防ぎます。
