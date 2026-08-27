@@ -13,8 +13,8 @@ const input: JobInput = {
 	id: "job-001",
 	companyId: "company-001",
 	companyName: "Example Inc.",
-	targetUrl: "https://example.com/contact",
-	targetDomain: "example.com",
+	targetUrl: "https://acme.co.jp/contact",
+	targetDomain: "acme.co.jp",
 	payload: { message: "Hello" },
 };
 
@@ -23,9 +23,9 @@ describe("RestrictedBrowserTools", () => {
 		const driver = new FakeDriver();
 		const tools = await createTools(driver);
 
-		await tools.navigate("https://contact.example.com/form");
+		await tools.navigate("https://contact.acme.co.jp/form");
 		await expect(
-			tools.navigate("https://example.com.evil.test/form"),
+			tools.navigate("https://acme.co.jp.evil.test/form"),
 		).rejects.toBeInstanceOf(NavigationPolicyError);
 	});
 
@@ -35,7 +35,7 @@ describe("RestrictedBrowserTools", () => {
 		const tools = await createTools(driver);
 
 		await expect(
-			tools.navigate("https://example.com/contact"),
+			tools.navigate("https://acme.co.jp/contact"),
 		).rejects.toBeInstanceOf(NavigationPolicyError);
 	});
 
@@ -122,7 +122,7 @@ describe("RestrictedBrowserTools", () => {
 
 	test("allows a subdomain target URL and a redirect to the apex domain", async () => {
 		const driver = new FakeDriver();
-		driver.url = "https://www.example.com/contact";
+		driver.url = "https://www.acme.co.jp/contact";
 		const store = new InMemoryJobStore();
 		await store.create(
 			{ ...input, targetUrl: driver.url },
@@ -136,9 +136,9 @@ describe("RestrictedBrowserTools", () => {
 			"run-token-1",
 		);
 
-		driver.redirectTo = "https://example.com/contact";
-		await tools.navigate("https://www.example.com/contact");
-		expect(await driver.currentUrl()).toBe("https://example.com/contact");
+		driver.redirectTo = "https://acme.co.jp/contact";
+		await tools.navigate("https://www.acme.co.jp/contact");
+		expect(await driver.currentUrl()).toBe("https://acme.co.jp/contact");
 	});
 
 	test("rejects a public suffix as the target domain", async () => {
@@ -154,6 +154,28 @@ describe("RestrictedBrowserTools", () => {
 		await expect(
 			RestrictedBrowserTools.create(driver, store, input.id, "run-token-1"),
 		).rejects.toBeInstanceOf(NavigationPolicyError);
+	});
+
+	test("rejects special-use and internal target domains", async () => {
+		for (const targetDomain of [
+			"foo.localhost",
+			"evil.local",
+			"example.internal",
+			"example.invalid",
+		]) {
+			const driver = new FakeDriver();
+			driver.url = `http://${targetDomain}/contact`;
+			const store = new InMemoryJobStore();
+			await store.create(
+				{ ...input, targetUrl: driver.url, targetDomain },
+				"2026-08-28T00:00:00.000Z",
+			);
+			await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+
+			await expect(
+				RestrictedBrowserTools.create(driver, store, input.id, "run-token-1"),
+			).rejects.toBeInstanceOf(NavigationPolicyError);
+		}
 	});
 
 	test("does not persist a sent result for an outside form URL", async () => {

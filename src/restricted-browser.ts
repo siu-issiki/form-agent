@@ -1,4 +1,4 @@
-import { getDomain } from "tldts";
+import { parse } from "tldts";
 import type { Job, JobStore } from "./job";
 
 export interface BrowserObservation {
@@ -232,11 +232,19 @@ export class RestrictedBrowserTools {
 
 function normalizeTargetDomain(value: string): string {
 	const normalized = value.toLowerCase().replace(/\.$/, "");
+	const parsed = parse(normalized, {
+		allowPrivateDomains: true,
+		detectSpecialUse: true,
+		extractHostname: false,
+	});
 	if (
 		!normalized ||
 		normalized.includes(":") ||
 		normalized.includes("/") ||
-		getDomain(normalized, { allowPrivateDomains: true }) !== normalized
+		parsed.domain !== normalized ||
+		parsed.isIp ||
+		parsed.isSpecialUse ||
+		(!parsed.isIcann && !parsed.isPrivate)
 	) {
 		throw new NavigationPolicyError();
 	}
