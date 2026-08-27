@@ -6,7 +6,7 @@
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.workers.json",
     "lint": "biome check src test vitest.config.ts",
     "test": "bun run test:unit && bun run test:workers",
-    "test:unit": "bun test test/job.test.ts",
+    "test:unit": "bun test test/job.test.ts test/browser-use-client.test.ts test/restricted-browser.test.ts",
     "test:workers": "vitest run",
     "db:migrate:local": "wrangler d1 migrations apply DB --local",
     "dev": "wrangler dev"
