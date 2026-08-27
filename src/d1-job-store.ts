@@ -7,7 +7,7 @@ import {
 	type JobStore,
 } from "./job";
 
-interface JobRow {
+interface StoredJobRow {
 	id: string;
 	company_id: string;
 	company_name: string;
@@ -19,6 +19,9 @@ interface JobRow {
 	run_token: string | null;
 	created_at: string;
 	updated_at: string;
+}
+
+interface JobRow extends StoredJobRow {
 	outcome: JobResult["outcome"] | null;
 	form_url: string | null;
 	reason_code: string | null;
@@ -69,19 +72,20 @@ export class D1JobStore implements JobStore {
 		now: string,
 	): Promise<Job | null> {
 		const session = this.db.withSession("first-primary");
-		const result = await session
+		const row = await session
 			.prepare(
 				`UPDATE jobs
          SET status = 'running',
              attempt_count = attempt_count + 1,
              run_token = ?,
              updated_at = ?
-         WHERE id = ? AND status = 'pending'`,
+         WHERE id = ? AND status = 'pending'
+         RETURNING *`,
 			)
 			.bind(runToken, now, id)
-			.run();
+			.first<StoredJobRow>();
 
-		return result.meta.changes === 1 ? this.#findRequired(session, id) : null;
+		return row ? mapStoredJob(row) : null;
 	}
 
 	async claimSubmission(
@@ -90,16 +94,17 @@ export class D1JobStore implements JobStore {
 		now: string,
 	): Promise<Job | null> {
 		const session = this.db.withSession("first-primary");
-		const result = await session
+		const row = await session
 			.prepare(
 				`UPDATE jobs
          SET status = 'submitting', updated_at = ?
-         WHERE id = ? AND status = 'running' AND run_token = ?`,
+         WHERE id = ? AND status = 'running' AND run_token = ?
+         RETURNING *`,
 			)
 			.bind(now, id, runToken)
-			.run();
+			.first<StoredJobRow>();
 
-		return result.meta.changes === 1 ? this.#findRequired(session, id) : null;
+		return row ? mapStoredJob(row) : null;
 	}
 
 	recordSent(
@@ -108,7 +113,7 @@ export class D1JobStore implements JobStore {
 		formUrl: string,
 		now: string,
 	): Promise<Job | null> {
-		return this.#finishSubmission(id, runToken, now, {
+		return this.#finish(id, runToken, "submitting", now, {
 			outcome: "sent",
 			formUrl,
 			reasonCode: null,
@@ -124,7 +129,7 @@ export class D1JobStore implements JobStore {
 		reason: string,
 		now: string,
 	): Promise<Job | null> {
-		return this.#finishSubmission(id, runToken, now, {
+		return this.#finish(id, runToken, "submitting", now, {
 			outcome: "uncertain",
 			formUrl: null,
 			reasonCode,
@@ -133,9 +138,67 @@ export class D1JobStore implements JobStore {
 		});
 	}
 
-	async #finishSubmission(
+	recordFailed(
 		id: string,
 		runToken: string,
+		reasonCode: string,
+		reason: string,
+		now: string,
+	): Promise<Job | null> {
+		return this.#finish(id, runToken, "running", now, {
+			outcome: "failed",
+			formUrl: null,
+			reasonCode,
+			reason,
+			completedAt: now,
+		});
+	}
+
+	async markDeadLettered(
+		id: string,
+		reason: string,
+		now: string,
+	): Promise<Job | null> {
+		const session = this.db.withSession("first-primary");
+		const eventId = crypto.randomUUID();
+		const batchResult = await session.batch([
+			session
+				.prepare(
+					`UPDATE jobs
+           SET status = 'dead_lettered', updated_at = ?
+           WHERE id = ? AND status IN ('pending', 'running', 'failed')`,
+				)
+				.bind(now, id),
+			session
+				.prepare(
+					`INSERT INTO events (
+             id, job_id, attempt, type, data_json, created_at
+           )
+           SELECT ?, id, attempt_count, 'job.dead_lettered', ?, ?
+           FROM jobs
+           WHERE id = ? AND status = 'dead_lettered' AND updated_at = ?`,
+				)
+				.bind(eventId, JSON.stringify({ reason }), now, id, now),
+		]);
+		const statusUpdate = batchResult[0];
+		const eventInsert = batchResult[1];
+
+		if (
+			!statusUpdate ||
+			!eventInsert ||
+			statusUpdate.meta.changes !== 1 ||
+			eventInsert.meta.changes !== 1
+		) {
+			return null;
+		}
+
+		return this.#findRequired(session, id);
+	}
+
+	async #finish(
+		id: string,
+		runToken: string,
+		expectedStatus: "running" | "submitting",
 		now: string,
 		result: JobResult,
 	): Promise<Job | null> {
@@ -145,9 +208,9 @@ export class D1JobStore implements JobStore {
 				.prepare(
 					`UPDATE jobs
            SET status = ?, updated_at = ?
-           WHERE id = ? AND status = 'submitting' AND run_token = ?`,
+           WHERE id = ? AND status = ? AND run_token = ?`,
 				)
-				.bind(result.outcome, now, id, runToken),
+				.bind(result.outcome, now, id, expectedStatus, runToken),
 			session
 				.prepare(
 					`INSERT INTO results (
@@ -216,6 +279,22 @@ export class D1JobStore implements JobStore {
 }
 
 function mapJob(row: JobRow): Job {
+	const job = mapStoredJob(row);
+	return {
+		...job,
+		result: row.outcome
+			? {
+					outcome: row.outcome,
+					formUrl: row.form_url,
+					reasonCode: row.reason_code,
+					reason: row.reason,
+					completedAt: row.completed_at ?? row.updated_at,
+				}
+			: null,
+	};
+}
+
+function mapStoredJob(row: StoredJobRow): Job {
 	return {
 		id: row.id,
 		companyId: row.company_id,
@@ -226,15 +305,7 @@ function mapJob(row: JobRow): Job {
 		status: row.status,
 		attemptCount: row.attempt_count,
 		runToken: row.run_token,
-		result: row.outcome
-			? {
-					outcome: row.outcome,
-					formUrl: row.form_url,
-					reasonCode: row.reason_code,
-					reason: row.reason,
-					completedAt: row.completed_at ?? row.updated_at,
-				}
-			: null,
+		result: null,
 		createdAt: row.created_at,
 		updatedAt: row.updated_at,
 	};

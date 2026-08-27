@@ -19,6 +19,8 @@ interface JobQueue {
 	send(message: JobMessage): Promise<unknown>;
 }
 
+const DEAD_LETTER_QUEUE = "form-agent-jobs-dlq";
+
 export async function registerJob(
 	db: D1Database,
 	queue: JobQueue,
@@ -70,10 +72,32 @@ const worker: ExportedHandler<Env, JobMessage> = {
 			}
 
 			try {
-				await store.claimRun(
-					message.body.jobId,
-					crypto.randomUUID(),
-					new Date().toISOString(),
+				const now = new Date().toISOString();
+				if (batch.queue === DEAD_LETTER_QUEUE) {
+					await store.markDeadLettered(
+						message.body.jobId,
+						"QUEUE_RETRY_EXHAUSTED",
+						now,
+					);
+					message.ack();
+					continue;
+				}
+
+				const runToken = message.id;
+				const claimed = await store.claimRun(message.body.jobId, runToken, now);
+				const job = claimed ?? (await store.find(message.body.jobId));
+
+				if (job?.status !== "running" || job.runToken !== runToken) {
+					message.ack();
+					continue;
+				}
+
+				await store.recordFailed(
+					job.id,
+					runToken,
+					"EXECUTOR_NOT_CONFIGURED",
+					"The browser executor has not been configured yet.",
+					now,
 				);
 				message.ack();
 			} catch {

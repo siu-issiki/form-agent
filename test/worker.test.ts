@@ -100,7 +100,7 @@ describe("Queue orchestration", () => {
 		expect(sent).toEqual([{ jobId: input.id }]);
 	});
 
-	test("acknowledges duplicate deliveries but claims the job once", async () => {
+	test("fails closed before acknowledging duplicate deliveries", async () => {
 		const store = new D1JobStore(env.DB);
 		await store.create(input, "2026-08-28T00:00:00.000Z");
 		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
@@ -125,7 +125,62 @@ describe("Queue orchestration", () => {
 
 		expect(result.explicitAcks).toEqual(["message-1", "message-2"]);
 		expect(result.retryMessages).toEqual([]);
-		expect(persisted?.status).toBe("running");
+		expect(persisted?.status).toBe("failed");
 		expect(persisted?.attemptCount).toBe(1);
+		expect(persisted?.result?.reasonCode).toBe("EXECUTOR_NOT_CONFIGURED");
+	});
+
+	test("resumes a run claimed by the same queue message", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "message-1", "2026-08-28T00:00:01.000Z");
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
+			{
+				id: "message-1",
+				timestamp: new Date("2026-08-28T00:00:02.000Z"),
+				body: { jobId: input.id },
+				attempts: 2,
+			},
+		]);
+		const ctx = createExecutionContext();
+
+		await worker.queue?.(batch, env, ctx);
+		const result = await getQueueResult(batch, ctx);
+		const persisted = await store.find(input.id);
+
+		expect(result.explicitAcks).toEqual(["message-1"]);
+		expect(result.retryMessages).toEqual([]);
+		expect(persisted?.status).toBe("failed");
+		expect(persisted?.attemptCount).toBe(1);
+	});
+
+	test("marks a safe job state as dead-lettered", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs-dlq", [
+			{
+				id: "dlq-message-1",
+				timestamp: new Date("2026-08-28T00:00:03.000Z"),
+				body: { jobId: input.id },
+				attempts: 1,
+			},
+		]);
+		const ctx = createExecutionContext();
+
+		await worker.queue?.(batch, env, ctx);
+		const result = await getQueueResult(batch, ctx);
+		const persisted = await store.find(input.id);
+		const event = await env.DB.prepare(
+			"SELECT type, data_json FROM events WHERE job_id = ?",
+		)
+			.bind(input.id)
+			.first<{ type: string; data_json: string }>();
+
+		expect(result.explicitAcks).toEqual(["dlq-message-1"]);
+		expect(persisted?.status).toBe("dead_lettered");
+		expect(event?.type).toBe("job.dead_lettered");
+		expect(JSON.parse(event?.data_json ?? "{}")).toEqual({
+			reason: "QUEUE_RETRY_EXHAUSTED",
+		});
 	});
 });

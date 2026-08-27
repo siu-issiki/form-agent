@@ -56,6 +56,13 @@ export interface JobStore {
 		reason: string,
 		now: string,
 	): Promise<Job | null>;
+	recordFailed(
+		id: string,
+		runToken: string,
+		reasonCode: string,
+		reason: string,
+		now: string,
+	): Promise<Job | null>;
 }
 
 export class DuplicateJobError extends Error {
@@ -133,7 +140,7 @@ export class InMemoryJobStore implements JobStore {
 		formUrl: string,
 		now: string,
 	): Promise<Job | null> {
-		return this.#finishSubmission(id, runToken, now, {
+		return this.#finish(id, runToken, "submitting", now, {
 			outcome: "sent",
 			formUrl,
 			reasonCode: null,
@@ -149,7 +156,7 @@ export class InMemoryJobStore implements JobStore {
 		reason: string,
 		now: string,
 	): Promise<Job | null> {
-		return this.#finishSubmission(id, runToken, now, {
+		return this.#finish(id, runToken, "submitting", now, {
 			outcome: "uncertain",
 			formUrl: null,
 			reasonCode,
@@ -158,14 +165,31 @@ export class InMemoryJobStore implements JobStore {
 		});
 	}
 
-	#finishSubmission(
+	async recordFailed(
 		id: string,
 		runToken: string,
+		reasonCode: string,
+		reason: string,
+		now: string,
+	): Promise<Job | null> {
+		return this.#finish(id, runToken, "running", now, {
+			outcome: "failed",
+			formUrl: null,
+			reasonCode,
+			reason,
+			completedAt: now,
+		});
+	}
+
+	#finish(
+		id: string,
+		runToken: string,
+		expectedStatus: "running" | "submitting",
 		now: string,
 		result: JobResult,
 	): Job | null {
 		const job = this.#jobs.get(id);
-		if (job?.status !== "submitting" || job.runToken !== runToken) {
+		if (job?.status !== expectedStatus || job.runToken !== runToken) {
 			return null;
 		}
 
