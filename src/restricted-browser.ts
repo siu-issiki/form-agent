@@ -1,3 +1,4 @@
+import { getDomain } from "tldts";
 import type { Job, JobStore } from "./job";
 
 export interface BrowserObservation {
@@ -231,7 +232,12 @@ export class RestrictedBrowserTools {
 
 function normalizeTargetDomain(value: string): string {
 	const normalized = value.toLowerCase().replace(/\.$/, "");
-	if (!normalized || normalized.includes(":") || normalized.includes("/")) {
+	if (
+		!normalized ||
+		normalized.includes(":") ||
+		normalized.includes("/") ||
+		getDomain(normalized, { allowPrivateDomains: true }) !== normalized
+	) {
 		throw new NavigationPolicyError();
 	}
 	return normalized;
@@ -253,7 +259,7 @@ function assertTargetUrlMatchesDomain(
 		(url.protocol !== "https:" && url.protocol !== "http:") ||
 		url.username ||
 		url.password ||
-		hostname !== targetDomain
+		(hostname !== targetDomain && !hostname.endsWith(`.${targetDomain}`))
 	) {
 		throw new NavigationPolicyError();
 	}

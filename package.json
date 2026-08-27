@@ -19,5 +19,8 @@
     "typescript": "^5.9.2",
     "vitest": "^4.1.11",
     "wrangler": "^4.127.0"
+  },
+  "dependencies": {
+    "tldts": "^7.4.11"
   }
 }

@@ -120,6 +120,42 @@ describe("RestrictedBrowserTools", () => {
 		).rejects.toBeInstanceOf(NavigationPolicyError);
 	});
 
+	test("allows a subdomain target URL and a redirect to the apex domain", async () => {
+		const driver = new FakeDriver();
+		driver.url = "https://www.example.com/contact";
+		const store = new InMemoryJobStore();
+		await store.create(
+			{ ...input, targetUrl: driver.url },
+			"2026-08-28T00:00:00.000Z",
+		);
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const tools = await RestrictedBrowserTools.create(
+			driver,
+			store,
+			input.id,
+			"run-token-1",
+		);
+
+		driver.redirectTo = "https://example.com/contact";
+		await tools.navigate("https://www.example.com/contact");
+		expect(await driver.currentUrl()).toBe("https://example.com/contact");
+	});
+
+	test("rejects a public suffix as the target domain", async () => {
+		const driver = new FakeDriver();
+		driver.url = "https://co.uk/contact";
+		const store = new InMemoryJobStore();
+		await store.create(
+			{ ...input, targetUrl: driver.url, targetDomain: "co.uk" },
+			"2026-08-28T00:00:00.000Z",
+		);
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+
+		await expect(
+			RestrictedBrowserTools.create(driver, store, input.id, "run-token-1"),
+		).rejects.toBeInstanceOf(NavigationPolicyError);
+	});
+
 	test("does not persist a sent result for an outside form URL", async () => {
 		const driver = new FakeDriver();
 		driver.submitResult = {
