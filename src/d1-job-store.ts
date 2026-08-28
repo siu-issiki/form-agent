@@ -107,6 +107,26 @@ export class D1JobStore implements JobStore {
 		return row ? mapStoredJob(row) : null;
 	}
 
+	async recordRunAttempt(
+		id: string,
+		runToken: string,
+		attempt: number,
+		now: string,
+	): Promise<Job | null> {
+		const session = this.db.withSession("first-primary");
+		const row = await session
+			.prepare(
+				`UPDATE jobs
+         SET attempt_count = MAX(attempt_count, ?), updated_at = ?
+         WHERE id = ? AND status = 'running' AND run_token = ?
+         RETURNING *`,
+			)
+			.bind(attempt, now, id, runToken)
+			.first<StoredJobRow>();
+
+		return row ? mapStoredJob(row) : null;
+	}
+
 	recordSent(
 		id: string,
 		runToken: string,

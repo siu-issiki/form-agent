@@ -38,6 +38,12 @@ export interface JobStore {
 	create(input: JobInput, now: string): Promise<Job>;
 	find(id: string): Promise<Job | null>;
 	claimRun(id: string, runToken: string, now: string): Promise<Job | null>;
+	recordRunAttempt(
+		id: string,
+		runToken: string,
+		attempt: number,
+		now: string,
+	): Promise<Job | null>;
 	claimSubmission(
 		id: string,
 		runToken: string,
@@ -138,6 +144,26 @@ export class InMemoryJobStore implements JobStore {
 		}
 
 		const updated: Job = { ...job, status: "submitting", updatedAt: now };
+		this.#jobs.set(id, updated);
+		return structuredClone(updated);
+	}
+
+	async recordRunAttempt(
+		id: string,
+		runToken: string,
+		attempt: number,
+		now: string,
+	): Promise<Job | null> {
+		const job = this.#jobs.get(id);
+		if (job?.status !== "running" || job.runToken !== runToken) {
+			return null;
+		}
+
+		const updated: Job = {
+			...job,
+			attemptCount: Math.max(job.attemptCount, attempt),
+			updatedAt: now,
+		};
 		this.#jobs.set(id, updated);
 		return structuredClone(updated);
 	}

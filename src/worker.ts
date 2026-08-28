@@ -1,8 +1,7 @@
 import {
 	AgentExecutionError,
 	type AgentExecutor,
-	type AgentRunnerBinding,
-	ServiceBindingAgentExecutor,
+	executeAgent,
 } from "./agent-executor";
 import type { AgentRunResult } from "./agent-runtime";
 import { D1JobStore } from "./d1-job-store";
@@ -15,7 +14,6 @@ export interface JobMessage {
 export interface Env {
 	DB: D1Database;
 	JOB_QUEUE: Queue<JobMessage>;
-	AGENT_RUNNER?: AgentRunnerBinding;
 }
 
 export interface RegisterJobResult {
@@ -72,7 +70,7 @@ const worker: ExportedHandler<Env, JobMessage> = {
 	},
 
 	async queue(batch, env) {
-		await consumeJobBatch(batch, env, createAgentExecutor(env));
+		await consumeJobBatch(batch, env, createAgentExecutor());
 	},
 };
 
@@ -111,11 +109,21 @@ export async function consumeJobBatch(
 				message.ack();
 				continue;
 			}
+			const attemptedJob = await store.recordRunAttempt(
+				job.id,
+				runToken,
+				message.attempts,
+				now,
+			);
+			if (!attemptedJob) {
+				message.ack();
+				continue;
+			}
 
 			const disposition = await executeClaimedJob(
 				store,
 				executor,
-				job,
+				attemptedJob,
 				runToken,
 				now,
 			);
@@ -139,7 +147,7 @@ async function executeClaimedJob(
 ): Promise<"ack" | "retry"> {
 	let result: AgentRunResult;
 	try {
-		result = await executor.execute({
+		result = await executeAgent(executor, {
 			job,
 			runToken,
 			maxDurationMs: MAX_AGENT_DURATION_MS,
@@ -250,10 +258,7 @@ async function closeSubmittingConflict(
 	);
 }
 
-function createAgentExecutor(env: Env): AgentExecutor {
-	if (env.AGENT_RUNNER) {
-		return new ServiceBindingAgentExecutor(env.AGENT_RUNNER);
-	}
+function createAgentExecutor(): AgentExecutor {
 	return {
 		async execute() {
 			return {

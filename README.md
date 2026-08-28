@@ -21,6 +21,6 @@ BrowserUse は Agent API ではなく standalone browser API だけを使用し�
 
 ## エージェント実行境界
 
-Queue Consumer は `AgentRuntime` の結果契約を使い、Sandbox 上の runner とは Cloudflare Service Binding の `AGENT_RUNNER` を介して接続します。runner が未設定の場合は `EXECUTOR_NOT_CONFIGURED` で fail-closed に終了します。
+Queue Consumer は `AgentRuntime` の結果契約を使います。Sandbox runner と制限付きツールRPCの接続が完成するまではproduction executorを有効化せず、`EXECUTOR_NOT_CONFIGURED`でfail-closedに終了します。
 
 runner は `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返します。`sent` は制限付き `submit` ツールが D1 へ結果を保存済みの場合だけ確定し、送信権取得後の切断や矛盾した結果は `uncertain` として自動再試行を止めます。

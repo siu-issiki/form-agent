@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { AgentTools } from "../src/agent-runtime";
 import { InMemoryJobStore, type JobInput } from "../src/job";
 import {
 	type BrowserSubmitResult,
@@ -101,9 +102,10 @@ describe("RestrictedBrowserTools", () => {
 	test("derives the domain from the persisted job and installs a network policy", async () => {
 		const driver = new FakeDriver();
 		const tools = await createTools(driver);
+		const agentTools: AgentTools = tools;
 
 		expect(driver.restrictedDomain).toBe(input.targetDomain);
-		await tools.navigate(input.targetUrl);
+		await agentTools.navigate(input.targetUrl);
 	});
 
 	test("rejects a persisted target domain that does not match the target URL", async () => {

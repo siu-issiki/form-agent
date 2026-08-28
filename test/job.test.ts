@@ -168,4 +168,26 @@ describe("job submission guard", () => {
 		expect(uncertain?.status).toBe("uncertain");
 		expect(retried).toBeNull();
 	});
+
+	test("tracks redelivery attempts for the current run token", async () => {
+		const store = new InMemoryJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+
+		const redelivered = await store.recordRunAttempt(
+			input.id,
+			"run-token-1",
+			3,
+			"2026-08-28T00:00:02.000Z",
+		);
+		const stale = await store.recordRunAttempt(
+			input.id,
+			"run-token-2",
+			4,
+			"2026-08-28T00:00:03.000Z",
+		);
+
+		expect(redelivered?.attemptCount).toBe(3);
+		expect(stale).toBeNull();
+	});
 });

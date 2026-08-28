@@ -156,7 +156,7 @@ describe("Queue orchestration", () => {
 		expect(result.explicitAcks).toEqual(["message-1"]);
 		expect(result.retryMessages).toEqual([]);
 		expect(persisted?.status).toBe("failed");
-		expect(persisted?.attemptCount).toBe(1);
+		expect(persisted?.attemptCount).toBe(2);
 	});
 
 	test("persists a prohibited agent decision and acknowledges the message", async () => {

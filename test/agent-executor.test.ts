@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
 	AgentExecutionError,
-	ServiceBindingAgentExecutor,
+	type AgentExecutor,
+	executeAgent,
 } from "../src/agent-executor";
 import type { AgentRunInput } from "../src/agent-runtime";
 
@@ -21,75 +22,41 @@ const input: AgentRunInput = {
 		updatedAt: "2026-08-28T00:00:01.000Z",
 	},
 	runToken: "run-token-1",
-	maxDurationMs: 600_000,
+	maxDurationMs: 10,
 };
 
-describe("ServiceBindingAgentExecutor", () => {
-	test("sends one structured job to the internal runner", async () => {
-		const requests: Request[] = [];
-		const executor = new ServiceBindingAgentExecutor({
-			async fetch(url, init) {
-				requests.push(new Request(url, init));
-				return Response.json({
-					outcome: "prohibited",
-					formUrl: input.job.targetUrl,
-					reasonCode: "SALES_PROHIBITED",
-					reason: "Sales messages are prohibited.",
-				});
+describe("executeAgent", () => {
+	test("passes a deadline signal to the executor", async () => {
+		let receivedSignal: AbortSignal | undefined;
+		const executor: AgentExecutor = {
+			async execute(_input, signal) {
+				receivedSignal = signal;
+				return {
+					outcome: "failed",
+					reasonCode: "TEST_STOP",
+					reason: "Stopped by the test.",
+					retryable: false,
+				};
 			},
-		});
+		};
 
-		const result = await executor.execute(input);
-		const request = requests[0];
+		await executeAgent(executor, input);
 
-		expect(result.outcome).toBe("prohibited");
-		expect(request?.url).toBe("https://agent-runner.internal/run");
-		expect(request?.method).toBe("POST");
-		expect(await request?.json()).toEqual(input);
+		expect(receivedSignal).toBeDefined();
+		expect(receivedSignal?.aborted).toBe(false);
 	});
 
-	test("classifies runner unavailability as retryable without exposing details", async () => {
-		const executor = new ServiceBindingAgentExecutor({
-			async fetch() {
-				throw new Error("secret network detail");
+	test("rejects an executor that ignores the deadline", async () => {
+		const executor: AgentExecutor = {
+			async execute() {
+				return await new Promise(() => {});
 			},
-		});
+		};
 
-		const error = await executor.execute(input).catch((caught) => caught);
+		const error = await executeAgent(executor, input).catch((caught) => caught);
 
 		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(error.reasonCode).toBe("AGENT_TIMEOUT");
 		expect(error.retryable).toBe(true);
-		expect(error.message).not.toContain("secret network detail");
-	});
-
-	test("rejects an invalid runner result as non-retryable", async () => {
-		const executor = new ServiceBindingAgentExecutor({
-			async fetch() {
-				return Response.json({ outcome: "sent" });
-			},
-		});
-
-		const error = await executor.execute(input).catch((caught) => caught);
-
-		expect(error).toBeInstanceOf(AgentExecutionError);
-		expect(error.reasonCode).toBe("AGENT_RESULT_INVALID");
-		expect(error.retryable).toBe(false);
-	});
-
-	test("rejects an oversized runner result", async () => {
-		const executor = new ServiceBindingAgentExecutor({
-			async fetch() {
-				return Response.json({
-					outcome: "uncertain",
-					reasonCode: "FORM_UNCLEAR",
-					reason: "x".repeat(17 * 1024),
-				});
-			},
-		});
-
-		const error = await executor.execute(input).catch((caught) => caught);
-
-		expect(error).toBeInstanceOf(AgentExecutionError);
-		expect(error.reasonCode).toBe("AGENT_RESULT_INVALID");
 	});
 });
