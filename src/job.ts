@@ -49,6 +49,14 @@ export interface JobStore {
 		formUrl: string,
 		now: string,
 	): Promise<Job | null>;
+	recordProhibited(
+		id: string,
+		runToken: string,
+		formUrl: string | null,
+		reasonCode: string,
+		reason: string,
+		now: string,
+	): Promise<Job | null>;
 	recordUncertain(
 		id: string,
 		runToken: string,
@@ -140,11 +148,28 @@ export class InMemoryJobStore implements JobStore {
 		formUrl: string,
 		now: string,
 	): Promise<Job | null> {
-		return this.#finish(id, runToken, "submitting", now, {
+		return this.#finish(id, runToken, ["submitting"], now, {
 			outcome: "sent",
 			formUrl,
 			reasonCode: null,
 			reason: null,
+			completedAt: now,
+		});
+	}
+
+	async recordProhibited(
+		id: string,
+		runToken: string,
+		formUrl: string | null,
+		reasonCode: string,
+		reason: string,
+		now: string,
+	): Promise<Job | null> {
+		return this.#finish(id, runToken, ["running"], now, {
+			outcome: "prohibited",
+			formUrl,
+			reasonCode,
+			reason,
 			completedAt: now,
 		});
 	}
@@ -156,7 +181,7 @@ export class InMemoryJobStore implements JobStore {
 		reason: string,
 		now: string,
 	): Promise<Job | null> {
-		return this.#finish(id, runToken, "submitting", now, {
+		return this.#finish(id, runToken, ["running", "submitting"], now, {
 			outcome: "uncertain",
 			formUrl: null,
 			reasonCode,
@@ -172,7 +197,7 @@ export class InMemoryJobStore implements JobStore {
 		reason: string,
 		now: string,
 	): Promise<Job | null> {
-		return this.#finish(id, runToken, "running", now, {
+		return this.#finish(id, runToken, ["running"], now, {
 			outcome: "failed",
 			formUrl: null,
 			reasonCode,
@@ -184,12 +209,16 @@ export class InMemoryJobStore implements JobStore {
 	#finish(
 		id: string,
 		runToken: string,
-		expectedStatus: "running" | "submitting",
+		expectedStatuses: readonly ("running" | "submitting")[],
 		now: string,
 		result: JobResult,
 	): Job | null {
 		const job = this.#jobs.get(id);
-		if (job?.status !== expectedStatus || job.runToken !== runToken) {
+		if (
+			!job ||
+			!expectedStatuses.includes(job.status as "running" | "submitting") ||
+			job.runToken !== runToken
+		) {
 			return null;
 		}
 

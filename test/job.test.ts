@@ -128,4 +128,44 @@ describe("job submission guard", () => {
 		expect(retriedRun).toBeNull();
 		expect(retriedSubmission).toBeNull();
 	});
+
+	test("records a prohibited decision before submission", async () => {
+		const store = new InMemoryJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+
+		const prohibited = await store.recordProhibited(
+			input.id,
+			"run-token-1",
+			input.targetUrl,
+			"SALES_PROHIBITED",
+			"Sales messages are prohibited.",
+			"2026-08-28T00:00:02.000Z",
+		);
+
+		expect(prohibited?.status).toBe("prohibited");
+		expect(prohibited?.result?.reasonCode).toBe("SALES_PROHIBITED");
+	});
+
+	test("records an uncertain decision before submission and blocks retry", async () => {
+		const store = new InMemoryJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+
+		const uncertain = await store.recordUncertain(
+			input.id,
+			"run-token-1",
+			"FORM_UNCLEAR",
+			"The form purpose could not be confirmed.",
+			"2026-08-28T00:00:02.000Z",
+		);
+		const retried = await store.claimRun(
+			input.id,
+			"run-token-2",
+			"2026-08-28T00:00:03.000Z",
+		);
+
+		expect(uncertain?.status).toBe("uncertain");
+		expect(retried).toBeNull();
+	});
 });

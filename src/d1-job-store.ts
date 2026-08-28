@@ -113,11 +113,28 @@ export class D1JobStore implements JobStore {
 		formUrl: string,
 		now: string,
 	): Promise<Job | null> {
-		return this.#finish(id, runToken, "submitting", now, {
+		return this.#finish(id, runToken, ["submitting"], now, {
 			outcome: "sent",
 			formUrl,
 			reasonCode: null,
 			reason: null,
+			completedAt: now,
+		});
+	}
+
+	recordProhibited(
+		id: string,
+		runToken: string,
+		formUrl: string | null,
+		reasonCode: string,
+		reason: string,
+		now: string,
+	): Promise<Job | null> {
+		return this.#finish(id, runToken, ["running"], now, {
+			outcome: "prohibited",
+			formUrl,
+			reasonCode,
+			reason,
 			completedAt: now,
 		});
 	}
@@ -129,7 +146,7 @@ export class D1JobStore implements JobStore {
 		reason: string,
 		now: string,
 	): Promise<Job | null> {
-		return this.#finish(id, runToken, "submitting", now, {
+		return this.#finish(id, runToken, ["running", "submitting"], now, {
 			outcome: "uncertain",
 			formUrl: null,
 			reasonCode,
@@ -145,7 +162,7 @@ export class D1JobStore implements JobStore {
 		reason: string,
 		now: string,
 	): Promise<Job | null> {
-		return this.#finish(id, runToken, "running", now, {
+		return this.#finish(id, runToken, ["running"], now, {
 			outcome: "failed",
 			formUrl: null,
 			reasonCode,
@@ -198,19 +215,20 @@ export class D1JobStore implements JobStore {
 	async #finish(
 		id: string,
 		runToken: string,
-		expectedStatus: "running" | "submitting",
+		expectedStatuses: readonly ("running" | "submitting")[],
 		now: string,
 		result: JobResult,
 	): Promise<Job | null> {
 		const session = this.db.withSession("first-primary");
+		const statusPlaceholders = expectedStatuses.map(() => "?").join(", ");
 		const batchResult = await session.batch([
 			session
 				.prepare(
 					`UPDATE jobs
            SET status = ?, updated_at = ?
-           WHERE id = ? AND status = ? AND run_token = ?`,
+           WHERE id = ? AND status IN (${statusPlaceholders}) AND run_token = ?`,
 				)
-				.bind(result.outcome, now, id, expectedStatus, runToken),
+				.bind(result.outcome, now, id, ...expectedStatuses, runToken),
 			session
 				.prepare(
 					`INSERT INTO results (

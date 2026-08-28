@@ -18,3 +18,9 @@ bun run dev
 ローカル開発では Miniflare 上の D1 と Queue を使用します。Queue の最大並列数はローカル実行では再現されないため、D1 の条件付き更新と重複配信テストで二重実行を防ぎます。
 
 BrowserUse は Agent API ではなく standalone browser API だけを使用します。ブラウザ操作層は対象ドメイン内のみに制限し、送信は D1 上で `running` から `submitting` へ遷移できたジョブにだけ許可します。
+
+## エージェント実行境界
+
+Queue Consumer は `AgentRuntime` の結果契約を使い、Sandbox 上の runner とは Cloudflare Service Binding の `AGENT_RUNNER` を介して接続します。runner が未設定の場合は `EXECUTOR_NOT_CONFIGURED` で fail-closed に終了します。
+
+runner は `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返します。`sent` は制限付き `submit` ツールが D1 へ結果を保存済みの場合だけ確定し、送信権取得後の切断や矛盾した結果は `uncertain` として自動再試行を止めます。
