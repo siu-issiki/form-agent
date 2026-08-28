@@ -10,7 +10,7 @@ import {
 	type BrowserToolName,
 	type BrowserToolParams,
 } from "./browser-tool-handler";
-import { BrowserUsePlaywrightDriver } from "./browser-use-playwright-driver";
+import { BrowserUseCdpDriver } from "./browser-use-cdp-driver";
 import type { Job } from "./job";
 import {
 	BrowserElementError,
@@ -57,10 +57,7 @@ export class FormAgentSandbox extends Sandbox<FormAgentSandboxEnv> {
 			throw new Error("Browser Use is not configured");
 		}
 		this.#browserTools ??= new BrowserToolCoordinator(this.env.DB, (job) =>
-			BrowserUsePlaywrightDriver.connect(
-				this.env.BROWSER_USE_API_KEY ?? "",
-				job,
-			),
+			BrowserUseCdpDriver.connect(this.env.BROWSER_USE_API_KEY ?? "", job),
 		);
 		return this.#browserTools.execute(jobId, runToken, tool, params);
 	}

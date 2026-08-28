@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { hasNewSubmissionConfirmation } from "../src/browser-submit-confirmation";
 
-describe("BrowserUsePlaywrightDriver submission confirmation", () => {
+describe("BrowserUseCdpDriver submission confirmation", () => {
 	test("accepts a confirmation that appears after submit", () => {
 		expect(
 			hasNewSubmissionConfirmation(
