@@ -27,13 +27,18 @@ export async function executeAgent(
 	let graceTimeoutId: ReturnType<typeof setTimeout> | undefined;
 	const timeout = new Promise<never>((_, reject) => {
 		onAbort = () => {
+			const waitsForTermination = (executor.terminationGraceMs ?? 0) > 0;
 			graceTimeoutId = setTimeout(
 				() =>
 					reject(
 						new AgentExecutionError(
-							"AGENT_TIMEOUT",
-							"The agent execution exceeded its time limit.",
-							true,
+							waitsForTermination
+								? "AGENT_TERMINATION_UNCONFIRMED"
+								: "AGENT_TIMEOUT",
+							waitsForTermination
+								? "The agent process could not be confirmed stopped."
+								: "The agent execution exceeded its time limit.",
+							!waitsForTermination,
 						),
 					),
 				executor.terminationGraceMs ?? 0,

@@ -83,4 +83,19 @@ describe("executeAgent", () => {
 		expect(error).toBeInstanceOf(AgentExecutionError);
 		expect(cleanupFinished).toBe(true);
 	});
+
+	test("does not retry when termination cannot be confirmed within grace", async () => {
+		const executor: AgentExecutor = {
+			terminationGraceMs: 5,
+			async execute() {
+				return await new Promise(() => {});
+			},
+		};
+
+		const error = await executeAgent(executor, input).catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(error.reasonCode).toBe("AGENT_TERMINATION_UNCONFIRMED");
+		expect(error.retryable).toBe(false);
+	});
 });
