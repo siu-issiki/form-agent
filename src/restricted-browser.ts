@@ -194,25 +194,7 @@ export class RestrictedBrowserTools {
 	}
 
 	#assertAllowedUrl(rawUrl: string): void {
-		let url: URL;
-		try {
-			url = new URL(rawUrl);
-		} catch {
-			throw new NavigationPolicyError();
-		}
-
-		const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
-		const allowedHost =
-			hostname === this.#targetDomain ||
-			hostname.endsWith(`.${this.#targetDomain}`);
-		if (
-			(url.protocol !== "https:" && url.protocol !== "http:") ||
-			url.username ||
-			url.password ||
-			!allowedHost
-		) {
-			throw new NavigationPolicyError();
-		}
+		assertAllowedTargetUrl(rawUrl, this.#targetDomain);
 	}
 
 	async #recordUncertain(reasonCode: string, reason: string): Promise<void> {
@@ -227,6 +209,32 @@ export class RestrictedBrowserTools {
 		} catch {
 			// The caller still receives an uncertain result and must never retry submit.
 		}
+	}
+}
+
+export function assertAllowedTargetUrl(
+	rawUrl: string,
+	targetDomain: string,
+): void {
+	const normalizedTargetDomain = normalizeTargetDomain(targetDomain);
+	let url: URL;
+	try {
+		url = new URL(rawUrl);
+	} catch {
+		throw new NavigationPolicyError();
+	}
+
+	const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+	const allowedHost =
+		hostname === normalizedTargetDomain ||
+		hostname.endsWith(`.${normalizedTargetDomain}`);
+	if (
+		(url.protocol !== "https:" && url.protocol !== "http:") ||
+		url.username ||
+		url.password ||
+		!allowedHost
+	) {
+		throw new NavigationPolicyError();
 	}
 }
 

@@ -6,6 +6,7 @@ import {
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, test } from "vitest";
 import type { AgentExecutor } from "../src/agent-executor";
+import { AgentToolGateway } from "../src/agent-tool-service";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobInput } from "../src/job";
 import worker, {
@@ -18,8 +19,8 @@ const input: JobInput = {
 	id: "job-001",
 	companyId: "company-001",
 	companyName: "Example Inc.",
-	targetUrl: "https://example.com/contact",
-	targetDomain: "example.com",
+	targetUrl: "https://form-agent.dev/contact",
+	targetDomain: "form-agent.dev",
 	payload: { message: "Hello" },
 };
 
@@ -81,6 +82,69 @@ describe("D1JobStore", () => {
 		expect(uncertain?.result?.reasonCode).toBe("SUBMIT_RESULT_UNKNOWN");
 		expect(repeatedResult).toBeNull();
 		expect(duplicate).toBeNull();
+	});
+});
+
+describe("AgentToolGateway", () => {
+	const toolNow = () => "2026-08-28T00:00:02.000Z";
+
+	test("scopes job access and submission permission to the current run token", async () => {
+		const store = new D1JobStore(env.DB);
+		const gateway = new AgentToolGateway(env.DB, toolNow);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+
+		const stale = await gateway.find(input.id, "run-token-2");
+		const running = await gateway.find(input.id, "run-token-1");
+		const submitting = await gateway.claimSubmission(input.id, "run-token-1");
+
+		expect(stale).toBeNull();
+		expect(running?.status).toBe("running");
+		expect(submitting?.status).toBe("submitting");
+	});
+
+	test("records a sent result only for the persisted target domain", async () => {
+		const store = new D1JobStore(env.DB);
+		const gateway = new AgentToolGateway(env.DB, toolNow);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		await gateway.claimSubmission(input.id, "run-token-1");
+
+		await expect(
+			gateway.recordSent(input.id, "run-token-1", "https://evil.test/collect"),
+		).rejects.toThrow();
+		const sent = await gateway.recordSent(
+			input.id,
+			"run-token-1",
+			input.targetUrl,
+		);
+
+		expect(sent?.status).toBe("sent");
+		expect(sent?.result?.formUrl).toBe(input.targetUrl);
+	});
+
+	test("rejects stale tokens and unbounded uncertain reasons", async () => {
+		const store = new D1JobStore(env.DB);
+		const gateway = new AgentToolGateway(env.DB, toolNow);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+
+		const stale = await gateway.recordUncertain(
+			input.id,
+			"run-token-2",
+			"FORM_UNCLEAR",
+			"The form purpose could not be confirmed.",
+		);
+		await expect(
+			gateway.recordUncertain(
+				input.id,
+				"run-token-1",
+				"invalid-code",
+				"x".repeat(1_001),
+			),
+		).rejects.toThrow();
+
+		expect(stale).toBeNull();
 	});
 });
 

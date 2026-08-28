@@ -7,6 +7,8 @@ import type { AgentRunResult } from "./agent-runtime";
 import { D1JobStore } from "./d1-job-store";
 import { DuplicateJobError, type Job, type JobInput } from "./job";
 
+export { AgentToolService } from "./agent-tool-service";
+
 export interface JobMessage {
 	jobId: string;
 }
