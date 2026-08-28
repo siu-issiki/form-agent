@@ -3,10 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.workers.json",
-    "lint": "biome check src test vitest.config.ts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.workers.json && tsc --noEmit -p tsconfig.runner.json",
+    "lint": "biome check src runner test vitest.config.ts",
     "test": "bun run test:unit && bun run test:workers",
-    "test:unit": "bun test test/job.test.ts test/browser-use-client.test.ts test/restricted-browser.test.ts test/agent-executor.test.ts",
+    "test:unit": "bun test test/job.test.ts test/browser-use-client.test.ts test/restricted-browser.test.ts test/agent-executor.test.ts runner/tool-client.test.ts runner/agent-tools.test.ts",
     "test:workers": "vitest run",
     "db:migrate:local": "wrangler d1 migrations apply DB --local",
     "dev": "wrangler dev"
@@ -21,6 +21,9 @@
     "wrangler": "^4.127.0"
   },
   "dependencies": {
+    "@cloudflare/sandbox": "0.13.0-next.751.1",
+    "@earendil-works/pi-agent-core": "0.74.0",
+    "@earendil-works/pi-ai": "0.74.0",
     "tldts": "^7.4.11"
   }
 }

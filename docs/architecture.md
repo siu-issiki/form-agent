@@ -68,7 +68,7 @@ PoC では、実装速度を優先して SQLite と薄い API を状態管理に
 - ブラウザ本体は保持せず、BrowserUse Cloud Browser に接続する。
 - 処理終了後は構造化結果とイベントを保存し、実行環境を破棄または休止する。
 
-Containers と Sandbox SDK の最終選定は、起動時間、実行時間上限、隔離、同時実行数、運用性、料金を PoC で比較して決める。
+PoC実装はCloudflare Sandbox SDK 1.0 previewを採用する。起動時間、実行時間上限、隔離、同時実行数、運用性、料金を計測し、正式採用はContainersとの比較後に決める。
 
 ### Pi
 
@@ -156,6 +156,7 @@ pending ──► running ──► submitting ──► sent
 | `status` | TEXT | `pending` / `running` / `submitting` / `sent` / `prohibited` / `uncertain` / `failed` / `dead_lettered` |
 | `attempt_count` | INTEGER | 実行試行回数 |
 | `run_token` | TEXT NULL | 現在の実行権を識別する token |
+| `provider_request_count` | INTEGER | 現在のrunが使用した推論Provider呼び出し回数 |
 | `last_error_code` | TEXT NULL | 正規化した直近エラー |
 | `created_at` | TEXT | 作成日時 |
 | `updated_at` | TEXT | 更新日時 |
