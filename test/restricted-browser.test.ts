@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentTools } from "../src/agent-runtime";
+import { assertAllowedBrowserRequest } from "../src/browser-network-policy";
 import { InMemoryJobStore, type JobInput } from "../src/job";
 import {
 	type BrowserSubmitResult,
@@ -20,6 +21,24 @@ const input: JobInput = {
 };
 
 describe("RestrictedBrowserTools", () => {
+	test("blocks unsafe requests until submission is authorized", () => {
+		expect(() =>
+			assertAllowedBrowserRequest(
+				"https://form-agent.dev/contact",
+				"form-agent.dev",
+				"POST",
+				false,
+			),
+		).toThrow();
+		expect(() =>
+			assertAllowedBrowserRequest(
+				"https://form-agent.dev/contact",
+				"form-agent.dev",
+				"POST",
+				true,
+			),
+		).not.toThrow();
+	});
 	test("allows only the target domain and its subdomains", async () => {
 		const driver = new FakeDriver();
 		const tools = await createTools(driver);
@@ -53,11 +72,11 @@ describe("RestrictedBrowserTools", () => {
 			() => "2026-08-28T00:00:02.000Z",
 		);
 
-		const sent = await tools.submit();
+		const sent = await tools.submit("fa-0-1");
 
 		expect(sent.status).toBe("sent");
 		expect(driver.submitCount).toBe(1);
-		await expect(tools.submit()).rejects.toBeInstanceOf(
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
 			SubmissionNotAuthorizedError,
 		);
 		expect(driver.submitCount).toBe(1);
@@ -70,6 +89,25 @@ describe("RestrictedBrowserTools", () => {
 		await expect(
 			RestrictedBrowserTools.create(driver, store, input.id, "run-token-1"),
 		).rejects.toBeInstanceOf(SubmissionNotAuthorizedError);
+		expect(driver.submitCount).toBe(0);
+	});
+
+	test("validates the selected submit control before claiming permission", async () => {
+		const driver = new FakeDriver();
+		driver.submitValidationError = new Error("not a submit control");
+		const store = new InMemoryJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const tools = await RestrictedBrowserTools.create(
+			driver,
+			store,
+			input.id,
+			"run-token-1",
+		);
+
+		await expect(tools.submit("fa-0-1")).rejects.toThrow();
+
+		expect((await store.find(input.id))?.status).toBe("running");
 		expect(driver.submitCount).toBe(0);
 	});
 
@@ -87,13 +125,13 @@ describe("RestrictedBrowserTools", () => {
 			() => "2026-08-28T00:00:02.000Z",
 		);
 
-		await expect(tools.submit()).rejects.toBeInstanceOf(
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
 			SubmissionResultUncertainError,
 		);
 		const persisted = await store.find(input.id);
 		expect(persisted?.status).toBe("uncertain");
 		expect(persisted?.result?.reasonCode).toBe("SUBMIT_RESULT_UNKNOWN");
-		await expect(tools.submit()).rejects.toBeInstanceOf(
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
 			SubmissionNotAuthorizedError,
 		);
 		expect(driver.submitCount).toBe(1);
@@ -196,7 +234,7 @@ describe("RestrictedBrowserTools", () => {
 			"run-token-1",
 		);
 
-		await expect(tools.submit()).rejects.toBeInstanceOf(
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
 			SubmissionResultUncertainError,
 		);
 		const persisted = await store.find(input.id);
@@ -220,6 +258,7 @@ class FakeDriver implements RestrictedBrowserDriver {
 	redirectTo: string | null = null;
 	submitCount = 0;
 	submitError: Error | null = null;
+	submitValidationError: Error | null = null;
 	submitResult: BrowserSubmitResult = {
 		outcome: "sent",
 		formUrl: input.targetUrl,
@@ -246,6 +285,12 @@ class FakeDriver implements RestrictedBrowserDriver {
 	async fill(): Promise<void> {}
 
 	async select(): Promise<void> {}
+
+	async validateSubmit(): Promise<void> {
+		if (this.submitValidationError) {
+			throw this.submitValidationError;
+		}
+	}
 
 	async submit(): Promise<BrowserSubmitResult> {
 		this.submitCount += 1;

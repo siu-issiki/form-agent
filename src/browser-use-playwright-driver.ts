@@ -4,10 +4,14 @@ import {
 	chromium,
 	type Page,
 } from "@cloudflare/playwright";
-import { hasNewSubmissionConfirmation } from "./browser-submit-confirmation";
+import { assertAllowedBrowserRequest } from "./browser-network-policy";
+import {
+	hasNewSubmissionConfirmation,
+	SUBMISSION_CONFIRMATION_PATTERN,
+} from "./browser-submit-confirmation";
 import type { Job } from "./job";
 import {
-	assertAllowedTargetUrl,
+	BrowserElementError,
 	type BrowserObservation,
 	type BrowserSubmitResult,
 	type RestrictedBrowserDriver,
@@ -63,6 +67,8 @@ const MAX_PAGE_TEXT = 20_000;
 
 export class BrowserUsePlaywrightDriver implements RestrictedBrowserDriver {
 	#targetDomain: string | undefined;
+	#submissionRequestAllowed = false;
+	#submissionRequestCount = 0;
 
 	private constructor(
 		private readonly browser: Browser,
@@ -113,12 +119,27 @@ export class BrowserUsePlaywrightDriver implements RestrictedBrowserDriver {
 		this.#targetDomain = targetDomain;
 		await this.context.route("**/*", async (route) => {
 			try {
-				assertAllowedTargetUrl(route.request().url(), targetDomain);
+				const request = route.request();
+				const unsafeRequest = !["GET", "HEAD", "OPTIONS"].includes(
+					request.method().toUpperCase(),
+				);
+				assertAllowedBrowserRequest(
+					request.url(),
+					targetDomain,
+					request.method(),
+					this.#submissionRequestAllowed && this.#submissionRequestCount === 0,
+				);
+				if (unsafeRequest) {
+					this.#submissionRequestCount += 1;
+				}
 				await route.continue();
 			} catch {
 				await route.abort("blockedbyclient");
 			}
 		});
+		await this.context.routeWebSocket("**/*", (webSocket) =>
+			webSocket.close({ code: 1008, reason: "WebSocket access is disabled" }),
+		);
 		const cdp = await this.context.newCDPSession(this.page);
 		await cdp.send("Network.setBypassServiceWorker", { bypass: true });
 	}
@@ -255,39 +276,49 @@ export class BrowserUsePlaywrightDriver implements RestrictedBrowserDriver {
 		throw new Error("Element does not support the requested selection");
 	}
 
-	async submit(): Promise<BrowserSubmitResult> {
-		const candidates = this.page.locator(
-			'form button:not([type="button"]):not([type="reset"]), form input[type="submit"], form input[type="image"]',
-		);
-		const visible = [];
-		for (let index = 0; index < (await candidates.count()); index += 1) {
-			const candidate = candidates.nth(index);
-			if (await candidate.isVisible()) {
-				visible.push(candidate);
-			}
+	async validateSubmit(elementId: string): Promise<void> {
+		const locator = this.#element(elementId);
+		if ((await locator.count()) !== 1 || !(await locator.isVisible())) {
+			throw new BrowserElementError();
 		}
-		if (visible.length !== 1) {
-			return {
-				outcome: "uncertain",
-				reasonCode: "SUBMIT_TARGET_AMBIGUOUS",
-				reason: "A single visible submit control could not be identified.",
-			};
+		const submitLike = await locator.evaluate((element) => {
+			const input = element as unknown as BrowserInputElement;
+			return (
+				(input.tagName === "BUTTON" &&
+					(!input.type || input.type === "submit")) ||
+				(input.tagName === "INPUT" && ["submit", "image"].includes(input.type))
+			);
+		});
+		if (!submitLike) {
+			throw new BrowserElementError();
 		}
-		const beforeUrl = this.page.url();
-		const beforeForms = await this.page.locator("form:visible").count();
+	}
+
+	async submit(elementId: string): Promise<BrowserSubmitResult> {
+		await this.validateSubmit(elementId);
+		const submitControl = this.#element(elementId);
 		const beforeText = await this.#bodyText();
-		await visible[0]?.click();
-		await this.page
-			.waitForLoadState("domcontentloaded", { timeout: 5_000 })
-			.catch(() => undefined);
-		const afterUrl = this.page.url();
-		const afterForms = await this.page.locator("form:visible").count();
-		const newSuccessText = hasNewSubmissionConfirmation(
-			beforeText,
-			await this.#bodyText(),
-		);
-		if (afterUrl !== beforeUrl || afterForms < beforeForms || newSuccessText) {
-			return { outcome: "sent", formUrl: afterUrl };
+		this.#submissionRequestAllowed = true;
+		this.#submissionRequestCount = 0;
+		try {
+			await submitControl.click();
+			await this.page
+				.waitForFunction(
+					(pattern) =>
+						new RegExp(pattern, "i").test(document.body?.innerText ?? ""),
+					SUBMISSION_CONFIRMATION_PATTERN,
+					{ timeout: 5_000 },
+				)
+				.catch(() => undefined);
+			await this.page
+				.waitForLoadState("domcontentloaded", { timeout: 5_000 })
+				.catch(() => undefined);
+			const afterUrl = this.page.url();
+			if (hasNewSubmissionConfirmation(beforeText, await this.#bodyText())) {
+				return { outcome: "sent", formUrl: afterUrl };
+			}
+		} finally {
+			this.#submissionRequestAllowed = false;
 		}
 		return {
 			outcome: "uncertain",
@@ -303,6 +334,9 @@ export class BrowserUsePlaywrightDriver implements RestrictedBrowserDriver {
 	}
 
 	#bodyText(): Promise<string> {
-		return this.page.locator("body").innerText();
+		return this.page
+			.locator("body")
+			.innerText()
+			.then((text) => text.slice(0, MAX_PAGE_TEXT));
 	}
 }

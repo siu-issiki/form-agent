@@ -19,4 +19,13 @@ describe("BrowserUsePlaywrightDriver submission confirmation", () => {
 			),
 		).toBe(false);
 	});
+
+	test("does not accept a negative submitted message", () => {
+		expect(
+			hasNewSubmissionConfirmation(
+				"Contact form",
+				"The form was not submitted. Please correct the errors.",
+			),
+		).toBe(false);
+	});
 });

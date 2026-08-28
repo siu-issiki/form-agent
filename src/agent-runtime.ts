@@ -29,7 +29,7 @@ export interface AgentTools {
 	click(elementId: string): Promise<void>;
 	fill(elementId: string, value: string): Promise<void>;
 	select(elementId: string, value: string): Promise<void>;
-	submit(): Promise<Job>;
+	submit(elementId: string): Promise<Job>;
 }
 
 export interface AgentRuntime {

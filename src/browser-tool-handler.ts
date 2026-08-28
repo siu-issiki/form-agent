@@ -82,7 +82,7 @@ export class BrowserToolCoordinator {
 				);
 				return { result: { ok: true } };
 			case "submit": {
-				const job = await tools.submit();
+				const job = await tools.submit(readElementId(params));
 				const { runToken: _, ...safeJob } = job;
 				return { job: safeJob };
 			}

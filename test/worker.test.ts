@@ -589,7 +589,7 @@ describe("BrowserToolCoordinator", () => {
 			input.id,
 			"run-token-1",
 			"submit",
-			{},
+			{ elementId: "fa-0-1" },
 		);
 		await expect(
 			coordinator.execute(input.id, "run-token-1", "observe", {}),
@@ -630,6 +630,7 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	async clickNonSubmit(): Promise<void> {}
 	async fill(): Promise<void> {}
 	async select(): Promise<void> {}
+	async validateSubmit(): Promise<void> {}
 	async submit(): Promise<BrowserSubmitResult> {
 		return { outcome: "sent", formUrl: this.url };
 	}

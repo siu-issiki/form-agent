@@ -23,13 +23,21 @@ export interface RestrictedBrowserDriver {
 	clickNonSubmit(elementId: string): Promise<void>;
 	fill(elementId: string, value: string): Promise<void>;
 	select(elementId: string, value: string): Promise<void>;
-	submit(): Promise<BrowserSubmitResult>;
+	validateSubmit(elementId: string): Promise<void>;
+	submit(elementId: string): Promise<BrowserSubmitResult>;
 }
 
 export class NavigationPolicyError extends Error {
 	constructor() {
 		super("Browser navigation is outside the allowed target domain");
 		this.name = "NavigationPolicyError";
+	}
+}
+
+export class BrowserElementError extends Error {
+	constructor() {
+		super("The browser element is unavailable or incompatible");
+		this.name = "BrowserElementError";
 	}
 }
 
@@ -115,12 +123,13 @@ export class RestrictedBrowserTools {
 		await this.#assertCurrentUrlAllowed();
 	}
 
-	async submit(): Promise<Job> {
+	async submit(elementId: string): Promise<Job> {
 		if (this.#submitAttempted) {
 			throw new SubmissionNotAuthorizedError();
 		}
-		this.#submitAttempted = true;
 		await this.#assertCurrentUrlAllowed();
+		await this.driver.validateSubmit(elementId);
+		this.#submitAttempted = true;
 
 		const authorized = await this.jobs.claimSubmission(
 			this.jobId,
@@ -136,7 +145,7 @@ export class RestrictedBrowserTools {
 
 		let result: BrowserSubmitResult;
 		try {
-			result = await this.driver.submit();
+			result = await this.driver.submit(elementId);
 			await this.#assertCurrentUrlAllowed();
 		} catch {
 			await this.#recordUncertain(

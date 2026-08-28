@@ -13,6 +13,7 @@ import {
 import { BrowserUsePlaywrightDriver } from "./browser-use-playwright-driver";
 import type { Job } from "./job";
 import {
+	BrowserElementError,
 	NavigationPolicyError,
 	SubmissionNotAuthorizedError,
 	SubmissionResultUncertainError,
@@ -141,6 +142,7 @@ export async function handleAgentToolRequest(
 		if (
 			error instanceof AgentToolInputError ||
 			error instanceof BrowserToolInputError ||
+			error instanceof BrowserElementError ||
 			error instanceof NavigationPolicyError ||
 			error instanceof SyntaxError
 		) {
