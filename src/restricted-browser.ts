@@ -15,6 +15,7 @@ export type BrowserSubmitResult =
 	  };
 
 export interface RestrictedBrowserDriver {
+	close?(): Promise<void>;
 	restrictToDomain(targetDomain: string): Promise<void>;
 	currentUrl(): Promise<string>;
 	navigate(url: string): Promise<void>;

@@ -25,6 +25,8 @@ Queue Consumer は `AgentRuntime` の結果契約を使います。Cloudflare Sa
 
 内部tool hostが公開する状態参照はrun tokenで絞り込み、D1の送信状態を直接更新するAPIはrunnerへ公開しません。OpenAI通信はHTTPS interceptionを必須とし、Worker側でモデル、本文サイズ、出力token、tool種別、1 runの呼び出し回数を制限します。
 
-production executorは`AGENT_EXECUTOR_ENABLED=true`、`AGENT_MODEL`、`OPENAI_API_KEY`がすべて設定された場合だけ有効になります。CDPブラウザhandlerの接続が完成するまではフラグを設定せず、`EXECUTOR_NOT_CONFIGURED`でfail-closedに終了させます。
+ブラウザはSandbox Durable Object内の信頼済みhandlerがBrowserUseへCDP接続し、runnerには`navigate` / `observe` / `click` / `fill` / `select` / `submit`の高レベルtoolだけを公開します。BrowserUse認証情報とCDP URLはrunnerへ渡さず、対象ドメイン外の通信とService Worker経由の迂回を遮断し、runner終了時に接続を閉じます。
+
+production executorは`AGENT_EXECUTOR_ENABLED=true`、`AGENT_MODEL`、`OPENAI_API_KEY`、`BROWSER_USE_API_KEY`がすべて設定された場合だけ有効になります。いずれかが不足する場合は`EXECUTOR_NOT_CONFIGURED`でfail-closedに終了します。
 
 runner は `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返します。`sent` は制限付き `submit` ツールが D1 へ結果を保存済みの場合だけ確定し、送信権取得後の切断や矛盾した結果は `uncertain` として自動再試行を止めます。

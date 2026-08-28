@@ -7,12 +7,20 @@ import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, test } from "vitest";
 import { AgentExecutionError, type AgentExecutor } from "../src/agent-executor";
 import { AgentToolGateway } from "../src/agent-tool-service";
+import {
+	BrowserToolCoordinator,
+	type BrowserToolName,
+} from "../src/browser-tool-handler";
 import { D1JobStore } from "../src/d1-job-store";
 import {
 	handleAgentToolRequest,
 	proxyOpenAiRequest,
 } from "../src/form-agent-sandbox";
 import type { JobInput } from "../src/job";
+import type {
+	BrowserSubmitResult,
+	RestrictedBrowserDriver,
+} from "../src/restricted-browser";
 import {
 	type AgentSandboxLike,
 	parseRunnerResult,
@@ -212,6 +220,39 @@ describe("FormAgentSandbox outbound handlers", () => {
 		expect((await store.find(input.id))?.status).toBe("running");
 	});
 
+	test("routes browser tools without exposing low-level submission mutations", async () => {
+		const calls: unknown[][] = [];
+		const browserTool = async (
+			tool: BrowserToolName,
+			params: Record<string, unknown>,
+		) => {
+			calls.push([tool, params]);
+			return { result: { ok: true } };
+		};
+		const navigate = await handleAgentToolRequest(
+			new Request("http://agent-tools.internal/browser/navigate", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ url: input.targetUrl }),
+			}),
+			new AgentToolGateway(env.DB),
+			{ jobId: input.id, runToken: "run-token-1" },
+			browserTool,
+		);
+		const rawSent = await handleAgentToolRequest(
+			new Request("http://agent-tools.internal/submission/sent", {
+				method: "POST",
+			}),
+			new AgentToolGateway(env.DB),
+			{ jobId: input.id, runToken: "run-token-1" },
+			browserTool,
+		);
+
+		expect(navigate.status).toBe(200);
+		expect(calls).toEqual([["navigate", { url: input.targetUrl }]]);
+		expect(rawSent.status).toBe(404);
+	});
+
 	test("injects the OpenAI credential and enforces the run model budget", async () => {
 		let forwarded: Request | undefined;
 		const upstreamFetch = (async (request: RequestInfo | URL) => {
@@ -362,7 +403,11 @@ describe("SandboxAgentExecutor", () => {
 		let sandboxId: string | undefined;
 		let launchEnv: Record<string, string> | undefined;
 		let destroyed = false;
+		let browserClosed = false;
 		const sandbox: AgentSandboxLike = {
+			async closeBrowser() {
+				browserClosed = true;
+			},
 			async setAllowedHosts(hosts) {
 				handlerCalls.push(["allowed", hosts]);
 			},
@@ -407,7 +452,11 @@ describe("SandboxAgentExecutor", () => {
 		expect(handlerCalls).toContainEqual([
 			"agent-tools.internal",
 			"agentTools",
-			{ jobId: input.id, runToken: "run-token-1" },
+			{
+				jobId: input.id,
+				runToken: "run-token-1",
+				sandboxId: await sandboxIdForJob(input.id),
+			},
 		]);
 		expect(handlerCalls).toContainEqual([
 			"api.openai.com",
@@ -427,6 +476,7 @@ describe("SandboxAgentExecutor", () => {
 			OPENAI_API_KEY: "injected-by-worker-outbound-handler",
 		});
 		expect(destroyed).toBe(true);
+		expect(browserClosed).toBe(true);
 	});
 
 	test("kills a process obtained after the deadline before returning", async () => {
@@ -516,6 +566,74 @@ describe("SandboxAgentExecutor", () => {
 		);
 	});
 });
+
+describe("BrowserToolCoordinator", () => {
+	test("keeps one run-scoped browser and persists submit through RestrictedBrowserTools", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const driver = new WorkerFakeBrowserDriver();
+		let createCount = 0;
+		const coordinator = new BrowserToolCoordinator(env.DB, async () => {
+			createCount += 1;
+			return driver;
+		});
+
+		const observed = await coordinator.execute(
+			input.id,
+			"run-token-1",
+			"observe",
+			{},
+		);
+		const submitted = await coordinator.execute(
+			input.id,
+			"run-token-1",
+			"submit",
+			{},
+		);
+		await expect(
+			coordinator.execute(input.id, "run-token-1", "observe", {}),
+		).rejects.toBeInstanceOf(Error);
+		await coordinator.close();
+
+		expect(observed).toEqual({
+			result: { url: input.targetUrl, forms: [] },
+		});
+		expect(submitted).toMatchObject({ job: { status: "sent" } });
+		expect("runToken" in (submitted as { job: object }).job).toBe(false);
+		expect(createCount).toBe(1);
+		expect(driver.restrictedDomain).toBe(input.targetDomain);
+		expect(driver.closed).toBe(true);
+	});
+});
+
+class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
+	url = input.targetUrl;
+	restrictedDomain: string | undefined;
+	closed = false;
+
+	async close(): Promise<void> {
+		this.closed = true;
+	}
+	async restrictToDomain(targetDomain: string): Promise<void> {
+		this.restrictedDomain = targetDomain;
+	}
+	async currentUrl(): Promise<string> {
+		return this.url;
+	}
+	async navigate(url: string): Promise<void> {
+		this.url = url;
+	}
+	async observe() {
+		return { url: this.url, forms: [] };
+	}
+	async clickNonSubmit(): Promise<void> {}
+	async fill(): Promise<void> {}
+	async select(): Promise<void> {}
+	async submit(): Promise<BrowserSubmitResult> {
+		return { outcome: "sent", formUrl: this.url };
+	}
+}
 
 describe("Queue orchestration", () => {
 	test("registers a pending job before enqueueing it", async () => {

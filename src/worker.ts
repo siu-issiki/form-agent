@@ -24,6 +24,7 @@ export interface Env {
 	AGENT_EXECUTOR_ENABLED?: string;
 	AGENT_MODEL?: string;
 	OPENAI_API_KEY?: string;
+	BROWSER_USE_API_KEY?: string;
 }
 
 export interface RegisterJobResult {
@@ -273,7 +274,8 @@ function createAgentExecutor(env: Env): AgentExecutor {
 		env.AGENT_EXECUTOR_ENABLED === "true" &&
 		env.SANDBOX &&
 		env.AGENT_MODEL &&
-		env.OPENAI_API_KEY
+		env.OPENAI_API_KEY &&
+		env.BROWSER_USE_API_KEY
 	) {
 		return createSandboxAgentExecutor(env.SANDBOX, env.AGENT_MODEL);
 	}
