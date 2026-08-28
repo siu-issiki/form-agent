@@ -136,6 +136,7 @@ export async function proxyOpenAiRequest(
 				: scope.maxOutputTokens;
 	} else {
 		if (
+			(body.n !== undefined && body.n !== 1) ||
 			!validOptionalTokenLimit(
 				body.max_completion_tokens,
 				scope.maxOutputTokens,
@@ -149,6 +150,7 @@ export async function proxyOpenAiRequest(
 				? body.max_completion_tokens
 				: body.max_tokens;
 		delete body.max_tokens;
+		body.n = 1;
 		body.max_completion_tokens =
 			typeof requestedLimit === "number"
 				? requestedLimit

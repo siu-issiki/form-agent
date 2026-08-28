@@ -307,6 +307,21 @@ describe("FormAgentSandbox outbound handlers", () => {
 		expect(repeated.status).toBe(429);
 	});
 
+	test("denies multiple Chat Completions candidates", async () => {
+		const response = await proxyOpenAiRequest(
+			new Request("https://api.openai.com/v1/chat/completions", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ model: "gpt-5.4-mini", n: 2 }),
+			}),
+			"worker-secret",
+			openAiScope,
+			async () => true,
+		);
+
+		expect(response.status).toBe(403);
+	});
+
 	test("rejects oversized provider request bodies before claiming budget", async () => {
 		let claimed = false;
 		const response = await proxyOpenAiRequest(
