@@ -18,6 +18,7 @@
   "include": [
     "src/**/*.ts",
     "test/apply-migrations.ts",
+    "test/browser-use-smoke.test.ts",
     "test/worker.test.ts"
   ]
 }

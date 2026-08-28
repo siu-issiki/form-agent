@@ -20,6 +20,7 @@
     "test/agent-executor.test.ts",
     "test/browser-use-client.test.ts",
     "test/restricted-browser.test.ts",
-    "vitest.config.ts"
+    "vitest.config.ts",
+    "vitest.browser-use.config.ts"
   ]
 }
