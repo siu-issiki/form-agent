@@ -10,6 +10,8 @@ import { assertAllowedTargetUrl } from "./restricted-browser";
 
 const RUNNER_PATH = "/app/runner/index.ts";
 const MAX_RUNNER_OUTPUT_BYTES = 64 * 1_024;
+const MAX_PROVIDER_REQUESTS = 16;
+const MAX_PROVIDER_OUTPUT_TOKENS = 4_096;
 
 interface SandboxProcessLike {
 	output(options: {
@@ -46,6 +48,8 @@ export interface AgentSandboxLike {
 type SandboxFactory = (jobId: string) => AgentSandboxLike;
 
 export class SandboxAgentExecutor implements AgentExecutor {
+	readonly terminationGraceMs = 30_000;
+
 	constructor(
 		private readonly sandboxFor: SandboxFactory,
 		private readonly model: string,
@@ -59,16 +63,31 @@ export class SandboxAgentExecutor implements AgentExecutor {
 		input: AgentRunInput,
 		signal: AbortSignal,
 	): Promise<AgentRunResult> {
-		const sandbox = this.sandboxFor(input.job.id);
+		let sandbox: AgentSandboxLike | undefined;
 		let process: SandboxProcessLike | undefined;
+		let killPromise: Promise<void> | undefined;
+		let needsTermination = false;
+		let result: AgentRunResult | undefined;
+		let executionError: AgentExecutionError | undefined;
+		let terminationError: AgentExecutionError | undefined;
 		const kill = () => {
-			if (process) {
-				void process.kill(9).catch(() => undefined);
+			if (process && !killPromise) {
+				killPromise = process.kill(9);
 			}
+			return killPromise;
 		};
-		signal.addEventListener("abort", kill, { once: true });
+		const abort = () => {
+			needsTermination = true;
+			void kill()?.catch(() => undefined);
+		};
+		signal.addEventListener("abort", abort, { once: true });
 
 		try {
+			const sandboxId = await sandboxIdForJob(input.job.id);
+			if (signal.aborted) {
+				throw timeoutError();
+			}
+			sandbox = this.sandboxFor(sandboxId);
 			await sandbox.setAllowedHosts([
 				FORM_AGENT_TOOL_HOST,
 				FORM_AGENT_OPENAI_HOST,
@@ -77,7 +96,13 @@ export class SandboxAgentExecutor implements AgentExecutor {
 				jobId: input.job.id,
 				runToken: input.runToken,
 			});
-			await sandbox.setOutboundByHost(FORM_AGENT_OPENAI_HOST, "openai");
+			await sandbox.setOutboundByHost(FORM_AGENT_OPENAI_HOST, "openai", {
+				jobId: input.job.id,
+				runToken: input.runToken,
+				model: this.model,
+				maxRequests: MAX_PROVIDER_REQUESTS,
+				maxOutputTokens: MAX_PROVIDER_OUTPUT_TOKENS,
+			});
 			process = await sandbox.exec(["bun", "run", RUNNER_PATH], {
 				env: {
 					FORM_AGENT_MODEL: this.model,
@@ -86,17 +111,20 @@ export class SandboxAgentExecutor implements AgentExecutor {
 				},
 				timeout: input.maxDurationMs,
 			});
+			if (signal.aborted) {
+				needsTermination = true;
+				void kill()?.catch(() => undefined);
+				throw timeoutError();
+			}
 			const output = await process.output({
 				encoding: "utf8",
 				maxBytes: MAX_RUNNER_OUTPUT_BYTES,
 				signal,
 			});
 			if (output.timedOut || signal.aborted) {
-				throw new AgentExecutionError(
-					"AGENT_TIMEOUT",
-					"The isolated agent runner exceeded its time limit.",
-					true,
-				);
+				needsTermination = true;
+				void kill()?.catch(() => undefined);
+				throw timeoutError();
 			}
 			if (output.exitCode !== 0) {
 				throw new AgentExecutionError(
@@ -108,22 +136,44 @@ export class SandboxAgentExecutor implements AgentExecutor {
 			if (output.truncated) {
 				throw invalidResult();
 			}
-			return parseRunnerResult(output.stdout, input.job.targetDomain);
+			result = parseRunnerResult(output.stdout, input.job.targetDomain);
 		} catch (error) {
 			if (error instanceof AgentExecutionError) {
-				throw error;
+				executionError = error;
+			} else {
+				executionError = new AgentExecutionError(
+					signal.aborted ? "AGENT_TIMEOUT" : "AGENT_SANDBOX_FAILED",
+					signal.aborted
+						? "The isolated agent runner exceeded its time limit."
+						: "The isolated agent runner could not be executed.",
+					true,
+				);
 			}
-			throw new AgentExecutionError(
-				signal.aborted ? "AGENT_TIMEOUT" : "AGENT_SANDBOX_FAILED",
-				signal.aborted
-					? "The isolated agent runner exceeded its time limit."
-					: "The isolated agent runner could not be executed.",
-				true,
-			);
 		} finally {
-			signal.removeEventListener("abort", kill);
-			await sandbox.destroy().catch(() => undefined);
+			signal.removeEventListener("abort", abort);
+			if ((needsTermination || signal.aborted) && process) {
+				try {
+					await kill();
+				} catch {
+					terminationError = new AgentExecutionError(
+						"AGENT_TERMINATION_UNCONFIRMED",
+						"The isolated agent runner could not be confirmed stopped.",
+						false,
+					);
+				}
+			}
+			await sandbox?.destroy().catch(() => undefined);
 		}
+		if (terminationError) {
+			throw terminationError;
+		}
+		if (executionError) {
+			throw executionError;
+		}
+		if (!result) {
+			throw invalidResult();
+		}
+		return result;
 	}
 }
 
@@ -135,6 +185,17 @@ export function createSandboxAgentExecutor(
 		(jobId) => getSandbox(namespace, jobId, { sleepAfter: "1m" }),
 		model,
 	);
+}
+
+export async function sandboxIdForJob(jobId: string): Promise<string> {
+	const digest = await crypto.subtle.digest(
+		"SHA-256",
+		new TextEncoder().encode(jobId),
+	);
+	const hex = Array.from(new Uint8Array(digest), (byte) =>
+		byte.toString(16).padStart(2, "0"),
+	).join("");
+	return `job-${hex.slice(0, 48)}`;
 }
 
 export function parseRunnerResult(
@@ -228,5 +289,13 @@ function invalidResult(): AgentExecutionError {
 		"AGENT_RESULT_INVALID",
 		"The isolated agent runner returned an invalid result.",
 		false,
+	);
+}
+
+function timeoutError(): AgentExecutionError {
+	return new AgentExecutionError(
+		"AGENT_TIMEOUT",
+		"The isolated agent runner exceeded its time limit.",
+		true,
 	);
 }

@@ -59,4 +59,28 @@ describe("executeAgent", () => {
 		expect(error.reasonCode).toBe("AGENT_TIMEOUT");
 		expect(error.retryable).toBe(true);
 	});
+
+	test("allows a bounded grace period for executor termination", async () => {
+		let cleanupFinished = false;
+		const executor: AgentExecutor = {
+			terminationGraceMs: 100,
+			async execute(_input, signal) {
+				await new Promise<void>((resolve) => {
+					signal.addEventListener("abort", () => resolve(), { once: true });
+				});
+				await new Promise((resolve) => setTimeout(resolve, 5));
+				cleanupFinished = true;
+				throw new AgentExecutionError(
+					"AGENT_TIMEOUT",
+					"The executor stopped after cleanup.",
+					true,
+				);
+			},
+		};
+
+		const error = await executeAgent(executor, input).catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(cleanupFinished).toBe(true);
+	});
 });

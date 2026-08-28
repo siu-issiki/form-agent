@@ -17,6 +17,7 @@ import {
 	type AgentSandboxLike,
 	parseRunnerResult,
 	SandboxAgentExecutor,
+	sandboxIdForJob,
 } from "../src/sandbox-agent-executor";
 import worker, {
 	consumeJobBatch,
@@ -158,7 +159,15 @@ describe("AgentToolGateway", () => {
 });
 
 describe("FormAgentSandbox outbound handlers", () => {
-	test("exposes only run-scoped job and submission state transitions", async () => {
+	const openAiScope = {
+		jobId: input.id,
+		runToken: "run-token-1",
+		model: "gpt-5.4-mini",
+		maxRequests: 16,
+		maxOutputTokens: 4_096,
+	};
+
+	test("exposes only run-scoped job data", async () => {
 		const store = new D1JobStore(env.DB);
 		const gateway = new AgentToolGateway(
 			env.DB,
@@ -177,14 +186,14 @@ describe("FormAgentSandbox outbound handlers", () => {
 			gateway,
 			{ jobId: input.id, runToken: "run-token-1" },
 		);
-		const claim = await handleAgentToolRequest(
+		const rawClaim = await handleAgentToolRequest(
 			new Request("http://agent-tools.internal/submission/claim", {
 				method: "POST",
 			}),
 			gateway,
 			{ jobId: input.id, runToken: "run-token-1" },
 		);
-		const outside = await handleAgentToolRequest(
+		const rawSent = await handleAgentToolRequest(
 			new Request("http://agent-tools.internal/submission/sent", {
 				method: "POST",
 				body: JSON.stringify({ formUrl: "https://evil.test/collect" }),
@@ -192,44 +201,18 @@ describe("FormAgentSandbox outbound handlers", () => {
 			gateway,
 			{ jobId: input.id, runToken: "run-token-1" },
 		);
-		const sent = await handleAgentToolRequest(
-			new Request("http://agent-tools.internal/submission/sent", {
-				method: "POST",
-				body: JSON.stringify({ formUrl: input.targetUrl }),
-			}),
-			gateway,
-			{ jobId: input.id, runToken: "run-token-1" },
-		);
-
 		expect(stale.status).toBe(404);
 		expect(current.status).toBe(200);
 		const currentBody = (await current.json()) as {
 			job: { runToken?: unknown };
 		};
 		expect(currentBody.job.runToken).toBeUndefined();
-		expect(claim.status).toBe(200);
-		expect(outside.status).toBe(400);
-		expect(sent.status).toBe(200);
-		expect((await store.find(input.id))?.status).toBe("sent");
+		expect(rawClaim.status).toBe(404);
+		expect(rawSent.status).toBe(404);
+		expect((await store.find(input.id))?.status).toBe("running");
 	});
 
-	test("rejects oversized tool request bodies", async () => {
-		const response = await handleAgentToolRequest(
-			new Request("http://agent-tools.internal/submission/uncertain", {
-				method: "POST",
-				body: JSON.stringify({
-					reasonCode: "FORM_UNCLEAR",
-					reason: "x".repeat(4_096),
-				}),
-			}),
-			new AgentToolGateway(env.DB),
-			{ jobId: input.id, runToken: "run-token-1" },
-		);
-
-		expect(response.status).toBe(413);
-	});
-
-	test("injects the OpenAI credential outside the sandbox", async () => {
+	test("injects the OpenAI credential and enforces the run model budget", async () => {
 		let forwarded: Request | undefined;
 		const upstreamFetch = (async (request: RequestInfo | URL) => {
 			forwarded = new Request(request);
@@ -241,10 +224,13 @@ describe("FormAgentSandbox outbound handlers", () => {
 				headers: {
 					authorization: "Bearer sandbox-controlled",
 					cookie: "must-not-leave",
+					"content-type": "application/json",
 				},
-				body: "{}",
+				body: JSON.stringify({ model: "gpt-5.4-mini" }),
 			}),
 			"worker-secret",
+			openAiScope,
+			async () => true,
 			upstreamFetch,
 		);
 
@@ -254,15 +240,94 @@ describe("FormAgentSandbox outbound handlers", () => {
 			"Bearer worker-secret",
 		);
 		expect(forwarded?.headers.get("cookie")).toBeNull();
+		expect(await forwarded?.json()).toMatchObject({
+			model: "gpt-5.4-mini",
+			max_output_tokens: 4_096,
+		});
 	});
 
 	test("denies unapproved provider endpoints", async () => {
 		const response = await proxyOpenAiRequest(
 			new Request("https://api.openai.com/v1/files", { method: "POST" }),
 			"worker-secret",
+			openAiScope,
+			async () => true,
 		);
 
 		expect(response.status).toBe(403);
+	});
+
+	test("denies model changes, remote tools, and requests beyond the D1 limit", async () => {
+		const store = new D1JobStore(env.DB);
+		const gateway = new AgentToolGateway(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const request = (body: unknown) =>
+			new Request("https://api.openai.com/v1/responses", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+			});
+		const claim = () =>
+			gateway.claimProviderRequest(input.id, "run-token-1", 1);
+		const upstreamFetch = (async () => new Response("ok")) as typeof fetch;
+
+		const changedModel = await proxyOpenAiRequest(
+			request({ model: "gpt-5.4" }),
+			"worker-secret",
+			openAiScope,
+			claim,
+			upstreamFetch,
+		);
+		const remoteTool = await proxyOpenAiRequest(
+			request({ model: "gpt-5.4-mini", tools: [{ type: "web_search" }] }),
+			"worker-secret",
+			openAiScope,
+			claim,
+			upstreamFetch,
+		);
+		const first = await proxyOpenAiRequest(
+			request({ model: "gpt-5.4-mini" }),
+			"worker-secret",
+			openAiScope,
+			claim,
+			upstreamFetch,
+		);
+		const repeated = await proxyOpenAiRequest(
+			request({ model: "gpt-5.4-mini" }),
+			"worker-secret",
+			openAiScope,
+			claim,
+			upstreamFetch,
+		);
+
+		expect(changedModel.status).toBe(403);
+		expect(remoteTool.status).toBe(403);
+		expect(first.status).toBe(200);
+		expect(repeated.status).toBe(429);
+	});
+
+	test("rejects oversized provider request bodies before claiming budget", async () => {
+		let claimed = false;
+		const response = await proxyOpenAiRequest(
+			new Request("https://api.openai.com/v1/responses", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "gpt-5.4-mini",
+					input: "x".repeat(128 * 1_024),
+				}),
+			}),
+			"worker-secret",
+			openAiScope,
+			async () => {
+				claimed = true;
+				return true;
+			},
+		);
+
+		expect(response.status).toBe(413);
+		expect(claimed).toBe(false);
 	});
 });
 
@@ -279,6 +344,7 @@ describe("SandboxAgentExecutor", () => {
 			throw new Error("Expected a claimed job");
 		}
 		const handlerCalls: unknown[][] = [];
+		let sandboxId: string | undefined;
 		let launchEnv: Record<string, string> | undefined;
 		let destroyed = false;
 		const sandbox: AgentSandboxLike = {
@@ -312,7 +378,10 @@ describe("SandboxAgentExecutor", () => {
 				destroyed = true;
 			},
 		};
-		const executor = new SandboxAgentExecutor(() => sandbox, "gpt-5.4-mini");
+		const executor = new SandboxAgentExecutor((id) => {
+			sandboxId = id;
+			return sandbox;
+		}, "gpt-5.4-mini");
 
 		const result = await executor.execute(
 			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
@@ -325,12 +394,94 @@ describe("SandboxAgentExecutor", () => {
 			"agentTools",
 			{ jobId: input.id, runToken: "run-token-1" },
 		]);
+		expect(handlerCalls).toContainEqual([
+			"api.openai.com",
+			"openai",
+			{
+				jobId: input.id,
+				runToken: "run-token-1",
+				model: "gpt-5.4-mini",
+				maxRequests: 16,
+				maxOutputTokens: 4_096,
+			},
+		]);
+		expect(sandboxId).toBe(await sandboxIdForJob(input.id));
 		expect(launchEnv).toEqual({
 			FORM_AGENT_MODEL: "gpt-5.4-mini",
 			FORM_AGENT_TOOL_BASE_URL: "http://agent-tools.internal",
 			OPENAI_API_KEY: "injected-by-worker-outbound-handler",
 		});
 		expect(destroyed).toBe(true);
+	});
+
+	test("kills a process obtained after the deadline before returning", async () => {
+		let resolveProcess:
+			| ((process: Awaited<ReturnType<AgentSandboxLike["exec"]>>) => void)
+			| undefined;
+		let markExecStarted: (() => void) | undefined;
+		const execStarted = new Promise<void>((resolve) => {
+			markExecStarted = resolve;
+		});
+		let killCount = 0;
+		let destroyed = false;
+		const sandbox: AgentSandboxLike = {
+			async setAllowedHosts() {},
+			async setOutboundByHost() {},
+			exec() {
+				markExecStarted?.();
+				return new Promise((resolve) => {
+					resolveProcess = resolve;
+				});
+			},
+			async destroy() {
+				destroyed = true;
+			},
+		};
+		const controller = new AbortController();
+		const executor = new SandboxAgentExecutor(() => sandbox, "gpt-5.4-mini");
+		const execution = executor.execute(
+			{
+				job: {
+					...input,
+					status: "running",
+					attemptCount: 1,
+					runToken: "run-token-1",
+					result: null,
+					createdAt: "2026-08-28T00:00:00.000Z",
+					updatedAt: "2026-08-28T00:00:01.000Z",
+				},
+				runToken: "run-token-1",
+				maxDurationMs: 60_000,
+			},
+			controller.signal,
+		);
+		await execStarted;
+		controller.abort();
+		resolveProcess?.({
+			async output() {
+				throw new Error("output must not be read after abort");
+			},
+			async kill() {
+				killCount += 1;
+			},
+		});
+
+		const error = await execution.catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(error.reasonCode).toBe("AGENT_TIMEOUT");
+		expect(killCount).toBe(1);
+		expect(destroyed).toBe(true);
+	});
+
+	test("derives valid collision-resistant sandbox IDs from arbitrary job IDs", async () => {
+		const reserved = await sandboxIdForJob("api");
+		const long = await sandboxIdForJob("x".repeat(1_000));
+
+		expect(reserved).toMatch(/^job-[a-f0-9]{48}$/);
+		expect(long).toMatch(/^job-[a-f0-9]{48}$/);
+		expect(reserved).not.toBe(long);
+		expect(await sandboxIdForJob("api")).toBe(reserved);
 	});
 
 	test("rejects a runner result containing an outside form URL", () => {

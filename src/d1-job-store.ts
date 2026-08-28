@@ -107,6 +107,26 @@ export class D1JobStore implements JobStore {
 		return row ? mapStoredJob(row) : null;
 	}
 
+	async claimProviderRequest(
+		id: string,
+		runToken: string,
+		maxRequests: number,
+		now: string,
+	): Promise<boolean> {
+		const result = await this.db
+			.prepare(
+				`UPDATE jobs
+         SET provider_request_count = provider_request_count + 1,
+             updated_at = ?
+         WHERE id = ? AND status = 'running' AND run_token = ?
+           AND provider_request_count < ?`,
+			)
+			.bind(now, id, runToken, maxRequests)
+			.run();
+
+		return result.meta.changes === 1;
+	}
+
 	async recordRunAttempt(
 		id: string,
 		runToken: string,

@@ -50,6 +50,39 @@ describe("Pi agent tools", () => {
 		expect(error).toBeInstanceOf(Error);
 		expect(finalResult).toBeUndefined();
 	});
+
+	test("blocks submit after finish in the same tool batch", async () => {
+		let requestCount = 0;
+		const client = new AgentToolClient(
+			"http://agent-tools.internal",
+			(async () => {
+				requestCount += 1;
+				return Response.json({ job: sentJob });
+			}) as unknown as typeof fetch,
+		);
+		let finalResult: RunnerResult | undefined;
+		const tools = createAgentTools(client, (result) => {
+			finalResult = result;
+		});
+		const finish = tools.find((tool) => tool.name === "finish");
+		const submit = tools.find((tool) => tool.name === "submit");
+
+		await finish?.execute("call-1", {
+			outcome: "prohibited",
+			reasonCode: "SALES_PROHIBITED",
+			reason: "Sales messages are prohibited.",
+		});
+		const error = await submit?.execute("call-2", {}).catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(Error);
+		expect(requestCount).toBe(0);
+		expect(finalResult).toEqual({
+			outcome: "prohibited",
+			formUrl: null,
+			reasonCode: "SALES_PROHIBITED",
+			reason: "Sales messages are prohibited.",
+		});
+	});
 });
 
 function clientReturning(envelope: unknown): AgentToolClient {

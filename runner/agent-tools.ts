@@ -8,6 +8,17 @@ export function createAgentTools(
 	finish: (result: RunnerResult) => void,
 ): AgentTool[] {
 	const sequential = "sequential" as const;
+	let terminal = false;
+	const assertActive = () => {
+		if (terminal) {
+			throw new Error("Agent already returned a final result");
+		}
+	};
+	const finalize = (result: RunnerResult) => {
+		assertActive();
+		terminal = true;
+		finish(result);
+	};
 	return [
 		defineTool({
 			name: "navigate",
@@ -15,8 +26,10 @@ export function createAgentTools(
 			description: "Navigate within the single allowed company domain.",
 			parameters: Type.Object({ url: Type.String({ maxLength: 2_048 }) }),
 			executionMode: sequential,
-			execute: async (_id, { url }, signal) =>
-				toolOk(await client.navigate(url, signal)),
+			execute: async (_id, { url }, signal) => {
+				assertActive();
+				return toolOk(await client.navigate(url, signal));
+			},
 		}),
 		defineTool({
 			name: "observe",
@@ -25,8 +38,10 @@ export function createAgentTools(
 				"Inspect the current page URL, forms, fields, choices, and prohibition text.",
 			parameters: Type.Object({}),
 			executionMode: sequential,
-			execute: async (_id, _params, signal) =>
-				toolOk(await client.observe(signal)),
+			execute: async (_id, _params, signal) => {
+				assertActive();
+				return toolOk(await client.observe(signal));
+			},
 		}),
 		defineTool({
 			name: "click",
@@ -36,8 +51,10 @@ export function createAgentTools(
 				elementId: Type.String({ minLength: 1, maxLength: 256 }),
 			}),
 			executionMode: sequential,
-			execute: async (_id, { elementId }, signal) =>
-				toolOk(await client.click(elementId, signal)),
+			execute: async (_id, { elementId }, signal) => {
+				assertActive();
+				return toolOk(await client.click(elementId, signal));
+			},
 		}),
 		defineTool({
 			name: "fill",
@@ -48,8 +65,10 @@ export function createAgentTools(
 				value: Type.String({ maxLength: 8_192 }),
 			}),
 			executionMode: sequential,
-			execute: async (_id, { elementId, value }, signal) =>
-				toolOk(await client.fill(elementId, value, signal)),
+			execute: async (_id, { elementId, value }, signal) => {
+				assertActive();
+				return toolOk(await client.fill(elementId, value, signal));
+			},
 		}),
 		defineTool({
 			name: "select",
@@ -60,8 +79,10 @@ export function createAgentTools(
 				value: Type.String({ maxLength: 2_048 }),
 			}),
 			executionMode: sequential,
-			execute: async (_id, { elementId, value }, signal) =>
-				toolOk(await client.select(elementId, value, signal)),
+			execute: async (_id, { elementId, value }, signal) => {
+				assertActive();
+				return toolOk(await client.select(elementId, value, signal));
+			},
 		}),
 		defineTool({
 			name: "submit",
@@ -71,15 +92,16 @@ export function createAgentTools(
 			parameters: Type.Object({}),
 			executionMode: sequential,
 			execute: async (_id, _params, signal) => {
+				assertActive();
 				const job = await client.submit(signal);
 				if (job.status === "sent" && job.result?.formUrl) {
-					finish({ outcome: "sent", formUrl: job.result.formUrl });
+					finalize({ outcome: "sent", formUrl: job.result.formUrl });
 				} else if (
 					job.status === "uncertain" &&
 					job.result?.reasonCode &&
 					job.result.reason
 				) {
-					finish({
+					finalize({
 						outcome: "uncertain",
 						reasonCode: job.result.reasonCode,
 						reason: job.result.reason,
@@ -116,7 +138,7 @@ export function createAgentTools(
 			]),
 			executionMode: sequential,
 			execute: async (_id, result) => {
-				finish(
+				finalize(
 					result.outcome === "prohibited"
 						? { ...result, formUrl: result.formUrl ?? null }
 						: result,

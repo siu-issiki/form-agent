@@ -156,6 +156,7 @@ pending ──► running ──► submitting ──► sent
 | `status` | TEXT | `pending` / `running` / `submitting` / `sent` / `prohibited` / `uncertain` / `failed` / `dead_lettered` |
 | `attempt_count` | INTEGER | 実行試行回数 |
 | `run_token` | TEXT NULL | 現在の実行権を識別する token |
+| `provider_request_count` | INTEGER | 現在のrunが使用した推論Provider呼び出し回数 |
 | `last_error_code` | TEXT NULL | 正規化した直近エラー |
 | `created_at` | TEXT | 作成日時 |
 | `updated_at` | TEXT | 更新日時 |

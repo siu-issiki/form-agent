@@ -1,0 +1,2 @@
+ALTER TABLE jobs
+ADD COLUMN provider_request_count INTEGER NOT NULL DEFAULT 0;

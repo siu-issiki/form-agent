@@ -49,6 +49,28 @@ export class AgentToolGateway {
 		return this.#store.claimSubmission(jobId, runToken, this.now());
 	}
 
+	async claimProviderRequest(
+		jobId: string,
+		runToken: string,
+		maxRequests: number,
+	): Promise<boolean> {
+		assertIdentifier(jobId);
+		assertIdentifier(runToken);
+		if (
+			!Number.isInteger(maxRequests) ||
+			maxRequests < 1 ||
+			maxRequests > 100
+		) {
+			throw new AgentToolInputError();
+		}
+		return this.#store.claimProviderRequest(
+			jobId,
+			runToken,
+			maxRequests,
+			this.now(),
+		);
+	}
+
 	async recordSent(
 		jobId: string,
 		runToken: string,

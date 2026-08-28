@@ -5,11 +5,18 @@ import {
 	type AgentToolScope,
 } from "./agent-tool-service";
 import type { Job } from "./job";
-import { NavigationPolicyError } from "./restricted-browser";
 
 const AGENT_TOOL_HOST = "agent-tools.internal";
 const OPENAI_HOST = "api.openai.com";
-const MAX_TOOL_BODY_BYTES = 4_096;
+const MAX_PROVIDER_BODY_BYTES = 128 * 1_024;
+const MAX_PROVIDER_REQUESTS_LIMIT = 32;
+const MAX_PROVIDER_OUTPUT_TOKENS_LIMIT = 8_192;
+
+interface OpenAiScope extends AgentToolScope {
+	model: string;
+	maxRequests: number;
+	maxOutputTokens: number;
+}
 
 export interface FormAgentSandboxEnv {
 	DB: D1Database;
@@ -18,6 +25,7 @@ export interface FormAgentSandboxEnv {
 
 export class FormAgentSandbox extends Sandbox<FormAgentSandboxEnv> {
 	enableInternet = false;
+	interceptHttps = true;
 	allowedHosts = [AGENT_TOOL_HOST, OPENAI_HOST];
 	sleepAfter = "1m";
 }
@@ -33,8 +41,24 @@ FormAgentSandbox.outboundHandlers = {
 				)
 			: toolJson({ error: "INVALID_SCOPE" }, 403);
 	},
-	openai: (request, env) =>
-		proxyOpenAiRequest(request, (env as FormAgentSandboxEnv).OPENAI_API_KEY),
+	openai: (request, env, context) => {
+		const scope = parseOpenAiScope(context.params);
+		return scope
+			? proxyOpenAiRequest(
+					request,
+					(env as FormAgentSandboxEnv).OPENAI_API_KEY,
+					scope,
+					() =>
+						new AgentToolGateway(
+							(env as FormAgentSandboxEnv).DB,
+						).claimProviderRequest(
+							scope.jobId,
+							scope.runToken,
+							scope.maxRequests,
+						),
+				)
+			: toolJson({ error: "INVALID_SCOPE" }, 403);
+	},
 };
 
 export { ContainerProxy };
@@ -51,56 +75,22 @@ export async function handleAgentToolRequest(
 		if (request.method === "GET" && url.pathname === "/job") {
 			return toolResult(await tools.find(scope.jobId, scope.runToken), 404);
 		}
-		if (request.method === "POST" && url.pathname === "/submission/claim") {
-			return toolResult(
-				await tools.claimSubmission(scope.jobId, scope.runToken),
-				409,
-			);
-		}
-		if (request.method === "POST" && url.pathname === "/submission/sent") {
-			const body = await readToolBody(request);
-			return toolResult(
-				await tools.recordSent(
-					scope.jobId,
-					scope.runToken,
-					readString(body, "formUrl", 2_048),
-				),
-				409,
-			);
-		}
-		if (request.method === "POST" && url.pathname === "/submission/uncertain") {
-			const body = await readToolBody(request);
-			return toolResult(
-				await tools.recordUncertain(
-					scope.jobId,
-					scope.runToken,
-					readString(body, "reasonCode", 64),
-					readString(body, "reason", 1_000),
-				),
-				409,
-			);
-		}
 		return toolJson({ error: "NOT_FOUND" }, 404);
 	} catch (error) {
-		if (error instanceof ToolBodyTooLargeError) {
-			return toolJson({ error: "REQUEST_TOO_LARGE" }, 413);
-		}
-		if (
-			error instanceof AgentToolInputError ||
-			error instanceof NavigationPolicyError ||
-			error instanceof SyntaxError
-		) {
+		if (error instanceof AgentToolInputError) {
 			return toolJson({ error: "INVALID_REQUEST" }, 400);
 		}
 		return toolJson({ error: "TOOL_UNAVAILABLE" }, 503);
 	}
 }
 
-export function proxyOpenAiRequest(
+export async function proxyOpenAiRequest(
 	request: Request,
 	apiKey: string | undefined,
+	scope: OpenAiScope,
+	claimRequest: () => Promise<boolean>,
 	upstreamFetch: typeof fetch = fetch,
-): Promise<Response> | Response {
+): Promise<Response> {
 	const url = new URL(request.url);
 	if (
 		request.method !== "POST" ||
@@ -113,21 +103,108 @@ export function proxyOpenAiRequest(
 	if (!apiKey) {
 		return toolJson({ error: "PROVIDER_NOT_CONFIGURED" }, 503);
 	}
+	if (!isOpenAiScope(scope)) {
+		return toolJson({ error: "INVALID_SCOPE" }, 403);
+	}
+
+	let body: Record<string, unknown>;
+	try {
+		body = await readJsonObject(request, MAX_PROVIDER_BODY_BYTES);
+	} catch (error) {
+		return toolJson(
+			{
+				error:
+					error instanceof RequestTooLargeError
+						? "REQUEST_TOO_LARGE"
+						: "PROVIDER_REQUEST_INVALID",
+			},
+			error instanceof RequestTooLargeError ? 413 : 400,
+		);
+	}
+	if (body.model !== scope.model || !hasOnlyFunctionTools(body.tools)) {
+		return toolJson({ error: "PROVIDER_REQUEST_DENIED" }, 403);
+	}
+	if (url.pathname === "/v1/responses") {
+		if (
+			!validOptionalTokenLimit(body.max_output_tokens, scope.maxOutputTokens)
+		) {
+			return toolJson({ error: "PROVIDER_REQUEST_DENIED" }, 403);
+		}
+		body.max_output_tokens =
+			typeof body.max_output_tokens === "number"
+				? body.max_output_tokens
+				: scope.maxOutputTokens;
+	} else {
+		if (
+			!validOptionalTokenLimit(
+				body.max_completion_tokens,
+				scope.maxOutputTokens,
+			) ||
+			!validOptionalTokenLimit(body.max_tokens, scope.maxOutputTokens)
+		) {
+			return toolJson({ error: "PROVIDER_REQUEST_DENIED" }, 403);
+		}
+		const requestedLimit =
+			typeof body.max_completion_tokens === "number"
+				? body.max_completion_tokens
+				: body.max_tokens;
+		delete body.max_tokens;
+		body.max_completion_tokens =
+			typeof requestedLimit === "number"
+				? requestedLimit
+				: scope.maxOutputTokens;
+	}
+	if (!(await claimRequest())) {
+		return toolJson({ error: "PROVIDER_REQUEST_LIMIT_REACHED" }, 429);
+	}
 
 	url.protocol = "https:";
 	url.port = "";
 	const headers = new Headers(request.headers);
 	headers.set("authorization", `Bearer ${apiKey}`);
+	headers.set("content-type", "application/json");
 	headers.delete("cookie");
 	headers.delete("proxy-authorization");
+	headers.delete("content-length");
 	return upstreamFetch(
 		new Request(url, {
 			method: request.method,
 			headers,
-			body: request.body,
+			body: JSON.stringify(body),
 			redirect: "manual",
 			signal: request.signal,
 		}),
+	);
+}
+
+function parseOpenAiScope(value: unknown): OpenAiScope | null {
+	return isOpenAiScope(value) ? value : null;
+}
+
+function isOpenAiScope(value: unknown): value is OpenAiScope {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"jobId" in value &&
+		typeof value.jobId === "string" &&
+		value.jobId.length > 0 &&
+		value.jobId.length <= 128 &&
+		"runToken" in value &&
+		typeof value.runToken === "string" &&
+		value.runToken.length > 0 &&
+		value.runToken.length <= 128 &&
+		"model" in value &&
+		typeof value.model === "string" &&
+		value.model.length > 0 &&
+		value.model.length <= 128 &&
+		"maxRequests" in value &&
+		Number.isInteger(value.maxRequests) &&
+		(value.maxRequests as number) >= 1 &&
+		(value.maxRequests as number) <= MAX_PROVIDER_REQUESTS_LIMIT &&
+		"maxOutputTokens" in value &&
+		Number.isInteger(value.maxOutputTokens) &&
+		(value.maxOutputTokens as number) >= 1 &&
+		(value.maxOutputTokens as number) <= MAX_PROVIDER_OUTPUT_TOKENS_LIMIT
 	);
 }
 
@@ -145,15 +222,19 @@ function parseToolScope(value: unknown): AgentToolScope | null {
 	return { jobId: value.jobId, runToken: value.runToken };
 }
 
-async function readToolBody(
+async function readJsonObject(
 	request: Request,
+	maxBytes: number,
 ): Promise<Record<string, unknown>> {
+	if (!request.headers.get("content-type")?.startsWith("application/json")) {
+		throw new SyntaxError();
+	}
 	const contentLength = Number(request.headers.get("content-length"));
-	if (Number.isFinite(contentLength) && contentLength > MAX_TOOL_BODY_BYTES) {
-		throw new ToolBodyTooLargeError();
+	if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+		throw new RequestTooLargeError();
 	}
 	if (!request.body) {
-		throw new AgentToolInputError();
+		throw new SyntaxError();
 	}
 
 	const reader = request.body.getReader();
@@ -165,9 +246,9 @@ async function readToolBody(
 			break;
 		}
 		totalBytes += value.byteLength;
-		if (totalBytes > MAX_TOOL_BODY_BYTES) {
+		if (totalBytes > maxBytes) {
 			await reader.cancel();
-			throw new ToolBodyTooLargeError();
+			throw new RequestTooLargeError();
 		}
 		chunks.push(value);
 	}
@@ -180,21 +261,35 @@ async function readToolBody(
 	}
 	const parsed: unknown = JSON.parse(new TextDecoder().decode(body));
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-		throw new AgentToolInputError();
+		throw new SyntaxError();
 	}
 	return parsed as Record<string, unknown>;
 }
 
-function readString(
-	body: Record<string, unknown>,
-	key: string,
-	maxLength: number,
-): string {
-	const value = body[key];
-	if (typeof value !== "string" || !value || value.length > maxLength) {
-		throw new AgentToolInputError();
+function hasOnlyFunctionTools(value: unknown): boolean {
+	if (value === undefined) {
+		return true;
 	}
-	return value;
+	return (
+		Array.isArray(value) &&
+		value.length <= 16 &&
+		value.every(
+			(tool) =>
+				typeof tool === "object" &&
+				tool !== null &&
+				"type" in tool &&
+				tool.type === "function",
+		)
+	);
+}
+
+function validOptionalTokenLimit(value: unknown, maximum: number): boolean {
+	return (
+		value === undefined ||
+		(Number.isInteger(value) &&
+			(value as number) >= 1 &&
+			(value as number) <= maximum)
+	);
 }
 
 function toolResult(value: Job | null, missingStatus: number): Response {
@@ -212,4 +307,4 @@ function toolJson(value: unknown, status: number): Response {
 	});
 }
 
-class ToolBodyTooLargeError extends Error {}
+class RequestTooLargeError extends Error {}

@@ -23,6 +23,8 @@ BrowserUse は Agent API ではなく standalone browser API だけを使用し�
 
 Queue Consumer は `AgentRuntime` の結果契約を使います。Cloudflare Sandbox 1.0 preview上でPi 0.74.0 runnerを起動し、D1操作とProvider認証情報はコンテナへ渡さずoutbound handler内に保持します。コンテナの外向き通信は内部tool hostとOpenAI APIだけを許可します。
 
+内部tool hostが公開する状態参照はrun tokenで絞り込み、D1の送信状態を直接更新するAPIはrunnerへ公開しません。OpenAI通信はHTTPS interceptionを必須とし、Worker側でモデル、本文サイズ、出力token、tool種別、1 runの呼び出し回数を制限します。
+
 production executorは`AGENT_EXECUTOR_ENABLED=true`、`AGENT_MODEL`、`OPENAI_API_KEY`がすべて設定された場合だけ有効になります。CDPブラウザhandlerの接続が完成するまではフラグを設定せず、`EXECUTOR_NOT_CONFIGURED`でfail-closedに終了させます。
 
 runner は `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返します。`sent` は制限付き `submit` ツールが D1 へ結果を保存済みの場合だけ確定し、送信権取得後の切断や矛盾した結果は `uncertain` として自動再試行を止めます。
