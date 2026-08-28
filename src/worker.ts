@@ -6,8 +6,10 @@ import {
 import type { AgentRunResult } from "./agent-runtime";
 import { D1JobStore } from "./d1-job-store";
 import { DuplicateJobError, type Job, type JobInput } from "./job";
+import { createSandboxAgentExecutor } from "./sandbox-agent-executor";
 
 export { AgentToolService } from "./agent-tool-service";
+export { ContainerProxy, FormAgentSandbox } from "./form-agent-sandbox";
 
 export interface JobMessage {
 	jobId: string;
@@ -16,6 +18,12 @@ export interface JobMessage {
 export interface Env {
 	DB: D1Database;
 	JOB_QUEUE: Queue<JobMessage>;
+	SANDBOX?: DurableObjectNamespace<
+		import("./form-agent-sandbox").FormAgentSandbox
+	>;
+	AGENT_EXECUTOR_ENABLED?: string;
+	AGENT_MODEL?: string;
+	OPENAI_API_KEY?: string;
 }
 
 export interface RegisterJobResult {
@@ -72,7 +80,7 @@ const worker: ExportedHandler<Env, JobMessage> = {
 	},
 
 	async queue(batch, env) {
-		await consumeJobBatch(batch, env, createAgentExecutor());
+		await consumeJobBatch(batch, env, createAgentExecutor(env));
 	},
 };
 
@@ -260,7 +268,15 @@ async function closeSubmittingConflict(
 	);
 }
 
-function createAgentExecutor(): AgentExecutor {
+function createAgentExecutor(env: Env): AgentExecutor {
+	if (
+		env.AGENT_EXECUTOR_ENABLED === "true" &&
+		env.SANDBOX &&
+		env.AGENT_MODEL &&
+		env.OPENAI_API_KEY
+	) {
+		return createSandboxAgentExecutor(env.SANDBOX, env.AGENT_MODEL);
+	}
 	return {
 		async execute() {
 			return {

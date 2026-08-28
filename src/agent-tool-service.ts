@@ -7,6 +7,18 @@ export interface AgentToolEnv {
 	DB: D1Database;
 }
 
+export interface AgentToolScope {
+	jobId: string;
+	runToken: string;
+}
+
+export class AgentToolInputError extends Error {
+	constructor() {
+		super("Invalid agent tool input");
+		this.name = "AgentToolInputError";
+	}
+}
+
 export class AgentToolGateway {
 	readonly #store: D1JobStore;
 
@@ -102,7 +114,7 @@ export class AgentToolService extends WorkerEntrypoint<AgentToolEnv> {
 
 function assertIdentifier(value: string): void {
 	if (!value || value.length > 128) {
-		throw new Error("Invalid agent tool identifier");
+		throw new AgentToolInputError();
 	}
 }
 
@@ -112,6 +124,6 @@ function assertReason(reasonCode: string, reason: string): void {
 		!reason ||
 		reason.length > 1_000
 	) {
-		throw new Error("Invalid agent tool reason");
+		throw new AgentToolInputError();
 	}
 }

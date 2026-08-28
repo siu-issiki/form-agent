@@ -68,7 +68,7 @@ PoC では、実装速度を優先して SQLite と薄い API を状態管理に
 - ブラウザ本体は保持せず、BrowserUse Cloud Browser に接続する。
 - 処理終了後は構造化結果とイベントを保存し、実行環境を破棄または休止する。
 
-Containers と Sandbox SDK の最終選定は、起動時間、実行時間上限、隔離、同時実行数、運用性、料金を PoC で比較して決める。
+PoC実装はCloudflare Sandbox SDK 1.0 previewを採用する。起動時間、実行時間上限、隔離、同時実行数、運用性、料金を計測し、正式採用はContainersとの比較後に決める。
 
 ### Pi
 

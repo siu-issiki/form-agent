@@ -5,10 +5,19 @@ import {
 } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, test } from "vitest";
-import type { AgentExecutor } from "../src/agent-executor";
+import { AgentExecutionError, type AgentExecutor } from "../src/agent-executor";
 import { AgentToolGateway } from "../src/agent-tool-service";
 import { D1JobStore } from "../src/d1-job-store";
+import {
+	handleAgentToolRequest,
+	proxyOpenAiRequest,
+} from "../src/form-agent-sandbox";
 import type { JobInput } from "../src/job";
+import {
+	type AgentSandboxLike,
+	parseRunnerResult,
+	SandboxAgentExecutor,
+} from "../src/sandbox-agent-executor";
 import worker, {
 	consumeJobBatch,
 	type JobMessage,
@@ -145,6 +154,200 @@ describe("AgentToolGateway", () => {
 		).rejects.toThrow();
 
 		expect(stale).toBeNull();
+	});
+});
+
+describe("FormAgentSandbox outbound handlers", () => {
+	test("exposes only run-scoped job and submission state transitions", async () => {
+		const store = new D1JobStore(env.DB);
+		const gateway = new AgentToolGateway(
+			env.DB,
+			() => "2026-08-28T00:00:02.000Z",
+		);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+
+		const stale = await handleAgentToolRequest(
+			new Request("http://agent-tools.internal/job"),
+			gateway,
+			{ jobId: input.id, runToken: "run-token-2" },
+		);
+		const current = await handleAgentToolRequest(
+			new Request("http://agent-tools.internal/job"),
+			gateway,
+			{ jobId: input.id, runToken: "run-token-1" },
+		);
+		const claim = await handleAgentToolRequest(
+			new Request("http://agent-tools.internal/submission/claim", {
+				method: "POST",
+			}),
+			gateway,
+			{ jobId: input.id, runToken: "run-token-1" },
+		);
+		const outside = await handleAgentToolRequest(
+			new Request("http://agent-tools.internal/submission/sent", {
+				method: "POST",
+				body: JSON.stringify({ formUrl: "https://evil.test/collect" }),
+			}),
+			gateway,
+			{ jobId: input.id, runToken: "run-token-1" },
+		);
+		const sent = await handleAgentToolRequest(
+			new Request("http://agent-tools.internal/submission/sent", {
+				method: "POST",
+				body: JSON.stringify({ formUrl: input.targetUrl }),
+			}),
+			gateway,
+			{ jobId: input.id, runToken: "run-token-1" },
+		);
+
+		expect(stale.status).toBe(404);
+		expect(current.status).toBe(200);
+		const currentBody = (await current.json()) as {
+			job: { runToken?: unknown };
+		};
+		expect(currentBody.job.runToken).toBeUndefined();
+		expect(claim.status).toBe(200);
+		expect(outside.status).toBe(400);
+		expect(sent.status).toBe(200);
+		expect((await store.find(input.id))?.status).toBe("sent");
+	});
+
+	test("rejects oversized tool request bodies", async () => {
+		const response = await handleAgentToolRequest(
+			new Request("http://agent-tools.internal/submission/uncertain", {
+				method: "POST",
+				body: JSON.stringify({
+					reasonCode: "FORM_UNCLEAR",
+					reason: "x".repeat(4_096),
+				}),
+			}),
+			new AgentToolGateway(env.DB),
+			{ jobId: input.id, runToken: "run-token-1" },
+		);
+
+		expect(response.status).toBe(413);
+	});
+
+	test("injects the OpenAI credential outside the sandbox", async () => {
+		let forwarded: Request | undefined;
+		const upstreamFetch = (async (request: RequestInfo | URL) => {
+			forwarded = new Request(request);
+			return new Response("ok");
+		}) as typeof fetch;
+		const response = await proxyOpenAiRequest(
+			new Request("http://api.openai.com/v1/responses", {
+				method: "POST",
+				headers: {
+					authorization: "Bearer sandbox-controlled",
+					cookie: "must-not-leave",
+				},
+				body: "{}",
+			}),
+			"worker-secret",
+			upstreamFetch,
+		);
+
+		expect(response.status).toBe(200);
+		expect(forwarded?.url).toBe("https://api.openai.com/v1/responses");
+		expect(forwarded?.headers.get("authorization")).toBe(
+			"Bearer worker-secret",
+		);
+		expect(forwarded?.headers.get("cookie")).toBeNull();
+	});
+
+	test("denies unapproved provider endpoints", async () => {
+		const response = await proxyOpenAiRequest(
+			new Request("https://api.openai.com/v1/files", { method: "POST" }),
+			"worker-secret",
+		);
+
+		expect(response.status).toBe(403);
+	});
+});
+
+describe("SandboxAgentExecutor", () => {
+	test("scopes outbound handlers before launching the bounded runner", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) {
+			throw new Error("Expected a claimed job");
+		}
+		const handlerCalls: unknown[][] = [];
+		let launchEnv: Record<string, string> | undefined;
+		let destroyed = false;
+		const sandbox: AgentSandboxLike = {
+			async setAllowedHosts(hosts) {
+				handlerCalls.push(["allowed", hosts]);
+			},
+			async setOutboundByHost(host, handler, params) {
+				handlerCalls.push([host, handler, params]);
+			},
+			async exec(_command, options) {
+				launchEnv = options.env;
+				return {
+					async output() {
+						return {
+							stdout: JSON.stringify({
+								outcome: "failed",
+								reasonCode: "FORM_NOT_FOUND",
+								reason: "No compatible form was found.",
+								retryable: false,
+							}),
+							stderr: "",
+							exitCode: 0,
+							timedOut: false,
+							truncated: false,
+						};
+					},
+					async kill() {},
+				};
+			},
+			async destroy() {
+				destroyed = true;
+			},
+		};
+		const executor = new SandboxAgentExecutor(() => sandbox, "gpt-5.4-mini");
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result.outcome).toBe("failed");
+		expect(handlerCalls).toContainEqual([
+			"agent-tools.internal",
+			"agentTools",
+			{ jobId: input.id, runToken: "run-token-1" },
+		]);
+		expect(launchEnv).toEqual({
+			FORM_AGENT_MODEL: "gpt-5.4-mini",
+			FORM_AGENT_TOOL_BASE_URL: "http://agent-tools.internal",
+			OPENAI_API_KEY: "injected-by-worker-outbound-handler",
+		});
+		expect(destroyed).toBe(true);
+	});
+
+	test("rejects a runner result containing an outside form URL", () => {
+		let error: unknown;
+		try {
+			parseRunnerResult(
+				JSON.stringify({ outcome: "sent", formUrl: "https://evil.test" }),
+				input.targetDomain,
+			);
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect((error as AgentExecutionError).reasonCode).toBe(
+			"AGENT_RESULT_INVALID",
+		);
 	});
 });
 
