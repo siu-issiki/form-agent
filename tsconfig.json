@@ -12,9 +12,12 @@
   },
   "include": [
     "src/job.ts",
+    "src/agent-runtime.ts",
+    "src/agent-executor.ts",
     "src/browser-use-client.ts",
     "src/restricted-browser.ts",
     "test/job.test.ts",
+    "test/agent-executor.test.ts",
     "test/browser-use-client.test.ts",
     "test/restricted-browser.test.ts",
     "vitest.config.ts"

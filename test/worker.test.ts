@@ -5,9 +5,14 @@ import {
 } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, test } from "vitest";
+import type { AgentExecutor } from "../src/agent-executor";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobInput } from "../src/job";
-import worker, { type JobMessage, registerJob } from "../src/worker";
+import worker, {
+	consumeJobBatch,
+	type JobMessage,
+	registerJob,
+} from "../src/worker";
 
 const input: JobInput = {
 	id: "job-001",
@@ -151,7 +156,138 @@ describe("Queue orchestration", () => {
 		expect(result.explicitAcks).toEqual(["message-1"]);
 		expect(result.retryMessages).toEqual([]);
 		expect(persisted?.status).toBe("failed");
-		expect(persisted?.attemptCount).toBe(1);
+		expect(persisted?.attemptCount).toBe(2);
+	});
+
+	test("persists a prohibited agent decision and acknowledges the message", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
+			{
+				id: "message-1",
+				timestamp: new Date("2026-08-28T00:00:01.000Z"),
+				body: { jobId: input.id },
+				attempts: 1,
+			},
+		]);
+		const ctx = createExecutionContext();
+		const executor: AgentExecutor = {
+			async execute() {
+				return {
+					outcome: "prohibited",
+					formUrl: input.targetUrl,
+					reasonCode: "SALES_PROHIBITED",
+					reason: "Sales messages are prohibited.",
+				};
+			},
+		};
+
+		await consumeJobBatch(batch, env, executor);
+		const result = await getQueueResult(batch, ctx);
+		const persisted = await store.find(input.id);
+
+		expect(result.explicitAcks).toEqual(["message-1"]);
+		expect(result.retryMessages).toEqual([]);
+		expect(persisted?.status).toBe("prohibited");
+		expect(persisted?.result?.reasonCode).toBe("SALES_PROHIBITED");
+	});
+
+	test("retries a retryable agent failure without releasing the run claim", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
+			{
+				id: "message-1",
+				timestamp: new Date("2026-08-28T00:00:01.000Z"),
+				body: { jobId: input.id },
+				attempts: 1,
+			},
+		]);
+		const ctx = createExecutionContext();
+		const executor: AgentExecutor = {
+			async execute() {
+				return {
+					outcome: "failed",
+					reasonCode: "PROVIDER_RATE_LIMITED",
+					reason: "The provider rate limit was reached.",
+					retryable: true,
+				};
+			},
+		};
+
+		await consumeJobBatch(batch, env, executor);
+		const result = await getQueueResult(batch, ctx);
+		const persisted = await store.find(input.id);
+
+		expect(result.explicitAcks).toEqual([]);
+		expect(result.retryMessages).toHaveLength(1);
+		expect(persisted?.status).toBe("running");
+		expect(persisted?.runToken).toBe("message-1");
+	});
+
+	test("fails closed when the agent reports sent without a D1 sent result", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
+			{
+				id: "message-1",
+				timestamp: new Date("2026-08-28T00:00:01.000Z"),
+				body: { jobId: input.id },
+				attempts: 1,
+			},
+		]);
+		const ctx = createExecutionContext();
+		const executor: AgentExecutor = {
+			async execute() {
+				return { outcome: "sent", formUrl: input.targetUrl };
+			},
+		};
+
+		await consumeJobBatch(batch, env, executor);
+		const result = await getQueueResult(batch, ctx);
+		const persisted = await store.find(input.id);
+
+		expect(result.explicitAcks).toEqual(["message-1"]);
+		expect(persisted?.status).toBe("uncertain");
+		expect(persisted?.result?.reasonCode).toBe("SENT_RESULT_NOT_PERSISTED");
+	});
+
+	test("does not retry a retryable failure after submission permission", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
+			{
+				id: "message-1",
+				timestamp: new Date("2026-08-28T00:00:01.000Z"),
+				body: { jobId: input.id },
+				attempts: 1,
+			},
+		]);
+		const ctx = createExecutionContext();
+		const executor: AgentExecutor = {
+			async execute(agentInput) {
+				await store.claimSubmission(
+					agentInput.job.id,
+					agentInput.runToken,
+					"2026-08-28T00:00:02.000Z",
+				);
+				return {
+					outcome: "failed",
+					reasonCode: "BROWSER_CONNECTION_LOST",
+					reason: "The browser connection was lost.",
+					retryable: true,
+				};
+			},
+		};
+
+		await consumeJobBatch(batch, env, executor);
+		const result = await getQueueResult(batch, ctx);
+		const persisted = await store.find(input.id);
+
+		expect(result.explicitAcks).toEqual(["message-1"]);
+		expect(result.retryMessages).toEqual([]);
+		expect(persisted?.status).toBe("uncertain");
+		expect(persisted?.result?.reasonCode).toBe("AGENT_RESULT_CONFLICT");
 	});
 
 	test("marks a safe job state as dead-lettered", async () => {
