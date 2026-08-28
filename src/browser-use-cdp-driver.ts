@@ -325,7 +325,15 @@ export async function denyRelatedBrowserTargets(
 
 export const BLOCK_BROWSER_ESCAPE_EXPRESSION = `(() => {
   class BlockedNetworkConstructor { constructor() { throw new Error("Browser network escape is disabled"); } }
-  for (const name of ["WebSocket", "Worker", "SharedWorker"]) {
+  for (const name of [
+    "WebSocket",
+    "WebSocketStream",
+    "WebTransport",
+    "RTCPeerConnection",
+    "webkitRTCPeerConnection",
+    "Worker",
+    "SharedWorker"
+  ]) {
     Object.defineProperty(globalThis, name, { value: BlockedNetworkConstructor, configurable: false, writable: false });
   }
   Object.defineProperty(globalThis, "open", { value: () => null, configurable: false, writable: false });

@@ -76,9 +76,13 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		expect(failures).toEqual([]);
 	});
 
-	test("blocks page-realm WebSocket, worker, popup, and service worker escapes", async () => {
+	test("blocks page-realm socket, peer, worker, popup, and service worker escapes", async () => {
 		const context = {
 			WebSocket: class {},
+			WebSocketStream: class {},
+			WebTransport: class {},
+			RTCPeerConnection: class {},
+			webkitRTCPeerConnection: class {},
 			Worker: class {},
 			SharedWorker: class {},
 			open: () => ({ opened: true }),
@@ -86,7 +90,15 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		};
 		runInNewContext(BLOCK_BROWSER_ESCAPE_EXPRESSION, context);
 
-		for (const constructorName of ["WebSocket", "Worker", "SharedWorker"]) {
+		for (const constructorName of [
+			"WebSocket",
+			"WebSocketStream",
+			"WebTransport",
+			"RTCPeerConnection",
+			"webkitRTCPeerConnection",
+			"Worker",
+			"SharedWorker",
+		]) {
 			expect(() =>
 				runInNewContext(
 					`new ${constructorName}("https://example.com")`,
