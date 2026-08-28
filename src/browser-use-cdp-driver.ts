@@ -17,6 +17,12 @@ interface TargetInfo {
 	type: string;
 }
 
+interface AttachedTarget {
+	sessionId: string;
+	targetInfo: TargetInfo;
+	waitingForDebugger: boolean;
+}
+
 interface EvaluateResult {
 	result: { value?: unknown };
 	exceptionDetails?: unknown;
@@ -31,6 +37,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#targetDomain: string | undefined;
 	#submissionRequestAllowed = false;
 	#submissionRequestCount = 0;
+	#targetPolicyError: Error | undefined;
 
 	private constructor(
 		private readonly connection: BrowserUseCdpConnection,
@@ -177,6 +184,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async #initialize(): Promise<void> {
+		await denyRelatedBrowserTargets(
+			this.connection,
+			this.sessionId,
+			(error) => {
+				this.#targetPolicyError ??= error;
+			},
+		);
 		this.connection.on("Fetch.requestPaused", (params, sessionId) => {
 			if (sessionId === this.sessionId) {
 				void this.#handlePausedRequest(params as PausedRequest);
@@ -188,9 +202,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		await this.#send("Network.setBypassServiceWorker", { bypass: true });
 		await this.#send("Fetch.enable", { patterns: [{ urlPattern: "*" }] });
 		await this.#send("Page.addScriptToEvaluateOnNewDocument", {
-			source: BLOCK_WEBSOCKET_EXPRESSION,
+			source: BLOCK_BROWSER_ESCAPE_EXPRESSION,
 		});
-		await this.#evaluate(BLOCK_WEBSOCKET_EXPRESSION);
+		await this.#evaluate(BLOCK_BROWSER_ESCAPE_EXPRESSION);
 	}
 
 	async #handlePausedRequest(paused: PausedRequest): Promise<void> {
@@ -263,13 +277,68 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		method: string,
 		params: Record<string, unknown> = {},
 	): Promise<TResult> {
+		if (this.#targetPolicyError) {
+			return Promise.reject(this.#targetPolicyError);
+		}
 		return this.connection.send<TResult>(method, params, this.sessionId);
 	}
 }
 
-const BLOCK_WEBSOCKET_EXPRESSION = `(() => {
-  class BlockedWebSocket { constructor() { throw new Error("WebSocket access is disabled"); } }
-  Object.defineProperty(globalThis, "WebSocket", { value: BlockedWebSocket, configurable: false, writable: false });
+export async function denyRelatedBrowserTargets(
+	connection: Pick<BrowserUseCdpConnection, "on" | "send">,
+	parentSessionId: string,
+	onPolicyFailure: (error: Error) => void,
+): Promise<void> {
+	connection.on("Target.attachedToTarget", (params, sessionId) => {
+		if (sessionId !== parentSessionId) return;
+		const attached = params as AttachedTarget;
+		if (!attached.waitingForDebugger) {
+			onPolicyFailure(new Error("A related browser target was not paused"));
+		}
+		void connection
+			.send<{ success: boolean }>("Target.closeTarget", {
+				targetId: attached.targetInfo.targetId,
+			})
+			.then((result) => {
+				if (!result.success) {
+					onPolicyFailure(
+						new Error("A related browser target could not be closed"),
+					);
+				}
+			})
+			.catch(() => {
+				onPolicyFailure(
+					new Error("A related browser target could not be closed"),
+				);
+			});
+	});
+	await connection.send(
+		"Target.setAutoAttach",
+		{
+			autoAttach: true,
+			waitForDebuggerOnStart: true,
+			flatten: true,
+		},
+		parentSessionId,
+	);
+}
+
+export const BLOCK_BROWSER_ESCAPE_EXPRESSION = `(() => {
+  class BlockedNetworkConstructor { constructor() { throw new Error("Browser network escape is disabled"); } }
+  for (const name of ["WebSocket", "Worker", "SharedWorker"]) {
+    Object.defineProperty(globalThis, name, { value: BlockedNetworkConstructor, configurable: false, writable: false });
+  }
+  Object.defineProperty(globalThis, "open", { value: () => null, configurable: false, writable: false });
+  try {
+    const serviceWorker = globalThis.navigator?.serviceWorker;
+    if (serviceWorker) {
+      Object.defineProperty(serviceWorker, "register", {
+        value: () => Promise.reject(new Error("Service workers are disabled")),
+        configurable: false,
+        writable: false
+      });
+    }
+  } catch {}
 })()`;
 
 const OBSERVE_EXPRESSION = `(() => {
@@ -355,11 +424,15 @@ const SELECT_EXPRESSION = `(elementId, value) => {${ELEMENT_LOOKUP}
 
 const VALIDATE_SUBMIT_EXPRESSION = `(elementId) => {${ELEMENT_LOOKUP}
   if (!element) return false;
-  return (element.tagName === "BUTTON" && (!element.type || element.type === "submit")) || (element.tagName === "INPUT" && ["submit", "image"].includes(element.type));
+  const submitLike = (element.tagName === "BUTTON" && (!element.type || element.type === "submit")) || (element.tagName === "INPUT" && ["submit", "image"].includes(element.type));
+  const target = (element.getAttribute("formtarget") ?? element.form?.getAttribute("target") ?? "").trim().toLowerCase();
+  return submitLike && (target === "" || target === "_self");
 }`;
 
 const SUBMIT_EXPRESSION = `(elementId) => {${ELEMENT_LOOKUP}
   if (!element) return false;
+  const target = (element.getAttribute("formtarget") ?? element.form?.getAttribute("target") ?? "").trim().toLowerCase();
+  if (target !== "" && target !== "_self") return false;
   element.click();
   return true;
 }`;
