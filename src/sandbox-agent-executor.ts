@@ -29,6 +29,7 @@ interface SandboxProcessLike {
 }
 
 export interface AgentSandboxLike {
+	closeBrowser?(): Promise<void>;
 	setAllowedHosts(hosts: string[]): Promise<void>;
 	setOutboundByHost(
 		host: string,
@@ -95,6 +96,7 @@ export class SandboxAgentExecutor implements AgentExecutor {
 			await sandbox.setOutboundByHost(FORM_AGENT_TOOL_HOST, "agentTools", {
 				jobId: input.job.id,
 				runToken: input.runToken,
+				sandboxId,
 			});
 			await sandbox.setOutboundByHost(FORM_AGENT_OPENAI_HOST, "openai", {
 				jobId: input.job.id,
@@ -162,6 +164,7 @@ export class SandboxAgentExecutor implements AgentExecutor {
 					);
 				}
 			}
+			await sandbox?.closeBrowser?.().catch(() => undefined);
 			await sandbox?.destroy().catch(() => undefined);
 		}
 		if (terminationError) {

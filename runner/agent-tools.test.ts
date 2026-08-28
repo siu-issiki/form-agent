@@ -27,7 +27,9 @@ describe("Pi agent tools", () => {
 			finalResult = result;
 		}).find((tool) => tool.name === "submit");
 
-		const toolResult = await submit?.execute("call-1", {});
+		const toolResult = await submit?.execute("call-1", {
+			elementId: "fa-0-1",
+		});
 
 		expect(finalResult).toEqual({
 			outcome: "sent",
@@ -45,7 +47,9 @@ describe("Pi agent tools", () => {
 			finalResult = result;
 		}).find((tool) => tool.name === "submit");
 
-		const error = await submit?.execute("call-1", {}).catch((caught) => caught);
+		const error = await submit
+			?.execute("call-1", { elementId: "fa-0-1" })
+			.catch((caught) => caught);
 
 		expect(error).toBeInstanceOf(Error);
 		expect(finalResult).toBeUndefined();
@@ -72,7 +76,9 @@ describe("Pi agent tools", () => {
 			reasonCode: "SALES_PROHIBITED",
 			reason: "Sales messages are prohibited.",
 		});
-		const error = await submit?.execute("call-2", {}).catch((caught) => caught);
+		const error = await submit
+			?.execute("call-2", { elementId: "fa-0-1" })
+			.catch((caught) => caught);
 
 		expect(error).toBeInstanceOf(Error);
 		expect(requestCount).toBe(0);

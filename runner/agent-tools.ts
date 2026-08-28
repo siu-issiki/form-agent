@@ -89,11 +89,13 @@ export function createAgentTools(
 			label: "Submit",
 			description:
 				"Submit once after confirming the target, required fields, values, and absence of sales prohibitions.",
-			parameters: Type.Object({}),
+			parameters: Type.Object({
+				elementId: Type.String({ minLength: 1, maxLength: 64 }),
+			}),
 			executionMode: sequential,
-			execute: async (_id, _params, signal) => {
+			execute: async (_id, { elementId }, signal) => {
 				assertActive();
-				const job = await client.submit(signal);
+				const job = await client.submit(elementId, signal);
 				if (job.status === "sent" && job.result?.formUrl) {
 					finalize({ outcome: "sent", formUrl: job.result.formUrl });
 				} else if (

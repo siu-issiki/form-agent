@@ -60,8 +60,8 @@ export class AgentToolClient {
 		return this.#post("/browser/select", { elementId, value }, signal);
 	}
 
-	submit(signal?: AbortSignal): Promise<RunnerJob> {
-		return this.#post("/browser/submit", {}, signal);
+	submit(elementId: string, signal?: AbortSignal): Promise<RunnerJob> {
+		return this.#post("/browser/submit", { elementId }, signal);
 	}
 
 	#post<T>(
