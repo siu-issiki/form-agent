@@ -19,7 +19,7 @@
 | Agent 実行 | 実装済み | Worker から OpenAI Responses API の function calling を直接実行 |
 | 推論 Provider | 部分実装 | OpenAI Responses API のみ。モデル、回数、本文、出力 token を Worker 側で制限 |
 | BrowserUse | 実装済み | standalone browser へ CDP 接続し、用途限定ツールだけを公開 |
-| E2E | 部分実装 | production Worker 直実行の AnyReach dry-run E2E に成功。実送信 E2E は未実施 |
+| E2E | 部分実装 | production Worker 直実行の AnyReach dry-run E2E に成功。管理下テストフォームは実装済み、デプロイと実送信 E2E は未実施 |
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。一覧・キャンセルは未実装 |
 | Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
 | 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ イベント |
@@ -101,7 +101,7 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 - 最大 12 turn、ジョブ prompt 最大 64,000 文字とする。
 - `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返す。
 - Agent 終了時または timeout 時に browser 接続を閉じる。
-- ジョブ入力にない個人情報・企業情報を推測して入力しないよう system prompt で指示する。現時点では信頼済み handler による入力値照合までは行わない。
+- `fill` / `select`ではモデルに生の値を渡させず、`payload.formValues`内の`payloadKey`を指定させる。信頼済みhandlerがD1の保存値を解決し、存在しないキー、文字列以外、上限超過、空文字を拒否する。
 
 ### 推論 Provider
 
@@ -215,6 +215,17 @@ pending / running / failed ── retry 上限超過 ──► dead_lettered
 
 Provider、model、input / output token、処理時間、BrowserUse 待ち時間等の metrics はまだ保存しない。
 
+### test_fixture_submissions
+
+管理下テストフォームへの実POSTをジョブ単位で数える。送信本文は保存しない。
+
+| 列 | 型 | 内容 |
+| --- | --- | --- |
+| `job_id` | TEXT PK | `jobs.id`への参照 |
+| `post_count` | INTEGER | 管理下フォームが受け取ったPOST回数 |
+| `first_submitted_at` | TEXT | 初回受信日時 |
+| `last_submitted_at` | TEXT | 最終受信日時 |
+
 ### events
 
 | 列 | 型 | 内容 |
@@ -245,13 +256,14 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 - popup、Worker、Service Worker、WebSocket、WebRTC 等の迂回経路を遮断する。
 - Provider / BrowserUse の認証情報と D1 の実行権をモデル入力・tool 出力へ渡さない。
 - Agent に返すジョブ情報から `runToken` を除外する。
+- モデルが`fill` / `select`で指定できるのは`payload.formValues`内のキーだけとし、実際の値は信頼済みhandlerがD1から取得する。
 - ジョブ間で browser session、cookie、入力データを共有しない。
 
 `submitting` 中に Worker が停止し、結果保存まで到達しなかった場合は自動再送せず、人間の確認対象にする。現在は人手照合の API / UI / runbook が未実装である。
 
 ### Agent への安全指示
 
-system prompt では、営業禁止・用途制限の確認、payload に存在する値だけの入力、送信前の再観察と確認を指示する。ただし、現在の信頼済み handler は、禁止判定の証跡、送信前確認の実施、入力値が payload 由来かを機械的には検証しない。ページ上の prompt injection や Agent の誤判断に対するハードガードではないため、実送信開始前に信頼済み handler 側の検証範囲を決めて実装する。
+system prompt では、営業禁止・用途制限の確認と送信前の再観察を指示する。入力値は信頼済みhandlerが`payload.formValues`由来であることを機械的に強制する。一方、禁止判定の証跡と送信前確認の実施はまだAgentへの指示だけであり、ページ上のprompt injectionやAgentの誤判断に対する完全なハードガードではない。
 
 ## 現在の制約
 
@@ -267,7 +279,7 @@ system prompt では、営業禁止・用途制限の確認、payload に存在�
 - 確認画面、複数ページフォーム、ファイル添付、CAPTCHA は未対応である。
 - 送信完了は、送信前にはなかった日本語の送信完了表現または `thank you` が 5 秒以内に出現した場合だけ確定する。
 - `GET` / `HEAD` / `OPTIONS` は送信権なしでも許可するため、同一ドメインの GET 型副作用 endpoint を通常の `click` や `navigate` で起動する経路は防止できない。
-- 営業禁止判定、送信前確認、payload 由来の入力値は Agent への指示であり、信頼済み handler では未検証である。
+- 営業禁止判定と送信前確認はAgentへの指示であり、信頼済みhandlerでは未検証である。
 - dry-runではジョブURLへのbootstrap後の再navigateと、最初のclick / fill / select以降に発生するbrowser requestをすべて遮断し、座標click前にCDPのhit targetが検証済み要素またはそのcomposed descendantであることを確認する。
 
 ### API / 運用
@@ -325,6 +337,8 @@ PoC はまず 1 並列の production dry-run で開始し、観測結果をも�
 - [x] production送信なしE2Eの成功条件を1 attemptに限定する。
 - [x] retryのreason code、発生元、attempt、実行時間、Provider呼び出し累計をD1イベントへ保存する。
 - [x] `DRY_RUN_COMPLETE`の前提として入力成功とnative form validityを検証する。
+- [x] `fill` / `select`の入力値を`payload.formValues`由来に限定する。
+- [x] 固定ダミー値だけを受け付け、POST回数だけを保存する管理下テストフォームを実装する。
 - [x] production から旧 Sandbox Durable Object を削除する。
 - [x] CI で typecheck、lint、unit / Workers test、deploy dry-run を実行する。
 
@@ -365,7 +379,7 @@ PoC はまず 1 並列の production dry-run で開始し、観測結果をも�
 
 - 利用者別の認証・権限管理と、ジョブ一覧・キャンセル API。
 - 管理下テストフォームを使う実送信 E2E。
-- 禁止判定の証跡、送信前確認、payload 由来入力を信頼済み handler で検証する境界。
+- 禁止判定の証跡と送信前確認を信頼済みhandlerで検証する境界。
 - 同一ドメインの GET 型副作用を submit gate 外から起動させない設計。
 - 状態遷移、tool、token、時間、費用の observability。
 - `submitting` / `uncertain` の照合、DLQ 再投入、緊急停止の運用機能。

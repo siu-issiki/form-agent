@@ -504,7 +504,7 @@ function systemPrompt(dryRun: boolean): string {
 		"Stay on the persisted target domain. Never use another company or arbitrary URL.",
 		"Observe the page before acting and check for sales, solicitation, or purpose restrictions.",
 		"If outreach is prohibited or the form purpose is incompatible, do not submit; call finish with prohibited.",
-		"Fill only values present in the job payload. Never invent required personal or company data.",
+		"For fill and select, choose only a payloadKey from payload.formValues. The trusted handler resolves its value; never invent personal or company data.",
 		"Before submit, re-observe and verify the target, all values, required fields, and that submit has not been attempted.",
 		"Use submit exactly once. Only submit can report sent.",
 		"If meaning or submission outcome is unclear, call finish with uncertain. For technical failures, call finish with failed.",
@@ -533,13 +533,25 @@ const AGENT_TOOLS = [
 	functionTool("click", "Click a non-submit element on the current page.", {
 		elementId: { type: "string", pattern: "^fa-[a-z0-9-]+$", maxLength: 64 },
 	}),
-	functionTool("fill", "Fill one text-like form field.", {
+	functionTool(
+		"fill",
+		"Fill one text-like form field with a trusted payload.formValues entry.",
+		{
+			elementId: { type: "string", pattern: "^fa-[a-z0-9-]+$", maxLength: 64 },
+			payloadKey: {
+				type: "string",
+				pattern: "^[A-Za-z][A-Za-z0-9_]{0,63}$",
+				maxLength: 64,
+			},
+		},
+	),
+	functionTool("select", "Select using a trusted payload.formValues entry.", {
 		elementId: { type: "string", pattern: "^fa-[a-z0-9-]+$", maxLength: 64 },
-		value: { type: "string", maxLength: 8_192 },
-	}),
-	functionTool("select", "Select a dropdown, radio, or checkbox value.", {
-		elementId: { type: "string", pattern: "^fa-[a-z0-9-]+$", maxLength: 64 },
-		value: { type: "string", maxLength: 2_048 },
+		payloadKey: {
+			type: "string",
+			pattern: "^[A-Za-z][A-Za-z0-9_]{0,63}$",
+			maxLength: 64,
+		},
 	}),
 	functionTool(
 		"submit",
