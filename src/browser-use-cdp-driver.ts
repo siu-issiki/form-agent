@@ -369,9 +369,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		this.#submissionRequestCount = 0;
 		try {
 			try {
-				await this.#clickElement(this.#element(elementId).backendNodeId);
+				const activated = await this.#callFunctionOnElement<boolean>(
+					this.#element(elementId).backendNodeId,
+					ACTIVATE_SUBMIT_FUNCTION,
+				);
+				if (!activated) throw new BrowserElementError();
 			} catch (error) {
-				throw createBrowserSubmitDiagnosticError("SUBMIT_CLICK", error);
+				throw createBrowserSubmitDiagnosticError("SUBMIT_ACTIVATE", error);
 			}
 			const deadline = Date.now() + CONFIRMATION_WAIT_MS;
 			while (Date.now() < deadline) {
@@ -896,6 +900,12 @@ const SET_SELECT_VALUE_FUNCTION = `function(value) {
   this.value = value;
   this.dispatchEvent(new Event("input", { bubbles: true }));
   this.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
+}`;
+
+export const ACTIVATE_SUBMIT_FUNCTION = `function() {
+  if (!this.isConnected || typeof this.click !== "function") return false;
+  this.click();
   return true;
 }`;
 

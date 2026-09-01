@@ -8,6 +8,7 @@ import {
 } from "../src/browser-use-cdp";
 import { discoverCdpForms } from "../src/browser-use-cdp-dom";
 import {
+	ACTIVATE_SUBMIT_FUNCTION,
 	assertDryRunNavigationAllowed,
 	BLOCK_BROWSER_ESCAPE_EXPRESSION,
 	CHECK_FORM_VALIDITY_FUNCTION,
@@ -88,6 +89,24 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 });
 
 describe("BrowserUseCdpDriver child target policy", () => {
+	test("activates exactly the resolved connected submit element", () => {
+		const activateSubmit = runInNewContext(
+			`(${ACTIVATE_SUBMIT_FUNCTION})`,
+		) as (this: { isConnected: boolean; click?(): void }) => boolean;
+		let clickCount = 0;
+		const button = {
+			isConnected: true,
+			click: () => {
+				clickCount += 1;
+			},
+		};
+
+		expect(activateSubmit.call(button)).toBe(true);
+		expect(clickCount).toBe(1);
+		expect(activateSubmit.call({ ...button, isConnected: false })).toBe(false);
+		expect(clickCount).toBe(1);
+	});
+
 	test("rounds hit-test coordinates to CDP integers", () => {
 		expect(
 			centerOfQuad([10.25, 20.75, 20.25, 20.75, 20.25, 30.75, 10.25, 30.75]),

@@ -62,6 +62,7 @@ export type BrowserSubmitFailureStage =
 	| "SUBMIT_READ_BEFORE_TEXT"
 	| "SUBMIT_READ_AFTER_TEXT"
 	| "SUBMIT_CLICK"
+	| "SUBMIT_ACTIVATE"
 	| "POST_SUBMIT_URL_CHECK";
 
 export type BrowserSubmitFailureCode =
