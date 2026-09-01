@@ -385,6 +385,7 @@ async function executeClaimedJob(
 	runToken: string,
 	now: string,
 ): Promise<"ack" | "retry"> {
+	const startedAt = Date.now();
 	let result: AgentRunResult;
 	try {
 		result = await executeAgent(executor, {
@@ -419,6 +420,16 @@ async function executeClaimedJob(
 			return "ack";
 		}
 		if (!(error instanceof AgentExecutionError) || error.retryable) {
+			await recordRetryScheduled(
+				store,
+				job,
+				runToken,
+				error instanceof AgentExecutionError
+					? error.reasonCode
+					: "UNEXPECTED_AGENT_ERROR",
+				"exception",
+				startedAt,
+			);
 			return "retry";
 		}
 		await store.recordFailed(
@@ -483,9 +494,18 @@ async function executeClaimedJob(
 					await closeSubmittingConflict(store, job.id, runToken, now);
 					return "ack";
 				}
-				return current?.status === "running" && current.runToken === runToken
-					? "retry"
-					: "ack";
+				if (current?.status !== "running" || current.runToken !== runToken) {
+					return "ack";
+				}
+				await recordRetryScheduled(
+					store,
+					job,
+					runToken,
+					result.reasonCode,
+					"result",
+					startedAt,
+				);
+				return "retry";
 			}
 			if (
 				!(await store.recordFailed(
@@ -499,6 +519,42 @@ async function executeClaimedJob(
 				await closeSubmittingConflict(store, job.id, runToken, now);
 			}
 			return "ack";
+	}
+}
+
+async function recordRetryScheduled(
+	store: D1JobStore,
+	job: Job,
+	runToken: string,
+	reasonCode: string,
+	source: "exception" | "result",
+	startedAt: number,
+): Promise<void> {
+	try {
+		const recorded = await store.recordRetryScheduled(
+			job.id,
+			runToken,
+			job.attemptCount,
+			reasonCode,
+			source,
+			Math.max(0, Date.now() - startedAt),
+			new Date().toISOString(),
+		);
+		if (!recorded) {
+			console.warn(
+				JSON.stringify({
+					event: "retry_event_not_recorded",
+					reasonCode,
+				}),
+			);
+		}
+	} catch {
+		console.warn(
+			JSON.stringify({
+				event: "retry_event_record_failed",
+				reasonCode,
+			}),
+		);
 	}
 }
 

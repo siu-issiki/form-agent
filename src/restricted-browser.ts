@@ -58,6 +58,7 @@ export class SubmissionResultUncertainError extends Error {
 
 export class RestrictedBrowserTools {
 	readonly #targetDomain: string;
+	#successfulInputCount = 0;
 	#submitAttempted = false;
 
 	private constructor(
@@ -117,14 +118,19 @@ export class RestrictedBrowserTools {
 	async fill(elementId: string, value: string): Promise<void> {
 		await this.driver.fill(elementId, value);
 		await this.#assertCurrentUrlAllowed();
+		this.#successfulInputCount += 1;
 	}
 
 	async select(elementId: string, value: string): Promise<void> {
 		await this.driver.select(elementId, value);
 		await this.#assertCurrentUrlAllowed();
+		this.#successfulInputCount += 1;
 	}
 
 	async validateSubmit(elementId: string): Promise<void> {
+		if (this.#successfulInputCount < 1) {
+			throw new BrowserElementError();
+		}
 		await this.#assertCurrentUrlAllowed();
 		await this.driver.validateSubmit(elementId);
 		await this.#assertCurrentUrlAllowed();

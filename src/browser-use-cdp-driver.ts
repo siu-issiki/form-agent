@@ -316,6 +316,11 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		) {
 			throw new BrowserElementError();
 		}
+		const formValid = await this.#callFunctionOnElement<boolean>(
+			reference.backendNodeId,
+			CHECK_FORM_VALIDITY_FUNCTION,
+		);
+		if (!formValid) throw new BrowserElementError();
 	}
 
 	async submit(elementId: string): Promise<BrowserSubmitResult> {
@@ -776,6 +781,10 @@ const SET_SELECT_VALUE_FUNCTION = `function(value) {
   this.dispatchEvent(new Event("input", { bubbles: true }));
   this.dispatchEvent(new Event("change", { bubbles: true }));
   return true;
+}`;
+
+export const CHECK_FORM_VALIDITY_FUNCTION = `function() {
+  return Boolean(this.form && typeof this.form.checkValidity === "function" && this.form.checkValidity());
 }`;
 
 export const IS_COMPOSED_DESCENDANT_FUNCTION = `function(candidate) {

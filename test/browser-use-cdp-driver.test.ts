@@ -10,6 +10,7 @@ import { discoverCdpForms } from "../src/browser-use-cdp-dom";
 import {
 	assertDryRunNavigationAllowed,
 	BLOCK_BROWSER_ESCAPE_EXPRESSION,
+	CHECK_FORM_VALIDITY_FUNCTION,
 	denyRelatedBrowserTargets,
 	IS_COMPOSED_DESCENDANT_FUNCTION,
 } from "../src/browser-use-cdp-driver";
@@ -82,6 +83,20 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 });
 
 describe("BrowserUseCdpDriver child target policy", () => {
+	test("requires the submit control's form to pass native validity", () => {
+		const checkFormValidity = runInNewContext(
+			`(${CHECK_FORM_VALIDITY_FUNCTION})`,
+		) as (this: { form?: { checkValidity(): boolean } }) => boolean;
+
+		expect(
+			checkFormValidity.call({ form: { checkValidity: () => true } }),
+		).toBe(true);
+		expect(
+			checkFormValidity.call({ form: { checkValidity: () => false } }),
+		).toBe(false);
+		expect(checkFormValidity.call({})).toBe(false);
+	});
+
 	test("allows only the bootstrap navigation in dry-run", () => {
 		expect(() => assertDryRunNavigationAllowed(true, 0)).not.toThrow();
 		expect(() => assertDryRunNavigationAllowed(true, 1)).toThrow();
