@@ -705,6 +705,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async #activateSubmitElement(backendNodeId: number): Promise<void> {
+		await this.#send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
 		const unobscured = await this.#callFunctionOnElement<boolean>(
 			backendNodeId,
 			IS_SUBMIT_UNOBSCURED_FUNCTION,
