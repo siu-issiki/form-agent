@@ -11,7 +11,6 @@
     "test:browser-use-smoke": "vitest run --config vitest.browser-use.config.ts",
     "test:agent-e2e": "bun run test/run-agent-e2e.ts",
     "test:agent-e2e:production": "bun run test/run-production-agent-e2e.ts",
-    "deploy:test-fixture:dry-run": "wrangler deploy --dry-run -c wrangler.test-fixture.jsonc",
     "db:migrate:local": "wrangler d1 migrations apply DB --local",
     "dev": "wrangler dev"
   },

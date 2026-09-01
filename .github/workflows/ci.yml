@@ -29,4 +29,3 @@ jobs:
       - run: bun run lint
       - run: bun run test
       - run: bunx wrangler deploy --dry-run
-      - run: bun run deploy:test-fixture:dry-run

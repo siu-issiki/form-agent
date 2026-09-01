@@ -19,9 +19,9 @@
 | Agent 実行 | 実装済み | Worker から OpenAI Responses API の function calling を直接実行 |
 | 推論 Provider | 部分実装 | OpenAI Responses API のみ。モデル、回数、本文、出力 token を Worker 側で制限 |
 | BrowserUse | 実装済み | standalone browser へ CDP 接続し、用途限定ツールだけを公開 |
-| E2E | 部分実装 | production Worker 直実行の AnyReach dry-run E2E に成功。管理下テストフォームはproductionへデプロイ済み、実送信 E2E は未実施 |
+| E2E | 部分実装 | production Worker 直実行の AnyReach dry-run E2E に成功。実送信 E2E は未実施 |
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値を検証。一覧・キャンセルは未実装 |
-| Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、メインWorker、管理下テストフォームWorker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
+| Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
 | 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ イベント |
 | 並列検証 | 部分実施 | 安全確認中は `max_concurrency: 1`。Cloudflare 上の単一ジョブを検証済みで、5 並列以上は未検証 |
 
@@ -215,17 +215,6 @@ pending / running / failed ── retry 上限超過 ──► dead_lettered
 
 Provider、model、input / output token、処理時間、BrowserUse 待ち時間等の metrics はまだ保存しない。
 
-### test_fixture_submissions
-
-管理下テストフォームへの実POSTをジョブ単位で数える。送信本文は保存しない。
-
-| 列 | 型 | 内容 |
-| --- | --- | --- |
-| `job_id` | TEXT PK | `jobs.id`への参照 |
-| `post_count` | INTEGER | 管理下フォームが受け取ったPOST回数 |
-| `first_submitted_at` | TEXT | 初回受信日時 |
-| `last_submitted_at` | TEXT | 最終受信日時 |
-
 ### events
 
 | 列 | 型 | 内容 |
@@ -338,14 +327,13 @@ PoC はまず 1 並列の production dry-run で開始し、観測結果をも�
 - [x] retryのreason code、発生元、attempt、実行時間、Provider呼び出し累計をD1イベントへ保存する。
 - [x] `DRY_RUN_COMPLETE`の前提として入力成功とnative form validityを検証する。
 - [x] `fill` / `select`の入力値を`payload.formValues`由来に限定する。
-- [x] 固定ダミー値だけを受け付け、POST回数だけを保存する管理下テストフォームを実装する。
 - [x] production から旧 Sandbox Durable Object を削除する。
 - [x] CI で typecheck、lint、unit / Workers test、deploy dry-run を実行する。
 
 未完了:
 
 - [x] 認証付きジョブ登録・取得 API を実装する。
-- [ ] 管理下のテストフォームで `submitting` から `sent` まで検証する。
+- [ ] 実送信 E2E の対象と手順を決め、`submitting` から `sent` まで検証する。
 - [ ] Queue 重複配信時に実 POST が 1 回だけであることを検証する。
 - [ ] `submitting` 中断時に `uncertain` となり再送しないことを検証する。
 - [ ] 状態遷移、理由、時間、token、BrowserUse 待ち時間を記録する。
@@ -378,7 +366,7 @@ PoC はまず 1 並列の production dry-run で開始し、観測結果をも�
 ### 実装
 
 - 利用者別の認証・権限管理と、ジョブ一覧・キャンセル API。
-- 管理下テストフォームを使う実送信 E2E。
+- 実送信 E2E の対象と手順の決定。
 - 禁止判定の証跡と送信前確認を信頼済みhandlerで検証する境界。
 - 同一ドメインの GET 型副作用を submit gate 外から起動させない設計。
 - 状態遷移、tool、token、時間、費用の observability。
