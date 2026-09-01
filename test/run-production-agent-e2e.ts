@@ -98,6 +98,11 @@ while (Date.now() < deadline) {
 		) {
 			throw new Error("Production E2E did not finish at the dry-run boundary");
 		}
+		if (result.job.attemptCount !== 1) {
+			throw new Error(
+				`Production E2E retried unexpectedly (${result.job.attemptCount} attempts)`,
+			);
+		}
 		process.exit(0);
 	}
 	await Bun.sleep(2_000);

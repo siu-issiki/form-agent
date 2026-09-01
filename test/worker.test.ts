@@ -4,7 +4,7 @@ import {
 	getQueueResult,
 } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, test } from "vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 import { AgentExecutionError, type AgentExecutor } from "../src/agent-executor";
 import { BrowserToolCoordinator } from "../src/browser-tool-handler";
 import { BrowserUseCdpPayloadTooLargeError } from "../src/browser-use-cdp";
@@ -322,7 +322,12 @@ describe("BrowserToolCoordinator", () => {
 			"observe",
 			{},
 		);
-		const submitted = await coordinator.execute(
+		const filled = await coordinator.execute(input.id, "run-token-1", "fill", {
+			elementId: "fa-0-0",
+			value: "Hello",
+		});
+		expect(filled).toEqual({ result: { ok: true } });
+		const submitResult = await coordinator.execute(
 			input.id,
 			"run-token-1",
 			"submit",
@@ -336,8 +341,8 @@ describe("BrowserToolCoordinator", () => {
 		expect(observed).toEqual({
 			result: { url: input.targetUrl, forms: [] },
 		});
-		expect(submitted).toMatchObject({ job: { status: "sent" } });
-		expect("runToken" in (submitted as { job: object }).job).toBe(false);
+		expect(submitResult).toMatchObject({ job: { status: "sent" } });
+		expect("runToken" in (submitResult as { job: object }).job).toBe(false);
 		expect(createCount).toBe(1);
 		expect(driver.restrictedDomain).toBe(input.targetDomain);
 		expect(driver.closed).toBe(true);
@@ -404,6 +409,10 @@ describe("ResponsesAgentExecutor", () => {
 		}> = [];
 		const responses = [
 			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-fill", "fill", {
+				elementId: "fa-0-0",
+				value: "送信なしテスト",
+			}),
 			functionResponse("call-submit", "submit", {
 				elementId: "fa-0-1",
 			}),
@@ -500,7 +509,7 @@ describe("ResponsesAgentExecutor", () => {
 			outcome: "failed",
 			reasonCode: "SUBMIT_ELEMENT_NOT_OBSERVED",
 		});
-		expect(driver.validateSubmitCount).toBe(1);
+		expect(driver.validateSubmitCount).toBe(0);
 		expect(driver.submitCount).toBe(0);
 	});
 
@@ -820,17 +829,25 @@ describe("ResponsesAgentExecutor", () => {
 		);
 		if (!job) throw new Error("Expected a claimed job");
 		const driver = new WorkerFakeBrowserDriver();
+		const responses = [
+			functionResponse("call-fill", "fill", {
+				elementId: "fa-0-0",
+				value: "Hello",
+			}),
+			functionResponse("call-submit", "submit", {
+				elementId: "fa-0-1",
+			}),
+		];
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
 			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
-			fetcher: (async () =>
-				Response.json(
-					functionResponse("call-submit", "submit", {
-						elementId: "fa-0-1",
-					}),
-				)) as typeof fetch,
+			fetcher: (async () => {
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
 			createBrowserDriver: async () => driver,
 		});
 
@@ -1058,11 +1075,121 @@ describe("Queue orchestration", () => {
 		await consumeJobBatch(batch, env, executor);
 		const result = await getQueueResult(batch, ctx);
 		const persisted = await store.find(input.id);
+		const event = await env.DB.prepare(
+			"SELECT attempt, type, data_json, created_at FROM events WHERE job_id = ?",
+		)
+			.bind(input.id)
+			.first<{
+				attempt: number;
+				type: string;
+				data_json: string;
+				created_at: string;
+			}>();
 
 		expect(result.explicitAcks).toEqual([]);
 		expect(result.retryMessages).toHaveLength(1);
 		expect(persisted?.status).toBe("running");
 		expect(persisted?.runToken).toBe("message-1");
+		expect(event?.attempt).toBe(1);
+		expect(event?.type).toBe("job.retry_scheduled");
+		expect(event?.created_at).toBeTruthy();
+		expect(JSON.parse(event?.data_json ?? "{}")).toMatchObject({
+			reasonCode: "PROVIDER_RATE_LIMITED",
+			source: "result",
+			durationMs: expect.any(Number),
+			providerRequestCount: 0,
+		});
+	});
+
+	test("persists the reason for a retryable agent exception", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
+			{
+				id: "message-1",
+				timestamp: new Date("2026-08-28T00:00:01.000Z"),
+				body: { jobId: input.id },
+				attempts: 1,
+			},
+		]);
+		const ctx = createExecutionContext();
+		const executor: AgentExecutor = {
+			async execute() {
+				throw new AgentExecutionError(
+					"BROWSER_TOOL_UNAVAILABLE",
+					"The browser tool became unavailable.",
+					true,
+				);
+			},
+		};
+
+		await consumeJobBatch(batch, env, executor);
+		const result = await getQueueResult(batch, ctx);
+		const event = await env.DB.prepare(
+			"SELECT attempt, type, data_json FROM events WHERE job_id = ?",
+		)
+			.bind(input.id)
+			.first<{ attempt: number; type: string; data_json: string }>();
+
+		expect(result.retryMessages).toHaveLength(1);
+		expect(event?.attempt).toBe(1);
+		expect(event?.type).toBe("job.retry_scheduled");
+		expect(JSON.parse(event?.data_json ?? "{}")).toMatchObject({
+			reasonCode: "BROWSER_TOOL_UNAVAILABLE",
+			source: "exception",
+			durationMs: expect.any(Number),
+			providerRequestCount: 0,
+		});
+	});
+
+	test("persists a safe reason when the queue consumer schedules a retry", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
+			{
+				id: "message-1",
+				timestamp: new Date("2026-08-28T00:00:01.000Z"),
+				body: { jobId: input.id },
+				attempts: 1,
+			},
+		]);
+		const ctx = createExecutionContext();
+		const executor: AgentExecutor = {
+			async execute() {
+				return {
+					outcome: "prohibited",
+					formUrl: input.targetUrl,
+					reasonCode: "SALES_PROHIBITED",
+					reason: "Sales messages are prohibited.",
+				};
+			},
+		};
+		const recordProhibited = vi
+			.spyOn(D1JobStore.prototype, "recordProhibited")
+			.mockRejectedValueOnce(new Error("D1 write failed"));
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+		try {
+			await consumeJobBatch(batch, env, executor);
+		} finally {
+			recordProhibited.mockRestore();
+			warn.mockRestore();
+		}
+		const result = await getQueueResult(batch, ctx);
+		const event = await env.DB.prepare(
+			"SELECT attempt, type, data_json FROM events WHERE job_id = ?",
+		)
+			.bind(input.id)
+			.first<{ attempt: number; type: string; data_json: string }>();
+
+		expect(result.retryMessages).toHaveLength(1);
+		expect(event?.attempt).toBe(1);
+		expect(event?.type).toBe("job.retry_scheduled");
+		expect(JSON.parse(event?.data_json ?? "{}")).toMatchObject({
+			reasonCode: "QUEUE_CONSUMER_ERROR",
+			source: "consumer",
+			providerRequestCount: 0,
+		});
 	});
 
 	test("fails closed when the agent reports sent without a D1 sent result", async () => {

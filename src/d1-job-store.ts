@@ -147,6 +147,44 @@ export class D1JobStore implements JobStore {
 		return row ? mapStoredJob(row) : null;
 	}
 
+	async recordRetryScheduled(
+		id: string,
+		runToken: string,
+		attempt: number,
+		reasonCode: string,
+		source: "consumer" | "exception" | "result",
+		durationMs: number,
+		now: string,
+	): Promise<boolean> {
+		const result = await this.db
+			.prepare(
+				`INSERT INTO events (
+          id, job_id, attempt, type, data_json, created_at
+        )
+        SELECT ?, id, ?, 'job.retry_scheduled', json_object(
+          'reasonCode', ?,
+          'source', ?,
+          'durationMs', ?,
+          'providerRequestCount', provider_request_count
+        ), ?
+        FROM jobs
+        WHERE id = ? AND status = 'running' AND run_token = ?`,
+			)
+			.bind(
+				crypto.randomUUID(),
+				attempt,
+				reasonCode,
+				source,
+				durationMs,
+				now,
+				id,
+				runToken,
+			)
+			.run();
+
+		return result.meta.changes === 1;
+	}
+
 	recordSent(
 		id: string,
 		runToken: string,

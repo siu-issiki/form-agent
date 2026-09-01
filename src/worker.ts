@@ -329,6 +329,8 @@ export async function consumeJobBatch(
 			continue;
 		}
 
+		let attemptedJob: Job | null = null;
+		let executionStartedAt: number | null = null;
 		try {
 			const now = new Date().toISOString();
 			if (batch.queue === DEAD_LETTER_QUEUE) {
@@ -349,7 +351,7 @@ export async function consumeJobBatch(
 				message.ack();
 				continue;
 			}
-			const attemptedJob = await store.recordRunAttempt(
+			attemptedJob = await store.recordRunAttempt(
 				job.id,
 				runToken,
 				message.attempts,
@@ -360,6 +362,7 @@ export async function consumeJobBatch(
 				continue;
 			}
 
+			executionStartedAt = Date.now();
 			const disposition = await executeClaimedJob(
 				store,
 				executor,
@@ -373,6 +376,22 @@ export async function consumeJobBatch(
 				message.ack();
 			}
 		} catch {
+			console.warn(
+				JSON.stringify({
+					event: "queue_consumer_error",
+					reasonCode: "QUEUE_CONSUMER_ERROR",
+				}),
+			);
+			if (attemptedJob) {
+				await recordRetryScheduled(
+					store,
+					attemptedJob,
+					message.id,
+					"QUEUE_CONSUMER_ERROR",
+					"consumer",
+					executionStartedAt ?? Date.now(),
+				);
+			}
 			message.retry({ delaySeconds: 30 });
 		}
 	}
@@ -385,6 +404,7 @@ async function executeClaimedJob(
 	runToken: string,
 	now: string,
 ): Promise<"ack" | "retry"> {
+	const startedAt = Date.now();
 	let result: AgentRunResult;
 	try {
 		result = await executeAgent(executor, {
@@ -419,6 +439,16 @@ async function executeClaimedJob(
 			return "ack";
 		}
 		if (!(error instanceof AgentExecutionError) || error.retryable) {
+			await recordRetryScheduled(
+				store,
+				job,
+				runToken,
+				error instanceof AgentExecutionError
+					? error.reasonCode
+					: "UNEXPECTED_AGENT_ERROR",
+				"exception",
+				startedAt,
+			);
 			return "retry";
 		}
 		await store.recordFailed(
@@ -483,9 +513,18 @@ async function executeClaimedJob(
 					await closeSubmittingConflict(store, job.id, runToken, now);
 					return "ack";
 				}
-				return current?.status === "running" && current.runToken === runToken
-					? "retry"
-					: "ack";
+				if (current?.status !== "running" || current.runToken !== runToken) {
+					return "ack";
+				}
+				await recordRetryScheduled(
+					store,
+					job,
+					runToken,
+					result.reasonCode,
+					"result",
+					startedAt,
+				);
+				return "retry";
 			}
 			if (
 				!(await store.recordFailed(
@@ -499,6 +538,42 @@ async function executeClaimedJob(
 				await closeSubmittingConflict(store, job.id, runToken, now);
 			}
 			return "ack";
+	}
+}
+
+async function recordRetryScheduled(
+	store: D1JobStore,
+	job: Job,
+	runToken: string,
+	reasonCode: string,
+	source: "consumer" | "exception" | "result",
+	startedAt: number,
+): Promise<void> {
+	try {
+		const recorded = await store.recordRetryScheduled(
+			job.id,
+			runToken,
+			job.attemptCount,
+			reasonCode,
+			source,
+			Math.max(0, Date.now() - startedAt),
+			new Date().toISOString(),
+		);
+		if (!recorded) {
+			console.warn(
+				JSON.stringify({
+					event: "retry_event_not_recorded",
+					reasonCode,
+				}),
+			);
+		}
+	} catch {
+		console.warn(
+			JSON.stringify({
+				event: "retry_event_record_failed",
+				reasonCode,
+			}),
+		);
 	}
 }
 

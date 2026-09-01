@@ -22,7 +22,7 @@
 | E2E | 部分実装 | production Worker 直実行の AnyReach dry-run E2E に成功。実送信 E2E は未実施 |
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。一覧・キャンセルは未実装 |
 | Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
-| 監査・メトリクス | 部分実装 | Provider 呼び出し回数と DLQ イベントのみ |
+| 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ イベント |
 | 並列検証 | 部分実施 | 安全確認中は `max_concurrency: 1`。Cloudflare 上の単一ジョブを検証済みで、5 並列以上は未検証 |
 
 本書では、実装済みの構成を現在形で記述し、未実装または未検証の内容は「現在の制約」「PoC 計画」「残タスク・未決事項」に明示する。
@@ -65,7 +65,7 @@ Worker-native Agent executor
 Cloudflare D1
   ├─ jobs
   ├─ results
-  └─ events（現在は DLQ イベントのみ）
+  └─ events（retry / DLQ イベント）
 ```
 
 PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外部の OpenAI / BrowserUse を組み合わせる。本番は production 環境だけを対象とし、D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済みである。2026-09-02 に `https://anyreach.co.jp/contact` を対象とした production dry-run を実行し、`pending → running → prohibited`、`DRY_RUN_COMPLETE`、1 attempt、8 Provider requests、BrowserUse active session 0 件を確認した。`submitting` / `sent` には遷移しておらず、フォーム送信は行っていない。
@@ -79,7 +79,7 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 - ジョブ取得レスポンスから実行権を表す `runToken` を除外し、キャッシュを禁止する。
 - Queue の at-least-once 配信を前提に、D1 の条件付き更新で実行権を 1 つの Consumer だけに与える。
 - Agent の構造化結果を D1 の終端状態へ反映する。
-- 再試行可能な失敗は Queue retry、再試行上限超過は DLQ へ送る。
+- 再試行可能な失敗は理由、attempt、実行時間をイベントへ保存して Queue retry、再試行上限超過は DLQ へ送る。
 - executor 設定が不足している場合は `EXECUTOR_NOT_CONFIGURED` で fail-closed に終了する。
 
 現在の Queue 設定は次のとおり。
@@ -97,7 +97,7 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 - Queue から受け取った 1 ジョブについて Responses API と browser tool の反復を制御する。
 - 1 回の実行で 1 社だけを処理する。
 - `parallel_tool_calls: false` と strict schema により、1 turn で最大 1 tool だけを処理する。
-- `AGENT_DRY_RUN`が明示的な`false`以外、またはジョブpayloadが`_formAgentDryRun: true`の場合は、`submit`をモデルへ公開したまま現在のsubmit要素を実ブラウザで検証し、送信権取得とブラウザsubmitより前に`DRY_RUN_COMPLETE`で終了する。
+- `AGENT_DRY_RUN`が明示的な`false`以外、またはジョブpayloadが`_formAgentDryRun: true`の場合は、`submit`をモデルへ公開したまま、送信対象と同じフォームへの入力成功、現在のsubmit要素、`form.checkValidity()`の成功を実ブラウザで検証し、送信権取得とブラウザsubmitより前に`DRY_RUN_COMPLETE`で終了する。
 - 最大 12 turn、ジョブ prompt 最大 64,000 文字とする。
 - `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返す。
 - Agent 終了時または timeout 時に browser 接続を閉じる。
@@ -226,7 +226,7 @@ Provider、model、input / output token、処理時間、BrowserUse 待ち時間
 | `data_json` | TEXT | 秘密情報を除いたイベント詳細 |
 | `created_at` | TEXT | 発生日時 |
 
-現在保存するイベントは `job.dead_lettered` だけである。
+現在保存するイベントは `job.retry_scheduled` と `job.dead_lettered` である。retry イベントには秘密情報や自由記述のエラー本文を含めず、reason code、発生元、attempt、実行時間、retry時点のProvider呼び出し累計を保存する。
 
 ## 安全設計 / 冪等性
 
@@ -322,6 +322,9 @@ PoC はまず 1 並列の production dry-run で開始し、観測結果をも�
 - [x] 旧 E2E 後に Worker、Container、BrowserUse session が残らないことを確認する。
 - [x] production Worker へ Secrets、公開 URL、Queue consumer を設定する。
 - [x] Worker 直実行構成で AnyReach の送信なし E2E を実行する。
+- [x] production送信なしE2Eの成功条件を1 attemptに限定する。
+- [x] retryのreason code、発生元、attempt、実行時間、Provider呼び出し累計をD1イベントへ保存する。
+- [x] `DRY_RUN_COMPLETE`の前提として入力成功とnative form validityを検証する。
 - [x] production から旧 Sandbox Durable Object を削除する。
 - [x] CI で typecheck、lint、unit / Workers test、deploy dry-run を実行する。
 
@@ -369,7 +372,6 @@ PoC はまず 1 並列の production dry-run で開始し、観測結果をも�
 - 実 form の cross-origin iframe、確認画面、複数ページ、添付、CAPTCHA 対応方針と Shadow DOM の互換性検証。
 - Shadow DOM 内の禁止文言を含む可視テキストの収集。
 - SPA の遅延描画で無関係なbuttonだけが先に現れる場合のフォーム探索再試行。
-- `DRY_RUN_COMPLETE`の成功条件へ、少なくとも1件の入力成功とフォームvalidity確認を含める。
 - 外部 CDN / API / form action を許可する場合の安全な allowlist 設計。
 - Provider abstraction と fallback。
 - 外部 API E2E は GitHub Actions の通常 CI に含めず、手動実行に限定する。

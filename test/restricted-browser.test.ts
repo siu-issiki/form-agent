@@ -3,6 +3,7 @@ import type { AgentTools } from "../src/agent-runtime";
 import { assertAllowedBrowserRequest } from "../src/browser-network-policy";
 import { InMemoryJobStore, type JobInput } from "../src/job";
 import {
+	BrowserElementError,
 	type BrowserSubmitResult,
 	NavigationPolicyError,
 	type RestrictedBrowserDriver,
@@ -114,6 +115,7 @@ describe("RestrictedBrowserTools", () => {
 			"run-token-1",
 			() => "2026-08-28T00:00:02.000Z",
 		);
+		await tools.fill("fa-0-0", "Hello");
 
 		const sent = await tools.submit("fa-0-1");
 
@@ -123,6 +125,28 @@ describe("RestrictedBrowserTools", () => {
 			SubmissionNotAuthorizedError,
 		);
 		expect(driver.submitCount).toBe(1);
+	});
+
+	test("forgets successful inputs after navigation", async () => {
+		const driver = new FakeDriver();
+		const tools = await createTools(driver);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.navigate(input.targetUrl);
+
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			BrowserElementError,
+		);
+		expect(driver.submitCount).toBe(0);
+	});
+
+	test("rejects submit before any successful input", async () => {
+		const driver = new FakeDriver();
+		const tools = await createTools(driver);
+
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			BrowserElementError,
+		);
+		expect(driver.submitCount).toBe(0);
 	});
 
 	test("does not touch the browser when submission permission is missing", async () => {
@@ -147,6 +171,7 @@ describe("RestrictedBrowserTools", () => {
 			input.id,
 			"run-token-1",
 		);
+		await tools.fill("fa-0-0", "Hello");
 
 		await expect(tools.submit("fa-0-1")).rejects.toThrow();
 
@@ -167,6 +192,7 @@ describe("RestrictedBrowserTools", () => {
 			"run-token-1",
 			() => "2026-08-28T00:00:02.000Z",
 		);
+		await tools.fill("fa-0-0", "Hello");
 
 		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
 			SubmissionResultUncertainError,
@@ -276,6 +302,7 @@ describe("RestrictedBrowserTools", () => {
 			input.id,
 			"run-token-1",
 		);
+		await tools.fill("fa-0-0", "Hello");
 
 		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
 			SubmissionResultUncertainError,
