@@ -14,6 +14,7 @@ import {
 	CHECK_FORM_VALIDITY_FUNCTION,
 	centerOfQuad,
 	createExpectedSubmissionRequest,
+	createSubmitActivationFailureLog,
 	denyRelatedBrowserTargets,
 	ENTER_KEY_DOWN_EVENT,
 	HAS_SAME_FORM_OWNER_FUNCTION,
@@ -391,6 +392,16 @@ describe("BrowserUseCdpDriver child target policy", () => {
 });
 
 describe("BrowserUseCdpDriver submission confirmation", () => {
+	test("logs only the activation strategy and allowlisted failure stage", () => {
+		expect(
+			JSON.parse(createSubmitActivationFailureLog("mouse", "hit_test")),
+		).toEqual({
+			event: "browser_submit_activation_failure",
+			activationStrategy: "mouse",
+			stage: "hit_test",
+		});
+	});
+
 	test("includes the Enter text required for native button activation", () => {
 		expect(ENTER_KEY_DOWN_EVENT).toMatchObject({
 			type: "keyDown",
