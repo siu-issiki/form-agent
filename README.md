@@ -3,6 +3,7 @@
 企業の問い合わせフォームへの営業送信を、安全かつ並列に実行するエージェント基盤です。
 
 設計方針は [docs/architecture.md](docs/architecture.md) を参照してください。
+本番停止・照合・再開手順は [docs/operations.md](docs/operations.md) を参照してください。
 
 ## 開発
 

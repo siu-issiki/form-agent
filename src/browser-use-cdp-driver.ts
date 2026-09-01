@@ -722,6 +722,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	async #prepareMouseClick(
 		backendNodeId: number,
 		activationStrategy?: SubmitActivationStrategy,
+		onAttempt?: (attempt: number) => void,
 	): Promise<{ x: number; y: number }> {
 		let stage: SubmitActivationStage = "scroll";
 		try {
@@ -757,10 +758,14 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				return point;
 			};
 			if (!activationStrategy) return await prepare();
-			return await retrySubmitMousePreparation(prepare, async () => {
-				stage = "retry_wait";
-				await this.#nextAnimationFrame();
-			});
+			return await retrySubmitMousePreparation(
+				prepare,
+				async () => {
+					stage = "retry_wait";
+					await this.#nextAnimationFrame();
+				},
+				onAttempt,
+			);
 		} catch (error) {
 			if (activationStrategy) {
 				console.log(
@@ -845,10 +850,18 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			}),
 		);
 		if (activationStrategy === "mouse") {
-			const point = await this.#prepareMouseClick(backendNodeId, "mouse");
+			let hitTestAttempts = 0;
+			const point = await this.#prepareMouseClick(
+				backendNodeId,
+				"mouse",
+				(attempt) => {
+					hitTestAttempts = attempt;
+				},
+			);
 			await this.#activatePreparedSubmit(
 				() => this.#dispatchMouseClick(point),
 				"mouse",
+				hitTestAttempts,
 			);
 			return;
 		}
@@ -865,6 +878,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	async #activatePreparedSubmit(
 		activate: () => Promise<unknown>,
 		activationStrategy: SubmitActivationStrategy,
+		hitTestAttempts?: number,
 	): Promise<void> {
 		const startedAt = Date.now();
 		let resolveSubmissionRequestObserved: () => void = () => undefined;
@@ -894,6 +908,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 					activationStrategy,
 					requestObserved: this.#submissionRequestCount > 0,
 					durationMs: Date.now() - startedAt,
+					...(hitTestAttempts === undefined ? {} : { hitTestAttempts }),
 				}),
 			);
 		}
@@ -994,12 +1009,14 @@ export function createSubmitActivationFailureLog(
 export async function retrySubmitMousePreparation<TResult>(
 	prepare: () => Promise<TResult>,
 	waitForNextFrame: () => Promise<unknown>,
+	onAttempt: (attempt: number) => void = () => undefined,
 ): Promise<TResult> {
 	for (
 		let attempt = 1;
 		attempt <= MAX_SUBMIT_MOUSE_PREPARATION_ATTEMPTS;
 		attempt += 1
 	) {
+		onAttempt(attempt);
 		try {
 			return await prepare();
 		} catch (error) {
