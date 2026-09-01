@@ -10,9 +10,10 @@ import { BrowserToolCoordinator } from "../src/browser-tool-handler";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobInput } from "../src/job";
 import { ResponsesAgentExecutor } from "../src/responses-agent-executor";
-import type {
-	BrowserSubmitResult,
-	RestrictedBrowserDriver,
+import {
+	BrowserElementError,
+	type BrowserSubmitResult,
+	type RestrictedBrowserDriver,
 } from "../src/restricted-browser";
 import worker, {
 	consumeJobBatch,
@@ -540,6 +541,65 @@ describe("ResponsesAgentExecutor", () => {
 			.first<{ provider_request_count: number }>();
 		expect(counter?.provider_request_count).toBe(2);
 		expect(driver.closed).toBe(true);
+	});
+
+	test("lets the model recover when click is used for a submit control", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-click", "click", { elementId: "fa-0-1" }),
+			functionResponse("call-finish", "finish", {
+				outcome: "failed",
+				formUrl: null,
+				reasonCode: "CORRECTED_TOOL_SELECTION",
+				reason: "The submit control requires the submit tool.",
+				retryable: false,
+			}),
+		];
+		const requests: unknown[] = [];
+		const driver = new WorkerFakeBrowserDriver();
+		driver.clickNonSubmit = async () => {
+			throw new BrowserElementError();
+		};
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			model: "gpt-5.4-mini",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async (_resource, init) => {
+				requests.push(JSON.parse(String(init?.body)));
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toMatchObject({
+			outcome: "failed",
+			reasonCode: "CORRECTED_TOOL_SELECTION",
+		});
+		expect(requests).toHaveLength(2);
+		expect(requests[1]).toMatchObject({
+			input: expect.arrayContaining([
+				expect.objectContaining({
+					type: "function_call_output",
+					call_id: "call-click",
+					output: JSON.stringify({ error: "INVALID_TOOL_INPUT" }),
+				}),
+			]),
+		});
 	});
 
 	test("reports sent only from the restricted browser persisted result", async () => {

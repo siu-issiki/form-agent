@@ -124,7 +124,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}>(elementId, CLICK_EXPRESSION);
 		if (!result.ok) throw new BrowserElementError();
 		if (result.submitLike) {
-			throw new Error("Submit controls require the submit tool");
+			throw new BrowserElementError();
 		}
 	}
 
