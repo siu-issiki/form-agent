@@ -42,6 +42,7 @@ const e2eWorker: ExportedHandler<E2eEnv, JobMessage> = {
 				companyName: `${target.hostname} E2E Fixture`,
 				targetUrl,
 				targetDomain: target.hostname,
+				allowedHosts: [],
 				payload: {
 					_formAgentDryRun: true,
 					scenario: "safe-no-submit",

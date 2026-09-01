@@ -19,7 +19,10 @@ export type SubmitActivationStrategy = "mouse" | "enter";
 
 export interface RestrictedBrowserDriver {
 	close?(): Promise<void>;
-	restrictToDomain(targetDomain: string): Promise<void>;
+	restrictToDomain(
+		targetDomain: string,
+		allowedHosts: readonly string[],
+	): Promise<void>;
 	currentUrl(): Promise<string>;
 	navigate(url: string): Promise<void>;
 	observe(): Promise<BrowserObservation>;
@@ -100,6 +103,7 @@ export function createBrowserSubmitDiagnosticError(
 
 export class RestrictedBrowserTools {
 	readonly #targetDomain: string;
+	readonly #allowedHosts: string[];
 	readonly #successfulInputElementIds = new Set<string>();
 	#submitAttempted = false;
 
@@ -109,9 +113,11 @@ export class RestrictedBrowserTools {
 		private readonly jobId: string,
 		private readonly runToken: string,
 		targetDomain: string,
+		allowedHosts: readonly string[],
 		private readonly now: () => string = () => new Date().toISOString(),
 	) {
 		this.#targetDomain = normalizeTargetDomain(targetDomain);
+		this.#allowedHosts = normalizeAllowedHosts(allowedHosts);
 	}
 
 	static async create(
@@ -127,14 +133,16 @@ export class RestrictedBrowserTools {
 		}
 
 		const targetDomain = normalizeTargetDomain(job.targetDomain);
-		assertTargetUrlMatchesDomain(job.targetUrl, targetDomain);
-		await driver.restrictToDomain(targetDomain);
+		const allowedHosts = normalizeAllowedHosts(job.allowedHosts);
+		assertAllowedTargetUrl(job.targetUrl, targetDomain, allowedHosts);
+		await driver.restrictToDomain(targetDomain, allowedHosts);
 		return new RestrictedBrowserTools(
 			driver,
 			jobs,
 			jobId,
 			runToken,
 			targetDomain,
+			allowedHosts,
 			now,
 		);
 	}
@@ -196,7 +204,11 @@ export class RestrictedBrowserTools {
 		);
 		if (
 			!authorized ||
-			normalizeTargetDomain(authorized.targetDomain) !== this.#targetDomain
+			normalizeTargetDomain(authorized.targetDomain) !== this.#targetDomain ||
+			!hasSameStringArray(
+				normalizeAllowedHosts(authorized.allowedHosts),
+				this.#allowedHosts,
+			)
 		) {
 			throw new SubmissionNotAuthorizedError();
 		}
@@ -276,7 +288,7 @@ export class RestrictedBrowserTools {
 	}
 
 	#assertAllowedUrl(rawUrl: string): void {
-		assertAllowedTargetUrl(rawUrl, this.#targetDomain);
+		assertAllowedTargetUrl(rawUrl, this.#targetDomain, this.#allowedHosts);
 	}
 
 	async #recordUncertain(reasonCode: string, reason: string): Promise<void> {
@@ -325,8 +337,10 @@ function classifyBrowserFailure(error: unknown): BrowserSubmitFailureCode {
 export function assertAllowedTargetUrl(
 	rawUrl: string,
 	targetDomain: string,
+	allowedHosts: readonly string[] = [],
 ): void {
 	const normalizedTargetDomain = normalizeTargetDomain(targetDomain);
+	const normalizedAllowedHosts = normalizeAllowedHosts(allowedHosts);
 	let url: URL;
 	try {
 		url = new URL(rawUrl);
@@ -337,7 +351,8 @@ export function assertAllowedTargetUrl(
 	const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
 	const allowedHost =
 		hostname === normalizedTargetDomain ||
-		hostname.endsWith(`.${normalizedTargetDomain}`);
+		hostname.endsWith(`.${normalizedTargetDomain}`) ||
+		normalizedAllowedHosts.includes(hostname);
 	if (
 		(url.protocol !== "https:" && url.protocol !== "http:") ||
 		url.username ||
@@ -348,7 +363,40 @@ export function assertAllowedTargetUrl(
 	}
 }
 
-function normalizeTargetDomain(value: string): string {
+export function normalizeAllowedHosts(values: readonly string[]): string[] {
+	if (!Array.isArray(values) || values.length > 8) {
+		throw new NavigationPolicyError();
+	}
+
+	const normalized = values.map(normalizeAllowedHost);
+	return [...new Set(normalized)].sort();
+}
+
+function normalizeAllowedHost(value: string): string {
+	if (typeof value !== "string" || value.length > 253) {
+		throw new NavigationPolicyError();
+	}
+	const normalized = value.toLowerCase().replace(/\.$/, "");
+	const parsed = parse(normalized, {
+		allowPrivateDomains: true,
+		detectSpecialUse: true,
+		extractHostname: false,
+	});
+	if (
+		!normalized ||
+		normalized.includes(":") ||
+		normalized.includes("/") ||
+		parsed.hostname !== normalized ||
+		parsed.isIp ||
+		parsed.isSpecialUse ||
+		(!parsed.isIcann && !parsed.isPrivate)
+	) {
+		throw new NavigationPolicyError();
+	}
+	return normalized;
+}
+
+export function normalizeTargetDomain(value: string): string {
 	const normalized = value.toLowerCase().replace(/\.$/, "");
 	const parsed = parse(normalized, {
 		allowPrivateDomains: true,
@@ -369,24 +417,9 @@ function normalizeTargetDomain(value: string): string {
 	return normalized;
 }
 
-function assertTargetUrlMatchesDomain(
-	targetUrl: string,
-	targetDomain: string,
-): void {
-	let url: URL;
-	try {
-		url = new URL(targetUrl);
-	} catch {
-		throw new NavigationPolicyError();
-	}
-
-	const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
-	if (
-		(url.protocol !== "https:" && url.protocol !== "http:") ||
-		url.username ||
-		url.password ||
-		(hostname !== targetDomain && !hostname.endsWith(`.${targetDomain}`))
-	) {
-		throw new NavigationPolicyError();
-	}
+function hasSameStringArray(left: readonly string[], right: readonly string[]) {
+	return (
+		left.length === right.length &&
+		left.every((value, index) => value === right[index])
+	);
 }

@@ -6,6 +6,7 @@ import {
 	type JobStatus,
 	type JobStore,
 } from "./job";
+import { normalizeAllowedHosts } from "./restricted-browser";
 
 interface StoredJobRow {
 	id: string;
@@ -13,6 +14,7 @@ interface StoredJobRow {
 	company_name: string;
 	target_url: string;
 	target_domain: string;
+	allowed_hosts_json: string;
 	payload_json: string;
 	status: JobStatus;
 	attempt_count: number;
@@ -40,8 +42,9 @@ export class D1JobStore implements JobStore {
 			.prepare(
 				`INSERT OR IGNORE INTO jobs (
           id, company_id, company_name, target_url, target_domain,
-          payload_json, status, attempt_count, run_token, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, NULL, ?, ?)`,
+          allowed_hosts_json, payload_json, status, attempt_count, run_token,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, ?, ?)`,
 			)
 			.bind(
 				input.id,
@@ -49,6 +52,7 @@ export class D1JobStore implements JobStore {
 				input.companyName,
 				input.targetUrl,
 				input.targetDomain,
+				JSON.stringify(input.allowedHosts),
 				JSON.stringify(input.payload),
 				now,
 				now,
@@ -397,6 +401,9 @@ function mapStoredJob(row: StoredJobRow): Job {
 		companyName: row.company_name,
 		targetUrl: row.target_url,
 		targetDomain: row.target_domain,
+		allowedHosts: normalizeAllowedHosts(
+			JSON.parse(row.allowed_hosts_json) as string[],
+		),
 		payload: JSON.parse(row.payload_json) as Record<string, unknown>,
 		status: row.status,
 		attemptCount: row.attempt_count,

@@ -14,6 +14,7 @@ const job: Job = {
 	companyName: "BrowserUse smoke fixture",
 	targetUrl,
 	targetDomain: "selenium.dev",
+	allowedHosts: [],
 	payload: {},
 	status: "running",
 	attemptCount: 1,

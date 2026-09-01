@@ -31,13 +31,16 @@ Content-Type: application/json
   "id": "job-001",
   "companyId": "company-001",
   "companyName": "Example Inc.",
-  "targetUrl": "https://example.com/contact",
+  "targetUrl": "https://forms.gle/example",
   "targetDomain": "example.com",
+  "allowedHosts": ["forms.gle", "docs.google.com"],
   "payload": {
     "formValues": { "message": "お問い合わせ内容" }
   }
 }
 ```
+
+`targetDomain`は企業の登録可能ドメインです。フォームが外部サービスにある場合だけ、CSVのフォームURLと事前に解決したredirect先の**完全一致hostname**をジョブ固有の`allowedHosts`へ設定します。許可は他ジョブへ共有されず、`google.com`のような上位ドメインへ自動拡張しません。
 
 登録成功は`201`、同じID・同じ内容のジョブが既に存在する場合は`200`を返します。既存ジョブが`pending`なら、作成後のQueue投入失敗から復旧できるよう再度Queueへ投入します。同じIDで内容が異なる場合は、既存情報を返さず`409`とします。`GET /jobs/:id`は同じBearer認証で現在状態を返します。いずれのレスポンスにも実行権を表す`runToken`は含めません。一覧・キャンセルAPIは未実装です。
 
@@ -48,6 +51,20 @@ BrowserUse は Agent API ではなく standalone browser API だけを使用し�
 実Queue/D1/Responses API/BrowserUseを通す送信なしE2Eは、`.env`へ`OPENAI_API_KEY`と`BROWSER_USE_API_KEY`を設定して`bun run test:agent-e2e`で実行します。専用の`wrangler dev`環境を一時ディレクトリへ起動し、標準ではSelenium公式サイトの空ページ1件をQueue bindingへ登録します。`E2E_TARGET_URL=https://example.co.jp/contact bun run test:agent-e2e`のように実フォームを指定した場合も、`AGENT_DRY_RUN=true`を強制します。モデルには`submit`ツールを公開したまま、Workerが送信対象と同じフォームへの入力成功、現在のsubmit要素、native form validityを実ブラウザで検証し、D1の送信権取得とブラウザsubmitより前に`DRY_RUN_COMPLETE`で終了するため、フォーム送信は行いません。dry-runではジョブURLへの初回遷移後の`navigate`と、最初のclick / fill / select後に発生するbrowser requestを遮断します。終了時にWorkerと一時データを破棄します。外部API利用料が発生するため、通常の`bun run test`には含めません。
 
 production Workerを使う送信なしE2Eは、productionの`JOB_API_TOKEN`と同じ値を一時的な環境変数へ設定し、`bun run test:agent-e2e:production`で実行します。スクリプトはジョブpayloadの`_formAgentDryRun: true`でもdry-runを強制し、リモートの環境変数が誤って解除されても実送信しません。さらに`submitting`または`sent`を観測した場合に即失敗し、1 attemptで`prohibited`かつ`DRY_RUN_COMPLETE`へ到達した場合だけを成功とします。通常のCIは外部APIを呼ばず、typecheck、lint、unit / Workers test、`wrangler deploy --dry-run`だけを実行します。
+
+## CSVキャンペーンのdry-run
+
+登録情報JSONと送信対象CSVはリポジトリへ追加せず、ローカルパスから読み込みます。インポーターは送信済み・NGチェック該当・HTTPS以外を除外し、登録情報の日本語labelを固定のASCII form keyへ変換します。IDはキャンペーン名・企業ドメイン・フォームURLから安定生成し、previewには値・本文・メールアドレス・電話番号を出しません。
+
+```bash
+bun run campaign:dry-run \
+  --registration /path/to/registration.json \
+  --csv /path/to/targets.csv \
+  --campaign agb-shaken-2026-09-dryrun-v1 \
+  --limit 5
+```
+
+productionへ登録する場合だけ`JOB_API_TOKEN`を環境変数へ設定し、同じコマンドへ`--submit-dry-run`を追加します。生成ジョブは必ず`_formAgentDryRun: true`を持ち、`submitting` / `sent`を検出した時点で失敗します。成功条件は各ジョブが1 attemptで`prohibited / DRY_RUN_COMPLETE`になることです。
 
 ## エージェント実行境界
 

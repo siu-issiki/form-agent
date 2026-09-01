@@ -12,6 +12,7 @@ import {
 	type BrowserObservation,
 	type BrowserSubmitResult,
 	createBrowserSubmitDiagnosticError,
+	normalizeAllowedHosts,
 	type RestrictedBrowserDriver,
 	type SubmitActivationStrategy,
 } from "./restricted-browser";
@@ -113,6 +114,7 @@ export type SubmitActivationStage =
 
 export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#targetDomain: string | undefined;
+	#allowedHosts: string[] = [];
 	#submissionRequestAllowed = false;
 	#submissionRequestCount = 0;
 	#submissionRequestObserved: (() => void) | undefined;
@@ -178,11 +180,23 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		this.connection.close();
 	}
 
-	async restrictToDomain(targetDomain: string): Promise<void> {
+	async restrictToDomain(
+		targetDomain: string,
+		allowedHosts: readonly string[],
+	): Promise<void> {
 		if (this.#targetDomain && this.#targetDomain !== targetDomain) {
 			throw new Error("Browser domain scope cannot be changed");
 		}
+		const normalizedAllowedHosts = normalizeAllowedHosts(allowedHosts);
+		if (
+			this.#targetDomain &&
+			JSON.stringify(this.#allowedHosts) !==
+				JSON.stringify(normalizedAllowedHosts)
+		) {
+			throw new Error("Browser host scope cannot be changed");
+		}
 		this.#targetDomain ??= targetDomain;
+		this.#allowedHosts = normalizedAllowedHosts;
 	}
 
 	currentUrl(): Promise<string> {
@@ -489,6 +503,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				this.#submissionRequestAllowed && this.#submissionRequestCount === 0,
 				!this.#formDataEntered && paused.resourceType !== "Document",
 				this.dryRun && this.#interactionStarted,
+				this.#allowedHosts,
 			);
 			if (unsafeRequest) {
 				this.#submissionRequestCount += 1;

@@ -248,7 +248,11 @@ async function executeToolCall(
 	}
 
 	if (call.name === "finish") {
-		const result = parseFinishResult(params, job.targetDomain);
+		const result = parseFinishResult(
+			params,
+			job.targetDomain,
+			job.allowedHosts,
+		);
 		return result
 			? { output: JSON.stringify({ outcome: result.outcome }), result }
 			: toolError("INVALID_TOOL_INPUT");
@@ -345,6 +349,7 @@ function terminalResultFromJob(
 function parseFinishResult(
 	params: JsonObject,
 	targetDomain: string,
+	allowedHosts: readonly string[],
 ): AgentRunResult | null {
 	const { outcome, formUrl, reasonCode, reason, retryable } = params;
 	if (
@@ -361,7 +366,9 @@ function parseFinishResult(
 
 	if (outcome === "prohibited" && retryable === null) {
 		try {
-			if (formUrl) assertAllowedTargetUrl(formUrl, targetDomain);
+			if (formUrl) {
+				assertAllowedTargetUrl(formUrl, targetDomain, allowedHosts);
+			}
 		} catch {
 			return null;
 		}

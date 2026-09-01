@@ -7,7 +7,10 @@ import type { AgentRunResult } from "./agent-runtime";
 import { D1JobStore } from "./d1-job-store";
 import { DuplicateJobError, type Job, type JobInput } from "./job";
 import { ResponsesAgentExecutor } from "./responses-agent-executor";
-import { assertAllowedTargetUrl } from "./restricted-browser";
+import {
+	assertAllowedTargetUrl,
+	normalizeAllowedHosts,
+} from "./restricted-browser";
 
 export interface JobMessage {
 	jobId: string;
@@ -207,7 +210,15 @@ async function parseJobInput(request: Request): Promise<JobInput> {
 		throw new InvalidJobRequestError("INVALID_JOB", 400);
 	}
 
-	const { id, companyId, companyName, targetUrl, targetDomain, payload } = body;
+	const {
+		id,
+		companyId,
+		companyName,
+		targetUrl,
+		targetDomain,
+		allowedHosts = [],
+		payload,
+	} = body;
 	if (
 		typeof id !== "string" ||
 		!JOB_ID_PATTERN.test(id) ||
@@ -215,6 +226,7 @@ async function parseJobInput(request: Request): Promise<JobInput> {
 		!validRequiredString(companyName, 256) ||
 		!validRequiredString(targetUrl, 2_048) ||
 		!validRequiredString(targetDomain, 253) ||
+		!Array.isArray(allowedHosts) ||
 		!isRecord(payload) ||
 		!hasValidFormValues(payload)
 	) {
@@ -222,12 +234,20 @@ async function parseJobInput(request: Request): Promise<JobInput> {
 	}
 
 	try {
-		assertAllowedTargetUrl(targetUrl, targetDomain);
+		const normalizedAllowedHosts = normalizeAllowedHosts(allowedHosts);
+		assertAllowedTargetUrl(targetUrl, targetDomain, normalizedAllowedHosts);
+		return {
+			id,
+			companyId,
+			companyName,
+			targetUrl,
+			targetDomain,
+			allowedHosts: normalizedAllowedHosts,
+			payload,
+		};
 	} catch {
 		throw new InvalidJobRequestError("INVALID_JOB", 400);
 	}
-
-	return { id, companyId, companyName, targetUrl, targetDomain, payload };
 }
 
 function hasValidFormValues(payload: Record<string, unknown>): boolean {
@@ -304,6 +324,7 @@ function hasSameInput(job: Job, input: JobInput): boolean {
 		job.companyName === input.companyName &&
 		job.targetUrl === input.targetUrl &&
 		job.targetDomain === input.targetDomain &&
+		hasSameJsonValue(job.allowedHosts, input.allowedHosts) &&
 		hasSameJsonValue(job.payload, input.payload)
 	);
 }

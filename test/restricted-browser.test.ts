@@ -21,6 +21,7 @@ const input: JobInput = {
 	companyName: "Example Inc.",
 	targetUrl: "https://acme.co.jp/contact",
 	targetDomain: "acme.co.jp",
+	allowedHosts: [],
 	payload: { message: "Hello" },
 };
 
@@ -93,6 +94,42 @@ describe("RestrictedBrowserTools", () => {
 		await tools.navigate("https://contact.acme.co.jp/form");
 		await expect(
 			tools.navigate("https://acme.co.jp.evil.test/form"),
+		).rejects.toBeInstanceOf(NavigationPolicyError);
+	});
+
+	test("allows only exact job-specific external hosts", async () => {
+		const driver = new FakeDriver();
+		const externalInput = {
+			...input,
+			targetUrl: "https://forms.gle/example",
+			allowedHosts: ["forms.gle", "docs.google.com"],
+		};
+		const store = new InMemoryJobStore();
+		await store.create(externalInput, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(
+			externalInput.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		const tools = await RestrictedBrowserTools.create(
+			driver,
+			store,
+			externalInput.id,
+			"run-token-1",
+		);
+
+		await tools.navigate("https://docs.google.com/forms/example");
+		await expect(
+			tools.navigate("https://drive.google.com/example"),
+		).rejects.toBeInstanceOf(NavigationPolicyError);
+	});
+
+	test("does not share an external host allowance between jobs", async () => {
+		const driver = new FakeDriver();
+		const tools = await createTools(driver);
+
+		await expect(
+			tools.navigate("https://forms.gle/example"),
 		).rejects.toBeInstanceOf(NavigationPolicyError);
 	});
 

@@ -1,29 +1,31 @@
 {
-  "name": "form-agent",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.workers.json",
-    "lint": "biome check src test vitest.config.ts vitest.browser-use.config.ts",
-    "test": "bun run test:unit && bun run test:workers",
-    "test:unit": "bun test test/job.test.ts test/browser-use-client.test.ts test/browser-use-cdp-driver.test.ts test/restricted-browser.test.ts test/agent-executor.test.ts",
-    "test:workers": "vitest run",
-    "test:browser-use-smoke": "vitest run --config vitest.browser-use.config.ts",
-    "test:agent-e2e": "bun run test/run-agent-e2e.ts",
-    "test:agent-e2e:production": "bun run test/run-production-agent-e2e.ts",
-    "db:migrate:local": "wrangler d1 migrations apply DB --local",
-    "dev": "wrangler dev"
-  },
-  "devDependencies": {
-    "@biomejs/biome": "^2.2.2",
-    "@cloudflare/vitest-plugin": "^1.1.1",
-    "@cloudflare/workers-types": "^5.20260827.1",
-    "@types/bun": "^1.2.21",
-    "typescript": "^5.9.2",
-    "vitest": "^4.1.11",
-    "wrangler": "^4.127.0"
-  },
-  "dependencies": {
-    "tldts": "^7.4.11"
-  }
+	"name": "form-agent",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.workers.json",
+		"lint": "biome check src test vitest.config.ts vitest.browser-use.config.ts",
+		"test": "bun run test:unit && bun run test:workers",
+		"test:unit": "bun test test/job.test.ts test/browser-use-client.test.ts test/browser-use-cdp-driver.test.ts test/restricted-browser.test.ts test/agent-executor.test.ts test/campaign-import.test.ts",
+		"test:workers": "vitest run",
+		"test:browser-use-smoke": "vitest run --config vitest.browser-use.config.ts",
+		"test:agent-e2e": "bun run test/run-agent-e2e.ts",
+		"test:agent-e2e:production": "bun run test/run-production-agent-e2e.ts",
+		"campaign:dry-run": "bun run tools/campaign-dry-run.ts",
+		"db:migrate:local": "wrangler d1 migrations apply DB --local",
+		"dev": "wrangler dev"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.2.2",
+		"@cloudflare/vitest-plugin": "^1.1.1",
+		"@cloudflare/workers-types": "^5.20260827.1",
+		"@types/bun": "^1.2.21",
+		"typescript": "^5.9.2",
+		"vitest": "^4.1.11",
+		"wrangler": "^4.127.0"
+	},
+	"dependencies": {
+		"csv-parse": "^6.1.0",
+		"tldts": "^7.4.11"
+	}
 }

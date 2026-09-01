@@ -13,6 +13,7 @@ const input: AgentRunInput = {
 		companyName: "Example Inc.",
 		targetUrl: "https://example.com/contact",
 		targetDomain: "example.com",
+		allowedHosts: [],
 		payload: { message: "Hello" },
 		status: "running",
 		attemptCount: 1,
