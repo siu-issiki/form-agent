@@ -23,6 +23,16 @@ const DOM_DISCOVERY_RETRY_DELAY_MS = 500;
 const CONFIRMATION_WAIT_MS = 5_000;
 const SUBMISSION_PERMISSION_WINDOW_MS = 250;
 
+export const ENTER_KEY_DOWN_EVENT = {
+	type: "keyDown",
+	key: "Enter",
+	code: "Enter",
+	text: "\r",
+	unmodifiedText: "\r",
+	windowsVirtualKeyCode: 13,
+	nativeVirtualKeyCode: 13,
+} as const;
+
 interface TargetInfo {
 	targetId: string;
 	type: string;
@@ -742,13 +752,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		try {
 			await runSubmissionActivationWithinPermissionWindow(
 				() =>
-					this.#send("Input.dispatchKeyEvent", {
-						type: "keyDown",
-						key: "Enter",
-						code: "Enter",
-						windowsVirtualKeyCode: 13,
-						nativeVirtualKeyCode: 13,
-					}).then(() => this.#nextAnimationFrame().catch(() => undefined)),
+					this.#send("Input.dispatchKeyEvent", ENTER_KEY_DOWN_EVENT).then(() =>
+						this.#nextAnimationFrame().catch(() => undefined),
+					),
 				submissionRequestObserved,
 			);
 		} finally {

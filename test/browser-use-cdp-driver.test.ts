@@ -13,6 +13,7 @@ import {
 	CHECK_FORM_VALIDITY_FUNCTION,
 	centerOfQuad,
 	denyRelatedBrowserTargets,
+	ENTER_KEY_DOWN_EVENT,
 	HAS_SAME_FORM_OWNER_FUNCTION,
 	IS_COMPOSED_DESCENDANT_FUNCTION,
 	IS_ELEMENT_FOCUSED_FUNCTION,
@@ -362,6 +363,15 @@ describe("BrowserUseCdpDriver child target policy", () => {
 });
 
 describe("BrowserUseCdpDriver submission confirmation", () => {
+	test("includes the Enter text required for native button activation", () => {
+		expect(ENTER_KEY_DOWN_EVENT).toMatchObject({
+			type: "keyDown",
+			key: "Enter",
+			text: "\r",
+			unmodifiedText: "\r",
+		});
+	});
+
 	test("bounds the submission request permission window when keydown does not resolve", async () => {
 		let waitedMilliseconds: number | null = null;
 		const neverResolvingKeyDown = new Promise<never>(() => undefined);
