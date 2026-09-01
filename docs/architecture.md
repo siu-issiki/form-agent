@@ -54,7 +54,7 @@ Cloudflare Worker Queue Consumer
         ├─ D1 の実行権を原子的に取得
         ▼
 Cloudflare Sandbox Durable Object / Container
-  1 ジョブ = 1 Sandbox = 1 Pi 実行
+  1 試行 = 1 隔離実行 = 1 Pi 実行
   ┌─────────────────────────────────────────────┐
   │ Pi 0.74.0                                  │
   │  ├─ Worker 管理の OpenAI proxy             │
@@ -109,7 +109,7 @@ PoC は Cloudflare Sandbox SDK 1.0 preview を採用している。正式採用�
 - 1 回の実行で 1 社だけを処理する。
 - 最大 12 turn、ジョブ prompt 最大 64,000 文字とする。
 - `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返す。
-- ジョブ入力にない個人情報・企業情報を推測して入力しない。
+- ジョブ入力にない個人情報・企業情報を推測して入力しないよう system prompt で指示する。現時点では信頼済み handler による入力値照合までは行わない。
 
 ### 推論 Provider
 
@@ -129,7 +129,7 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 
 - BrowserUse Agent ではなく、standalone browser へ CDP 接続する。
 - BrowserUse API key と CDP URL は Sandbox / Pi へ渡さない。
-- 1 ジョブにつき 1 browser session とし、終了時に接続を閉じる。
+- 1 試行につき最大 1 browser session とし、終了時に接続を閉じる。Queue retry では同じジョブに対して新しい Pi 実行と session を開始する。
 - proxy country は `jp`、session timeout は 15 分とする。
 - popup、Worker、Service Worker、WebSocket 等の迂回経路を遮断する。
 
@@ -147,7 +147,7 @@ Pi に汎用 JavaScript や CDP を公開せず、次の用途限定 tool だけ
 | `submit` | D1 の送信権取得後に 1 回だけ送信する |
 | `finish` | 送信せず、構造化された終端結果を返す |
 
-通常の `click` では submit control を操作できない。`submit` は対象要素を検証してから D1 を `running` から `submitting` へ更新し、最初の unsafe request だけを許可する。
+driver が submit control と識別した要素は通常の `click` で操作できない。`submit` は対象要素を検証してから D1 を `running` から `submitting` へ更新し、最初の非safe HTTP methodだけを許可する。同一ドメインの GET 型副作用はこの制御の対象外である。
 
 ### Cloudflare D1
 
@@ -163,10 +163,10 @@ Pi に汎用 JavaScript や CDP を公開せず、次の用途限定 tool だけ
 1. 対象企業、対象 URL、許可ドメイン、送信内容を含むジョブを D1 に `pending` として作成する。
 2. `jobId` を Cloudflare Queue へ登録する。
 3. Consumer は `pending` から `running` への条件付き更新に成功した場合だけ実行する。
-4. Pi は対象ドメイン内でフォームを探し、営業禁止・用途制限を確認する。
-5. 禁止または対象フォームなしの場合は送信せず、`prohibited` または `uncertain` を返す。
-6. フォーム項目を観察し、ジョブ入力に存在する値だけを入力する。
-7. 送信前に対象、禁止事項、入力値、必須項目、送信回数を再確認する。
+4. Pi には、対象ドメイン内でフォームを探し、営業禁止・用途制限を確認するよう指示する。
+5. Pi が禁止または対象フォームなしと判断した場合は、送信せず `prohibited` または `uncertain` を返す。
+6. Pi には、フォーム項目を観察し、ジョブ入力に存在する値だけを入力するよう指示する。
+7. Pi には、送信前に対象、禁止事項、入力値、必須項目、送信回数を再確認するよう指示する。
 8. D1 を `running` から `submitting` へ原子的に更新できた場合だけ `submit` を許可する。
 9. 送信完了を確認できた場合は `sent` を保存する。
 10. 送信後に結果を確認できない場合は `uncertain` とし、自動 retry を止める。
@@ -186,7 +186,7 @@ pending ── claim ──► running ── claim submit ──► submitting 
 pending / running / failed ── retry 上限超過 ──► dead_lettered
 ```
 
-`prohibited` と `uncertain` は自動 retry しない。retryable error は `failed` を保存せず、`running` と同じ `runToken` を維持したまま Queue の再配信を待つ。`submitting` または `sent` を受け取った Consumer は送信を再実行しない。
+`prohibited` と `uncertain` は自動 retry しない。retryable error は `failed` を保存せず、`running` と同じ `runToken` を維持したまま Queue の再配信を待つ。再配信では新しい Pi 実行と browser session を開始する。`submitting` または `sent` を受け取った Consumer は送信を再実行しない。
 
 ## データモデル
 
@@ -237,21 +237,26 @@ Provider、model、input / output token、処理時間、BrowserUse 待ち時間
 
 Cloudflare Queue はメッセージを複数回配信し得るため、処理全体を exactly-once と仮定しない。外部フォーム側には一般に idempotency key を渡せないため、送信処理は自動復旧より二重送信防止を優先する。
 
+### 技術的に強制する境界
+
 - すべての処理を一意な `jobId` に紐付ける。
 - Consumer は D1 の条件付き更新で実行権を 1 つの `runToken` だけに与える。
 - 送信直前に `running` から `submitting` への条件付き更新を行う。
 - `submitting` または `sent` のジョブは自動送信しない。
 - 送信後に応答を取得できない場合は `uncertain` として自動 retry を止める。
-- `submit` は 1 ジョブにつき 1 回に制限し、通常の `click` で代替できないようにする。
+- driver が submit control と識別した要素は通常の `click` で操作させず、`submit` tool へ限定する。
 - HTTP(S) の通信先を対象企業の登録可能ドメインとサブドメインに限定する。
-- unsafe request は送信権取得後の最初の 1 回だけ許可する。
+- POST 等の非safe HTTP method は送信権取得後の最初の 1 回だけ許可する。
 - popup、Worker、Service Worker、WebSocket、WebRTC 等の迂回経路を遮断する。
 - Provider / BrowserUse の認証情報と D1 の実行権を Sandbox へ渡さない。
 - Agent に返すジョブ情報から `runToken` を除外する。
-- 営業禁止の記述や同意できない規約がある場合は送信しない。
 - ジョブ間で browser session、cookie、入力データを共有しない。
 
 `submitting` 中に Worker が停止し、結果保存まで到達しなかった場合は自動再送せず、人間の確認対象にする。現在は人手照合の API / UI / runbook が未実装である。
+
+### Agent への安全指示
+
+Pi の system prompt では、営業禁止・用途制限の確認、payload に存在する値だけの入力、送信前の再観察と確認を指示する。ただし、現在の信頼済み handler は、禁止判定の証跡、送信前確認の実施、入力値が payload 由来かを機械的には検証しない。ページ上の prompt injection や Agent の誤判断に対するハードガードではないため、実送信開始前に信頼済み handler 側の検証範囲を決めて実装する。
 
 ## 現在の制約
 
@@ -264,6 +269,8 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 - popup、別 tab、Service Worker を利用するフォームは未対応である。
 - 確認画面、複数ページフォーム、ファイル添付、CAPTCHA は未対応である。
 - 送信完了は、送信前にはなかった日本語の送信完了表現または `thank you` が 5 秒以内に出現した場合だけ確定する。
+- `GET` / `HEAD` / `OPTIONS` は送信権なしでも許可するため、同一ドメインの GET 型副作用 endpoint を通常の `click` や `navigate` で起動する経路は防止できない。
+- 営業禁止判定、送信前確認、payload 由来の入力値は Agent への指示であり、信頼済み handler では未検証である。
 
 ### API / 運用
 
@@ -351,6 +358,8 @@ PoC は 5 並列から開始し、観測結果をもとに 20、50 へ段階的�
 - 認証付きジョブ登録・取得・一覧・キャンセル API。
 - staging / production の Cloudflare resource と環境分離。
 - 管理下テストフォームを使う実送信 E2E。
+- 禁止判定の証跡、送信前確認、payload 由来入力を信頼済み handler で検証する境界。
+- 同一ドメインの GET 型副作用を submit gate 外から起動させない設計。
 - 状態遷移、tool、token、時間、費用の observability。
 - `submitting` / `uncertain` の照合、DLQ 再投入、緊急停止の運用機能。
 - 実 form の iframe、Shadow DOM、確認画面、複数ページ、添付、CAPTCHA 対応方針。
