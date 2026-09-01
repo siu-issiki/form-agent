@@ -1,5 +1,8 @@
 import type { Job } from "./job";
-import type { BrowserObservation } from "./restricted-browser";
+import type {
+	BrowserObservation,
+	SubmitActivationStrategy,
+} from "./restricted-browser";
 
 export interface AgentRunInput {
 	job: Job;
@@ -29,7 +32,10 @@ export interface AgentTools {
 	click(elementId: string): Promise<void>;
 	fill(elementId: string, value: string): Promise<void>;
 	select(elementId: string, value: string): Promise<void>;
-	submit(elementId: string): Promise<Job>;
+	submit(
+		elementId: string,
+		activationStrategy: SubmitActivationStrategy,
+	): Promise<Job>;
 }
 
 export interface AgentRuntime {

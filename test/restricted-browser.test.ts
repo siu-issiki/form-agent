@@ -12,6 +12,7 @@ import {
 	RestrictedBrowserTools,
 	SubmissionNotAuthorizedError,
 	SubmissionResultUncertainError,
+	type SubmitActivationStrategy,
 } from "../src/restricted-browser";
 
 const input: JobInput = {
@@ -119,10 +120,11 @@ describe("RestrictedBrowserTools", () => {
 		);
 		await tools.fill("fa-0-0", "Hello");
 
-		const sent = await tools.submit("fa-0-1");
+		const sent = await tools.submit("fa-0-1", "mouse");
 
 		expect(sent.status).toBe("sent");
 		expect(driver.submitCount).toBe(1);
+		expect(driver.submitActivationStrategies).toEqual(["mouse"]);
 		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
 			SubmissionNotAuthorizedError,
 		);
@@ -370,6 +372,7 @@ class FakeDriver implements RestrictedBrowserDriver {
 	restrictedDomain: string | null = null;
 	redirectTo: string | null = null;
 	submitCount = 0;
+	submitActivationStrategies: SubmitActivationStrategy[] = [];
 	submitError: Error | null = null;
 	submitValidationError: Error | null = null;
 	submitResult: BrowserSubmitResult = {
@@ -405,8 +408,12 @@ class FakeDriver implements RestrictedBrowserDriver {
 		}
 	}
 
-	async submit(): Promise<BrowserSubmitResult> {
+	async submit(
+		_elementId: string,
+		activationStrategy: SubmitActivationStrategy,
+	): Promise<BrowserSubmitResult> {
 		this.submitCount += 1;
+		this.submitActivationStrategies.push(activationStrategy);
 		if (this.submitError) {
 			throw this.submitError;
 		}

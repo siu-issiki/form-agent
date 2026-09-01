@@ -253,7 +253,12 @@ async function executeToolCall(
 			? { output: JSON.stringify({ outcome: result.outcome }), result }
 			: toolError("INVALID_TOOL_INPUT");
 	}
-	if (call.name === "submit" && dryRun && !isElementId(params.elementId)) {
+	if (
+		call.name === "submit" &&
+		dryRun &&
+		(!isElementId(params.elementId) ||
+			!isSubmitActivationStrategy(params.activationStrategy))
+	) {
 		return toolError("INVALID_TOOL_INPUT");
 	}
 
@@ -397,6 +402,12 @@ function isElementId(value: unknown): value is string {
 	);
 }
 
+function isSubmitActivationStrategy(
+	value: unknown,
+): value is "mouse" | "enter" {
+	return value === "mouse" || value === "enter";
+}
+
 function readResponseOutput(value: JsonObject): JsonObject[] {
 	if (value.status !== "completed" || !Array.isArray(value.output)) {
 		throw invalidProviderResponse();
@@ -506,6 +517,7 @@ function systemPrompt(dryRun: boolean): string {
 		"If outreach is prohibited or the form purpose is incompatible, do not submit; call finish with prohibited.",
 		"For fill and select, choose only a payloadKey from payload.formValues. The trusted handler resolves its value; never invent personal or company data.",
 		"Before submit, re-observe and verify the target, all values, required fields, and that submit has not been attempted.",
+		"Choose submit activationStrategy from the observed DOM: prefer mouse for visible button or input submit controls; use enter only when keyboard activation is more appropriate.",
 		"Use submit exactly once. Only submit can report sent.",
 		"If meaning or submission outcome is unclear, call finish with uncertain. For technical failures, call finish with failed.",
 	];
@@ -555,12 +567,16 @@ const AGENT_TOOLS = [
 	}),
 	functionTool(
 		"submit",
-		"Submit once after confirming the target, required fields, values, and absence of sales prohibitions.",
+		"Submit once with a model-selected constrained CDP activation after confirming the target, required fields, values, and absence of sales prohibitions. Mouse coordinates are derived from the live DOM by the trusted handler.",
 		{
 			elementId: {
 				type: "string",
 				pattern: "^fa-[a-z0-9-]+$",
 				maxLength: 64,
+			},
+			activationStrategy: {
+				type: "string",
+				enum: ["mouse", "enter"],
 			},
 		},
 	),
