@@ -73,6 +73,8 @@ interface ElementState {
 	options: Array<{ value: string; label: string }>;
 	submitLike: boolean;
 	target: string;
+	formAction: string;
+	formMethod: string;
 	disabled: boolean;
 	readOnly: boolean;
 	checked: boolean;
@@ -88,11 +90,17 @@ interface PausedRequest {
 	request: { url: string; method: string };
 }
 
+interface ExpectedSubmissionRequest {
+	url: string;
+	method: string;
+}
+
 export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#targetDomain: string | undefined;
 	#submissionRequestAllowed = false;
 	#submissionRequestCount = 0;
 	#submissionRequestObserved: (() => void) | undefined;
+	#expectedSubmissionRequest: ExpectedSubmissionRequest | undefined;
 	#targetPolicyError: Error | undefined;
 	#elementGeneration = 0;
 	#elements = new Map<string, ElementReference>();
@@ -330,6 +338,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async validateSubmit(elementId: string): Promise<void> {
+		this.#expectedSubmissionRequest = undefined;
 		const reference = this.#element(elementId);
 		const state = await this.#inspectElement(reference.backendNodeId);
 		if (
@@ -360,6 +369,10 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			CHECK_FORM_VALIDITY_FUNCTION,
 		);
 		if (!formValid) throw new BrowserElementError();
+		this.#expectedSubmissionRequest = createExpectedSubmissionRequest(
+			state.formAction,
+			state.formMethod,
+		);
 	}
 
 	async submit(
@@ -447,6 +460,12 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			const unsafeRequest = !["GET", "HEAD", "OPTIONS"].includes(
 				paused.request.method.toUpperCase(),
 			);
+			if (unsafeRequest && this.#submissionRequestAllowed) {
+				assertExpectedSubmissionRequest(
+					paused.request,
+					this.#expectedSubmissionRequest,
+				);
+			}
 			assertAllowedBrowserRequest(
 				paused.request.url,
 				this.#targetDomain,
@@ -497,6 +516,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#clearElements(): void {
 		this.#elements.clear();
 		this.#successfulInputBackendNodeIds.clear();
+		this.#expectedSubmissionRequest = undefined;
 	}
 
 	async #discoverForms(
@@ -1012,6 +1032,8 @@ const INSPECT_ELEMENT_FUNCTION = String.raw`function() {
   const label = (element.getAttribute("aria-label") || labelledBy || labels || element.closest("label")?.textContent?.trim() || "").slice(0, 500);
   const submitLike = (tag === "button" && (!type || type === "submit")) || (tag === "input" && ["submit", "image"].includes(type));
   const target = (element.getAttribute("formtarget") ?? element.form?.getAttribute("target") ?? "").trim().toLowerCase();
+  const formAction = element.hasAttribute("formaction") ? element.formAction : element.form?.action;
+  const formMethod = element.hasAttribute("formmethod") ? element.formMethod : element.form?.method;
   return {
     ok: true,
     visible,
@@ -1025,11 +1047,40 @@ const INSPECT_ELEMENT_FUNCTION = String.raw`function() {
     options: tag === "select" ? Array.from(element.options).slice(0, 100).map((option) => ({ value: option.value.slice(0, 2048), label: option.text.slice(0, 500) })) : [],
     submitLike,
     target,
+    formAction: typeof formAction === "string" ? formAction.slice(0, 2048) : "",
+    formMethod: typeof formMethod === "string" ? formMethod.slice(0, 20) : "",
     disabled: Boolean(element.disabled),
     readOnly: Boolean(element.readOnly),
     checked: Boolean(element.checked)
   };
 }`;
+
+export function createExpectedSubmissionRequest(
+	formAction: string,
+	formMethod: string,
+): ExpectedSubmissionRequest {
+	const url = new URL(formAction);
+	if (!["http:", "https:"].includes(url.protocol) || !formMethod) {
+		throw new BrowserElementError();
+	}
+	url.hash = "";
+	return { url: url.toString(), method: formMethod.toUpperCase() };
+}
+
+export function assertExpectedSubmissionRequest(
+	request: { url: string; method: string },
+	expected: ExpectedSubmissionRequest | undefined,
+): void {
+	const url = new URL(request.url);
+	url.hash = "";
+	if (
+		!expected ||
+		request.method.toUpperCase() !== expected.method ||
+		url.toString() !== expected.url
+	) {
+		throw new BrowserElementError();
+	}
+}
 
 const SET_SELECT_VALUE_FUNCTION = `function(value) {
   if (this.tagName !== "SELECT" || !Array.from(this.options).some((option) => option.value === value)) return false;
