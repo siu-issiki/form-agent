@@ -127,6 +127,18 @@ describe("RestrictedBrowserTools", () => {
 		expect(driver.submitCount).toBe(1);
 	});
 
+	test("forgets successful inputs after navigation", async () => {
+		const driver = new FakeDriver();
+		const tools = await createTools(driver);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.navigate(input.targetUrl);
+
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			BrowserElementError,
+		);
+		expect(driver.submitCount).toBe(0);
+	});
+
 	test("rejects submit before any successful input", async () => {
 		const driver = new FakeDriver();
 		const tools = await createTools(driver);

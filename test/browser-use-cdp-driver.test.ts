@@ -12,6 +12,7 @@ import {
 	BLOCK_BROWSER_ESCAPE_EXPRESSION,
 	CHECK_FORM_VALIDITY_FUNCTION,
 	denyRelatedBrowserTargets,
+	HAS_SAME_FORM_OWNER_FUNCTION,
 	IS_COMPOSED_DESCENDANT_FUNCTION,
 } from "../src/browser-use-cdp-driver";
 
@@ -95,6 +96,21 @@ describe("BrowserUseCdpDriver child target policy", () => {
 			checkFormValidity.call({ form: { checkValidity: () => false } }),
 		).toBe(false);
 		expect(checkFormValidity.call({})).toBe(false);
+	});
+
+	test("requires a successful input owned by the submit control's form", () => {
+		const hasSameFormOwner = runInNewContext(
+			`(${HAS_SAME_FORM_OWNER_FUNCTION})`,
+		) as (this: { form?: object }, input: { form?: object }) => boolean;
+		const submitForm = {};
+
+		expect(
+			hasSameFormOwner.call({ form: submitForm }, { form: submitForm }),
+		).toBe(true);
+		expect(hasSameFormOwner.call({ form: submitForm }, { form: {} })).toBe(
+			false,
+		);
+		expect(hasSameFormOwner.call({}, { form: submitForm })).toBe(false);
 	});
 
 	test("allows only the bootstrap navigation in dry-run", () => {

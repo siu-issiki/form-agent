@@ -152,7 +152,7 @@ export class D1JobStore implements JobStore {
 		runToken: string,
 		attempt: number,
 		reasonCode: string,
-		source: "exception" | "result",
+		source: "consumer" | "exception" | "result",
 		durationMs: number,
 		now: string,
 	): Promise<boolean> {

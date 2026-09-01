@@ -97,7 +97,7 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 - Queue から受け取った 1 ジョブについて Responses API と browser tool の反復を制御する。
 - 1 回の実行で 1 社だけを処理する。
 - `parallel_tool_calls: false` と strict schema により、1 turn で最大 1 tool だけを処理する。
-- `AGENT_DRY_RUN`が明示的な`false`以外、またはジョブpayloadが`_formAgentDryRun: true`の場合は、`submit`をモデルへ公開したまま、少なくとも1件の入力成功、現在のsubmit要素、`form.checkValidity()`の成功を実ブラウザで検証し、送信権取得とブラウザsubmitより前に`DRY_RUN_COMPLETE`で終了する。
+- `AGENT_DRY_RUN`が明示的な`false`以外、またはジョブpayloadが`_formAgentDryRun: true`の場合は、`submit`をモデルへ公開したまま、送信対象と同じフォームへの入力成功、現在のsubmit要素、`form.checkValidity()`の成功を実ブラウザで検証し、送信権取得とブラウザsubmitより前に`DRY_RUN_COMPLETE`で終了する。
 - 最大 12 turn、ジョブ prompt 最大 64,000 文字とする。
 - `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返す。
 - Agent 終了時または timeout 時に browser 接続を閉じる。

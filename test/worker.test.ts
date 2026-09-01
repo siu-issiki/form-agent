@@ -4,7 +4,7 @@ import {
 	getQueueResult,
 } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, test } from "vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 import { AgentExecutionError, type AgentExecutor } from "../src/agent-executor";
 import { BrowserToolCoordinator } from "../src/browser-tool-handler";
 import { BrowserUseCdpPayloadTooLargeError } from "../src/browser-use-cdp";
@@ -1138,6 +1138,56 @@ describe("Queue orchestration", () => {
 			reasonCode: "BROWSER_TOOL_UNAVAILABLE",
 			source: "exception",
 			durationMs: expect.any(Number),
+			providerRequestCount: 0,
+		});
+	});
+
+	test("persists a safe reason when the queue consumer schedules a retry", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
+			{
+				id: "message-1",
+				timestamp: new Date("2026-08-28T00:00:01.000Z"),
+				body: { jobId: input.id },
+				attempts: 1,
+			},
+		]);
+		const ctx = createExecutionContext();
+		const executor: AgentExecutor = {
+			async execute() {
+				return {
+					outcome: "prohibited",
+					formUrl: input.targetUrl,
+					reasonCode: "SALES_PROHIBITED",
+					reason: "Sales messages are prohibited.",
+				};
+			},
+		};
+		const recordProhibited = vi
+			.spyOn(D1JobStore.prototype, "recordProhibited")
+			.mockRejectedValueOnce(new Error("D1 write failed"));
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+		try {
+			await consumeJobBatch(batch, env, executor);
+		} finally {
+			recordProhibited.mockRestore();
+			warn.mockRestore();
+		}
+		const result = await getQueueResult(batch, ctx);
+		const event = await env.DB.prepare(
+			"SELECT attempt, type, data_json FROM events WHERE job_id = ?",
+		)
+			.bind(input.id)
+			.first<{ attempt: number; type: string; data_json: string }>();
+
+		expect(result.retryMessages).toHaveLength(1);
+		expect(event?.attempt).toBe(1);
+		expect(event?.type).toBe("job.retry_scheduled");
+		expect(JSON.parse(event?.data_json ?? "{}")).toMatchObject({
+			reasonCode: "QUEUE_CONSUMER_ERROR",
+			source: "consumer",
 			providerRequestCount: 0,
 		});
 	});

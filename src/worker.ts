@@ -329,6 +329,8 @@ export async function consumeJobBatch(
 			continue;
 		}
 
+		let attemptedJob: Job | null = null;
+		let executionStartedAt: number | null = null;
 		try {
 			const now = new Date().toISOString();
 			if (batch.queue === DEAD_LETTER_QUEUE) {
@@ -349,7 +351,7 @@ export async function consumeJobBatch(
 				message.ack();
 				continue;
 			}
-			const attemptedJob = await store.recordRunAttempt(
+			attemptedJob = await store.recordRunAttempt(
 				job.id,
 				runToken,
 				message.attempts,
@@ -360,6 +362,7 @@ export async function consumeJobBatch(
 				continue;
 			}
 
+			executionStartedAt = Date.now();
 			const disposition = await executeClaimedJob(
 				store,
 				executor,
@@ -373,6 +376,22 @@ export async function consumeJobBatch(
 				message.ack();
 			}
 		} catch {
+			console.warn(
+				JSON.stringify({
+					event: "queue_consumer_error",
+					reasonCode: "QUEUE_CONSUMER_ERROR",
+				}),
+			);
+			if (attemptedJob) {
+				await recordRetryScheduled(
+					store,
+					attemptedJob,
+					message.id,
+					"QUEUE_CONSUMER_ERROR",
+					"consumer",
+					executionStartedAt ?? Date.now(),
+				);
+			}
 			message.retry({ delaySeconds: 30 });
 		}
 	}
@@ -527,7 +546,7 @@ async function recordRetryScheduled(
 	job: Job,
 	runToken: string,
 	reasonCode: string,
-	source: "exception" | "result",
+	source: "consumer" | "exception" | "result",
 	startedAt: number,
 ): Promise<void> {
 	try {

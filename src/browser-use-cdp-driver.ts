@@ -85,6 +85,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#formDataEntered = false;
 	#interactionStarted = false;
 	#navigationCount = 0;
+	readonly #successfulInputBackendNodeIds = new Set<number>();
 
 	private constructor(
 		private readonly connection: BrowserUseCdpConnection,
@@ -270,6 +271,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			backendNodeId: reference.backendNodeId,
 		});
 		await this.#replaceFocusedText(value);
+		this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
 	}
 
 	async select(elementId: string, value: string): Promise<void> {
@@ -287,6 +289,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				[value],
 			);
 			if (!changed) throw new BrowserElementError();
+			this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
 			return;
 		}
 		const desiredChecked =
@@ -295,10 +298,12 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			if (state.checked !== desiredChecked) {
 				await this.#clickElement(reference.backendNodeId);
 			}
+			this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
 			return;
 		}
 		if (state.type === "radio" && value === state.value) {
 			if (!state.checked) await this.#clickElement(reference.backendNodeId);
+			this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
 			return;
 		}
 		throw new BrowserElementError();
@@ -316,6 +321,20 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		) {
 			throw new BrowserElementError();
 		}
+		let hasInputInSubmitForm = false;
+		for (const inputBackendNodeId of this.#successfulInputBackendNodeIds) {
+			if (
+				await this.#callFunctionOnElementWithElementArgument<boolean>(
+					reference.backendNodeId,
+					inputBackendNodeId,
+					HAS_SAME_FORM_OWNER_FUNCTION,
+				)
+			) {
+				hasInputInSubmitForm = true;
+				break;
+			}
+		}
+		if (!hasInputInSubmitForm) throw new BrowserElementError();
 		const formValid = await this.#callFunctionOnElement<boolean>(
 			reference.backendNodeId,
 			CHECK_FORM_VALIDITY_FUNCTION,
@@ -432,6 +451,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 
 	#clearElements(): void {
 		this.#elements.clear();
+		this.#successfulInputBackendNodeIds.clear();
 	}
 
 	async #discoverForms(
@@ -515,6 +535,58 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			await this.#send("Runtime.releaseObject", { objectId }).catch(
 				() => undefined,
 			);
+		}
+	}
+
+	async #callFunctionOnElementWithElementArgument<TResult>(
+		backendNodeId: number,
+		argumentBackendNodeId: number,
+		functionDeclaration: string,
+	): Promise<TResult> {
+		const [resolved, argumentResolved] = await Promise.all([
+			this.#send<ResolvedNode>("DOM.resolveNode", { backendNodeId }),
+			this.#send<ResolvedNode>("DOM.resolveNode", {
+				backendNodeId: argumentBackendNodeId,
+			}),
+		]);
+		const objectId = resolved.object.objectId;
+		const argumentObjectId = argumentResolved.object.objectId;
+		if (!objectId || !argumentObjectId) {
+			await Promise.all([
+				objectId
+					? this.#send("Runtime.releaseObject", { objectId }).catch(
+							() => undefined,
+						)
+					: Promise.resolve(),
+				argumentObjectId
+					? this.#send("Runtime.releaseObject", {
+							objectId: argumentObjectId,
+						}).catch(() => undefined)
+					: Promise.resolve(),
+			]);
+			throw new BrowserElementError();
+		}
+		try {
+			const result = await this.#send<EvaluateResult>(
+				"Runtime.callFunctionOn",
+				{
+					objectId,
+					functionDeclaration,
+					arguments: [{ objectId: argumentObjectId }],
+					returnByValue: true,
+				},
+			);
+			if (result.exceptionDetails) throw new BrowserElementError();
+			return result.result.value as TResult;
+		} finally {
+			await Promise.all([
+				this.#send("Runtime.releaseObject", { objectId }).catch(
+					() => undefined,
+				),
+				this.#send("Runtime.releaseObject", {
+					objectId: argumentObjectId,
+				}).catch(() => undefined),
+			]);
 		}
 	}
 
@@ -785,6 +857,10 @@ const SET_SELECT_VALUE_FUNCTION = `function(value) {
 
 export const CHECK_FORM_VALIDITY_FUNCTION = `function() {
   return Boolean(this.form && typeof this.form.checkValidity === "function" && this.form.checkValidity());
+}`;
+
+export const HAS_SAME_FORM_OWNER_FUNCTION = `function(input) {
+  return Boolean(this.form && input && input.form === this.form);
 }`;
 
 export const IS_COMPOSED_DESCENDANT_FUNCTION = `function(candidate) {
