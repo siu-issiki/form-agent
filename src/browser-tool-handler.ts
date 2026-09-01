@@ -50,6 +50,23 @@ export class BrowserToolCoordinator {
 		return operation;
 	}
 
+	async validateSubmit(
+		jobId: string,
+		runToken: string,
+		params: BrowserToolParams,
+	): Promise<void> {
+		const operation = this.#operationTail.then(async () => {
+			if (this.#closed) throw new BrowserToolInputError();
+			const tools = await this.#getTools(jobId, runToken);
+			await tools.validateSubmit(readElementId(params));
+		});
+		this.#operationTail = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation;
+	}
+
 	async #execute(
 		jobId: string,
 		runToken: string,

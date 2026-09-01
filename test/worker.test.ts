@@ -348,6 +348,10 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	url = input.targetUrl;
 	restrictedDomain: string | undefined;
 	closed = false;
+	observed = false;
+	requireObservationForSubmit = false;
+	validateSubmitCount = 0;
+	submitCount = 0;
 
 	async close(): Promise<void> {
 		this.closed = true;
@@ -362,49 +366,65 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 		this.url = url;
 	}
 	async observe() {
+		this.observed = true;
 		return { url: this.url, forms: [] };
 	}
 	async clickNonSubmit(): Promise<void> {}
 	async fill(): Promise<void> {}
 	async select(): Promise<void> {}
-	async validateSubmit(): Promise<void> {}
+	async validateSubmit(): Promise<void> {
+		this.validateSubmitCount += 1;
+		if (this.requireObservationForSubmit && !this.observed) {
+			throw new BrowserElementError();
+		}
+	}
 	async submit(): Promise<BrowserSubmitResult> {
+		this.submitCount += 1;
 		return { outcome: "sent", formUrl: this.url };
 	}
 }
 
 describe("ResponsesAgentExecutor", () => {
-	test("keeps submit visible but intercepts it before browser and D1 submission in dry-run", async () => {
+	test("validates the observed submit control without browser submission for a job-level dry-run", async () => {
 		const store = new D1JobStore(env.DB);
-		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const dryRunInput = {
+			...input,
+			payload: { ...input.payload, _formAgentDryRun: true },
+		};
+		await store.create(dryRunInput, "2026-08-28T00:00:00.000Z");
 		const job = await store.claimRun(
 			input.id,
 			"run-token-1",
 			"2026-08-28T00:00:01.000Z",
 		);
 		if (!job) throw new Error("Expected a claimed job");
-		let requestBody: {
+		const requestBodies: Array<{
 			tools?: Array<{ name?: string }>;
 			instructions?: string;
-		} = {};
-		let browserCreated = false;
+		}> = [];
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-submit", "submit", {
+				elementId: "fa-0-1",
+			}),
+		];
+		const driver = new WorkerFakeBrowserDriver();
+		driver.requireObservationForSubmit = true;
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
 			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
-			dryRun: true,
+			dryRun: false,
 			fetcher: (async (_resource, init) => {
-				requestBody = JSON.parse(String(init?.body));
-				return Response.json(
-					functionResponse("call-submit", "submit", {
-						elementId: "fa-0-1",
-					}),
-				);
+				requestBodies.push(JSON.parse(String(init?.body)));
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
 			}) as typeof fetch,
-			createBrowserDriver: async () => {
-				browserCreated = true;
-				return new WorkerFakeBrowserDriver();
+			createBrowserDriver: async (_apiKey, _job, dryRun) => {
+				expect(dryRun).toBe(true);
+				return driver;
 			},
 		});
 
@@ -418,12 +438,70 @@ describe("ResponsesAgentExecutor", () => {
 			formUrl: input.targetUrl,
 			reasonCode: "DRY_RUN_COMPLETE",
 			reason:
-				"Dry-run intercepted the submit tool before submission authorization or browser interaction.",
+				"Dry-run validated the current submit control and stopped before submission authorization or browser submission.",
 		});
-		expect(requestBody.tools?.map((tool) => tool.name)).toContain("submit");
-		expect(requestBody.instructions).toContain("This is a dry-run");
-		expect(browserCreated).toBe(false);
+		expect(requestBodies[0]?.tools?.map((tool) => tool.name)).toContain(
+			"submit",
+		);
+		expect(requestBodies[0]?.instructions).toContain("This is a dry-run");
+		expect(driver.validateSubmitCount).toBe(1);
+		expect(driver.submitCount).toBe(0);
+		expect(driver.closed).toBe(true);
 		expect((await store.find(input.id))?.status).toBe("running");
+	});
+
+	test("rejects a guessed dry-run submit element before observation", async () => {
+		const store = new D1JobStore(env.DB);
+		const dryRunInput = {
+			...input,
+			payload: { ...input.payload, _formAgentDryRun: true },
+		};
+		await store.create(dryRunInput, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-guessed-submit", "submit", {
+				elementId: "fa-0-1",
+			}),
+			functionResponse("call-finish", "finish", {
+				outcome: "failed",
+				formUrl: null,
+				reasonCode: "SUBMIT_ELEMENT_NOT_OBSERVED",
+				reason: "The submit element was not observed.",
+				retryable: false,
+			}),
+		];
+		const driver = new WorkerFakeBrowserDriver();
+		driver.requireObservationForSubmit = true;
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			dryRun: false,
+			fetcher: (async () => {
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toMatchObject({
+			outcome: "failed",
+			reasonCode: "SUBMIT_ELEMENT_NOT_OBSERVED",
+		});
+		expect(driver.validateSubmitCount).toBe(1);
+		expect(driver.submitCount).toBe(0);
 	});
 
 	test.each([408, 409])(

@@ -42,9 +42,9 @@ BrowserUse は Agent API ではなく standalone browser API だけを使用し�
 
 実BrowserUse/CDPの送信なしスモークテストは、追跡対象外の`.env`へ`BROWSER_USE_API_KEY`を設定して`bun run test:browser-use-smoke`で実行します。このテストは公開テストフォームの観察と入力、送信ボタンの通常click拒否、対象外ドメイン遷移拒否を確認し、フォーム送信は行いません。通常の`bun run test`には含めず、外部セッションを明示実行時だけ作成します。
 
-実Queue/D1/Responses API/BrowserUseを通す送信なしE2Eは、`.env`へ`OPENAI_API_KEY`と`BROWSER_USE_API_KEY`を設定して`bun run test:agent-e2e`で実行します。専用の`wrangler dev`環境を一時ディレクトリへ起動し、標準ではSelenium公式サイトの空ページ1件をQueue bindingへ登録します。`E2E_TARGET_URL=https://example.co.jp/contact bun run test:agent-e2e`のように実フォームを指定した場合も、`AGENT_DRY_RUN=true`を強制します。モデルには`submit`ツールを公開したまま、WorkerがD1の送信権取得とブラウザ操作より前に`DRY_RUN_COMPLETE`で終了するため、フォーム送信は行いません。終了時にWorkerと一時データを破棄します。外部API利用料が発生するため、通常の`bun run test`には含めません。
+実Queue/D1/Responses API/BrowserUseを通す送信なしE2Eは、`.env`へ`OPENAI_API_KEY`と`BROWSER_USE_API_KEY`を設定して`bun run test:agent-e2e`で実行します。専用の`wrangler dev`環境を一時ディレクトリへ起動し、標準ではSelenium公式サイトの空ページ1件をQueue bindingへ登録します。`E2E_TARGET_URL=https://example.co.jp/contact bun run test:agent-e2e`のように実フォームを指定した場合も、`AGENT_DRY_RUN=true`を強制します。モデルには`submit`ツールを公開したまま、Workerが現在のsubmit要素を実ブラウザで検証し、D1の送信権取得とブラウザsubmitより前に`DRY_RUN_COMPLETE`で終了するため、フォーム送信は行いません。dry-runでは最初のclick / fill / select後に発生するbrowser requestも遮断します。終了時にWorkerと一時データを破棄します。外部API利用料が発生するため、通常の`bun run test`には含めません。
 
-production Workerを使う送信なしE2Eは、productionの`JOB_API_TOKEN`と同じ値を一時的な環境変数へ設定し、`bun run test:agent-e2e:production`で実行します。スクリプトは`submitting`または`sent`を観測した場合に即失敗し、`prohibited`かつ`DRY_RUN_COMPLETE`だけを成功とします。通常のCIは外部APIを呼ばず、typecheck、lint、unit / Workers test、`wrangler deploy --dry-run`だけを実行します。
+production Workerを使う送信なしE2Eは、productionの`JOB_API_TOKEN`と同じ値を一時的な環境変数へ設定し、`bun run test:agent-e2e:production`で実行します。スクリプトはジョブpayloadの`_formAgentDryRun: true`でもdry-runを強制し、リモートの環境変数が誤って解除されても実送信しません。さらに`submitting`または`sent`を観測した場合に即失敗し、`prohibited`かつ`DRY_RUN_COMPLETE`だけを成功とします。通常のCIは外部APIを呼ばず、typecheck、lint、unit / Workers test、`wrangler deploy --dry-run`だけを実行します。
 
 ## エージェント実行境界
 

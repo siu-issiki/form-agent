@@ -45,6 +45,7 @@ interface ResponsesAgentExecutorOptions {
 	createBrowserDriver?: (
 		apiKey: string,
 		job: Job,
+		dryRun: boolean,
 	) => ReturnType<BrowserDriverFactory>;
 }
 
@@ -65,6 +66,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 	readonly #createBrowserDriver: (
 		apiKey: string,
 		job: Job,
+		dryRun: boolean,
 	) => ReturnType<BrowserDriverFactory>;
 
 	constructor(options: ResponsesAgentExecutorOptions) {
@@ -89,8 +91,9 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 		input: AgentRunInput,
 		signal: AbortSignal,
 	): Promise<AgentRunResult> {
+		const dryRun = this.#dryRun || input.job.payload._formAgentDryRun === true;
 		const coordinator = new BrowserToolCoordinator(this.#db, (job) =>
-			this.#createBrowserDriver(this.#browserUseApiKey, job),
+			this.#createBrowserDriver(this.#browserUseApiKey, job, dryRun),
 		);
 		const abort = () => {
 			void coordinator.close().catch(() => undefined);
@@ -98,7 +101,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 		signal.addEventListener("abort", abort, { once: true });
 
 		try {
-			return await this.#run(input, coordinator, signal);
+			return await this.#run(input, coordinator, signal, dryRun);
 		} finally {
 			signal.removeEventListener("abort", abort);
 			await coordinator.close().catch(() => undefined);
@@ -109,6 +112,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 		input: AgentRunInput,
 		coordinator: BrowserToolCoordinator,
 		signal: AbortSignal,
+		dryRun: boolean,
 	): Promise<AgentRunResult> {
 		const safeJob = withoutRunToken(input.job);
 		const jobJson = JSON.stringify(safeJob);
@@ -128,7 +132,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 			throwIfAborted(signal);
 			const body = JSON.stringify({
 				model: this.#model,
-				instructions: systemPrompt(this.#dryRun),
+				instructions: systemPrompt(dryRun),
 				input: history,
 				tools: AGENT_TOOLS,
 				tool_choice: "required",
@@ -170,7 +174,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 				input.runToken,
 				signal,
 				this.#db,
-				this.#dryRun,
+				dryRun,
 			);
 			if (execution.result) return execution.result;
 			history.push({
@@ -249,25 +253,26 @@ async function executeToolCall(
 			? { output: JSON.stringify({ outcome: result.outcome }), result }
 			: toolError("INVALID_TOOL_INPUT");
 	}
-	if (call.name === "submit" && dryRun) {
-		if (!isElementId(params.elementId)) {
-			return toolError("INVALID_TOOL_INPUT");
-		}
-		return {
-			output: JSON.stringify({ status: "dry_run", submitted: false }),
-			result: {
-				outcome: "prohibited",
-				formUrl: job.targetUrl,
-				reasonCode: "DRY_RUN_COMPLETE",
-				reason:
-					"Dry-run intercepted the submit tool before submission authorization or browser interaction.",
-			},
-		};
+	if (call.name === "submit" && dryRun && !isElementId(params.elementId)) {
+		return toolError("INVALID_TOOL_INPUT");
 	}
 
 	const tool = browserToolName(call.name);
 	if (!tool) return toolError("UNKNOWN_TOOL");
 	try {
+		if (tool === "submit" && dryRun) {
+			await coordinator.validateSubmit(job.id, runToken, params);
+			return {
+				output: JSON.stringify({ status: "dry_run", submitted: false }),
+				result: {
+					outcome: "prohibited",
+					formUrl: job.targetUrl,
+					reasonCode: "DRY_RUN_COMPLETE",
+					reason:
+						"Dry-run validated the current submit control and stopped before submission authorization or browser submission.",
+				},
+			};
+		}
 		const value = await coordinator.execute(job.id, runToken, tool, params);
 		if (tool === "submit" && "job" in value) {
 			const result = terminalResultFromJob(value.job);

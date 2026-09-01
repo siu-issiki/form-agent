@@ -83,15 +83,18 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#elementGeneration = 0;
 	#elements = new Map<string, ElementReference>();
 	#formDataEntered = false;
+	#interactionStarted = false;
 
 	private constructor(
 		private readonly connection: BrowserUseCdpConnection,
 		private readonly sessionId: string,
+		private readonly dryRun: boolean,
 	) {}
 
 	static async connect(
 		apiKey: string,
 		_job: Job,
+		dryRun = false,
 		endpoint = "wss://connect.browser-use.com",
 	): Promise<BrowserUseCdpDriver> {
 		if (!apiKey) throw new Error("Browser Use API key is required");
@@ -122,7 +125,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				"Target.attachToTarget",
 				{ targetId, flatten: true },
 			);
-			const driver = new BrowserUseCdpDriver(connection, sessionId);
+			const driver = new BrowserUseCdpDriver(connection, sessionId, dryRun);
 			await driver.#initialize();
 			return driver;
 		} catch (error) {
@@ -239,6 +242,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		if (!state.ok || !state.visible || state.disabled || state.submitLike) {
 			throw new BrowserElementError();
 		}
+		this.#interactionStarted = true;
 		await this.#clickElement(reference.backendNodeId);
 	}
 
@@ -254,6 +258,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		) {
 			throw new BrowserElementError();
 		}
+		this.#interactionStarted = true;
 		this.#formDataEntered = true;
 		await this.#send("DOM.scrollIntoViewIfNeeded", {
 			backendNodeId: reference.backendNodeId,
@@ -270,6 +275,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		if (!state.ok || !state.visible || state.disabled) {
 			throw new BrowserElementError();
 		}
+		this.#interactionStarted = true;
 		this.#formDataEntered = true;
 		if (state.tag === "select") {
 			const changed = await this.#callFunctionOnElement<boolean>(
@@ -311,6 +317,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 
 	async submit(elementId: string): Promise<BrowserSubmitResult> {
 		await this.validateSubmit(elementId);
+		this.#interactionStarted = true;
 		const beforeText = await this.#bodyText();
 		this.#submissionRequestAllowed = true;
 		this.#submissionRequestCount = 0;
@@ -377,6 +384,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				paused.request.method,
 				this.#submissionRequestAllowed && this.#submissionRequestCount === 0,
 				!this.#formDataEntered && paused.resourceType !== "Document",
+				this.dryRun && this.#interactionStarted,
 			);
 			if (unsafeRequest) this.#submissionRequestCount += 1;
 			await this.#send("Fetch.continueRequest", {
@@ -557,6 +565,20 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			x: point.x,
 			y: point.y,
 		});
+		const hit = await this.#send<{ backendNodeId?: number }>(
+			"DOM.getNodeForLocation",
+			{
+				x: point.x,
+				y: point.y,
+				includeUserAgentShadowDOM: true,
+			},
+		);
+		if (
+			!hit.backendNodeId ||
+			!(await this.#isComposedDescendant(backendNodeId, hit.backendNodeId))
+		) {
+			throw new BrowserElementError();
+		}
 		await this.#send("Input.dispatchMouseEvent", {
 			type: "mousePressed",
 			x: point.x,
@@ -573,6 +595,49 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			buttons: 0,
 			clickCount: 1,
 		});
+	}
+
+	async #isComposedDescendant(
+		ancestorBackendNodeId: number,
+		candidateBackendNodeId: number,
+	): Promise<boolean> {
+		if (ancestorBackendNodeId === candidateBackendNodeId) return true;
+		const [ancestor, candidate] = await Promise.all([
+			this.#send<ResolvedNode>("DOM.resolveNode", {
+				backendNodeId: ancestorBackendNodeId,
+				objectGroup: "form-agent-hit-test",
+			}),
+			this.#send<ResolvedNode>("DOM.resolveNode", {
+				backendNodeId: candidateBackendNodeId,
+				objectGroup: "form-agent-hit-test",
+			}),
+		]);
+		const ancestorObjectId = ancestor.object.objectId;
+		const candidateObjectId = candidate.object.objectId;
+		if (!ancestorObjectId || !candidateObjectId)
+			throw new BrowserElementError();
+		try {
+			const result = await this.#send<EvaluateResult>(
+				"Runtime.callFunctionOn",
+				{
+					objectId: ancestorObjectId,
+					functionDeclaration: IS_COMPOSED_DESCENDANT_FUNCTION,
+					arguments: [{ objectId: candidateObjectId }],
+					returnByValue: true,
+				},
+			);
+			if (result.exceptionDetails) throw new BrowserElementError();
+			return result.result.value === true;
+		} finally {
+			await Promise.all([
+				this.#send("Runtime.releaseObject", {
+					objectId: ancestorObjectId,
+				}).catch(() => undefined),
+				this.#send("Runtime.releaseObject", {
+					objectId: candidateObjectId,
+				}).catch(() => undefined),
+			]);
+		}
 	}
 
 	async #evaluate<TResult>(expression: string): Promise<TResult> {
@@ -701,6 +766,16 @@ const SET_SELECT_VALUE_FUNCTION = `function(value) {
   this.dispatchEvent(new Event("input", { bubbles: true }));
   this.dispatchEvent(new Event("change", { bubbles: true }));
   return true;
+}`;
+
+export const IS_COMPOSED_DESCENDANT_FUNCTION = `function(candidate) {
+  let current = candidate;
+  while (current) {
+    if (current === this) return true;
+    const root = current.getRootNode?.();
+    current = current.parentElement ?? root?.host ?? null;
+  }
+  return false;
 }`;
 
 function centerOfQuad(quad: number[]): { x: number; y: number } | null {

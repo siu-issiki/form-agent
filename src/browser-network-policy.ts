@@ -12,7 +12,9 @@ export function assertAllowedBrowserRequest(
 	method: string,
 	submissionAuthorized: boolean,
 	allowExternalRead = false,
+	blockRequest = false,
 ): void {
+	if (blockRequest) throw new NavigationPolicyError();
 	const safeMethod = SAFE_METHODS.has(method.toUpperCase());
 	if (allowExternalRead && safeMethod) {
 		assertPublicBrowserResourceUrl(url);

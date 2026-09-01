@@ -69,6 +69,19 @@ describe("RestrictedBrowserTools", () => {
 			),
 		).toThrow();
 	});
+
+	test("blocks every browser request after a dry-run interaction starts", () => {
+		expect(() =>
+			assertAllowedBrowserRequest(
+				"https://form-agent.dev/collect?value=entered",
+				"form-agent.dev",
+				"GET",
+				false,
+				false,
+				true,
+			),
+		).toThrow(NavigationPolicyError);
+	});
 	test("allows only the target domain and its subdomains", async () => {
 		const driver = new FakeDriver();
 		const tools = await createTools(driver);

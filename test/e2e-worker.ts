@@ -43,6 +43,7 @@ const e2eWorker: ExportedHandler<E2eEnv, JobMessage> = {
 				targetUrl,
 				targetDomain: target.hostname,
 				payload: {
+					_formAgentDryRun: true,
 					scenario: "safe-no-submit",
 					name: "送信なしテスト",
 					companyName: "Form Agent E2E",

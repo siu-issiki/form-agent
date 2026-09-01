@@ -10,6 +10,7 @@ import { discoverCdpForms } from "../src/browser-use-cdp-dom";
 import {
 	BLOCK_BROWSER_ESCAPE_EXPRESSION,
 	denyRelatedBrowserTargets,
+	IS_COMPOSED_DESCENDANT_FUNCTION,
 } from "../src/browser-use-cdp-driver";
 
 describe("BrowserUse CDP payload and DOM discovery", () => {
@@ -80,6 +81,24 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 });
 
 describe("BrowserUseCdpDriver child target policy", () => {
+	test("accepts only the intended click target or its composed descendants", () => {
+		const isComposedDescendant = runInNewContext(
+			`(${IS_COMPOSED_DESCENDANT_FUNCTION})`,
+		) as (this: object, candidate: object) => boolean;
+		const target = { getRootNode: () => ({}) };
+		const child = { parentElement: target, getRootNode: () => ({}) };
+		const shadowChild = {
+			parentElement: null,
+			getRootNode: () => ({ host: target }),
+		};
+		const overlay = { parentElement: null, getRootNode: () => ({}) };
+
+		expect(isComposedDescendant.call(target, target)).toBe(true);
+		expect(isComposedDescendant.call(target, child)).toBe(true);
+		expect(isComposedDescendant.call(target, shadowChild)).toBe(true);
+		expect(isComposedDescendant.call(target, overlay)).toBe(false);
+	});
+
 	test("pauses and closes related worker and popup targets", async () => {
 		const calls: Array<{
 			method: string;
