@@ -18,6 +18,7 @@ import {
 	BrowserElementError,
 	type BrowserSubmitResult,
 	type RestrictedBrowserDriver,
+	type SubmitActivationStrategy,
 } from "../src/restricted-browser";
 import worker, {
 	consumeJobBatch,
@@ -349,7 +350,7 @@ describe("BrowserToolCoordinator", () => {
 			input.id,
 			"run-token-1",
 			"submit",
-			{ elementId: "fa-0-1" },
+			{ elementId: "fa-0-1", activationStrategy: "mouse" },
 		);
 		await expect(
 			coordinator.execute(input.id, "run-token-1", "observe", {}),
@@ -364,7 +365,31 @@ describe("BrowserToolCoordinator", () => {
 		expect(createCount).toBe(1);
 		expect(driver.restrictedDomain).toBe(input.targetDomain);
 		expect(driver.filledValues).toEqual(["Hello"]);
+		expect(driver.submitActivationStrategies).toEqual(["mouse"]);
 		expect(driver.closed).toBe(true);
+	});
+
+	test("rejects an unsupported submit activation before claiming permission", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const driver = new WorkerFakeBrowserDriver();
+		const coordinator = new BrowserToolCoordinator(env.DB, async () => driver);
+		await coordinator.execute(input.id, "run-token-1", "fill", {
+			elementId: "fa-0-0",
+			payloadKey: "message",
+		});
+
+		await expect(
+			coordinator.execute(input.id, "run-token-1", "submit", {
+				elementId: "fa-0-1",
+				activationStrategy: "coordinates",
+			}),
+		).rejects.toBeInstanceOf(BrowserToolInputError);
+
+		expect((await store.find(input.id))?.status).toBe("running");
+		expect(driver.submitCount).toBe(0);
+		await coordinator.close();
 	});
 
 	test("rejects raw, missing, and non-form payload values", async () => {
@@ -415,6 +440,7 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	requireObservationForSubmit = false;
 	validateSubmitCount = 0;
 	submitCount = 0;
+	submitActivationStrategies: SubmitActivationStrategy[] = [];
 	filledValues: string[] = [];
 
 	async close(): Promise<void> {
@@ -444,8 +470,12 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 			throw new BrowserElementError();
 		}
 	}
-	async submit(): Promise<BrowserSubmitResult> {
+	async submit(
+		_elementId: string,
+		activationStrategy: SubmitActivationStrategy,
+	): Promise<BrowserSubmitResult> {
 		this.submitCount += 1;
+		this.submitActivationStrategies.push(activationStrategy);
 		return { outcome: "sent", formUrl: this.url };
 	}
 }
@@ -479,6 +509,7 @@ describe("ResponsesAgentExecutor", () => {
 			}),
 			functionResponse("call-submit", "submit", {
 				elementId: "fa-0-1",
+				activationStrategy: "mouse",
 			}),
 		];
 		const driver = new WorkerFakeBrowserDriver();
@@ -521,6 +552,12 @@ describe("ResponsesAgentExecutor", () => {
 		);
 		expect(fillTool?.parameters?.properties).toHaveProperty("payloadKey");
 		expect(fillTool?.parameters?.properties).not.toHaveProperty("value");
+		const submitTool = requestBodies[0]?.tools?.find(
+			(tool) => tool.name === "submit",
+		);
+		expect(submitTool?.parameters?.properties).toHaveProperty(
+			"activationStrategy",
+		);
 		expect(requestBodies[0]?.instructions).toContain("This is a dry-run");
 		expect(driver.validateSubmitCount).toBe(1);
 		expect(driver.submitCount).toBe(0);
@@ -544,6 +581,7 @@ describe("ResponsesAgentExecutor", () => {
 		const responses = [
 			functionResponse("call-guessed-submit", "submit", {
 				elementId: "fa-0-1",
+				activationStrategy: "mouse",
 			}),
 			functionResponse("call-finish", "finish", {
 				outcome: "failed",
@@ -905,6 +943,7 @@ describe("ResponsesAgentExecutor", () => {
 			}),
 			functionResponse("call-submit", "submit", {
 				elementId: "fa-0-1",
+				activationStrategy: "mouse",
 			}),
 		];
 		const executor = new ResponsesAgentExecutor({

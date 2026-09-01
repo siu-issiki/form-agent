@@ -4,6 +4,7 @@ import {
 	type BrowserObservation,
 	type RestrictedBrowserDriver,
 	RestrictedBrowserTools,
+	type SubmitActivationStrategy,
 } from "./restricted-browser";
 
 export type BrowserToolName =
@@ -58,6 +59,7 @@ export class BrowserToolCoordinator {
 		const operation = this.#operationTail.then(async () => {
 			if (this.#closed) throw new BrowserToolInputError();
 			const { tools } = await this.#getToolsAndJob(jobId, runToken);
+			readSubmitActivationStrategy(params);
 			await tools.validateSubmit(readElementId(params));
 		});
 		this.#operationTail = operation.then(
@@ -99,7 +101,10 @@ export class BrowserToolCoordinator {
 				);
 				return { result: { ok: true } };
 			case "submit": {
-				const job = await tools.submit(readElementId(params));
+				const job = await tools.submit(
+					readElementId(params),
+					readSubmitActivationStrategy(params),
+				);
 				const { runToken: _, ...safeJob } = job;
 				return { job: safeJob };
 			}
@@ -153,6 +158,14 @@ export class BrowserToolCoordinator {
 			throw error;
 		}
 	}
+}
+
+function readSubmitActivationStrategy(
+	params: BrowserToolParams,
+): SubmitActivationStrategy {
+	const value = params.activationStrategy;
+	if (value === "mouse" || value === "enter") return value;
+	throw new BrowserToolInputError();
 }
 
 function readPayloadValue(

@@ -15,6 +15,8 @@ export type BrowserSubmitResult =
 			reason: string;
 	  };
 
+export type SubmitActivationStrategy = "mouse" | "enter";
+
 export interface RestrictedBrowserDriver {
 	close?(): Promise<void>;
 	restrictToDomain(targetDomain: string): Promise<void>;
@@ -25,7 +27,10 @@ export interface RestrictedBrowserDriver {
 	fill(elementId: string, value: string): Promise<void>;
 	select(elementId: string, value: string): Promise<void>;
 	validateSubmit(elementId: string): Promise<void>;
-	submit(elementId: string): Promise<BrowserSubmitResult>;
+	submit(
+		elementId: string,
+		activationStrategy: SubmitActivationStrategy,
+	): Promise<BrowserSubmitResult>;
 }
 
 export class NavigationPolicyError extends Error {
@@ -174,7 +179,10 @@ export class RestrictedBrowserTools {
 		await this.#assertCurrentUrlAllowed();
 	}
 
-	async submit(elementId: string): Promise<Job> {
+	async submit(
+		elementId: string,
+		activationStrategy: SubmitActivationStrategy = "mouse",
+	): Promise<Job> {
 		if (this.#submitAttempted) {
 			throw new SubmissionNotAuthorizedError();
 		}
@@ -195,7 +203,7 @@ export class RestrictedBrowserTools {
 
 		let result: BrowserSubmitResult;
 		try {
-			result = await this.driver.submit(elementId);
+			result = await this.driver.submit(elementId, activationStrategy);
 		} catch (error) {
 			const diagnostic =
 				error instanceof BrowserSubmitDiagnosticError

@@ -13,6 +13,7 @@ import {
 	type BrowserSubmitResult,
 	createBrowserSubmitDiagnosticError,
 	type RestrictedBrowserDriver,
+	type SubmitActivationStrategy,
 } from "./restricted-browser";
 
 const MAX_PAGE_TEXT = 20_000;
@@ -361,7 +362,10 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		if (!formValid) throw new BrowserElementError();
 	}
 
-	async submit(elementId: string): Promise<BrowserSubmitResult> {
+	async submit(
+		elementId: string,
+		activationStrategy: SubmitActivationStrategy,
+	): Promise<BrowserSubmitResult> {
 		try {
 			await this.validateSubmit(elementId);
 		} catch (error) {
@@ -381,6 +385,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			try {
 				await this.#activateSubmitElement(
 					this.#element(elementId).backendNodeId,
+					activationStrategy,
 				);
 			} catch (error) {
 				throw createBrowserSubmitDiagnosticError("SUBMIT_ACTIVATE", error);
@@ -674,6 +679,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async #clickElement(backendNodeId: number): Promise<void> {
+		const point = await this.#prepareMouseClick(backendNodeId);
+		await this.#dispatchMouseClick(point);
+	}
+
+	async #prepareMouseClick(
+		backendNodeId: number,
+	): Promise<{ x: number; y: number }> {
 		await this.#send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
 		const { model } = await this.#send<{
 			model: { border: number[] };
@@ -699,6 +711,10 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		) {
 			throw new BrowserElementError();
 		}
+		return point;
+	}
+
+	async #dispatchMouseClick(point: { x: number; y: number }): Promise<void> {
 		await this.#send("Input.dispatchMouseEvent", {
 			type: "mousePressed",
 			x: point.x,
@@ -717,7 +733,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		});
 	}
 
-	async #activateSubmitElement(backendNodeId: number): Promise<void> {
+	async #prepareEnterSubmitActivation(backendNodeId: number): Promise<void> {
 		await this.#send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
 		await this.#nextAnimationFrame();
 		if (
@@ -741,7 +757,34 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			),
 		]);
 		if (!unobscured || !focused) throw new BrowserElementError();
+	}
 
+	async #activateSubmitElement(
+		backendNodeId: number,
+		activationStrategy: SubmitActivationStrategy,
+	): Promise<void> {
+		if (activationStrategy === "mouse") {
+			const point = await this.#prepareMouseClick(backendNodeId);
+			await this.#activatePreparedSubmit(
+				() => this.#dispatchMouseClick(point),
+				"mouse",
+			);
+			return;
+		}
+		await this.#prepareEnterSubmitActivation(backendNodeId);
+		await this.#activatePreparedSubmit(
+			() =>
+				this.#send("Input.dispatchKeyEvent", ENTER_KEY_DOWN_EVENT).then(() =>
+					this.#nextAnimationFrame().catch(() => undefined),
+				),
+			"enter",
+		);
+	}
+
+	async #activatePreparedSubmit(
+		activate: () => Promise<unknown>,
+		activationStrategy: SubmitActivationStrategy,
+	): Promise<void> {
 		let resolveSubmissionRequestObserved: () => void = () => undefined;
 		const submissionRequestObserved = new Promise<void>((resolve) => {
 			resolveSubmissionRequestObserved = resolve;
@@ -751,10 +794,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		this.#submissionRequestAllowed = true;
 		try {
 			await runSubmissionActivationWithinPermissionWindow(
-				() =>
-					this.#send("Input.dispatchKeyEvent", ENTER_KEY_DOWN_EVENT).then(() =>
-						this.#nextAnimationFrame().catch(() => undefined),
-					),
+				activate,
 				submissionRequestObserved,
 			);
 		} finally {
@@ -762,13 +802,15 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			this.#submissionRequestObserved = undefined;
 			resolveSubmissionRequestObserved();
 		}
-		await this.#send("Input.dispatchKeyEvent", {
-			type: "keyUp",
-			key: "Enter",
-			code: "Enter",
-			windowsVirtualKeyCode: 13,
-			nativeVirtualKeyCode: 13,
-		}).catch(() => undefined);
+		if (activationStrategy === "enter") {
+			await this.#send("Input.dispatchKeyEvent", {
+				type: "keyUp",
+				key: "Enter",
+				code: "Enter",
+				windowsVirtualKeyCode: 13,
+				nativeVirtualKeyCode: 13,
+			}).catch(() => undefined);
+		}
 	}
 
 	#nextAnimationFrame(): Promise<unknown> {
