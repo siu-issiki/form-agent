@@ -95,6 +95,20 @@ interface ExpectedSubmissionRequest {
 	method: string;
 }
 
+export type SubmitActivationStage =
+	| "scroll"
+	| "render_before_check"
+	| "box_model"
+	| "pointer_move"
+	| "hit_test"
+	| "unobscured_before_focus"
+	| "focus"
+	| "render_after_focus"
+	| "post_focus_checks"
+	| "unobscured_after_focus"
+	| "focus_retained"
+	| "dispatch";
+
 export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#targetDomain: string | undefined;
 	#submissionRequestAllowed = false;
@@ -705,33 +719,47 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 
 	async #prepareMouseClick(
 		backendNodeId: number,
+		activationStrategy?: SubmitActivationStrategy,
 	): Promise<{ x: number; y: number }> {
-		await this.#send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
-		const { model } = await this.#send<{
-			model: { border: number[] };
-		}>("DOM.getBoxModel", { backendNodeId });
-		const point = centerOfQuad(model.border);
-		if (!point) throw new BrowserElementError();
-		await this.#send("Input.dispatchMouseEvent", {
-			type: "mouseMoved",
-			x: point.x,
-			y: point.y,
-		});
-		const hit = await this.#send<{ backendNodeId?: number }>(
-			"DOM.getNodeForLocation",
-			{
+		let stage: SubmitActivationStage = "scroll";
+		try {
+			await this.#send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
+			stage = "box_model";
+			const { model } = await this.#send<{
+				model: { border: number[] };
+			}>("DOM.getBoxModel", { backendNodeId });
+			const point = centerOfQuad(model.border);
+			if (!point) throw new BrowserElementError();
+			stage = "pointer_move";
+			await this.#send("Input.dispatchMouseEvent", {
+				type: "mouseMoved",
 				x: point.x,
 				y: point.y,
-				includeUserAgentShadowDOM: true,
-			},
-		);
-		if (
-			!hit.backendNodeId ||
-			!(await this.#isComposedDescendant(backendNodeId, hit.backendNodeId))
-		) {
-			throw new BrowserElementError();
+			});
+			stage = "hit_test";
+			const hit = await this.#send<{ backendNodeId?: number }>(
+				"DOM.getNodeForLocation",
+				{
+					x: point.x,
+					y: point.y,
+					includeUserAgentShadowDOM: true,
+				},
+			);
+			if (
+				!hit.backendNodeId ||
+				!(await this.#isComposedDescendant(backendNodeId, hit.backendNodeId))
+			) {
+				throw new BrowserElementError();
+			}
+			return point;
+		} catch (error) {
+			if (activationStrategy) {
+				console.log(
+					createSubmitActivationFailureLog(activationStrategy, stage),
+				);
+			}
+			throw error;
 		}
-		return point;
 	}
 
 	async #dispatchMouseClick(point: { x: number; y: number }): Promise<void> {
@@ -754,37 +782,61 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async #prepareEnterSubmitActivation(backendNodeId: number): Promise<void> {
-		await this.#send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
-		await this.#nextAnimationFrame();
-		if (
-			!(await this.#callFunctionOnElement<boolean>(
-				backendNodeId,
-				IS_SUBMIT_UNOBSCURED_FUNCTION,
-			))
-		) {
-			throw new BrowserElementError();
+		let stage: SubmitActivationStage = "scroll";
+		try {
+			await this.#send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
+			stage = "render_before_check";
+			await this.#nextAnimationFrame();
+			stage = "unobscured_before_focus";
+			if (
+				!(await this.#callFunctionOnElement<boolean>(
+					backendNodeId,
+					IS_SUBMIT_UNOBSCURED_FUNCTION,
+				))
+			) {
+				throw new BrowserElementError();
+			}
+			stage = "focus";
+			await this.#send("DOM.focus", { backendNodeId });
+			stage = "render_after_focus";
+			await this.#nextAnimationFrame();
+			stage = "post_focus_checks";
+			const [unobscured, focused] = await Promise.all([
+				this.#callFunctionOnElement<boolean>(
+					backendNodeId,
+					IS_SUBMIT_UNOBSCURED_FUNCTION,
+				),
+				this.#callFunctionOnElement<boolean>(
+					backendNodeId,
+					IS_ELEMENT_FOCUSED_FUNCTION,
+				),
+			]);
+			if (!unobscured) {
+				stage = "unobscured_after_focus";
+				throw new BrowserElementError();
+			}
+			if (!focused) {
+				stage = "focus_retained";
+				throw new BrowserElementError();
+			}
+		} catch (error) {
+			console.log(createSubmitActivationFailureLog("enter", stage));
+			throw error;
 		}
-		await this.#send("DOM.focus", { backendNodeId });
-		await this.#nextAnimationFrame();
-		const [unobscured, focused] = await Promise.all([
-			this.#callFunctionOnElement<boolean>(
-				backendNodeId,
-				IS_SUBMIT_UNOBSCURED_FUNCTION,
-			),
-			this.#callFunctionOnElement<boolean>(
-				backendNodeId,
-				IS_ELEMENT_FOCUSED_FUNCTION,
-			),
-		]);
-		if (!unobscured || !focused) throw new BrowserElementError();
 	}
 
 	async #activateSubmitElement(
 		backendNodeId: number,
 		activationStrategy: SubmitActivationStrategy,
 	): Promise<void> {
+		console.log(
+			JSON.stringify({
+				event: "browser_submit_activation_prepare",
+				activationStrategy,
+			}),
+		);
 		if (activationStrategy === "mouse") {
-			const point = await this.#prepareMouseClick(backendNodeId);
+			const point = await this.#prepareMouseClick(backendNodeId, "mouse");
 			await this.#activatePreparedSubmit(
 				() => this.#dispatchMouseClick(point),
 				"mouse",
@@ -818,6 +870,11 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				activate,
 				submissionRequestObserved,
 			);
+		} catch (error) {
+			console.log(
+				createSubmitActivationFailureLog(activationStrategy, "dispatch"),
+			);
+			throw error;
 		} finally {
 			this.#submissionRequestAllowed = false;
 			this.#submissionRequestObserved = undefined;
@@ -912,6 +969,17 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 		return this.connection.send<TResult>(method, params, this.sessionId);
 	}
+}
+
+export function createSubmitActivationFailureLog(
+	activationStrategy: SubmitActivationStrategy,
+	stage: SubmitActivationStage,
+): string {
+	return JSON.stringify({
+		event: "browser_submit_activation_failure",
+		activationStrategy,
+		stage,
+	});
 }
 
 export async function runSubmissionActivationWithinPermissionWindow(
