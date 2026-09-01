@@ -303,6 +303,22 @@ describe("Job HTTP API", () => {
 			),
 			apiEnv,
 		);
+		const invalidAttemptLimit = await handleHttpRequest(
+			jobRequest(
+				"POST",
+				"/jobs",
+				{
+					...input,
+					id: "job-005",
+					payload: {
+						...input.payload,
+						_formAgentMaxAttempts: 0,
+					},
+				},
+				apiToken,
+			),
+			apiEnv,
+		);
 
 		expect(invalidDomain.status).toBe(400);
 		expect(await invalidDomain.json()).toEqual({ error: "INVALID_JOB" });
@@ -312,6 +328,8 @@ describe("Job HTTP API", () => {
 		expect(await legacyPayload.json()).toEqual({ error: "INVALID_JOB" });
 		expect(unsafeAllowedHost.status).toBe(400);
 		expect(await unsafeAllowedHost.json()).toEqual({ error: "INVALID_JOB" });
+		expect(invalidAttemptLimit.status).toBe(400);
+		expect(await invalidAttemptLimit.json()).toEqual({ error: "INVALID_JOB" });
 		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
 		expect(queued).toEqual([]);
 	});
@@ -1245,6 +1263,96 @@ describe("Queue orchestration", () => {
 			durationMs: expect.any(Number),
 			providerRequestCount: 0,
 		});
+	});
+
+	test("stops a retryable failure at a job-specific attempt limit", async () => {
+		const limitedInput = {
+			...input,
+			payload: { ...input.payload, _formAgentMaxAttempts: 1 },
+		};
+		const store = new D1JobStore(env.DB);
+		await store.create(limitedInput, "2026-08-28T00:00:00.000Z");
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
+			{
+				id: "message-1",
+				timestamp: new Date("2026-08-28T00:00:01.000Z"),
+				body: { jobId: limitedInput.id },
+				attempts: 1,
+			},
+		]);
+		const ctx = createExecutionContext();
+		const executor: AgentExecutor = {
+			async execute() {
+				return {
+					outcome: "failed",
+					reasonCode: "PROVIDER_RATE_LIMITED",
+					reason: "The provider rate limit was reached.",
+					retryable: true,
+				};
+			},
+		};
+
+		await consumeJobBatch(batch, env, executor);
+		const result = await getQueueResult(batch, ctx);
+		const persisted = await store.find(limitedInput.id);
+
+		expect(result.explicitAcks).toEqual(["message-1"]);
+		expect(result.retryMessages).toEqual([]);
+		expect(persisted?.status).toBe("failed");
+		expect(persisted?.attemptCount).toBe(1);
+		expect(persisted?.result?.reasonCode).toBe("PROVIDER_RATE_LIMITED");
+	});
+
+	test("does not call the agent after a limited job is redelivered", async () => {
+		const limitedInput = {
+			...input,
+			payload: { ...input.payload, _formAgentMaxAttempts: 1 },
+		};
+		const store = new D1JobStore(env.DB);
+		await store.create(limitedInput, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(
+			limitedInput.id,
+			"message-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		await store.recordRunAttempt(
+			limitedInput.id,
+			"message-1",
+			1,
+			"2026-08-28T00:00:01.000Z",
+		);
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
+			{
+				id: "message-1",
+				timestamp: new Date("2026-08-28T00:00:02.000Z"),
+				body: { jobId: limitedInput.id },
+				attempts: 2,
+			},
+		]);
+		const ctx = createExecutionContext();
+		let executions = 0;
+		const executor: AgentExecutor = {
+			async execute() {
+				executions += 1;
+				return {
+					outcome: "failed",
+					reasonCode: "SHOULD_NOT_RUN",
+					reason: "The agent should not run.",
+					retryable: false,
+				};
+			},
+		};
+
+		await consumeJobBatch(batch, env, executor);
+		const result = await getQueueResult(batch, ctx);
+		const persisted = await store.find(limitedInput.id);
+
+		expect(executions).toBe(0);
+		expect(result.explicitAcks).toEqual(["message-1"]);
+		expect(result.retryMessages).toEqual([]);
+		expect(persisted?.status).toBe("failed");
+		expect(persisted?.attemptCount).toBe(2);
+		expect(persisted?.result?.reasonCode).toBe("JOB_ATTEMPT_LIMIT_REACHED");
 	});
 
 	test("persists the reason for a retryable agent exception", async () => {

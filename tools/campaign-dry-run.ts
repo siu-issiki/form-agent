@@ -72,8 +72,20 @@ if (jobs.length !== options.limit) {
 }
 
 if (options.submit) {
+	let completed = 0;
 	for (const job of jobs) {
-		await submitAndWait(job, options.apiToken);
+		if (await submitAndWait(job, options.apiToken)) completed += 1;
+	}
+	console.log(
+		JSON.stringify({
+			event: "campaign_dry_run_summary",
+			selectedJobs: jobs.length,
+			completedJobs: completed,
+			safeFailures: jobs.length - completed,
+		}),
+	);
+	if (completed !== jobs.length) {
+		throw new Error("One or more jobs failed before the dry-run boundary");
 	}
 }
 
@@ -144,7 +156,10 @@ async function readRegistration(path: string): Promise<RegistrationEntry[]> {
 	return value as RegistrationEntry[];
 }
 
-async function submitAndWait(job: JobInput, apiToken: string): Promise<void> {
+async function submitAndWait(
+	job: JobInput,
+	apiToken: string,
+): Promise<boolean> {
 	if (job.payload._formAgentDryRun !== true) {
 		throw new Error("Job-level dry-run guard is missing");
 	}
@@ -203,22 +218,25 @@ async function submitAndWait(job: JobInput, apiToken: string): Promise<void> {
 				body.job.status,
 			)
 		) {
-			if (
-				body.job.status !== "prohibited" ||
-				body.job.result?.reasonCode !== "DRY_RUN_COMPLETE" ||
-				body.job.attemptCount !== 1
-			) {
-				throw new Error(
-					`Dry-run failed safely with ${body.job.status}/${body.job.result?.reasonCode ?? "NO_REASON"}`,
-				);
-			}
-			break;
+			const completed =
+				body.job.status === "prohibited" &&
+				body.job.result?.reasonCode === "DRY_RUN_COMPLETE" &&
+				body.job.attemptCount === 1;
+			console.log(
+				JSON.stringify({
+					event: "campaign_job_result",
+					jobId: job.id,
+					completed,
+					status: body.job.status,
+					reasonCode: body.job.result?.reasonCode ?? "NO_REASON",
+					attemptCount: body.job.attemptCount,
+				}),
+			);
+			return completed;
 		}
 		await Bun.sleep(2_000);
 	}
-	if (lastStatus !== "prohibited") {
-		throw new Error(`Dry-run timed out with status ${lastStatus || "unknown"}`);
-	}
+	throw new Error(`Dry-run timed out with status ${lastStatus || "unknown"}`);
 }
 
 function requiredOption(values: Map<string, string>, name: string): string {

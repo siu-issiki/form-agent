@@ -134,6 +134,7 @@ describe("campaign import", () => {
 		expect(first.id).toBe(second.id);
 		expect(first.companyId).toBe(second.companyId);
 		expect(first.payload._formAgentDryRun).toBe(true);
+		expect(first.payload._formAgentMaxAttempts).toBe(1);
 		expect(Object.keys(first.payload.formValues as object)).not.toContain(
 			"会社名",
 		);

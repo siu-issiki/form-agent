@@ -64,7 +64,7 @@ bun run campaign:dry-run \
   --limit 5
 ```
 
-productionへ登録する場合だけ`JOB_API_TOKEN`を環境変数へ設定し、同じコマンドへ`--submit-dry-run`を追加します。生成ジョブは必ず`_formAgentDryRun: true`を持ち、`submitting` / `sent`を検出した時点で失敗します。成功条件は各ジョブが1 attemptで`prohibited / DRY_RUN_COMPLETE`になることです。
+productionへ登録する場合だけ`JOB_API_TOKEN`を環境変数へ設定し、同じコマンドへ`--submit-dry-run`を追加します。生成ジョブは必ず`_formAgentDryRun: true`と`_formAgentMaxAttempts: 1`を持ち、再試行と`submitting` / `sent`を防ぎます。成功条件は各ジョブが1 attemptで`prohibited / DRY_RUN_COMPLETE`になることです。
 
 ## エージェント実行境界
 
