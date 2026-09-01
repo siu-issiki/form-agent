@@ -251,6 +251,16 @@ async function parseJobInput(request: Request): Promise<JobInput> {
 }
 
 function hasValidFormValues(payload: Record<string, unknown>): boolean {
+	const maxAttempts = payload._formAgentMaxAttempts;
+	if (
+		maxAttempts !== undefined &&
+		(typeof maxAttempts !== "number" ||
+			!Number.isInteger(maxAttempts) ||
+			maxAttempts < 1 ||
+			maxAttempts > 4)
+	) {
+		return false;
+	}
 	const formValues = payload.formValues;
 	if (!isRecord(formValues) || Object.keys(formValues).length === 0) {
 		return false;
@@ -397,6 +407,20 @@ export async function consumeJobBatch(
 				message.ack();
 				continue;
 			}
+			if (hasExceededAttemptLimit(attemptedJob)) {
+				const failed = await store.recordFailed(
+					attemptedJob.id,
+					runToken,
+					"JOB_ATTEMPT_LIMIT_REACHED",
+					"The job was redelivered after its attempt limit.",
+					now,
+				);
+				if (failed) {
+					message.ack();
+					continue;
+				}
+				throw new Error("Job attempt limit result was not persisted");
+			}
 
 			executionStartedAt = Date.now();
 			const disposition = await executeClaimedJob(
@@ -418,6 +442,17 @@ export async function consumeJobBatch(
 					reasonCode: "QUEUE_CONSUMER_ERROR",
 				}),
 			);
+			if (attemptedJob && hasReachedAttemptLimit(attemptedJob)) {
+				await store.recordFailed(
+					attemptedJob.id,
+					message.id,
+					"QUEUE_CONSUMER_ERROR",
+					"The queue consumer failed at the job attempt limit.",
+					new Date().toISOString(),
+				);
+				message.ack();
+				continue;
+			}
 			if (attemptedJob) {
 				await recordRetryScheduled(
 					store,
@@ -475,6 +510,18 @@ async function executeClaimedJob(
 			return "ack";
 		}
 		if (!(error instanceof AgentExecutionError) || error.retryable) {
+			if (hasReachedAttemptLimit(job)) {
+				await store.recordFailed(
+					job.id,
+					runToken,
+					error instanceof AgentExecutionError
+						? error.reasonCode
+						: "UNEXPECTED_AGENT_ERROR",
+					"The agent failed at the job attempt limit.",
+					now,
+				);
+				return "ack";
+			}
 			await recordRetryScheduled(
 				store,
 				job,
@@ -552,6 +599,16 @@ async function executeClaimedJob(
 				if (current?.status !== "running" || current.runToken !== runToken) {
 					return "ack";
 				}
+				if (hasReachedAttemptLimit(job)) {
+					await store.recordFailed(
+						job.id,
+						runToken,
+						result.reasonCode,
+						"The agent failed at the job attempt limit.",
+						now,
+					);
+					return "ack";
+				}
 				await recordRetryScheduled(
 					store,
 					job,
@@ -575,6 +632,26 @@ async function executeClaimedJob(
 			}
 			return "ack";
 	}
+}
+
+function hasReachedAttemptLimit(job: Job): boolean {
+	const value = job.payload._formAgentMaxAttempts;
+	return (
+		typeof value === "number" &&
+		Number.isInteger(value) &&
+		value >= 1 &&
+		job.attemptCount >= value
+	);
+}
+
+function hasExceededAttemptLimit(job: Job): boolean {
+	const value = job.payload._formAgentMaxAttempts;
+	return (
+		typeof value === "number" &&
+		Number.isInteger(value) &&
+		value >= 1 &&
+		job.attemptCount > value
+	);
 }
 
 async function recordRetryScheduled(

@@ -200,6 +200,7 @@ export async function buildCampaignJob(
 		allowedHosts: normalizeAllowedHosts(resolution.allowedHosts),
 		payload: {
 			_formAgentDryRun: true,
+			_formAgentMaxAttempts: 1,
 			campaign,
 			sourceRow: candidate.rowNumber,
 			formValues: {
