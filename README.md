@@ -42,16 +42,16 @@ BrowserUse は Agent API ではなく standalone browser API だけを使用し�
 
 実BrowserUse/CDPの送信なしスモークテストは、追跡対象外の`.env`へ`BROWSER_USE_API_KEY`を設定して`bun run test:browser-use-smoke`で実行します。このテストは公開テストフォームの観察と入力、送信ボタンの通常click拒否、対象外ドメイン遷移拒否を確認し、フォーム送信は行いません。通常の`bun run test`には含めず、外部セッションを明示実行時だけ作成します。
 
-実Queue/D1/Sandbox/Pi/OpenAI/BrowserUseを通す送信なしE2Eは、`.env`へ`OPENAI_API_KEY`と`BROWSER_USE_API_KEY`を設定して`bun run test:agent-e2e`で実行します。専用の`wrangler dev`環境を一時ディレクトリへ起動し、Selenium公式サイトの空ページに固定した1ジョブをQueue bindingへ登録します。ジョブが送信以外の終端状態へ遷移すること、Provider呼び出しがD1へ記録されること、再試行がないことを確認し、終了時にWorker・Container・一時データを破棄します。外部API利用料が発生するため、通常の`bun run test`には含めません。
+実Queue/D1/Responses API/BrowserUseを通す送信なしE2Eは、`.env`へ`OPENAI_API_KEY`と`BROWSER_USE_API_KEY`を設定して`bun run test:agent-e2e`で実行します。専用の`wrangler dev`環境を一時ディレクトリへ起動し、Selenium公式サイトの空ページに固定した1ジョブをQueue bindingへ登録します。ジョブが送信以外の終端状態へ遷移すること、Provider呼び出しがD1へ記録されること、再試行がないことを確認し、終了時にWorkerと一時データを破棄します。外部API利用料が発生するため、通常の`bun run test`には含めません。
 
 ## エージェント実行境界
 
-Queue Consumer は `AgentRuntime` の結果契約を使います。Cloudflare Sandbox 1.0 preview上でPi 0.74.0 runnerを起動し、D1操作とProvider認証情報はコンテナへ渡さずoutbound handler内に保持します。コンテナの外向き通信は内部tool hostとOpenAI APIだけを許可します。
+Queue Consumer は `AgentRuntime` の結果契約を使い、WorkerからOpenAI Responses APIを直接呼び出します。モデルへ渡すジョブ情報から`runToken`を除外し、OpenAIとBrowserUseの認証情報はWorkerの環境変数にだけ保持します。
 
-内部tool hostが公開する状態参照はrun tokenで絞り込み、D1の送信状態を直接更新するAPIはrunnerへ公開しません。OpenAI通信はHTTPS interceptionを必須とし、Worker側でモデル、本文サイズ、出力token、tool種別、1 runの呼び出し回数を制限します。
+Responses APIのfunction callingはstrict schema、1ターン1toolで処理します。Worker側でモデル、request/response本文サイズ、出力token、最大turn、1 runの呼び出し回数を固定し、D1の条件付き更新でProvider予算を原子的に消費します。
 
-ブラウザはSandbox Durable Object内の信頼済みhandlerがBrowserUseへCDP接続し、runnerには`navigate` / `observe` / `click` / `fill` / `select` / `submit`の高レベルtoolだけを公開します。BrowserUse認証情報とCDP URLはrunnerへ渡さず、対象ドメイン外の通信とService Worker経由の迂回を遮断し、runner終了時に接続を閉じます。
+Worker内の信頼済みhandlerがBrowserUseへCDP接続し、モデルには`navigate` / `observe` / `click` / `fill` / `select` / `submit` / `finish`の高レベルtool定義だけを渡します。BrowserUse認証情報とCDP URLはモデルへ渡さず、対象ドメイン外の通信とService Worker経由の迂回を遮断し、実行終了時に接続を閉じます。
 
 production executorは`AGENT_EXECUTOR_ENABLED=true`、`AGENT_MODEL`、`OPENAI_API_KEY`、`BROWSER_USE_API_KEY`がすべて設定された場合だけ有効になります。いずれかが不足する場合は`EXECUTOR_NOT_CONFIGURED`でfail-closedに終了します。
 
-runner は `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返します。`sent` は制限付き `submit` ツールが D1 へ結果を保存済みの場合だけ確定し、送信権取得後の切断や矛盾した結果は `uncertain` として自動再試行を止めます。
+executor は `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返します。`sent` は制限付き `submit` ツールが D1 へ結果を保存済みの場合だけ確定し、送信権取得後の切断や矛盾した結果は `uncertain` として自動再試行を止めます。

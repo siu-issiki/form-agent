@@ -1,7 +1,7 @@
 # フォーム営業自動化アーキテクチャ
 
 - ステータス: PoC 実装中（単一ジョブの送信なし E2E 完了）
-- 最終更新: 2026-09-01
+- 最終更新: 2026-09-02
 - 対象: `siu-issiki/form-agent`
 
 ## 目的
@@ -16,12 +16,12 @@
 | --- | --- | --- |
 | ジョブ状態管理 | 実装済み | D1 の条件付き更新と `runToken` で実行権・送信権を制御 |
 | Queue / DLQ | 実装済み | ローカル Queue、retry、DLQ、重複配信テスト |
-| Agent 実行 | 実装済み | Cloudflare Sandbox 上で Pi 0.74.0 を実行 |
-| 推論 Provider | 部分実装 | OpenAI API のみ。モデル、回数、本文、出力 token を Worker 側で制限 |
+| Agent 実行 | 実装済み | Worker から OpenAI Responses API の function calling を直接実行 |
+| 推論 Provider | 部分実装 | OpenAI Responses API のみ。モデル、回数、本文、出力 token を Worker 側で制限 |
 | BrowserUse | 実装済み | standalone browser へ CDP 接続し、用途限定ツールだけを公開 |
-| E2E | 部分実装 | 実 Queue / D1 / Sandbox / Pi / OpenAI / BrowserUse の送信なし E2E 成功 |
+| E2E | 部分実装 | 旧 Sandbox 構成の送信なし E2E は成功。Worker 直実行へ変更後の外部 E2E は未実行 |
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。一覧・キャンセルは未実装 |
-| Cloudflare 配備 | 未実施 | ローカル設定のみ。staging / production の Worker、D1、Queue は未作成 |
+| Cloudflare 配備 | 部分実施 | production の D1、Queue、DLQ、Worker version は作成済み。Secrets、公開 URL、Queue consumer は未設定 |
 | 監査・メトリクス | 部分実装 | Provider 呼び出し回数と DLQ イベントのみ |
 | 並列検証 | 未実施 | `max_concurrency: 5` は設定済みだが、Cloudflare 上の 5 並列は未検証 |
 
@@ -31,7 +31,7 @@
 
 問い合わせフォームはサイトごとに DOM、ラベル、選択肢、必須項目、禁止事項が異なる。この差異を企業ごとのルールやセレクタとして保守する方式は、対象数が増えるほど更新コストが高くなる。
 
-そのため、フォームマッピングをルールベースで網羅せず、LLM / Agent による画面と項目の意味理解を中心に据える。Agent loop は自作せず、現在の PoC では Pi 0.74.0 を採用している。
+そのため、フォームマッピングをルールベースで網羅せず、LLM / Agent による画面と項目の意味理解を中心に据える。現在の PoC では、Cloudflare Container を必要としない小さな Agent loop を Worker に実装し、OpenAI Responses API の function calling を利用する。
 
 ブラウザは実行コンテナ内で Chromium を起動せず、BrowserUse Cloud Browser を利用する。BrowserUse Agent は採用せず、standalone browser の CDP 接続だけを利用する。これにより、ローカル PC や Cloudflare 上の各エージェントが Chromium の RAM を保持する構成を避ける。
 
@@ -53,15 +53,12 @@ Cloudflare Worker Queue Consumer
         │
         ├─ D1 の実行権を原子的に取得
         ▼
-Cloudflare Sandbox Durable Object / Container
-  1 試行 = 1 隔離実行 = 1 Pi 実行
-  ┌─────────────────────────────────────────────┐
-  │ Pi 0.74.0                                  │
-  │  ├─ Worker 管理の OpenAI proxy             │
-  │  └─ 用途限定 browser tools                 │
-  │       └─ 信頼済み handler                  │
-  │            └─ BrowserUse CDP ──► 対象企業  │
-  └─────────────────────────────────────────────┘
+Worker-native Agent executor
+  1 試行 = 1 Responses function-calling loop
+  ├─ OpenAI Responses API
+  └─ 用途限定 browser tools
+       └─ 信頼済み handler
+            └─ BrowserUse CDP ──► 対象企業
         │
         │ 状態・結果・Provider 呼び出し回数
         ▼
@@ -71,7 +68,7 @@ Cloudflare D1
   └─ events（現在は DLQ イベントのみ）
 ```
 
-PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、ローカル Container、外部の OpenAI / BrowserUse を組み合わせる。本番構成は Cloudflare 上で完結させる方針だが、staging / production への配備はまだ行っていない。
+PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外部の OpenAI / BrowserUse を組み合わせる。本番は production 環境だけを対象とし、D1、Queue、DLQ、Worker version まで作成済みだが、Secrets、公開 URL、Queue consumer の設定と動作確認は未完了である。
 
 ## コンポーネント責務
 
@@ -95,49 +92,42 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、ロ�
 | dead letter queue | `form-agent-jobs-dlq` |
 | max concurrency | 5（ローカル Wrangler では再現されない） |
 
-### Cloudflare Sandbox / Container
+### Worker-native Agent executor
 
-- Queue から受け取った 1 ジョブに、隔離された Agent 実行環境を提供する。
-- Sandbox には Pi runner とジョブ入力だけを渡し、D1、Queue、OpenAI、BrowserUse の認証情報は渡さない。
-- 外向き通信は内部 tool host と OpenAI API だけを許可し、HTTPS interception を必須とする。
-- OpenAI と browser tool の実処理は Worker / Durable Object の信頼済み handler で行う。
-- Agent 終了時に browser 接続を閉じ、Sandbox を破棄する。
-
-PoC は Cloudflare Sandbox SDK 1.0 preview を採用している。正式採用は、起動時間、同時実行、運用性、料金、preview 依存リスクを確認して決める。
-
-### Pi
-
-- Agent loop、推論、tool call の制御を担う。
+- Queue から受け取った 1 ジョブについて Responses API と browser tool の反復を制御する。
 - 1 回の実行で 1 社だけを処理する。
+- `parallel_tool_calls: false` と strict schema により、1 turn で最大 1 tool だけを処理する。
 - 最大 12 turn、ジョブ prompt 最大 64,000 文字とする。
 - `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返す。
+- Agent 終了時または timeout 時に browser 接続を閉じる。
 - ジョブ入力にない個人情報・企業情報を推測して入力しないよう system prompt で指示する。現時点では信頼済み handler による入力値照合までは行わない。
 
 ### 推論 Provider
 
-現在は OpenAI API のみ対応する。Sandbox からのリクエストを Worker の outbound handler で検査し、次を強制する。
+現在は OpenAI Responses API のみ対応する。Worker がリクエストを組み立て、次を強制する。
 
 - 設定されたモデルと一致すること。
-- Responses API または Chat Completions API だけを利用すること。
+- Responses API だけを利用すること。
 - function tool 以外を渡さないこと。
 - 1 run の Provider 呼び出しを最大 16 回に制限すること。
 - 出力 token を最大 4,096 に制限すること。
 - request body を最大 128 KiB に制限すること。
-- OpenAI API key を Sandbox へ公開しないこと。
+- response body を最大 256 KiB に制限すること。
+- OpenAI API key、BrowserUse API key、`runToken` をモデル入力へ含めないこと。
 
 DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイテンシ・料金比較は未実装である。
 
 ### BrowserUse Cloud Browser
 
 - BrowserUse Agent ではなく、standalone browser へ CDP 接続する。
-- BrowserUse API key と CDP URL は Sandbox / Pi へ渡さない。
-- 1 試行につき最大 1 browser session とし、終了時に接続を閉じる。Queue retry では同じジョブに対して新しい Pi 実行と session を開始する。
+- BrowserUse API key と CDP URL はモデルへ渡さない。
+- 1 試行につき最大 1 browser session とし、終了時に接続を閉じる。Queue retry では同じジョブに対して新しい Agent 実行と session を開始する。
 - proxy country は `jp`、session timeout は 15 分とする。
 - popup、Worker、Service Worker、WebSocket 等の迂回経路を遮断する。
 
 ### 制限付き browser tool
 
-Pi に汎用 JavaScript や CDP を公開せず、次の用途限定 tool だけを提供する。
+モデルに汎用 JavaScript や CDP を公開せず、次の用途限定 tool だけを提供する。
 
 | tool | 責務 |
 | --- | --- |
@@ -165,14 +155,14 @@ driver が submit control と識別した要素は通常の `click` で操作で
 1. 対象企業、対象 URL、許可ドメイン、送信内容を含むジョブを D1 に `pending` として作成する。
 2. `jobId` を Cloudflare Queue へ登録する。
 3. Consumer は `pending` から `running` への条件付き更新に成功した場合だけ実行する。
-4. Pi には、対象ドメイン内でフォームを探し、営業禁止・用途制限を確認するよう指示する。
-5. Pi が禁止または対象フォームなしと判断した場合は、送信せず `prohibited` または `uncertain` を返す。
-6. Pi には、フォーム項目を観察し、ジョブ入力に存在する値だけを入力するよう指示する。
-7. Pi には、送信前に対象、禁止事項、入力値、必須項目、送信回数を再確認するよう指示する。
+4. Agent には、対象ドメイン内でフォームを探し、営業禁止・用途制限を確認するよう指示する。
+5. Agent が禁止または対象フォームなしと判断した場合は、送信せず `prohibited` または `uncertain` を返す。
+6. Agent には、フォーム項目を観察し、ジョブ入力に存在する値だけを入力するよう指示する。
+7. Agent には、送信前に対象、禁止事項、入力値、必須項目、送信回数を再確認するよう指示する。
 8. D1 を `running` から `submitting` へ原子的に更新できた場合だけ `submit` を許可する。
 9. 送信完了を確認できた場合は `sent` を保存する。
 10. 送信後に結果を確認できない場合は `uncertain` とし、自動 retry を止める。
-11. retry しない終端結果を D1 に保存し、browser と Sandbox を終了する。
+11. retry しない終端結果を D1 に保存し、browser 接続を終了する。
 
 現在の状態遷移は次のとおり。
 
@@ -188,7 +178,7 @@ pending ── claim ──► running ── claim submit ──► submitting 
 pending / running / failed ── retry 上限超過 ──► dead_lettered
 ```
 
-`prohibited` と `uncertain` は自動 retry しない。retryable error は `failed` を保存せず、`running` と同じ `runToken` を維持したまま Queue の再配信を待つ。再配信では新しい Pi 実行と browser session を開始する。`submitting` または `sent` を受け取った Consumer は送信を再実行しない。
+`prohibited` と `uncertain` は自動 retry しない。retryable error は `failed` を保存せず、`running` と同じ `runToken` を維持したまま Queue の再配信を待つ。再配信では新しい Agent 実行と browser session を開始する。`submitting` または `sent` を受け取った Consumer は送信を再実行しない。
 
 ## データモデル
 
@@ -250,7 +240,7 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 - HTTP(S) の通信先を対象企業の登録可能ドメインとサブドメインに限定する。
 - POST 等の非safe HTTP method は送信権取得後の最初の 1 回だけ許可する。
 - popup、Worker、Service Worker、WebSocket、WebRTC 等の迂回経路を遮断する。
-- Provider / BrowserUse の認証情報と D1 の実行権を Sandbox へ渡さない。
+- Provider / BrowserUse の認証情報と D1 の実行権をモデル入力・tool 出力へ渡さない。
 - Agent に返すジョブ情報から `runToken` を除外する。
 - ジョブ間で browser session、cookie、入力データを共有しない。
 
@@ -258,7 +248,7 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 
 ### Agent への安全指示
 
-Pi の system prompt では、営業禁止・用途制限の確認、payload に存在する値だけの入力、送信前の再観察と確認を指示する。ただし、現在の信頼済み handler は、禁止判定の証跡、送信前確認の実施、入力値が payload 由来かを機械的には検証しない。ページ上の prompt injection や Agent の誤判断に対するハードガードではないため、実送信開始前に信頼済み handler 側の検証範囲を決めて実装する。
+system prompt では、営業禁止・用途制限の確認、payload に存在する値だけの入力、送信前の再観察と確認を指示する。ただし、現在の信頼済み handler は、禁止判定の証跡、送信前確認の実施、入力値が payload 由来かを機械的には検証しない。ページ上の prompt injection や Agent の誤判断に対するハードガードではないため、実送信開始前に信頼済み handler 側の検証範囲を決めて実装する。
 
 ## 現在の制約
 
@@ -308,28 +298,28 @@ PoC は 5 並列から開始し、観測結果をもとに 20、50 へ段階的�
 
 1. OpenAI の input / output token と呼び出し回数
 2. BrowserUse Cloud Browser の session 時間、並列数、待ち時間
-3. Cloudflare Sandbox / Container の CPU、メモリ、実行時間
-4. Queue、D1、ログ・イベント保存
+3. Cloudflare Worker、Queue、D1、ログ・イベント保存
 
 現時点で記録しているのは Provider 呼び出し回数だけであり、1 件原価は算出できない。今後は、全投入件数と `sent` 件数の両方を分母にして原価を計測する。
 
 ## PoC 計画と進捗
 
-### フェーズ 1: staging / 5 並列
+### フェーズ 1: production / 5 並列
 
 完了済み:
 
 - [x] D1 の条件付き更新で実行権・送信権を制御する。
 - [x] Queue の重複配信で二重実行しないことをテストする。
-- [x] Sandbox 上の Pi から OpenAI と BrowserUse を利用する。
+- [x] Worker から Responses API と BrowserUse を利用する実装へ変更する。
 - [x] 対象ドメイン、tool、Provider、token、呼び出し回数を制限する。
-- [x] 実 Queue / D1 / Sandbox / Pi / OpenAI / BrowserUse の送信なし E2E を実行する。
-- [x] E2E 後に Worker、Container、BrowserUse session が残らないことを確認する。
+- [x] 旧 Sandbox 構成で実 Queue / D1 / OpenAI / BrowserUse の送信なし E2E を実行する。
+- [x] 旧 E2E 後に Worker、Container、BrowserUse session が残らないことを確認する。
 
 未完了:
 
 - [x] 認証付きジョブ登録・取得 API を実装する。
-- [ ] staging の D1、Queue、DLQ、Secrets、Worker を作成する。
+- [ ] production Worker へ Secrets、公開 URL、Queue consumer を設定する。
+- [ ] Worker 直実行構成で送信なし E2E を再実行する。
 - [ ] 管理下のテストフォームで `submitting` から `sent` まで検証する。
 - [ ] Queue 重複配信時に実 POST が 1 回だけであることを検証する。
 - [ ] `submitting` 中断時に `uncertain` となり再送しないことを検証する。
@@ -350,7 +340,7 @@ PoC は 5 並列から開始し、観測結果をもとに 20、50 へ段階的�
 
 - [ ] 連続投入時の安定性とスループットを確認する。
 - [ ] 同時実行上限、rate limit、接続待ちから安全な運用値を決める。
-- [ ] Provider、model、Sandbox / Container の構成別に 1 件原価を比較する。
+- [ ] Provider、model の構成別に 1 件原価を比較する。
 
 並列数を引き上げる条件は、重大な二重送信がなく、`uncertain` と失敗原因を追跡でき、直前フェーズの rate limit と原価が許容範囲に収まることである。
 
@@ -359,7 +349,7 @@ PoC は 5 並列から開始し、観測結果をもとに 20、50 へ段階的�
 ### 実装
 
 - 利用者別の認証・権限管理と、ジョブ一覧・キャンセル API。
-- staging / production の Cloudflare resource と環境分離。
+- production の Cloudflare Secrets、公開 URL、Queue consumer 設定。
 - 管理下テストフォームを使う実送信 E2E。
 - 禁止判定の証跡、送信前確認、payload 由来入力を信頼済み handler で検証する境界。
 - 同一ドメインの GET 型副作用を submit gate 外から起動させない設計。
@@ -377,14 +367,13 @@ PoC は 5 並列から開始し、観測結果をもとに 20、50 へ段階的�
 - 対象サイトの利用規約、適用法令、社内ルールの確認手順。
 - 実送信を許可する対象、承認者、件数上限、緊急停止条件。
 - BrowserUse の session 上限、rate limit、保持期間、課金単位。
-- Cloudflare Sandbox preview を正式採用するか、Containers を直接使うか。
 - OpenAI 以外の Provider を採用するか。
 
 ## 決定事項の要約
 
 - ジョブ配送、retry、DLQ には Cloudflare Queue を使う。
 - 状態と結果は Cloudflare D1 に保存する。
-- 1 ジョブを 1 社に限定し、PoC は Cloudflare Sandbox で Pi 0.74.0 を実行する。
+- 1 ジョブを 1 社に限定し、Worker から OpenAI Responses API の function calling を直接実行する。
 - 現在の推論 Provider は OpenAI とし、認証情報と制限は Worker 側で管理する。
 - BrowserUse Agent は使わず、standalone browser へ CDP 接続する。
 - Agent には用途限定 browser tool だけを公開し、`submit` を独立した制御対象にする。

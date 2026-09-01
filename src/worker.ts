@@ -6,11 +6,8 @@ import {
 import type { AgentRunResult } from "./agent-runtime";
 import { D1JobStore } from "./d1-job-store";
 import { DuplicateJobError, type Job, type JobInput } from "./job";
+import { ResponsesAgentExecutor } from "./responses-agent-executor";
 import { assertAllowedTargetUrl } from "./restricted-browser";
-import { createSandboxAgentExecutor } from "./sandbox-agent-executor";
-
-export { AgentToolService } from "./agent-tool-service";
-export { ContainerProxy, FormAgentSandbox } from "./form-agent-sandbox";
 
 export interface JobMessage {
 	jobId: string;
@@ -19,9 +16,6 @@ export interface JobMessage {
 export interface Env {
 	DB: D1Database;
 	JOB_QUEUE: Queue<JobMessage>;
-	SANDBOX?: DurableObjectNamespace<
-		import("./form-agent-sandbox").FormAgentSandbox
-	>;
 	AGENT_EXECUTOR_ENABLED?: string;
 	AGENT_MODEL?: string;
 	OPENAI_API_KEY?: string;
@@ -506,19 +500,23 @@ async function closeSubmittingConflict(
 function createAgentExecutor(env: Env): AgentExecutor {
 	if (
 		env.AGENT_EXECUTOR_ENABLED === "true" &&
-		env.SANDBOX &&
 		env.AGENT_MODEL &&
 		env.OPENAI_API_KEY &&
 		env.BROWSER_USE_API_KEY
 	) {
-		return createSandboxAgentExecutor(env.SANDBOX, env.AGENT_MODEL);
+		return new ResponsesAgentExecutor({
+			db: env.DB,
+			model: env.AGENT_MODEL,
+			openAiApiKey: env.OPENAI_API_KEY,
+			browserUseApiKey: env.BROWSER_USE_API_KEY,
+		});
 	}
 	return {
 		async execute() {
 			return {
 				outcome: "failed",
 				reasonCode: "EXECUTOR_NOT_CONFIGURED",
-				reason: "The agent runner binding has not been configured yet.",
+				reason: "The agent executor has not been configured yet.",
 				retryable: false,
 			};
 		},

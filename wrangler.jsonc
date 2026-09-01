@@ -4,31 +4,15 @@
   "main": "src/worker.ts",
   "compatibility_date": "2026-08-27",
   "compatibility_flags": ["nodejs_compat"],
-  "containers": [
-    {
-      "class_name": "FormAgentSandbox",
-      "image": "./Dockerfile"
-    }
-  ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "class_name": "FormAgentSandbox",
-        "name": "SANDBOX"
-      }
-    ]
+  "vars": {
+    "AGENT_EXECUTOR_ENABLED": "true",
+    "AGENT_MODEL": "gpt-5.4-mini"
   },
-  "migrations": [
-    {
-      "new_sqlite_classes": ["FormAgentSandbox"],
-      "tag": "v1"
-    }
-  ],
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "form-agent-local",
-      "database_id": "local",
+      "database_name": "form-agent",
+      "database_id": "a48d393a-c9ac-452a-84be-e722a6f8e15b",
       "migrations_dir": "migrations"
     }
   ],
