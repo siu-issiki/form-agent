@@ -226,7 +226,11 @@ describe("Job HTTP API", () => {
 			jobRequest(
 				"POST",
 				"/jobs",
-				{ ...input, companyName: "Other Inc.", payload: { message: "Other" } },
+				{
+					...input,
+					companyName: "Other Inc.",
+					payload: { formValues: { message: "Other" } },
+				},
 				apiToken,
 			),
 			apiEnv,
@@ -256,11 +260,22 @@ describe("Job HTTP API", () => {
 			),
 			apiEnv,
 		);
+		const legacyPayload = await handleHttpRequest(
+			jobRequest(
+				"POST",
+				"/jobs",
+				{ ...input, id: "job-003", payload: { message: "Legacy" } },
+				apiToken,
+			),
+			apiEnv,
+		);
 
 		expect(invalidDomain.status).toBe(400);
 		expect(await invalidDomain.json()).toEqual({ error: "INVALID_JOB" });
 		expect(invalidPayload.status).toBe(400);
 		expect(await invalidPayload.json()).toEqual({ error: "INVALID_JOB" });
+		expect(legacyPayload.status).toBe(400);
+		expect(await legacyPayload.json()).toEqual({ error: "INVALID_JOB" });
 		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
 		expect(queued).toEqual([]);
 	});

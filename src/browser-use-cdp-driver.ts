@@ -243,7 +243,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	async clickNonSubmit(elementId: string): Promise<void> {
 		const reference = this.#element(elementId);
 		const state = await this.#inspectElement(reference.backendNodeId);
-		if (!state.ok || !state.visible || state.disabled || state.submitLike) {
+		if (
+			!state.ok ||
+			!state.visible ||
+			state.disabled ||
+			state.submitLike ||
+			!isPayloadIndependentClickTarget(state.tag, state.type)
+		) {
 			throw new BrowserElementError();
 		}
 		this.#interactionStarted = true;
@@ -909,6 +915,13 @@ function isFillable(tag: string, type: string): boolean {
 			"submit",
 		].includes(type)
 	);
+}
+
+export function isPayloadIndependentClickTarget(
+	tag: string,
+	type: string,
+): boolean {
+	return tag === "button" && type === "button";
 }
 
 function delay(milliseconds: number): Promise<void> {
