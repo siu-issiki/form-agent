@@ -84,6 +84,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#elements = new Map<string, ElementReference>();
 	#formDataEntered = false;
 	#interactionStarted = false;
+	#navigationCount = 0;
 
 	private constructor(
 		private readonly connection: BrowserUseCdpConnection,
@@ -150,6 +151,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async navigate(url: string): Promise<void> {
+		assertDryRunNavigationAllowed(this.dryRun, this.#navigationCount);
+		this.#navigationCount += 1;
 		this.#clearElements();
 		const result = await this.#send<{ errorText?: string }>("Page.navigate", {
 			url,
@@ -661,6 +664,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 		return this.connection.send<TResult>(method, params, this.sessionId);
 	}
+}
+
+export function assertDryRunNavigationAllowed(
+	dryRun: boolean,
+	navigationCount: number,
+): void {
+	if (dryRun && navigationCount > 0) throw new BrowserElementError();
 }
 
 export async function denyRelatedBrowserTargets(

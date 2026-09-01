@@ -8,6 +8,7 @@ import {
 } from "../src/browser-use-cdp";
 import { discoverCdpForms } from "../src/browser-use-cdp-dom";
 import {
+	assertDryRunNavigationAllowed,
 	BLOCK_BROWSER_ESCAPE_EXPRESSION,
 	denyRelatedBrowserTargets,
 	IS_COMPOSED_DESCENDANT_FUNCTION,
@@ -81,6 +82,12 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 });
 
 describe("BrowserUseCdpDriver child target policy", () => {
+	test("allows only the bootstrap navigation in dry-run", () => {
+		expect(() => assertDryRunNavigationAllowed(true, 0)).not.toThrow();
+		expect(() => assertDryRunNavigationAllowed(true, 1)).toThrow();
+		expect(() => assertDryRunNavigationAllowed(false, 1)).not.toThrow();
+	});
+
 	test("accepts only the intended click target or its composed descendants", () => {
 		const isComposedDescendant = runInNewContext(
 			`(${IS_COMPOSED_DESCENDANT_FUNCTION})`,

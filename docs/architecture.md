@@ -268,7 +268,7 @@ system prompt では、営業禁止・用途制限の確認、payload に存在�
 - 送信完了は、送信前にはなかった日本語の送信完了表現または `thank you` が 5 秒以内に出現した場合だけ確定する。
 - `GET` / `HEAD` / `OPTIONS` は送信権なしでも許可するため、同一ドメインの GET 型副作用 endpoint を通常の `click` や `navigate` で起動する経路は防止できない。
 - 営業禁止判定、送信前確認、payload 由来の入力値は Agent への指示であり、信頼済み handler では未検証である。
-- dry-runでは最初のclick / fill / select以降に発生するbrowser requestをすべて遮断し、座標click前にCDPのhit targetが検証済み要素またはそのcomposed descendantであることを確認する。
+- dry-runではジョブURLへのbootstrap後の再navigateと、最初のclick / fill / select以降に発生するbrowser requestをすべて遮断し、座標click前にCDPのhit targetが検証済み要素またはそのcomposed descendantであることを確認する。
 
 ### API / 運用
 
@@ -369,6 +369,7 @@ PoC はまず 1 並列の production dry-run で開始し、観測結果をも�
 - 実 form の cross-origin iframe、確認画面、複数ページ、添付、CAPTCHA 対応方針と Shadow DOM の互換性検証。
 - Shadow DOM 内の禁止文言を含む可視テキストの収集。
 - SPA の遅延描画で無関係なbuttonだけが先に現れる場合のフォーム探索再試行。
+- `DRY_RUN_COMPLETE`の成功条件へ、少なくとも1件の入力成功とフォームvalidity確認を含める。
 - 外部 CDN / API / form action を許可する場合の安全な allowlist 設計。
 - Provider abstraction と fallback。
 - 外部 API E2E は GitHub Actions の通常 CI に含めず、手動実行に限定する。
