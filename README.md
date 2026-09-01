@@ -56,7 +56,7 @@ Responses APIのfunction callingはstrict schema、1ターン1toolで処理し�
 
 Worker内の信頼済みhandlerがBrowserUseへCDP接続し、モデルには`navigate` / `observe` / `click` / `fill` / `select` / `submit` / `finish`の高レベルtool定義だけを渡します。`fill` / `select`ではモデルが生の値ではなく`payload.formValues`内の`payloadKey`だけを指定し、handlerがD1の保存値を解決します。BrowserUse認証情報とCDP URLはモデルへ渡さず、対象ドメイン外の通信とService Worker経由の迂回を遮断し、実行終了時に接続を閉じます。
 
-管理下の実送信テスト用フォームは、メインWorkerと分離した`form-agent-test-fixture`として実装しています。fixtureは固定のダミー値だけを受け付け、対象ジョブがD1上で`submitting`の場合だけPOSTを記録します。本文や個人情報は保存せず、ジョブ別のPOST回数と時刻だけを`test_fixture_submissions`へ保存します。現時点ではコードとローカルテストのみで、fixtureの本番デプロイと実送信E2Eはまだ行いません。
+管理下の実送信テスト用フォームは、メインWorkerと分離した`form-agent-test-fixture`としてproductionへデプロイ済みです。fixtureは固定のダミー値だけを受け付け、対象ジョブがD1上で`submitting`の場合だけPOSTを記録します。本文や個人情報は保存せず、ジョブ別のPOST回数と時刻だけを`test_fixture_submissions`へ保存します。fixtureを使う実送信E2Eはまだ行っていません。
 
 production executorは`AGENT_EXECUTOR_ENABLED=true`、`AGENT_MODEL`、`OPENAI_API_KEY`、`BROWSER_USE_API_KEY`がすべて設定された場合だけ有効になります。いずれかが不足する場合は`EXECUTOR_NOT_CONFIGURED`でfail-closedに終了します。
 

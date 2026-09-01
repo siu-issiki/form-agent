@@ -19,9 +19,9 @@
 | Agent 実行 | 実装済み | Worker から OpenAI Responses API の function calling を直接実行 |
 | 推論 Provider | 部分実装 | OpenAI Responses API のみ。モデル、回数、本文、出力 token を Worker 側で制限 |
 | BrowserUse | 実装済み | standalone browser へ CDP 接続し、用途限定ツールだけを公開 |
-| E2E | 部分実装 | production Worker 直実行の AnyReach dry-run E2E に成功。管理下テストフォームは実装済み、デプロイと実送信 E2E は未実施 |
+| E2E | 部分実装 | production Worker 直実行の AnyReach dry-run E2E に成功。管理下テストフォームはproductionへデプロイ済み、実送信 E2E は未実施 |
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値を検証。一覧・キャンセルは未実装 |
-| Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
+| Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、メインWorker、管理下テストフォームWorker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
 | 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ イベント |
 | 並列検証 | 部分実施 | 安全確認中は `max_concurrency: 1`。Cloudflare 上の単一ジョブを検証済みで、5 並列以上は未検証 |
 
