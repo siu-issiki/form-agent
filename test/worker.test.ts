@@ -7,6 +7,7 @@ import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, test } from "vitest";
 import { AgentExecutionError, type AgentExecutor } from "../src/agent-executor";
 import { BrowserToolCoordinator } from "../src/browser-tool-handler";
+import { BrowserUseCdpPayloadTooLargeError } from "../src/browser-use-cdp";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobInput } from "../src/job";
 import { ResponsesAgentExecutor } from "../src/responses-agent-executor";
@@ -18,6 +19,7 @@ import {
 import worker, {
 	consumeJobBatch,
 	handleHttpRequest,
+	isAgentDryRun,
 	type JobMessage,
 	registerJob,
 } from "../src/worker";
@@ -30,6 +32,12 @@ const input: JobInput = {
 	targetDomain: "form-agent.dev",
 	payload: { message: "Hello" },
 };
+
+test("keeps agent dry-run enabled unless production submission is explicitly enabled", () => {
+	expect(isAgentDryRun(undefined)).toBe(true);
+	expect(isAgentDryRun("true")).toBe(true);
+	expect(isAgentDryRun("false")).toBe(false);
+});
 
 beforeEach(async () => {
 	await env.DB.batch([
@@ -340,6 +348,10 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	url = input.targetUrl;
 	restrictedDomain: string | undefined;
 	closed = false;
+	observed = false;
+	requireObservationForSubmit = false;
+	validateSubmitCount = 0;
+	submitCount = 0;
 
 	async close(): Promise<void> {
 		this.closed = true;
@@ -354,18 +366,144 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 		this.url = url;
 	}
 	async observe() {
+		this.observed = true;
 		return { url: this.url, forms: [] };
 	}
 	async clickNonSubmit(): Promise<void> {}
 	async fill(): Promise<void> {}
 	async select(): Promise<void> {}
-	async validateSubmit(): Promise<void> {}
+	async validateSubmit(): Promise<void> {
+		this.validateSubmitCount += 1;
+		if (this.requireObservationForSubmit && !this.observed) {
+			throw new BrowserElementError();
+		}
+	}
 	async submit(): Promise<BrowserSubmitResult> {
+		this.submitCount += 1;
 		return { outcome: "sent", formUrl: this.url };
 	}
 }
 
 describe("ResponsesAgentExecutor", () => {
+	test("validates the observed submit control without browser submission for a job-level dry-run", async () => {
+		const store = new D1JobStore(env.DB);
+		const dryRunInput = {
+			...input,
+			payload: { ...input.payload, _formAgentDryRun: true },
+		};
+		await store.create(dryRunInput, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const requestBodies: Array<{
+			tools?: Array<{ name?: string }>;
+			instructions?: string;
+		}> = [];
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-submit", "submit", {
+				elementId: "fa-0-1",
+			}),
+		];
+		const driver = new WorkerFakeBrowserDriver();
+		driver.requireObservationForSubmit = true;
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			dryRun: false,
+			fetcher: (async (_resource, init) => {
+				requestBodies.push(JSON.parse(String(init?.body)));
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async (_apiKey, _job, dryRun) => {
+				expect(dryRun).toBe(true);
+				return driver;
+			},
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toEqual({
+			outcome: "prohibited",
+			formUrl: input.targetUrl,
+			reasonCode: "DRY_RUN_COMPLETE",
+			reason:
+				"Dry-run validated the current submit control and stopped before submission authorization or browser submission.",
+		});
+		expect(requestBodies[0]?.tools?.map((tool) => tool.name)).toContain(
+			"submit",
+		);
+		expect(requestBodies[0]?.instructions).toContain("This is a dry-run");
+		expect(driver.validateSubmitCount).toBe(1);
+		expect(driver.submitCount).toBe(0);
+		expect(driver.closed).toBe(true);
+		expect((await store.find(input.id))?.status).toBe("running");
+	});
+
+	test("rejects a guessed dry-run submit element before observation", async () => {
+		const store = new D1JobStore(env.DB);
+		const dryRunInput = {
+			...input,
+			payload: { ...input.payload, _formAgentDryRun: true },
+		};
+		await store.create(dryRunInput, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-guessed-submit", "submit", {
+				elementId: "fa-0-1",
+			}),
+			functionResponse("call-finish", "finish", {
+				outcome: "failed",
+				formUrl: null,
+				reasonCode: "SUBMIT_ELEMENT_NOT_OBSERVED",
+				reason: "The submit element was not observed.",
+				retryable: false,
+			}),
+		];
+		const driver = new WorkerFakeBrowserDriver();
+		driver.requireObservationForSubmit = true;
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			dryRun: false,
+			fetcher: (async () => {
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toMatchObject({
+			outcome: "failed",
+			reasonCode: "SUBMIT_ELEMENT_NOT_OBSERVED",
+		});
+		expect(driver.validateSubmitCount).toBe(1);
+		expect(driver.submitCount).toBe(0);
+	});
+
 	test.each([408, 409])(
 		"retries transient provider status %i",
 		async (status) => {
@@ -379,7 +517,7 @@ describe("ResponsesAgentExecutor", () => {
 			if (!job) throw new Error("Expected a claimed job");
 			const executor = new ResponsesAgentExecutor({
 				db: env.DB,
-				model: "gpt-5.4-mini",
+				model: "gpt-5.6-luna",
 				openAiApiKey: "openai-secret",
 				browserUseApiKey: "browser-secret",
 				fetcher: (async () => new Response(null, { status })) as typeof fetch,
@@ -410,7 +548,7 @@ describe("ResponsesAgentExecutor", () => {
 		if (!job) throw new Error("Expected a claimed job");
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
-			model: "gpt-5.4-mini",
+			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
 			fetcher: (async () =>
@@ -432,6 +570,41 @@ describe("ResponsesAgentExecutor", () => {
 		expect(error).toBeInstanceOf(AgentExecutionError);
 		expect(error.reasonCode).toBe("BROWSER_TOOL_UNAVAILABLE");
 		expect(error.retryable).toBe(true);
+	});
+
+	test("does not retry a browser document that exceeds the safe Worker cap", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () =>
+				Response.json(
+					functionResponse("call-observe", "observe", {}),
+				)) as typeof fetch,
+			createBrowserDriver: async () => {
+				throw new BrowserUseCdpPayloadTooLargeError();
+			},
+		});
+
+		const error = await executor
+			.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				new AbortController().signal,
+			)
+			.catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(error.reasonCode).toBe("BROWSER_PAYLOAD_TOO_LARGE");
+		expect(error.retryable).toBe(false);
 	});
 
 	test("waits for an active browser operation to stop after abort", async () => {
@@ -462,7 +635,7 @@ describe("ResponsesAgentExecutor", () => {
 		};
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
-			model: "gpt-5.4-mini",
+			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
 			fetcher: (async () =>
@@ -509,10 +682,12 @@ describe("ResponsesAgentExecutor", () => {
 				retryable: null,
 			}),
 		];
-		const fetcher = (async (
+		const fetcher = async function (
+			this: unknown,
 			resource: RequestInfo | URL,
 			init?: RequestInit,
-		) => {
+		) {
+			expect(this).toBeUndefined();
 			requests.push({
 				url: String(resource),
 				headers: new Headers(init?.headers),
@@ -521,11 +696,11 @@ describe("ResponsesAgentExecutor", () => {
 			const response = responses.shift();
 			if (!response) throw new Error("Unexpected provider request");
 			return Response.json(response);
-		}) as typeof fetch;
+		} as typeof fetch;
 		const driver = new WorkerFakeBrowserDriver();
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
-			model: "gpt-5.4-mini",
+			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
 			fetcher,
@@ -552,7 +727,7 @@ describe("ResponsesAgentExecutor", () => {
 			"Bearer openai-secret",
 		);
 		expect(requests[0]?.body).toMatchObject({
-			model: "gpt-5.4-mini",
+			model: "gpt-5.6-luna",
 			tool_choice: "required",
 			parallel_tool_calls: false,
 			max_output_tokens: 4_096,
@@ -602,7 +777,7 @@ describe("ResponsesAgentExecutor", () => {
 		};
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
-			model: "gpt-5.4-mini",
+			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
 			fetcher: (async (_resource, init) => {
@@ -647,7 +822,7 @@ describe("ResponsesAgentExecutor", () => {
 		const driver = new WorkerFakeBrowserDriver();
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
-			model: "gpt-5.4-mini",
+			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
 			fetcher: (async () =>
@@ -697,7 +872,7 @@ describe("ResponsesAgentExecutor", () => {
 		const requests: unknown[] = [];
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
-			model: "gpt-5.4-mini",
+			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
 			fetcher: (async (_resource, init) => {

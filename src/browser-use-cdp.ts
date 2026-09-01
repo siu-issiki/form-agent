@@ -1,4 +1,5 @@
 const CDP_COMMAND_TIMEOUT_MS = 15_000;
+export const MAX_CDP_MESSAGE_CHARACTERS = 4 * 1024 * 1024;
 
 interface CdpMessage {
 	id?: number;
@@ -10,6 +11,7 @@ interface CdpMessage {
 }
 
 interface PendingCommand {
+	method: string;
 	resolve(value: unknown): void;
 	reject(error: Error): void;
 	timeout: ReturnType<typeof setTimeout>;
@@ -24,6 +26,7 @@ export class BrowserUseCdpConnection {
 	#nextId = 1;
 	#pending = new Map<number, PendingCommand>();
 	#listeners = new Map<string, Set<CdpEventListener>>();
+	#lastResponseCharacters = new Map<string, number>();
 	#closed = false;
 
 	private constructor(private readonly webSocket: WebSocket) {
@@ -68,6 +71,7 @@ export class BrowserUseCdpConnection {
 				reject(new Error("Browser Use CDP command timed out"));
 			}, CDP_COMMAND_TIMEOUT_MS);
 			this.#pending.set(id, {
+				method,
 				resolve: (value) => resolve(value as TResult),
 				reject,
 				timeout,
@@ -90,6 +94,10 @@ export class BrowserUseCdpConnection {
 		return () => listeners.delete(listener);
 	}
 
+	lastResponseCharacters(method: string): number | undefined {
+		return this.#lastResponseCharacters.get(method);
+	}
+
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
@@ -99,6 +107,18 @@ export class BrowserUseCdpConnection {
 
 	#onMessage(event: MessageEvent): void {
 		if (typeof event.data !== "string") return;
+		try {
+			assertCdpMessageWithinLimit(event.data);
+		} catch (caught) {
+			const error =
+				caught instanceof BrowserUseCdpPayloadTooLargeError
+					? caught
+					: new BrowserUseCdpPayloadTooLargeError();
+			this.#closed = true;
+			this.webSocket.close(1009, "CDP message is too large");
+			this.#rejectPending(error);
+			return;
+		}
 		let message: CdpMessage;
 		try {
 			message = JSON.parse(event.data) as CdpMessage;
@@ -110,6 +130,7 @@ export class BrowserUseCdpConnection {
 			if (!pending) return;
 			clearTimeout(pending.timeout);
 			this.#pending.delete(message.id);
+			this.#lastResponseCharacters.set(pending.method, event.data.length);
 			if (message.error)
 				pending.reject(new Error("Browser Use CDP command failed"));
 			else pending.resolve(message.result);
@@ -127,11 +148,26 @@ export class BrowserUseCdpConnection {
 		this.#rejectPending();
 	}
 
-	#rejectPending(): void {
+	#rejectPending(
+		error: Error = new Error("Browser Use CDP connection closed"),
+	): void {
 		for (const pending of this.#pending.values()) {
 			clearTimeout(pending.timeout);
-			pending.reject(new Error("Browser Use CDP connection closed"));
+			pending.reject(error);
 		}
 		this.#pending.clear();
+	}
+}
+
+export class BrowserUseCdpPayloadTooLargeError extends Error {
+	constructor() {
+		super("Browser Use CDP payload exceeded the safe Worker limit");
+		this.name = "BrowserUseCdpPayloadTooLargeError";
+	}
+}
+
+export function assertCdpMessageWithinLimit(data: string): void {
+	if (data.length > MAX_CDP_MESSAGE_CHARACTERS) {
+		throw new BrowserUseCdpPayloadTooLargeError();
 	}
 }

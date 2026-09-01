@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const CONFIG_PATH = "wrangler.agent-e2e.jsonc";
-const SAFE_NO_FORM_REASON_CODES = new Set([
+const DEFAULT_TARGET_URL = "https://www.selenium.dev/selenium/web/blank.html";
+const SAFE_TERMINAL_REASON_CODES = new Set([
+	"DRY_RUN_COMPLETE",
 	"NO_FORM_PRESENT",
 	"NO_INQUIRY_FORM",
 ]);
@@ -35,6 +37,7 @@ await run();
 async function run(): Promise<void> {
 	requireEnvironment("OPENAI_API_KEY");
 	requireEnvironment("BROWSER_USE_API_KEY");
+	const targetUrl = process.env.E2E_TARGET_URL ?? DEFAULT_TARGET_URL;
 
 	const token = crypto.randomUUID();
 	const workerName = `form-agent-e2e-${token}`;
@@ -79,7 +82,11 @@ async function run(): Promise<void> {
 				"--var",
 				"AGENT_EXECUTOR_ENABLED:true",
 				"--var",
-				"AGENT_MODEL:gpt-5.4-mini",
+				"AGENT_MODEL:gpt-5.6-luna",
+				"--var",
+				"AGENT_DRY_RUN:true",
+				"--var",
+				`E2E_TARGET_URL:${targetUrl}`,
 				"--var",
 				`E2E_TOKEN:${token}`,
 				"--show-interactive-dev-session=false",
@@ -131,7 +138,7 @@ async function run(): Promise<void> {
 				reasonCode: result.job.result?.reasonCode ?? null,
 			}),
 		);
-		assertSuccessfulNoSubmitResult(result);
+		assertSuccessfulNoSubmitResult(result, targetUrl !== DEFAULT_TARGET_URL);
 
 		await stopProcess(devProcess);
 		devProcess = undefined;
@@ -234,7 +241,10 @@ async function waitForJob(
 	);
 }
 
-function assertSuccessfulNoSubmitResult(result: E2eJobResponse): void {
+function assertSuccessfulNoSubmitResult(
+	result: E2eJobResponse,
+	expectsForm: boolean,
+): void {
 	if (!SUCCESS_TERMINAL_STATUSES.has(result.job.status)) {
 		throw new Error(`Unexpected terminal status ${result.job.status}`);
 	}
@@ -248,7 +258,8 @@ function assertSuccessfulNoSubmitResult(result: E2eJobResponse): void {
 		!result.job.result ||
 		result.job.result.outcome === "sent" ||
 		!result.job.result.reasonCode ||
-		!SAFE_NO_FORM_REASON_CODES.has(result.job.result.reasonCode)
+		!SAFE_TERMINAL_REASON_CODES.has(result.job.result.reasonCode) ||
+		(expectsForm && result.job.result.reasonCode !== "DRY_RUN_COMPLETE")
 	) {
 		throw new Error("The E2E job did not persist a safe terminal result");
 	}

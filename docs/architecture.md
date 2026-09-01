@@ -1,6 +1,6 @@
 # フォーム営業自動化アーキテクチャ
 
-- ステータス: PoC 実装中（単一ジョブの送信なし E2E 完了）
+- ステータス: PoC 実装中（production の単一ジョブ dry-run E2E 完了）
 - 最終更新: 2026-09-02
 - 対象: `siu-issiki/form-agent`
 
@@ -19,11 +19,11 @@
 | Agent 実行 | 実装済み | Worker から OpenAI Responses API の function calling を直接実行 |
 | 推論 Provider | 部分実装 | OpenAI Responses API のみ。モデル、回数、本文、出力 token を Worker 側で制限 |
 | BrowserUse | 実装済み | standalone browser へ CDP 接続し、用途限定ツールだけを公開 |
-| E2E | 部分実装 | 旧 Sandbox 構成の送信なし E2E は成功。Worker 直実行へ変更後の外部 E2E は未実行 |
+| E2E | 部分実装 | production Worker 直実行の AnyReach dry-run E2E に成功。実送信 E2E は未実施 |
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。一覧・キャンセルは未実装 |
-| Cloudflare 配備 | 部分実施 | production の D1、Queue、DLQ、Worker version は作成済み。Secrets、公開 URL、Queue consumer は未設定 |
+| Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
 | 監査・メトリクス | 部分実装 | Provider 呼び出し回数と DLQ イベントのみ |
-| 並列検証 | 未実施 | `max_concurrency: 5` は設定済みだが、Cloudflare 上の 5 並列は未検証 |
+| 並列検証 | 部分実施 | 安全確認中は `max_concurrency: 1`。Cloudflare 上の単一ジョブを検証済みで、5 並列以上は未検証 |
 
 本書では、実装済みの構成を現在形で記述し、未実装または未検証の内容は「現在の制約」「PoC 計画」「残タスク・未決事項」に明示する。
 
@@ -68,7 +68,7 @@ Cloudflare D1
   └─ events（現在は DLQ イベントのみ）
 ```
 
-PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外部の OpenAI / BrowserUse を組み合わせる。本番は production 環境だけを対象とし、D1、Queue、DLQ、Worker version まで作成済みだが、Secrets、公開 URL、Queue consumer の設定と動作確認は未完了である。
+PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外部の OpenAI / BrowserUse を組み合わせる。本番は production 環境だけを対象とし、D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済みである。2026-09-02 に `https://anyreach.co.jp/contact` を対象とした production dry-run を実行し、`pending → running → prohibited`、`DRY_RUN_COMPLETE`、1 attempt、8 Provider requests、BrowserUse active session 0 件を確認した。`submitting` / `sent` には遷移しておらず、フォーム送信は行っていない。
 
 ## コンポーネント責務
 
@@ -90,13 +90,14 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 | max retries | 3 |
 | retry delay | 30 秒固定（Worker 実装） |
 | dead letter queue | `form-agent-jobs-dlq` |
-| max concurrency | 5（ローカル Wrangler では再現されない） |
+| max concurrency | 1（ローカル Wrangler では再現されない） |
 
 ### Worker-native Agent executor
 
 - Queue から受け取った 1 ジョブについて Responses API と browser tool の反復を制御する。
 - 1 回の実行で 1 社だけを処理する。
 - `parallel_tool_calls: false` と strict schema により、1 turn で最大 1 tool だけを処理する。
+- `AGENT_DRY_RUN`が明示的な`false`以外、またはジョブpayloadが`_formAgentDryRun: true`の場合は、`submit`をモデルへ公開したまま現在のsubmit要素を実ブラウザで検証し、送信権取得とブラウザsubmitより前に`DRY_RUN_COMPLETE`で終了する。
 - 最大 12 turn、ジョブ prompt 最大 64,000 文字とする。
 - `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返す。
 - Agent 終了時または timeout 時に browser 接続を閉じる。
@@ -124,6 +125,8 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 - 1 試行につき最大 1 browser session とし、終了時に接続を閉じる。Queue retry では同じジョブに対して新しい Agent 実行と session を開始する。
 - proxy country は `jp`、session timeout は 15 分とする。
 - popup、Worker、Service Worker、WebSocket 等の迂回経路を遮断する。
+- CDP の `DOM.getDocument` を `pierce: true` で取得し、通常 DOM と open / closed Shadow DOM を Worker 側で走査する。
+- CDP の単一 response は 4 MiB を上限とし、超過時は再試行せず `BROWSER_PAYLOAD_TOO_LARGE` で終了する。
 
 ### 制限付き browser tool
 
@@ -254,15 +257,18 @@ system prompt では、営業禁止・用途制限の確認、payload に存在�
 
 ### Browser / form 対応
 
-- 対象企業ドメイン外の CDN、API、外部 form action も遮断するため、外部 SaaS を利用するフォームは動かない可能性がある。
-- `document.forms` 配下の可視 `input` / `textarea` / `select` / `button` だけを観察する。
-- 観察対象は最大 10 form、合計 100 field、本文 20,000 文字までとする。
-- iframe、Shadow DOM、contenteditable、独自 UI component は未対応である。
+- top-level navigation は対象企業ドメインとそのサブドメインだけを許可する。
+- フォーム入力前に限り、公開 HTTPS host の read-only subresource（`GET` / `HEAD` / `OPTIONS`）を許可する。入力開始後は対象企業ドメイン外への通信を遮断する。
+- CDP DOM tree から `form` と可視 `input` / `textarea` / `select` / `button` を観察し、`form` 属性による外部関連付けにも対応する。
+- 探索上限は最大 25 form candidate、200 field candidate、モデルへ返す観察結果は最大 10 form、合計 100 field、本文 20,000 文字までとする。
+- open / closed Shadow DOM は探索対象とする。ただし実サイトでの互換性検証は継続する。
+- cross-origin iframe、contenteditable、独自 UI component は未対応または未検証である。
 - popup、別 tab、Service Worker を利用するフォームは未対応である。
 - 確認画面、複数ページフォーム、ファイル添付、CAPTCHA は未対応である。
 - 送信完了は、送信前にはなかった日本語の送信完了表現または `thank you` が 5 秒以内に出現した場合だけ確定する。
 - `GET` / `HEAD` / `OPTIONS` は送信権なしでも許可するため、同一ドメインの GET 型副作用 endpoint を通常の `click` や `navigate` で起動する経路は防止できない。
 - 営業禁止判定、送信前確認、payload 由来の入力値は Agent への指示であり、信頼済み handler では未検証である。
+- dry-runではジョブURLへのbootstrap後の再navigateと、最初のclick / fill / select以降に発生するbrowser requestをすべて遮断し、座標click前にCDPのhit targetが検証済み要素またはそのcomposed descendantであることを確認する。
 
 ### API / 運用
 
@@ -281,7 +287,7 @@ system prompt では、営業禁止・用途制限の確認、payload に存在�
 
 ## 並列・リトライ方針
 
-PoC は 5 並列から開始し、観測結果をもとに 20、50 へ段階的に引き上げる。設定値だけで並列対応済みとせず、Cloudflare 上での実測を完了条件とする。
+PoC はまず 1 並列の production dry-run で開始し、観測結果をもとに 5、20、50 へ段階的に引き上げる。設定値だけで並列対応済みとせず、Cloudflare 上での実測を完了条件とする。
 
 | 分類 | 例 | 現在の方針 |
 | --- | --- | --- |
@@ -304,7 +310,7 @@ PoC は 5 並列から開始し、観測結果をもとに 20、50 へ段階的�
 
 ## PoC 計画と進捗
 
-### フェーズ 1: production / 5 並列
+### フェーズ 1: production / 1 並列 dry-run
 
 完了済み:
 
@@ -314,21 +320,27 @@ PoC は 5 並列から開始し、観測結果をもとに 20、50 へ段階的�
 - [x] 対象ドメイン、tool、Provider、token、呼び出し回数を制限する。
 - [x] 旧 Sandbox 構成で実 Queue / D1 / OpenAI / BrowserUse の送信なし E2E を実行する。
 - [x] 旧 E2E 後に Worker、Container、BrowserUse session が残らないことを確認する。
+- [x] production Worker へ Secrets、公開 URL、Queue consumer を設定する。
+- [x] Worker 直実行構成で AnyReach の送信なし E2E を実行する。
+- [x] production から旧 Sandbox Durable Object を削除する。
+- [x] CI で typecheck、lint、unit / Workers test、deploy dry-run を実行する。
 
 未完了:
 
 - [x] 認証付きジョブ登録・取得 API を実装する。
-- [ ] production Worker へ Secrets、公開 URL、Queue consumer を設定する。
-- [ ] Worker 直実行構成で送信なし E2E を再実行する。
 - [ ] 管理下のテストフォームで `submitting` から `sent` まで検証する。
 - [ ] Queue 重複配信時に実 POST が 1 回だけであることを検証する。
 - [ ] `submitting` 中断時に `uncertain` となり再送しないことを検証する。
 - [ ] 状態遷移、理由、時間、token、BrowserUse 待ち時間を記録する。
 - [ ] `submitting` / `uncertain` / DLQ の人手確認手順を作る。
 - [ ] Cloudflare 上で送信なし 5 並列を実行し、rate limit と原価を計測する。
-- [ ] CI で typecheck、lint、unit / Workers test、deploy dry-run を実行する。
 
-### フェーズ 2: 20 並列
+### フェーズ 2: 5 並列
+
+- [ ] 送信なし5並列で二重実行、rate limit、BrowserUse session、原価を計測する。
+- [ ] `max_concurrency`を観測結果に基づいて1から5へ引き上げる。
+
+### フェーズ 3: 20 並列
 
 - [ ] Queue の backpressure と retry を検証する。
 - [ ] OpenAI / BrowserUse の 429、503、timeout を観測する。
@@ -336,7 +348,7 @@ PoC は 5 並列から開始し、観測結果をもとに 20、50 へ段階的�
 - [ ] 実 form の互換性と未対応パターンを分類する。
 - [ ] メトリクスの欠損とイベント量を確認する。
 
-### フェーズ 3: 50 並列
+### フェーズ 4: 50 並列
 
 - [ ] 連続投入時の安定性とスループットを確認する。
 - [ ] 同時実行上限、rate limit、接続待ちから安全な運用値を決める。
@@ -349,16 +361,18 @@ PoC は 5 並列から開始し、観測結果をもとに 20、50 へ段階的�
 ### 実装
 
 - 利用者別の認証・権限管理と、ジョブ一覧・キャンセル API。
-- production の Cloudflare Secrets、公開 URL、Queue consumer 設定。
 - 管理下テストフォームを使う実送信 E2E。
 - 禁止判定の証跡、送信前確認、payload 由来入力を信頼済み handler で検証する境界。
 - 同一ドメインの GET 型副作用を submit gate 外から起動させない設計。
 - 状態遷移、tool、token、時間、費用の observability。
 - `submitting` / `uncertain` の照合、DLQ 再投入、緊急停止の運用機能。
-- 実 form の iframe、Shadow DOM、確認画面、複数ページ、添付、CAPTCHA 対応方針。
+- 実 form の cross-origin iframe、確認画面、複数ページ、添付、CAPTCHA 対応方針と Shadow DOM の互換性検証。
+- Shadow DOM 内の禁止文言を含む可視テキストの収集。
+- SPA の遅延描画で無関係なbuttonだけが先に現れる場合のフォーム探索再試行。
+- `DRY_RUN_COMPLETE`の成功条件へ、少なくとも1件の入力成功とフォームvalidity確認を含める。
 - 外部 CDN / API / form action を許可する場合の安全な allowlist 設計。
 - Provider abstraction と fallback。
-- GitHub Actions による CI。外部 API E2E は手動実行に限定する。
+- 外部 API E2E は GitHub Actions の通常 CI に含めず、手動実行に限定する。
 
 ### 運用・ポリシー
 

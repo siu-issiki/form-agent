@@ -80,7 +80,7 @@ describe("BrowserUseCdpDriver real CDP smoke", () => {
 			).toBe("Form Agent Smoke Test");
 
 			await expect(tools.click(submitControl.elementId)).rejects.toThrow(
-				"Submit controls require the submit tool",
+				"The browser element is unavailable or incompatible",
 			);
 			await expect(
 				tools.navigate("https://example.com"),

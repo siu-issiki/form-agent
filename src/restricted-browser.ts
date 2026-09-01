@@ -4,6 +4,7 @@ import type { Job, JobStore } from "./job";
 export interface BrowserObservation {
 	url: string;
 	forms: unknown[];
+	pageText?: string;
 }
 
 export type BrowserSubmitResult =
@@ -123,12 +124,17 @@ export class RestrictedBrowserTools {
 		await this.#assertCurrentUrlAllowed();
 	}
 
+	async validateSubmit(elementId: string): Promise<void> {
+		await this.#assertCurrentUrlAllowed();
+		await this.driver.validateSubmit(elementId);
+		await this.#assertCurrentUrlAllowed();
+	}
+
 	async submit(elementId: string): Promise<Job> {
 		if (this.#submitAttempted) {
 			throw new SubmissionNotAuthorizedError();
 		}
-		await this.#assertCurrentUrlAllowed();
-		await this.driver.validateSubmit(elementId);
+		await this.validateSubmit(elementId);
 		this.#submitAttempted = true;
 
 		const authorized = await this.jobs.claimSubmission(
