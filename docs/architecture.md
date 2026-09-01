@@ -1,6 +1,6 @@
 # フォーム営業自動化アーキテクチャ
 
-- ステータス: PoC 実装中（production の単一ジョブ dry-run E2E 完了）
+- ステータス: PoC 実装中（production dry-run / 使い捨てサイト実送信 E2E 完了）
 - 最終更新: 2026-09-02
 - 対象: `siu-issiki/form-agent`
 
@@ -15,11 +15,11 @@
 | 領域 | 状態 | 現在の到達点 |
 | --- | --- | --- |
 | ジョブ状態管理 | 実装済み | D1 の条件付き更新と `runToken` で実行権・送信権を制御 |
-| Queue / DLQ | 実装済み | ローカル Queue、retry、DLQ、重複配信テスト |
+| Queue / DLQ | 実装済み | production Queue、retry、DLQ、実POSTを伴う重複配信テスト |
 | Agent 実行 | 実装済み | Worker から OpenAI Responses API の function calling を直接実行 |
 | 推論 Provider | 部分実装 | OpenAI Responses API のみ。モデル、回数、本文、出力 token を Worker 側で制限 |
 | BrowserUse | 実装済み | standalone browser へ CDP 接続し、用途限定ツールだけを公開 |
-| E2E | 部分実装 | production Worker 直実行の AnyReach dry-run E2E に成功。実送信 E2E は未実施 |
+| E2E | 部分実装 | AnyReach dry-runと使い捨てサイト実送信3件、重複配送、送信後`uncertain`をproductionで検証済み。実サイト送信は未実施 |
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値を検証。一覧・キャンセルは未実装 |
 | Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
 | 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ イベント |
@@ -339,7 +339,7 @@ PoC はまず 1 並列の production dry-run で開始し、観測結果をも�
 未完了:
 
 - [x] 認証付きジョブ登録・取得 API を実装する。
-- [ ] `submitting` 中断時に `uncertain` となり再送しないことを検証する。
+- [ ] `submitting` 中にWorkerを強制停止し、状態が`submitting`のまま残って再配信でも送信されないことを検証する。
 - [ ] 状態遷移、理由、時間、token、BrowserUse 待ち時間を記録する。
 - [ ] productionで`hitTestAttempts=2`または`3`となる自然な再試行を観測する。
 - [ ] Cloudflare 上で送信なし 5 並列を実行し、rate limit と原価を計測する。
@@ -370,7 +370,7 @@ PoC はまず 1 並列の production dry-run で開始し、観測結果をも�
 ### 実装
 
 - 利用者別の認証・権限管理と、ジョブ一覧・キャンセル API。
-- 実Workerを`submitting`中に停止した場合の結果保存・再送抑止の検証。
+- 実Workerを`submitting`中に停止した場合に、`submitting`のまま再配信がackされ、再送されないことの検証。
 - productionでhit testの2回目または3回目による回復を観測する。
 - 禁止判定の証跡と送信前確認を信頼済みhandlerで検証する境界。
 - 同一ドメインの GET 型副作用を submit gate 外から起動させない設計。
