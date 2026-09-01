@@ -10,6 +10,8 @@ import {
 } from "../src/campaign-import";
 import type { JobInput } from "../src/job";
 
+const PRODUCTION_BASE_URL = "https://form-agent.form-agent.workers.dev";
+
 const options = parseOptions(Bun.argv.slice(2));
 const registration = await readRegistration(options.registrationPath);
 const csvText = await Bun.file(options.csvPath).text();
@@ -39,8 +41,6 @@ for (const candidate of filtered.eligible) {
 		console.log(
 			JSON.stringify({
 				event: "campaign_preflight_skipped",
-				rowNumber: candidate.rowNumber,
-				targetHost: new URL(candidate.targetUrl).hostname,
 				reasonCode: "REDIRECT_PREFLIGHT_FAILED",
 			}),
 		);
@@ -56,14 +56,11 @@ for (const candidate of filtered.eligible) {
 	console.log(
 		JSON.stringify({
 			event: "campaign_job_preview",
-			rowNumber: candidate.rowNumber,
 			jobId: job.id,
 			companyId: job.companyId,
-			targetHost: new URL(job.targetUrl).hostname,
-			targetDomain: job.targetDomain,
-			allowedHosts: job.allowedHosts,
 			formValueKeys: Object.keys(formValues).sort(),
 			formValueCount: Object.keys(formValues).length,
+			allowedHostCount: job.allowedHosts.length,
 			requestBytes: new TextEncoder().encode(JSON.stringify(job)).byteLength,
 		}),
 	);
@@ -76,7 +73,7 @@ if (jobs.length !== options.limit) {
 
 if (options.submit) {
 	for (const job of jobs) {
-		await submitAndWait(job, options.baseUrl, options.apiToken);
+		await submitAndWait(job, options.apiToken);
 	}
 }
 
@@ -86,7 +83,6 @@ interface Options {
 	campaign: string;
 	limit: number;
 	submit: boolean;
-	baseUrl: string;
 	apiToken: string;
 }
 
@@ -100,6 +96,9 @@ function parseOptions(args: string[]): Options {
 			continue;
 		}
 		if (!arg?.startsWith("--")) throw new Error("Invalid argument");
+		if (!["--registration", "--csv", "--campaign", "--limit"].includes(arg)) {
+			throw new Error(`Unknown argument: ${arg}`);
+		}
 		const value = args[index + 1];
 		if (!value || value.startsWith("--"))
 			throw new Error(`Missing value: ${arg}`);
@@ -114,11 +113,6 @@ function parseOptions(args: string[]): Options {
 	if (!Number.isInteger(limit) || limit < 1 || limit > 5) {
 		throw new Error("--limit must be an integer from 1 to 5");
 	}
-	const baseUrl =
-		values.get("base-url") ?? "https://form-agent.form-agent.workers.dev";
-	if (new URL(baseUrl).protocol !== "https:") {
-		throw new Error("--base-url must use HTTPS");
-	}
 	const apiToken = process.env.JOB_API_TOKEN ?? "";
 	if (submit && !apiToken)
 		throw new Error("JOB_API_TOKEN is required for submission");
@@ -129,7 +123,6 @@ function parseOptions(args: string[]): Options {
 		campaign,
 		limit,
 		submit,
-		baseUrl: baseUrl.replace(/\/$/, ""),
 		apiToken,
 	};
 }
@@ -151,11 +144,7 @@ async function readRegistration(path: string): Promise<RegistrationEntry[]> {
 	return value as RegistrationEntry[];
 }
 
-async function submitAndWait(
-	job: JobInput,
-	baseUrl: string,
-	apiToken: string,
-): Promise<void> {
+async function submitAndWait(job: JobInput, apiToken: string): Promise<void> {
 	if (job.payload._formAgentDryRun !== true) {
 		throw new Error("Job-level dry-run guard is missing");
 	}
@@ -163,10 +152,11 @@ async function submitAndWait(
 		authorization: `Bearer ${apiToken}`,
 		"content-type": "application/json",
 	};
-	const created = await fetch(`${baseUrl}/jobs`, {
+	const created = await fetch(`${PRODUCTION_BASE_URL}/jobs`, {
 		method: "POST",
 		headers,
 		body: JSON.stringify(job),
+		redirect: "manual",
 	});
 	await created.body?.cancel();
 	if (created.status !== 200 && created.status !== 201) {
@@ -179,7 +169,10 @@ async function submitAndWait(
 	const deadline = Date.now() + 4 * 60 * 1_000;
 	let lastStatus = "";
 	while (Date.now() < deadline) {
-		const response = await fetch(`${baseUrl}/jobs/${job.id}`, { headers });
+		const response = await fetch(`${PRODUCTION_BASE_URL}/jobs/${job.id}`, {
+			headers,
+			redirect: "manual",
+		});
 		if (!response.ok) {
 			await response.body?.cancel();
 			throw new Error(`Job lookup failed with status ${response.status}`);
