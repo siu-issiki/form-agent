@@ -365,15 +365,41 @@ describe("BrowserUseCdpDriver submission confirmation", () => {
 	test("bounds the submission request permission window when keydown does not resolve", async () => {
 		let waitedMilliseconds: number | null = null;
 		const neverResolvingKeyDown = new Promise<never>(() => undefined);
+		const neverObservedRequest = new Promise<never>(() => undefined);
 
 		await runSubmissionActivationWithinPermissionWindow(
 			() => neverResolvingKeyDown,
+			neverObservedRequest,
 			async (milliseconds) => {
 				waitedMilliseconds = milliseconds;
 			},
 		);
 
 		expect(waitedMilliseconds).toBe(250);
+	});
+
+	test("keeps the permission window open until a request is observed", async () => {
+		let resolveObservedRequest: () => void = () => undefined;
+		const observedRequest = new Promise<void>((resolve) => {
+			resolveObservedRequest = resolve;
+		});
+		const neverReachingDeadline = new Promise<never>(() => undefined);
+		let completed = false;
+
+		const permissionWindow = runSubmissionActivationWithinPermissionWindow(
+			async () => undefined,
+			observedRequest,
+			() => neverReachingDeadline,
+		).then(() => {
+			completed = true;
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(completed).toBe(false);
+		resolveObservedRequest();
+		await permissionWindow;
+		expect(completed).toBe(true);
 	});
 
 	test("classifies a confirmation read failure without persisting its message", async () => {

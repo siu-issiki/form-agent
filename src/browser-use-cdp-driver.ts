@@ -81,6 +81,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#targetDomain: string | undefined;
 	#submissionRequestAllowed = false;
 	#submissionRequestCount = 0;
+	#submissionRequestObserved: (() => void) | undefined;
 	#targetPolicyError: Error | undefined;
 	#elementGeneration = 0;
 	#elements = new Map<string, ElementReference>();
@@ -439,7 +440,10 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				!this.#formDataEntered && paused.resourceType !== "Document",
 				this.dryRun && this.#interactionStarted,
 			);
-			if (unsafeRequest) this.#submissionRequestCount += 1;
+			if (unsafeRequest) {
+				this.#submissionRequestCount += 1;
+				this.#submissionRequestObserved?.();
+			}
 			await this.#send("Fetch.continueRequest", {
 				requestId: paused.requestId,
 			});
@@ -728,20 +732,29 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		]);
 		if (!unobscured || !focused) throw new BrowserElementError();
 
+		let resolveSubmissionRequestObserved: () => void = () => undefined;
+		const submissionRequestObserved = new Promise<void>((resolve) => {
+			resolveSubmissionRequestObserved = resolve;
+		});
 		this.#submissionRequestCount = 0;
+		this.#submissionRequestObserved = resolveSubmissionRequestObserved;
 		this.#submissionRequestAllowed = true;
 		try {
-			await runSubmissionActivationWithinPermissionWindow(() =>
-				this.#send("Input.dispatchKeyEvent", {
-					type: "keyDown",
-					key: "Enter",
-					code: "Enter",
-					windowsVirtualKeyCode: 13,
-					nativeVirtualKeyCode: 13,
-				}).then(() => this.#nextAnimationFrame().catch(() => undefined)),
+			await runSubmissionActivationWithinPermissionWindow(
+				() =>
+					this.#send("Input.dispatchKeyEvent", {
+						type: "keyDown",
+						key: "Enter",
+						code: "Enter",
+						windowsVirtualKeyCode: 13,
+						nativeVirtualKeyCode: 13,
+					}).then(() => this.#nextAnimationFrame().catch(() => undefined)),
+				submissionRequestObserved,
 			);
 		} finally {
 			this.#submissionRequestAllowed = false;
+			this.#submissionRequestObserved = undefined;
+			resolveSubmissionRequestObserved();
 		}
 		await this.#send("Input.dispatchKeyEvent", {
 			type: "keyUp",
@@ -826,12 +839,16 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 
 export async function runSubmissionActivationWithinPermissionWindow(
 	activate: () => Promise<unknown>,
+	submissionRequestObserved: Promise<unknown>,
 	wait: (milliseconds: number) => Promise<void> = delay,
 ): Promise<void> {
 	const permissionDeadline = wait(SUBMISSION_PERMISSION_WINDOW_MS);
 	const activation = activate();
 	void activation.catch(() => undefined);
-	await Promise.race([activation, permissionDeadline]);
+	await Promise.race([
+		activation.then(() => submissionRequestObserved),
+		permissionDeadline,
+	]);
 }
 
 export async function readSubmissionConfirmation(
