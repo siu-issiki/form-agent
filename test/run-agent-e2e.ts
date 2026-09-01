@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const CONFIG_PATH = "wrangler.agent-e2e.jsonc";
+const SAFE_NO_FORM_REASON_CODES = new Set([
+	"NO_FORM_PRESENT",
+	"NO_INQUIRY_FORM",
+]);
 const SUCCESS_TERMINAL_STATUSES = new Set(["prohibited", "uncertain"]);
 const POLL_TERMINAL_STATUSES = new Set([
 	...SUCCESS_TERMINAL_STATUSES,
@@ -32,10 +36,11 @@ async function run(): Promise<void> {
 	requireEnvironment("OPENAI_API_KEY");
 	requireEnvironment("BROWSER_USE_API_KEY");
 
-	const initialContainerIds = await listE2eContainerIds();
+	const token = crypto.randomUUID();
+	const workerName = `form-agent-e2e-${token}`;
+	const initialContainerIds = await listE2eContainerIds(workerName);
 	const port = await availablePort();
 	const persistPath = await mkdtemp(join(tmpdir(), "form-agent-e2e-"));
-	const token = crypto.randomUUID();
 	const baseUrl = `http://127.0.0.1:${port}`;
 	let devProcess: ReturnType<typeof Bun.spawn> | undefined;
 	let logs = "";
@@ -62,6 +67,8 @@ async function run(): Promise<void> {
 				"dev",
 				"--config",
 				CONFIG_PATH,
+				"--name",
+				workerName,
 				"--env-file",
 				".env",
 				"--ip",
@@ -128,23 +135,25 @@ async function run(): Promise<void> {
 		assertSuccessfulNoSubmitResult(result);
 
 		await stopProcess(devProcess);
+		devProcess = undefined;
 		await Promise.all([captureStdout, captureStderr]);
 	} catch (error) {
 		if (logs) console.error(logs);
 		throw error;
 	} finally {
-		if (devProcess && devProcess.exitCode === null) {
+		if (devProcess) {
 			await stopProcess(devProcess);
 		}
-		await removeNewE2eContainers(initialContainerIds);
+		await removeNewE2eContainers(workerName, initialContainerIds);
 		await rm(persistPath, { recursive: true, force: true });
 	}
 }
 
 async function stopProcess(child: ReturnType<typeof Bun.spawn>): Promise<void> {
-	if (child.exitCode !== null) return;
 	signalProcessGroup(child.pid, "SIGTERM");
-	await Promise.race([child.exited, delay(5_000)]);
+	if (child.exitCode === null) {
+		await Promise.race([child.exited, delay(5_000)]);
+	}
 	signalProcessGroup(child.pid, "SIGKILL");
 	await child.exited;
 }
@@ -237,7 +246,12 @@ function assertSuccessfulNoSubmitResult(result: E2eJobResponse): void {
 	if (result.providerRequestCount < 1) {
 		throw new Error("No OpenAI provider request was persisted");
 	}
-	if (!result.job.result || result.job.result.outcome === "sent") {
+	if (
+		!result.job.result ||
+		result.job.result.outcome === "sent" ||
+		!result.job.result.reasonCode ||
+		!SAFE_NO_FORM_REASON_CODES.has(result.job.result.reasonCode)
+	) {
 		throw new Error("The E2E job did not persist a safe terminal result");
 	}
 }
@@ -261,13 +275,16 @@ async function runCommand(command: string[]): Promise<string> {
 	return stdout;
 }
 
-async function listE2eContainerIds(): Promise<Set<string>> {
+async function listE2eContainerIds(workerName: string): Promise<Set<string>> {
+	if (!/^form-agent-e2e-[a-f0-9-]{36}$/.test(workerName)) {
+		throw new Error("Invalid E2E Worker name");
+	}
 	const output = await runCommand([
 		"docker",
 		"ps",
 		"-aq",
 		"--filter",
-		"name=workerd-form-agent-e2e-FormAgentSandbox-",
+		`name=workerd-${workerName}-FormAgentSandbox-`,
 	]);
 	const ids = output
 		.split(/\s+/)
@@ -281,8 +298,11 @@ async function listE2eContainerIds(): Promise<Set<string>> {
 	return new Set(ids);
 }
 
-async function removeNewE2eContainers(initialIds: Set<string>): Promise<void> {
-	const currentIds = await listE2eContainerIds();
+async function removeNewE2eContainers(
+	workerName: string,
+	initialIds: Set<string>,
+): Promise<void> {
+	const currentIds = await listE2eContainerIds(workerName);
 	const createdIds = [...currentIds].filter((id) => !initialIds.has(id));
 	if (createdIds.length === 0) return;
 	await runCommand(["docker", "rm", "--force", ...createdIds]);
