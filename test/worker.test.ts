@@ -29,6 +29,7 @@ import {
 } from "../src/sandbox-agent-executor";
 import worker, {
 	consumeJobBatch,
+	handleHttpRequest,
 	type JobMessage,
 	registerJob,
 } from "../src/worker";
@@ -102,6 +103,182 @@ describe("D1JobStore", () => {
 		expect(duplicate).toBeNull();
 	});
 });
+
+describe("Job HTTP API", () => {
+	const apiToken = "test-job-api-token";
+	const queued: JobMessage[] = [];
+	const apiEnv = {
+		DB: env.DB,
+		JOB_API_TOKEN: apiToken,
+		JOB_QUEUE: {
+			async send(message: JobMessage) {
+				queued.push(message);
+			},
+		} as unknown as Queue<JobMessage>,
+	};
+
+	beforeEach(() => {
+		queued.length = 0;
+	});
+
+	test("rejects unauthenticated registration without creating a job", async () => {
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", input),
+			apiEnv,
+		);
+
+		expect(response.status).toBe(401);
+		expect(response.headers.get("www-authenticate")).toBe("Bearer");
+		expect(await response.json()).toEqual({ error: "UNAUTHORIZED" });
+		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
+		expect(queued).toEqual([]);
+	});
+
+	test("registers and retrieves a job without exposing its run token", async () => {
+		const created = await handleHttpRequest(
+			jobRequest("POST", "/jobs", input, apiToken),
+			apiEnv,
+		);
+		const createdBody = (await created.json()) as {
+			created: boolean;
+			job: Record<string, unknown>;
+		};
+
+		expect(created.status).toBe(201);
+		expect(created.headers.get("cache-control")).toBe("no-store");
+		expect(createdBody.created).toBe(true);
+		expect(createdBody.job).toMatchObject({ id: input.id, status: "pending" });
+		expect(createdBody.job).not.toHaveProperty("runToken");
+		expect(queued).toEqual([{ jobId: input.id }]);
+
+		const fetched = await handleHttpRequest(
+			jobRequest("GET", `/jobs/${input.id}`, undefined, apiToken),
+			apiEnv,
+		);
+		const fetchedBody = (await fetched.json()) as {
+			job: Record<string, unknown>;
+		};
+
+		expect(fetched.status).toBe(200);
+		expect(fetchedBody.job).toMatchObject({
+			id: input.id,
+			payload: input.payload,
+			status: "pending",
+		});
+		expect(fetchedBody.job).not.toHaveProperty("runToken");
+	});
+
+	test("returns the existing pending job for duplicate registration", async () => {
+		const first = await handleHttpRequest(
+			jobRequest("POST", "/jobs", input, apiToken),
+			apiEnv,
+		);
+		const duplicate = await handleHttpRequest(
+			jobRequest("POST", "/jobs", input, apiToken),
+			apiEnv,
+		);
+
+		expect(first.status).toBe(201);
+		expect(duplicate.status).toBe(200);
+		expect(await duplicate.json()).toMatchObject({
+			created: false,
+			job: { id: input.id, status: "pending" },
+		});
+		expect(queued).toEqual([{ jobId: input.id }, { jobId: input.id }]);
+	});
+
+	test("rejects a duplicate id with different input without leaking the job", async () => {
+		await handleHttpRequest(
+			jobRequest("POST", "/jobs", input, apiToken),
+			apiEnv,
+		);
+		const conflict = await handleHttpRequest(
+			jobRequest(
+				"POST",
+				"/jobs",
+				{ ...input, companyName: "Other Inc.", payload: { message: "Other" } },
+				apiToken,
+			),
+			apiEnv,
+		);
+
+		expect(conflict.status).toBe(409);
+		expect(await conflict.json()).toEqual({ error: "JOB_ID_CONFLICT" });
+		expect(queued).toEqual([{ jobId: input.id }]);
+		expect(await new D1JobStore(env.DB).find(input.id)).toMatchObject(input);
+	});
+
+	test("rejects malformed jobs before persistence", async () => {
+		const mismatchedDomain = {
+			...input,
+			targetDomain: "evil.test",
+		};
+		const invalidDomain = await handleHttpRequest(
+			jobRequest("POST", "/jobs", mismatchedDomain, apiToken),
+			apiEnv,
+		);
+		const invalidPayload = await handleHttpRequest(
+			jobRequest(
+				"POST",
+				"/jobs",
+				{ ...input, id: "job-002", payload: [] },
+				apiToken,
+			),
+			apiEnv,
+		);
+
+		expect(invalidDomain.status).toBe(400);
+		expect(await invalidDomain.json()).toEqual({ error: "INVALID_JOB" });
+		expect(invalidPayload.status).toBe(400);
+		expect(await invalidPayload.json()).toEqual({ error: "INVALID_JOB" });
+		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
+		expect(queued).toEqual([]);
+	});
+
+	test("fails closed when the API token is not configured", async () => {
+		const response = await handleHttpRequest(
+			jobRequest("GET", `/jobs/${input.id}`, undefined, apiToken),
+			{ DB: apiEnv.DB, JOB_QUEUE: apiEnv.JOB_QUEUE },
+		);
+
+		expect(response.status).toBe(401);
+	});
+
+	test("stops reading a body when it exceeds the request limit", async () => {
+		const response = await handleHttpRequest(
+			new Request("https://form-agent.test/jobs", {
+				method: "POST",
+				headers: {
+					authorization: `Bearer ${apiToken}`,
+					"content-type": "application/json",
+				},
+				body: "x".repeat(64 * 1024 + 1),
+			}),
+			apiEnv,
+		);
+
+		expect(response.status).toBe(413);
+		expect(await response.json()).toEqual({ error: "REQUEST_TOO_LARGE" });
+		expect(queued).toEqual([]);
+	});
+});
+
+function jobRequest(
+	method: "GET" | "POST",
+	pathname: string,
+	body?: unknown,
+	token?: string,
+): Request {
+	const headers = new Headers();
+	if (token) headers.set("authorization", `Bearer ${token}`);
+	if (body !== undefined) headers.set("content-type", "application/json");
+	const init: RequestInit = {
+		method,
+		headers,
+	};
+	if (body !== undefined) init.body = JSON.stringify(body);
+	return new Request(`https://form-agent.test${pathname}`, init);
+}
 
 describe("AgentToolGateway", () => {
 	const toolNow = () => "2026-08-28T00:00:02.000Z";
