@@ -366,6 +366,39 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 }
 
 describe("ResponsesAgentExecutor", () => {
+	test.each([408, 409])(
+		"retries transient provider status %i",
+		async (status) => {
+			const store = new D1JobStore(env.DB);
+			await store.create(input, "2026-08-28T00:00:00.000Z");
+			const job = await store.claimRun(
+				input.id,
+				"run-token-1",
+				"2026-08-28T00:00:01.000Z",
+			);
+			if (!job) throw new Error("Expected a claimed job");
+			const executor = new ResponsesAgentExecutor({
+				db: env.DB,
+				model: "gpt-5.4-mini",
+				openAiApiKey: "openai-secret",
+				browserUseApiKey: "browser-secret",
+				fetcher: (async () => new Response(null, { status })) as typeof fetch,
+				createBrowserDriver: async () => new WorkerFakeBrowserDriver(),
+			});
+
+			const error = await executor
+				.execute(
+					{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+					new AbortController().signal,
+				)
+				.catch((caught) => caught);
+
+			expect(error).toBeInstanceOf(AgentExecutionError);
+			expect(error.reasonCode).toBe("PROVIDER_REQUEST_REJECTED");
+			expect(error.retryable).toBe(true);
+		},
+	);
+
 	test("retries infrastructure failures instead of asking the model to classify them", async () => {
 		const store = new D1JobStore(env.DB);
 		await store.create(input, "2026-08-28T00:00:00.000Z");

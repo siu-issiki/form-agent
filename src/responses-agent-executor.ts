@@ -206,7 +206,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 					? "PROVIDER_RATE_LIMITED"
 					: "PROVIDER_REQUEST_REJECTED",
 				"The model provider rejected the request.",
-				response.status === 429 || response.status >= 500,
+				[408, 409, 429].includes(response.status) || response.status >= 500,
 			);
 		}
 
