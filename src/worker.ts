@@ -215,7 +215,8 @@ async function parseJobInput(request: Request): Promise<JobInput> {
 		!validRequiredString(companyName, 256) ||
 		!validRequiredString(targetUrl, 2_048) ||
 		!validRequiredString(targetDomain, 253) ||
-		!isRecord(payload)
+		!isRecord(payload) ||
+		!hasValidFormValues(payload)
 	) {
 		throw new InvalidJobRequestError("INVALID_JOB", 400);
 	}
@@ -227,6 +228,20 @@ async function parseJobInput(request: Request): Promise<JobInput> {
 	}
 
 	return { id, companyId, companyName, targetUrl, targetDomain, payload };
+}
+
+function hasValidFormValues(payload: Record<string, unknown>): boolean {
+	const formValues = payload.formValues;
+	if (!isRecord(formValues) || Object.keys(formValues).length === 0) {
+		return false;
+	}
+	return Object.entries(formValues).every(
+		([key, value]) =>
+			/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(key) &&
+			typeof value === "string" &&
+			value.length > 0 &&
+			value.length <= 8_192,
+	);
 }
 
 async function readBoundedBody(request: Request): Promise<string> {

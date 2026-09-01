@@ -42,10 +42,12 @@ const created = await fetch(`${baseUrl}/jobs`, {
 		payload: {
 			_formAgentDryRun: true,
 			scenario: "safe-no-submit",
-			name: "送信なしテスト",
-			companyName: "Form Agent E2E",
-			email: "no-reply@example.com",
-			message: "これは送信しないフォーム動作確認です。",
+			formValues: {
+				name: "送信なしテスト",
+				companyName: "Form Agent E2E",
+				email: "no-reply@example.com",
+				message: "これは送信しないフォーム動作確認です。",
+			},
 			instruction:
 				"Inspect the target and fill a compatible inquiry form using only these payload values. Call submit after validation; dry-run mode must intercept it without sending.",
 		},

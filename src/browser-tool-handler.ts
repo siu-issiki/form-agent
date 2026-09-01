@@ -57,7 +57,7 @@ export class BrowserToolCoordinator {
 	): Promise<void> {
 		const operation = this.#operationTail.then(async () => {
 			if (this.#closed) throw new BrowserToolInputError();
-			const tools = await this.#getTools(jobId, runToken);
+			const { tools } = await this.#getToolsAndJob(jobId, runToken);
 			await tools.validateSubmit(readElementId(params));
 		});
 		this.#operationTail = operation.then(
@@ -76,7 +76,7 @@ export class BrowserToolCoordinator {
 		if (this.#closed) {
 			throw new BrowserToolInputError();
 		}
-		const tools = await this.#getTools(jobId, runToken);
+		const { job, tools } = await this.#getToolsAndJob(jobId, runToken);
 		switch (tool) {
 			case "navigate":
 				await tools.navigate(readString(params, "url", 2_048));
@@ -89,13 +89,13 @@ export class BrowserToolCoordinator {
 			case "fill":
 				await tools.fill(
 					readElementId(params),
-					readString(params, "value", 8_192, true),
+					readPayloadValue(job, params, 8_192),
 				);
 				return { result: { ok: true } };
 			case "select":
 				await tools.select(
 					readElementId(params),
-					readString(params, "value", 2_048),
+					readPayloadValue(job, params, 2_048),
 				);
 				return { result: { ok: true } };
 			case "submit": {
@@ -115,10 +115,10 @@ export class BrowserToolCoordinator {
 		await driver?.close?.();
 	}
 
-	async #getTools(
+	async #getToolsAndJob(
 		jobId: string,
 		runToken: string,
-	): Promise<RestrictedBrowserTools> {
+	): Promise<{ job: Job; tools: RestrictedBrowserTools }> {
 		const scopeKey = `${jobId}\u0000${runToken}`;
 		const store = new D1JobStore(this.db);
 		const job = await store.find(jobId);
@@ -129,7 +129,7 @@ export class BrowserToolCoordinator {
 			if (this.#scopeKey !== scopeKey) {
 				throw new BrowserToolInputError();
 			}
-			return this.#tools;
+			return { job, tools: this.#tools };
 		}
 
 		const driver = await this.createDriver(job);
@@ -147,12 +147,36 @@ export class BrowserToolCoordinator {
 			this.#driver = driver;
 			this.#tools = tools;
 			this.#scopeKey = scopeKey;
-			return tools;
+			return { job, tools };
 		} catch (error) {
 			await driver.close?.().catch(() => undefined);
 			throw error;
 		}
 	}
+}
+
+function readPayloadValue(
+	job: Job,
+	params: BrowserToolParams,
+	maxLength: number,
+): string {
+	const payloadKey = readString(params, "payloadKey", 64);
+	if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(payloadKey)) {
+		throw new BrowserToolInputError();
+	}
+	const formValues = job.payload.formValues;
+	if (!isRecord(formValues) || !Object.hasOwn(formValues, payloadKey)) {
+		throw new BrowserToolInputError();
+	}
+	const value = formValues[payloadKey];
+	if (
+		typeof value !== "string" ||
+		value.length === 0 ||
+		value.length > maxLength
+	) {
+		throw new BrowserToolInputError();
+	}
+	return value;
 }
 
 function readElementId(params: BrowserToolParams): string {
@@ -178,6 +202,10 @@ function readString(
 		throw new BrowserToolInputError();
 	}
 	return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export type { BrowserObservation };

@@ -14,6 +14,7 @@ import {
 	denyRelatedBrowserTargets,
 	HAS_SAME_FORM_OWNER_FUNCTION,
 	IS_COMPOSED_DESCENDANT_FUNCTION,
+	isPayloadIndependentClickTarget,
 } from "../src/browser-use-cdp-driver";
 
 describe("BrowserUse CDP payload and DOM discovery", () => {
@@ -135,6 +136,20 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		expect(isComposedDescendant.call(target, child)).toBe(true);
 		expect(isComposedDescendant.call(target, shadowChild)).toBe(true);
 		expect(isComposedDescendant.call(target, overlay)).toBe(false);
+	});
+
+	test("allows click only for a non-value button control", () => {
+		expect(isPayloadIndependentClickTarget("button", "button")).toBe(true);
+		for (const [tag, type] of [
+			["input", "checkbox"],
+			["input", "radio"],
+			["input", "button"],
+			["select", "select-one"],
+			["textarea", "textarea"],
+			["button", "reset"],
+		] as const) {
+			expect(isPayloadIndependentClickTarget(tag, type)).toBe(false);
+		}
 	});
 
 	test("pauses and closes related worker and popup targets", async () => {

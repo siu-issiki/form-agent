@@ -6,7 +6,10 @@ import {
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { AgentExecutionError, type AgentExecutor } from "../src/agent-executor";
-import { BrowserToolCoordinator } from "../src/browser-tool-handler";
+import {
+	BrowserToolCoordinator,
+	BrowserToolInputError,
+} from "../src/browser-tool-handler";
 import { BrowserUseCdpPayloadTooLargeError } from "../src/browser-use-cdp";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobInput } from "../src/job";
@@ -16,6 +19,8 @@ import {
 	type BrowserSubmitResult,
 	type RestrictedBrowserDriver,
 } from "../src/restricted-browser";
+import { TEST_FIXTURE_FORM_VALUES } from "../src/test-fixture-contract";
+import { handleTestFixtureRequest } from "../src/test-fixture-worker";
 import worker, {
 	consumeJobBatch,
 	handleHttpRequest,
@@ -30,7 +35,7 @@ const input: JobInput = {
 	companyName: "Example Inc.",
 	targetUrl: "https://form-agent.dev/contact",
 	targetDomain: "form-agent.dev",
-	payload: { message: "Hello" },
+	payload: { formValues: { message: "Hello" } },
 };
 
 test("keeps agent dry-run enabled unless production submission is explicitly enabled", () => {
@@ -41,6 +46,7 @@ test("keeps agent dry-run enabled unless production submission is explicitly ena
 
 beforeEach(async () => {
 	await env.DB.batch([
+		env.DB.prepare("DELETE FROM test_fixture_submissions"),
 		env.DB.prepare("DELETE FROM events"),
 		env.DB.prepare("DELETE FROM results"),
 		env.DB.prepare("DELETE FROM jobs"),
@@ -220,7 +226,11 @@ describe("Job HTTP API", () => {
 			jobRequest(
 				"POST",
 				"/jobs",
-				{ ...input, companyName: "Other Inc.", payload: { message: "Other" } },
+				{
+					...input,
+					companyName: "Other Inc.",
+					payload: { formValues: { message: "Other" } },
+				},
 				apiToken,
 			),
 			apiEnv,
@@ -250,11 +260,22 @@ describe("Job HTTP API", () => {
 			),
 			apiEnv,
 		);
+		const legacyPayload = await handleHttpRequest(
+			jobRequest(
+				"POST",
+				"/jobs",
+				{ ...input, id: "job-003", payload: { message: "Legacy" } },
+				apiToken,
+			),
+			apiEnv,
+		);
 
 		expect(invalidDomain.status).toBe(400);
 		expect(await invalidDomain.json()).toEqual({ error: "INVALID_JOB" });
 		expect(invalidPayload.status).toBe(400);
 		expect(await invalidPayload.json()).toEqual({ error: "INVALID_JOB" });
+		expect(legacyPayload.status).toBe(400);
+		expect(await legacyPayload.json()).toEqual({ error: "INVALID_JOB" });
 		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
 		expect(queued).toEqual([]);
 	});
@@ -304,6 +325,123 @@ function jobRequest(
 	return new Request(`https://form-agent.test${pathname}`, init);
 }
 
+function fixturePost(url: string, values: Record<string, string>): Request {
+	return new Request(url, {
+		method: "POST",
+		headers: { "content-type": "application/x-www-form-urlencoded" },
+		body: new URLSearchParams(values),
+	});
+}
+
+describe("managed test fixture", () => {
+	const fixtureToken = "fixture-api-token";
+	const fixtureJobId = "agent-submit-e2e-00000000-0000-4000-8000-000000000001";
+	const fixtureUrl = `https://form-agent-test-fixture.test/contact?jobId=${fixtureJobId}`;
+	const fixtureInput: JobInput = {
+		id: fixtureJobId,
+		companyId: "managed-test-fixture",
+		companyName: "Form Agent managed fixture",
+		targetUrl: fixtureUrl,
+		targetDomain: "form-agent-test-fixture.test",
+		payload: { formValues: TEST_FIXTURE_FORM_VALUES },
+	};
+	const fixtureEnv = { DB: env.DB, FIXTURE_API_TOKEN: fixtureToken };
+
+	test("serves an empty form only for the matching managed job", async () => {
+		const missing = await handleTestFixtureRequest(
+			new Request(fixtureUrl),
+			fixtureEnv,
+		);
+		expect(missing.status).toBe(404);
+
+		const store = new D1JobStore(env.DB);
+		await store.create(fixtureInput, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(
+			fixtureJobId,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		const response = await handleTestFixtureRequest(
+			new Request(fixtureUrl),
+			fixtureEnv,
+		);
+		const html = await response.text();
+
+		expect(response.status).toBe(200);
+		expect(response.headers.get("content-security-policy")).toContain(
+			"form-action 'self'",
+		);
+		expect(html).toContain('name="email"');
+		expect(html).toContain('name="message"');
+		expect(html).not.toContain(TEST_FIXTURE_FORM_VALUES.email);
+		expect(html).not.toContain(TEST_FIXTURE_FORM_VALUES.message);
+	});
+
+	test("accepts only exact fixture values after submission authorization", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(fixtureInput, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(
+			fixtureJobId,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		const submitUrl = fixtureUrl.replace("/contact?", "/contact/submit?");
+		const unauthorized = await handleTestFixtureRequest(
+			fixturePost(submitUrl, TEST_FIXTURE_FORM_VALUES),
+			fixtureEnv,
+		);
+		expect(unauthorized.status).toBe(409);
+
+		await store.claimSubmission(
+			fixtureJobId,
+			"run-token-1",
+			"2026-08-28T00:00:02.000Z",
+		);
+		const invalid = await handleTestFixtureRequest(
+			fixturePost(submitUrl, {
+				...TEST_FIXTURE_FORM_VALUES,
+				message: "invented",
+			}),
+			fixtureEnv,
+		);
+		expect(invalid.status).toBe(400);
+		const oversized = await handleTestFixtureRequest(
+			fixturePost(submitUrl, {
+				...TEST_FIXTURE_FORM_VALUES,
+				message: "x".repeat(16 * 1024 + 1),
+			}),
+			fixtureEnv,
+		);
+		expect(oversized.status).toBe(400);
+
+		const submitted = await handleTestFixtureRequest(
+			fixturePost(submitUrl, TEST_FIXTURE_FORM_VALUES),
+			fixtureEnv,
+		);
+		expect(submitted.status).toBe(200);
+		expect(await submitted.text()).toContain("送信が完了しました");
+
+		const unauthenticatedStatus = await handleTestFixtureRequest(
+			new Request(
+				`https://form-agent-test-fixture.test/submissions/${fixtureJobId}`,
+			),
+			fixtureEnv,
+		);
+		expect(unauthenticatedStatus.status).toBe(401);
+		const status = await handleTestFixtureRequest(
+			new Request(
+				`https://form-agent-test-fixture.test/submissions/${fixtureJobId}`,
+				{ headers: { authorization: `Bearer ${fixtureToken}` } },
+			),
+			fixtureEnv,
+		);
+		expect(await status.json()).toMatchObject({
+			jobId: fixtureJobId,
+			postCount: 1,
+		});
+	});
+});
+
 describe("BrowserToolCoordinator", () => {
 	test("keeps one run-scoped browser and persists submit through RestrictedBrowserTools", async () => {
 		const store = new D1JobStore(env.DB);
@@ -324,7 +462,7 @@ describe("BrowserToolCoordinator", () => {
 		);
 		const filled = await coordinator.execute(input.id, "run-token-1", "fill", {
 			elementId: "fa-0-0",
-			value: "Hello",
+			payloadKey: "message",
 		});
 		expect(filled).toEqual({ result: { ok: true } });
 		const submitResult = await coordinator.execute(
@@ -345,7 +483,47 @@ describe("BrowserToolCoordinator", () => {
 		expect("runToken" in (submitResult as { job: object }).job).toBe(false);
 		expect(createCount).toBe(1);
 		expect(driver.restrictedDomain).toBe(input.targetDomain);
+		expect(driver.filledValues).toEqual(["Hello"]);
 		expect(driver.closed).toBe(true);
+	});
+
+	test("rejects raw, missing, and non-form payload values", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(
+			{
+				...input,
+				payload: {
+					...input.payload,
+					instruction: "Do not enter this control value",
+				},
+			},
+			"2026-08-28T00:00:00.000Z",
+		);
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const coordinator = new BrowserToolCoordinator(
+			env.DB,
+			async () => new WorkerFakeBrowserDriver(),
+		);
+
+		await expect(
+			coordinator.execute(input.id, "run-token-1", "fill", {
+				elementId: "fa-0-0",
+				value: "invented",
+			}),
+		).rejects.toBeInstanceOf(BrowserToolInputError);
+		await expect(
+			coordinator.execute(input.id, "run-token-1", "fill", {
+				elementId: "fa-0-0",
+				payloadKey: "instruction",
+			}),
+		).rejects.toBeInstanceOf(BrowserToolInputError);
+		await expect(
+			coordinator.execute(input.id, "run-token-1", "fill", {
+				elementId: "fa-0-0",
+				payloadKey: "missing",
+			}),
+		).rejects.toBeInstanceOf(BrowserToolInputError);
+		await coordinator.close();
 	});
 });
 
@@ -357,6 +535,7 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	requireObservationForSubmit = false;
 	validateSubmitCount = 0;
 	submitCount = 0;
+	filledValues: string[] = [];
 
 	async close(): Promise<void> {
 		this.closed = true;
@@ -375,7 +554,9 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 		return { url: this.url, forms: [] };
 	}
 	async clickNonSubmit(): Promise<void> {}
-	async fill(): Promise<void> {}
+	async fill(_elementId: string, value: string): Promise<void> {
+		this.filledValues.push(value);
+	}
 	async select(): Promise<void> {}
 	async validateSubmit(): Promise<void> {
 		this.validateSubmitCount += 1;
@@ -404,14 +585,17 @@ describe("ResponsesAgentExecutor", () => {
 		);
 		if (!job) throw new Error("Expected a claimed job");
 		const requestBodies: Array<{
-			tools?: Array<{ name?: string }>;
+			tools?: Array<{
+				name?: string;
+				parameters?: { properties?: Record<string, unknown> };
+			}>;
 			instructions?: string;
 		}> = [];
 		const responses = [
 			functionResponse("call-observe", "observe", {}),
 			functionResponse("call-fill", "fill", {
 				elementId: "fa-0-0",
-				value: "送信なしテスト",
+				payloadKey: "message",
 			}),
 			functionResponse("call-submit", "submit", {
 				elementId: "fa-0-1",
@@ -452,6 +636,11 @@ describe("ResponsesAgentExecutor", () => {
 		expect(requestBodies[0]?.tools?.map((tool) => tool.name)).toContain(
 			"submit",
 		);
+		const fillTool = requestBodies[0]?.tools?.find(
+			(tool) => tool.name === "fill",
+		);
+		expect(fillTool?.parameters?.properties).toHaveProperty("payloadKey");
+		expect(fillTool?.parameters?.properties).not.toHaveProperty("value");
 		expect(requestBodies[0]?.instructions).toContain("This is a dry-run");
 		expect(driver.validateSubmitCount).toBe(1);
 		expect(driver.submitCount).toBe(0);
@@ -832,7 +1021,7 @@ describe("ResponsesAgentExecutor", () => {
 		const responses = [
 			functionResponse("call-fill", "fill", {
 				elementId: "fa-0-0",
-				value: "Hello",
+				payloadKey: "message",
 			}),
 			functionResponse("call-submit", "submit", {
 				elementId: "fa-0-1",
