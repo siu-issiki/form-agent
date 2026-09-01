@@ -21,6 +21,7 @@ const MAX_OBSERVED_FIELDS = 100;
 const MAX_DOM_DISCOVERY_ATTEMPTS = 5;
 const DOM_DISCOVERY_RETRY_DELAY_MS = 500;
 const CONFIRMATION_WAIT_MS = 5_000;
+const SUBMISSION_PERMISSION_WINDOW_MS = 250;
 
 interface TargetInfo {
 	targetId: string;
@@ -365,8 +366,6 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				error,
 			);
 		}
-		this.#submissionRequestAllowed = true;
-		this.#submissionRequestCount = 0;
 		try {
 			try {
 				await this.#activateSubmitElement(
@@ -705,24 +704,45 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async #activateSubmitElement(backendNodeId: number): Promise<void> {
-		const unobscured = await this.#callFunctionOnElement<boolean>(
-			backendNodeId,
-			IS_SUBMIT_UNOBSCURED_FUNCTION,
-		);
-		if (!unobscured) throw new BrowserElementError();
+		await this.#send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
+		await this.#nextAnimationFrame();
+		if (
+			!(await this.#callFunctionOnElement<boolean>(
+				backendNodeId,
+				IS_SUBMIT_UNOBSCURED_FUNCTION,
+			))
+		) {
+			throw new BrowserElementError();
+		}
 		await this.#send("DOM.focus", { backendNodeId });
-		const focused = await this.#callFunctionOnElement<boolean>(
-			backendNodeId,
-			IS_ELEMENT_FOCUSED_FUNCTION,
-		);
-		if (!focused) throw new BrowserElementError();
-		await this.#send("Input.dispatchKeyEvent", {
-			type: "keyDown",
-			key: "Enter",
-			code: "Enter",
-			windowsVirtualKeyCode: 13,
-			nativeVirtualKeyCode: 13,
-		});
+		await this.#nextAnimationFrame();
+		const [unobscured, focused] = await Promise.all([
+			this.#callFunctionOnElement<boolean>(
+				backendNodeId,
+				IS_SUBMIT_UNOBSCURED_FUNCTION,
+			),
+			this.#callFunctionOnElement<boolean>(
+				backendNodeId,
+				IS_ELEMENT_FOCUSED_FUNCTION,
+			),
+		]);
+		if (!unobscured || !focused) throw new BrowserElementError();
+
+		this.#submissionRequestCount = 0;
+		this.#submissionRequestAllowed = true;
+		try {
+			await runSubmissionActivationWithinPermissionWindow(() =>
+				this.#send("Input.dispatchKeyEvent", {
+					type: "keyDown",
+					key: "Enter",
+					code: "Enter",
+					windowsVirtualKeyCode: 13,
+					nativeVirtualKeyCode: 13,
+				}).then(() => this.#nextAnimationFrame().catch(() => undefined)),
+			);
+		} finally {
+			this.#submissionRequestAllowed = false;
+		}
 		await this.#send("Input.dispatchKeyEvent", {
 			type: "keyUp",
 			key: "Enter",
@@ -730,6 +750,12 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			windowsVirtualKeyCode: 13,
 			nativeVirtualKeyCode: 13,
 		}).catch(() => undefined);
+	}
+
+	#nextAnimationFrame(): Promise<unknown> {
+		return this.#evaluate(
+			"new Promise((resolve) => requestAnimationFrame(() => resolve()))",
+		);
 	}
 
 	async #isComposedDescendant(
@@ -796,6 +822,16 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 		return this.connection.send<TResult>(method, params, this.sessionId);
 	}
+}
+
+export async function runSubmissionActivationWithinPermissionWindow(
+	activate: () => Promise<unknown>,
+	wait: (milliseconds: number) => Promise<void> = delay,
+): Promise<void> {
+	const permissionDeadline = wait(SUBMISSION_PERMISSION_WINDOW_MS);
+	const activation = activate();
+	void activation.catch(() => undefined);
+	await Promise.race([activation, permissionDeadline]);
 }
 
 export async function readSubmissionConfirmation(
