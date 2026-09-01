@@ -1,6 +1,6 @@
 # フォーム営業自動化アーキテクチャ
 
-- ステータス: PoC 実装中（production の単一ジョブ dry-run E2E 完了）
+- ステータス: PoC 実装中（production dry-run / 使い捨てサイト実送信 E2E 完了）
 - 最終更新: 2026-09-02
 - 対象: `siu-issiki/form-agent`
 
@@ -15,11 +15,11 @@
 | 領域 | 状態 | 現在の到達点 |
 | --- | --- | --- |
 | ジョブ状態管理 | 実装済み | D1 の条件付き更新と `runToken` で実行権・送信権を制御 |
-| Queue / DLQ | 実装済み | ローカル Queue、retry、DLQ、重複配信テスト |
+| Queue / DLQ | 実装済み | production Queue、retry、DLQ、実POSTを伴う重複配信テスト |
 | Agent 実行 | 実装済み | Worker から OpenAI Responses API の function calling を直接実行 |
 | 推論 Provider | 部分実装 | OpenAI Responses API のみ。モデル、回数、本文、出力 token を Worker 側で制限 |
 | BrowserUse | 実装済み | standalone browser へ CDP 接続し、用途限定ツールだけを公開 |
-| E2E | 部分実装 | production Worker 直実行の AnyReach dry-run E2E に成功。実送信 E2E は未実施 |
+| E2E | 部分実装 | AnyReach dry-runと使い捨てサイト実送信3件、重複配送、送信後`uncertain`をproductionで検証済み。実サイト送信は未実施 |
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値を検証。一覧・キャンセルは未実装 |
 | Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
 | 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ イベント |
@@ -69,6 +69,8 @@ Cloudflare D1
 ```
 
 PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外部の OpenAI / BrowserUse を組み合わせる。本番は production 環境だけを対象とし、D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済みである。2026-09-02 に `https://anyreach.co.jp/contact` を対象とした production dry-run を実行し、`pending → running → prohibited`、`DRY_RUN_COMPLETE`、1 attempt、8 Provider requests、BrowserUse active session 0 件を確認した。`submitting` / `sent` には遷移しておらず、フォーム送信は行っていない。
+
+同日に使い捨てWorkerだけを対象としたproduction実送信E2Eを実行した。独立した3ジョブはすべて`sent`、1 attempt、8 Provider requests、受信POST 1件、mouse activation、`requestObserved=true`、`hitTestAttempts=1`で完了した。同一IDをpause中に2回登録した重複配送試験も、API応答`201 → 200`、`sent`、1 attempt、受信POST 1件で完了した。完了表示を返さない送信先ではPOSTを1件受信した後に`uncertain`、`SUBMIT_RESULT_UNKNOWN`、1 attemptとなり、自動再送しないことを確認した。検証後はproductionを`AGENT_DRY_RUN=true`、`AGENT_MODEL=gpt-5.6-luna`へ戻し、main QueueとDLQのbacklog 0件、active job 0件を確認して使い捨てWorkerを削除した。
 
 ## コンポーネント責務
 
@@ -142,7 +144,7 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 | `submit` | D1 の送信権取得後に 1 回だけ送信する |
 | `finish` | 送信せず、構造化された終端結果を返す |
 
-driver が submit control と識別した要素は通常の `click` で操作できない。`submit` は対象要素を検証してから D1 を `running` から `submitting` へ更新し、最初の非safe HTTP methodだけを許可する。同一ドメインの GET 型副作用はこの制御の対象外である。
+driver が submit control と識別した要素は通常の `click` で操作できない。`submit` は対象要素を検証してから D1 を `running` から `submitting` へ更新し、最初の非safe HTTP methodだけを許可する。mouse activationのhit testは1 animation frameごとに最大3回行い、成功時の試行回数を`browser_submit_activation.hitTestAttempts`へ記録する。同一ドメインの GET 型副作用はこの制御の対象外である。
 
 ### Cloudflare D1
 
@@ -248,7 +250,7 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 - モデルが`fill` / `select`で指定できるのは`payload.formValues`内のキーだけとし、実際の値は信頼済みhandlerがD1から取得する。
 - ジョブ間で browser session、cookie、入力データを共有しない。
 
-`submitting` 中に Worker が停止し、結果保存まで到達しなかった場合は自動再送せず、人間の確認対象にする。現在は人手照合の API / UI / runbook が未実装である。
+`submitting` 中に Worker が停止し、結果保存まで到達しなかった場合は自動再送せず、人間の確認対象にする。人手照合、DLQ確認、緊急停止、安全な再開のrunbookは [operations.md](operations.md) に定義済みである。照合用の専用 API / UI は未実装である。
 
 ### Agent への安全指示
 
@@ -276,7 +278,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 - Worker は認証不要の `GET /health`、Bearer 認証付きの `POST /jobs` と `GET /jobs/:id` を持つ。
 - `JOB_API_TOKEN` は単一の共有 secret であり、利用者別の認証・権限・失効管理は行わない。
 - ジョブ一覧、キャンセル API は未実装である。
-- `submitting` / `uncertain` の照合、DLQ の確認・再投入、緊急停止の運用機能は未実装である。
+- `submitting` / `uncertain` の照合、DLQ確認、緊急停止、安全な再開はrunbookで運用する。専用 API / UIと自動再投入は未実装であり、再実行時は既存ジョブを変更せず新しいジョブIDを使う。
 - payload、理由、ログ、DOM snapshot の保存期間・マスキング方針は未決定である。
 
 ### Provider / observability
@@ -329,15 +331,17 @@ PoC はまず 1 並列の production dry-run で開始し、観測結果をも�
 - [x] `fill` / `select`の入力値を`payload.formValues`由来に限定する。
 - [x] production から旧 Sandbox Durable Object を削除する。
 - [x] CI で typecheck、lint、unit / Workers test、deploy dry-run を実行する。
+- [x] 使い捨てサイトでproduction実送信E2Eを3件実行し、`submitting`から`sent`、受信POST、送信ログを照合する。
+- [x] Queue重複配送時に実POSTが1回だけであることをproductionで検証する。
+- [x] 送信後に完了確認できない場合に`uncertain`となり、自動再送しないことをproductionで検証する。
+- [x] `submitting` / `uncertain` / DLQの照合と緊急停止・安全な再開のrunbookを作る。
 
 未完了:
 
 - [x] 認証付きジョブ登録・取得 API を実装する。
-- [ ] 実送信 E2E の対象と手順を決め、`submitting` から `sent` まで検証する。
-- [ ] Queue 重複配信時に実 POST が 1 回だけであることを検証する。
-- [ ] `submitting` 中断時に `uncertain` となり再送しないことを検証する。
+- [ ] `submitting` 中にWorkerを強制停止し、状態が`submitting`のまま残って再配信でも送信されないことを検証する。
 - [ ] 状態遷移、理由、時間、token、BrowserUse 待ち時間を記録する。
-- [ ] `submitting` / `uncertain` / DLQ の人手確認手順を作る。
+- [ ] productionで`hitTestAttempts=2`または`3`となる自然な再試行を観測する。
 - [ ] Cloudflare 上で送信なし 5 並列を実行し、rate limit と原価を計測する。
 
 ### フェーズ 2: 5 並列
@@ -366,11 +370,12 @@ PoC はまず 1 並列の production dry-run で開始し、観測結果をも�
 ### 実装
 
 - 利用者別の認証・権限管理と、ジョブ一覧・キャンセル API。
-- 実送信 E2E の対象と手順の決定。
+- 実Workerを`submitting`中に停止した場合に、`submitting`のまま再配信がackされ、再送されないことの検証。
+- productionでhit testの2回目または3回目による回復を観測する。
 - 禁止判定の証跡と送信前確認を信頼済みhandlerで検証する境界。
 - 同一ドメインの GET 型副作用を submit gate 外から起動させない設計。
 - 状態遷移、tool、token、時間、費用の observability。
-- `submitting` / `uncertain` の照合、DLQ 再投入、緊急停止の運用機能。
+- `submitting` / `uncertain` の照合を支援する専用 API / UI。
 - 実 form の cross-origin iframe、確認画面、複数ページ、添付、CAPTCHA 対応方針と Shadow DOM の互換性検証。
 - Shadow DOM 内の禁止文言を含む可視テキストの収集。
 - SPA の遅延描画で無関係なbuttonだけが先に現れる場合のフォーム探索再試行。
