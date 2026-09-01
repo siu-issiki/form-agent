@@ -372,7 +372,7 @@ describe("BrowserUseCdpDriver submission confirmation", () => {
 		});
 	});
 
-	test("bounds the submission request permission window when keydown does not resolve", async () => {
+	test("bounds the submission request permission window when activation does not resolve", async () => {
 		let waitedMilliseconds: number | null = null;
 		const neverResolvingKeyDown = new Promise<never>(() => undefined);
 		const neverObservedRequest = new Promise<never>(() => undefined);
@@ -385,7 +385,7 @@ describe("BrowserUseCdpDriver submission confirmation", () => {
 			},
 		);
 
-		expect(waitedMilliseconds).toBe(250);
+		expect(waitedMilliseconds).toBe(2_000);
 	});
 
 	test("keeps the permission window open until a request is observed", async () => {

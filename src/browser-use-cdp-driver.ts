@@ -22,7 +22,7 @@ const MAX_OBSERVED_FIELDS = 100;
 const MAX_DOM_DISCOVERY_ATTEMPTS = 5;
 const DOM_DISCOVERY_RETRY_DELAY_MS = 500;
 const CONFIRMATION_WAIT_MS = 5_000;
-const SUBMISSION_PERMISSION_WINDOW_MS = 250;
+const SUBMISSION_PERMISSION_WINDOW_MS = 2_000;
 
 export const ENTER_KEY_DOWN_EVENT = {
 	type: "keyDown",
@@ -785,6 +785,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		activate: () => Promise<unknown>,
 		activationStrategy: SubmitActivationStrategy,
 	): Promise<void> {
+		const startedAt = Date.now();
 		let resolveSubmissionRequestObserved: () => void = () => undefined;
 		const submissionRequestObserved = new Promise<void>((resolve) => {
 			resolveSubmissionRequestObserved = resolve;
@@ -801,6 +802,14 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			this.#submissionRequestAllowed = false;
 			this.#submissionRequestObserved = undefined;
 			resolveSubmissionRequestObserved();
+			console.log(
+				JSON.stringify({
+					event: "browser_submit_activation",
+					activationStrategy,
+					requestObserved: this.#submissionRequestCount > 0,
+					durationMs: Date.now() - startedAt,
+				}),
+			);
 		}
 		if (activationStrategy === "enter") {
 			await this.#send("Input.dispatchKeyEvent", {
