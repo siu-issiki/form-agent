@@ -38,7 +38,6 @@ async function run(): Promise<void> {
 
 	const token = crypto.randomUUID();
 	const workerName = `form-agent-e2e-${token}`;
-	const initialContainerIds = await listE2eContainerIds(workerName);
 	const port = await availablePort();
 	const persistPath = await mkdtemp(join(tmpdir(), "form-agent-e2e-"));
 	const baseUrl = `http://127.0.0.1:${port}`;
@@ -144,7 +143,6 @@ async function run(): Promise<void> {
 		if (devProcess) {
 			await stopProcess(devProcess);
 		}
-		await removeNewE2eContainers(workerName, initialContainerIds);
 		await rm(persistPath, { recursive: true, force: true });
 	}
 }
@@ -273,39 +271,6 @@ async function runCommand(command: string[]): Promise<string> {
 		);
 	}
 	return stdout;
-}
-
-async function listE2eContainerIds(workerName: string): Promise<Set<string>> {
-	if (!/^form-agent-e2e-[a-f0-9-]{36}$/.test(workerName)) {
-		throw new Error("Invalid E2E Worker name");
-	}
-	const output = await runCommand([
-		"docker",
-		"ps",
-		"-aq",
-		"--filter",
-		`name=workerd-${workerName}-FormAgentSandbox-`,
-	]);
-	const ids = output
-		.split(/\s+/)
-		.filter(Boolean)
-		.map((id) => {
-			if (!/^[a-f0-9]{12,64}$/.test(id)) {
-				throw new Error("Docker returned an invalid E2E container identifier");
-			}
-			return id;
-		});
-	return new Set(ids);
-}
-
-async function removeNewE2eContainers(
-	workerName: string,
-	initialIds: Set<string>,
-): Promise<void> {
-	const currentIds = await listE2eContainerIds(workerName);
-	const createdIds = [...currentIds].filter((id) => !initialIds.has(id));
-	if (createdIds.length === 0) return;
-	await runCommand(["docker", "rm", "--force", ...createdIds]);
 }
 
 async function availablePort(): Promise<number> {

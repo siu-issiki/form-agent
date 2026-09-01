@@ -6,27 +6,15 @@ import {
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, test } from "vitest";
 import { AgentExecutionError, type AgentExecutor } from "../src/agent-executor";
-import { AgentToolGateway } from "../src/agent-tool-service";
-import {
-	BrowserToolCoordinator,
-	type BrowserToolName,
-} from "../src/browser-tool-handler";
+import { BrowserToolCoordinator } from "../src/browser-tool-handler";
 import { D1JobStore } from "../src/d1-job-store";
-import {
-	handleAgentToolRequest,
-	proxyOpenAiRequest,
-} from "../src/form-agent-sandbox";
 import type { JobInput } from "../src/job";
-import type {
-	BrowserSubmitResult,
-	RestrictedBrowserDriver,
-} from "../src/restricted-browser";
+import { ResponsesAgentExecutor } from "../src/responses-agent-executor";
 import {
-	type AgentSandboxLike,
-	parseRunnerResult,
-	SandboxAgentExecutor,
-	sandboxIdForJob,
-} from "../src/sandbox-agent-executor";
+	BrowserElementError,
+	type BrowserSubmitResult,
+	type RestrictedBrowserDriver,
+} from "../src/restricted-browser";
 import worker, {
 	consumeJobBatch,
 	handleHttpRequest,
@@ -101,6 +89,34 @@ describe("D1JobStore", () => {
 		expect(uncertain?.result?.reasonCode).toBe("SUBMIT_RESULT_UNKNOWN");
 		expect(repeatedResult).toBeNull();
 		expect(duplicate).toBeNull();
+	});
+
+	test("enforces the persisted provider request limit", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+
+		const first = await store.claimProviderRequest(
+			input.id,
+			"run-token-1",
+			1,
+			"2026-08-28T00:00:02.000Z",
+		);
+		const repeated = await store.claimProviderRequest(
+			input.id,
+			"run-token-1",
+			1,
+			"2026-08-28T00:00:03.000Z",
+		);
+
+		expect(first).toBe(true);
+		expect(repeated).toBe(false);
+		const counter = await env.DB.prepare(
+			"SELECT provider_request_count FROM jobs WHERE id = ?",
+		)
+			.bind(input.id)
+			.first<{ provider_request_count: number }>();
+		expect(counter?.provider_request_count).toBe(1);
 	});
 });
 
@@ -280,471 +296,6 @@ function jobRequest(
 	return new Request(`https://form-agent.test${pathname}`, init);
 }
 
-describe("AgentToolGateway", () => {
-	const toolNow = () => "2026-08-28T00:00:02.000Z";
-
-	test("scopes job access and submission permission to the current run token", async () => {
-		const store = new D1JobStore(env.DB);
-		const gateway = new AgentToolGateway(env.DB, toolNow);
-		await store.create(input, "2026-08-28T00:00:00.000Z");
-		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
-
-		const stale = await gateway.find(input.id, "run-token-2");
-		const running = await gateway.find(input.id, "run-token-1");
-		const submitting = await gateway.claimSubmission(input.id, "run-token-1");
-
-		expect(stale).toBeNull();
-		expect(running?.status).toBe("running");
-		expect(submitting?.status).toBe("submitting");
-	});
-
-	test("records a sent result only for the persisted target domain", async () => {
-		const store = new D1JobStore(env.DB);
-		const gateway = new AgentToolGateway(env.DB, toolNow);
-		await store.create(input, "2026-08-28T00:00:00.000Z");
-		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
-		await gateway.claimSubmission(input.id, "run-token-1");
-
-		await expect(
-			gateway.recordSent(input.id, "run-token-1", "https://evil.test/collect"),
-		).rejects.toThrow();
-		const sent = await gateway.recordSent(
-			input.id,
-			"run-token-1",
-			input.targetUrl,
-		);
-
-		expect(sent?.status).toBe("sent");
-		expect(sent?.result?.formUrl).toBe(input.targetUrl);
-	});
-
-	test("rejects stale tokens and unbounded uncertain reasons", async () => {
-		const store = new D1JobStore(env.DB);
-		const gateway = new AgentToolGateway(env.DB, toolNow);
-		await store.create(input, "2026-08-28T00:00:00.000Z");
-		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
-
-		const stale = await gateway.recordUncertain(
-			input.id,
-			"run-token-2",
-			"FORM_UNCLEAR",
-			"The form purpose could not be confirmed.",
-		);
-		await expect(
-			gateway.recordUncertain(
-				input.id,
-				"run-token-1",
-				"invalid-code",
-				"x".repeat(1_001),
-			),
-		).rejects.toThrow();
-
-		expect(stale).toBeNull();
-	});
-});
-
-describe("FormAgentSandbox outbound handlers", () => {
-	const openAiScope = {
-		jobId: input.id,
-		runToken: "run-token-1",
-		model: "gpt-5.4-mini",
-		maxRequests: 16,
-		maxOutputTokens: 4_096,
-	};
-
-	test("exposes only run-scoped job data", async () => {
-		const store = new D1JobStore(env.DB);
-		const gateway = new AgentToolGateway(
-			env.DB,
-			() => "2026-08-28T00:00:02.000Z",
-		);
-		await store.create(input, "2026-08-28T00:00:00.000Z");
-		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
-
-		const stale = await handleAgentToolRequest(
-			new Request("http://agent-tools.internal/job"),
-			gateway,
-			{ jobId: input.id, runToken: "run-token-2" },
-		);
-		const current = await handleAgentToolRequest(
-			new Request("http://agent-tools.internal/job"),
-			gateway,
-			{ jobId: input.id, runToken: "run-token-1" },
-		);
-		const rawClaim = await handleAgentToolRequest(
-			new Request("http://agent-tools.internal/submission/claim", {
-				method: "POST",
-			}),
-			gateway,
-			{ jobId: input.id, runToken: "run-token-1" },
-		);
-		const rawSent = await handleAgentToolRequest(
-			new Request("http://agent-tools.internal/submission/sent", {
-				method: "POST",
-				body: JSON.stringify({ formUrl: "https://evil.test/collect" }),
-			}),
-			gateway,
-			{ jobId: input.id, runToken: "run-token-1" },
-		);
-		expect(stale.status).toBe(404);
-		expect(current.status).toBe(200);
-		const currentBody = (await current.json()) as {
-			job: { runToken?: unknown };
-		};
-		expect(currentBody.job.runToken).toBeUndefined();
-		expect(rawClaim.status).toBe(404);
-		expect(rawSent.status).toBe(404);
-		expect((await store.find(input.id))?.status).toBe("running");
-	});
-
-	test("routes browser tools without exposing low-level submission mutations", async () => {
-		const calls: unknown[][] = [];
-		const browserTool = async (
-			tool: BrowserToolName,
-			params: Record<string, unknown>,
-		) => {
-			calls.push([tool, params]);
-			return { result: { ok: true } };
-		};
-		const navigate = await handleAgentToolRequest(
-			new Request("http://agent-tools.internal/browser/navigate", {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ url: input.targetUrl }),
-			}),
-			new AgentToolGateway(env.DB),
-			{ jobId: input.id, runToken: "run-token-1" },
-			browserTool,
-		);
-		const rawSent = await handleAgentToolRequest(
-			new Request("http://agent-tools.internal/submission/sent", {
-				method: "POST",
-			}),
-			new AgentToolGateway(env.DB),
-			{ jobId: input.id, runToken: "run-token-1" },
-			browserTool,
-		);
-
-		expect(navigate.status).toBe(200);
-		expect(calls).toEqual([["navigate", { url: input.targetUrl }]]);
-		expect(rawSent.status).toBe(404);
-	});
-
-	test("injects the OpenAI credential and enforces the run model budget", async () => {
-		let forwarded: Request | undefined;
-		const upstreamFetch = (async (request: RequestInfo | URL) => {
-			forwarded = new Request(request);
-			return new Response("ok");
-		}) as typeof fetch;
-		const response = await proxyOpenAiRequest(
-			new Request("http://api.openai.com/v1/responses", {
-				method: "POST",
-				headers: {
-					authorization: "Bearer sandbox-controlled",
-					cookie: "must-not-leave",
-					"content-type": "application/json",
-				},
-				body: JSON.stringify({ model: "gpt-5.4-mini" }),
-			}),
-			"worker-secret",
-			openAiScope,
-			async () => true,
-			upstreamFetch,
-		);
-
-		expect(response.status).toBe(200);
-		expect(forwarded?.url).toBe("https://api.openai.com/v1/responses");
-		expect(forwarded?.headers.get("authorization")).toBe(
-			"Bearer worker-secret",
-		);
-		expect(forwarded?.headers.get("cookie")).toBeNull();
-		expect(await forwarded?.json()).toMatchObject({
-			model: "gpt-5.4-mini",
-			max_output_tokens: 4_096,
-		});
-	});
-
-	test("denies unapproved provider endpoints", async () => {
-		const response = await proxyOpenAiRequest(
-			new Request("https://api.openai.com/v1/files", { method: "POST" }),
-			"worker-secret",
-			openAiScope,
-			async () => true,
-		);
-
-		expect(response.status).toBe(403);
-	});
-
-	test("denies model changes, remote tools, and requests beyond the D1 limit", async () => {
-		const store = new D1JobStore(env.DB);
-		const gateway = new AgentToolGateway(env.DB);
-		await store.create(input, "2026-08-28T00:00:00.000Z");
-		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
-		const request = (body: unknown) =>
-			new Request("https://api.openai.com/v1/responses", {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify(body),
-			});
-		const claim = () =>
-			gateway.claimProviderRequest(input.id, "run-token-1", 1);
-		const upstreamFetch = (async () => new Response("ok")) as typeof fetch;
-
-		const changedModel = await proxyOpenAiRequest(
-			request({ model: "gpt-5.4" }),
-			"worker-secret",
-			openAiScope,
-			claim,
-			upstreamFetch,
-		);
-		const remoteTool = await proxyOpenAiRequest(
-			request({ model: "gpt-5.4-mini", tools: [{ type: "web_search" }] }),
-			"worker-secret",
-			openAiScope,
-			claim,
-			upstreamFetch,
-		);
-		const first = await proxyOpenAiRequest(
-			request({ model: "gpt-5.4-mini" }),
-			"worker-secret",
-			openAiScope,
-			claim,
-			upstreamFetch,
-		);
-		const repeated = await proxyOpenAiRequest(
-			request({ model: "gpt-5.4-mini" }),
-			"worker-secret",
-			openAiScope,
-			claim,
-			upstreamFetch,
-		);
-
-		expect(changedModel.status).toBe(403);
-		expect(remoteTool.status).toBe(403);
-		expect(first.status).toBe(200);
-		expect(repeated.status).toBe(429);
-	});
-
-	test("denies multiple Chat Completions candidates", async () => {
-		const response = await proxyOpenAiRequest(
-			new Request("https://api.openai.com/v1/chat/completions", {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ model: "gpt-5.4-mini", n: 2 }),
-			}),
-			"worker-secret",
-			openAiScope,
-			async () => true,
-		);
-
-		expect(response.status).toBe(403);
-	});
-
-	test("rejects oversized provider request bodies before claiming budget", async () => {
-		let claimed = false;
-		const response = await proxyOpenAiRequest(
-			new Request("https://api.openai.com/v1/responses", {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({
-					model: "gpt-5.4-mini",
-					input: "x".repeat(128 * 1_024),
-				}),
-			}),
-			"worker-secret",
-			openAiScope,
-			async () => {
-				claimed = true;
-				return true;
-			},
-		);
-
-		expect(response.status).toBe(413);
-		expect(claimed).toBe(false);
-	});
-});
-
-describe("SandboxAgentExecutor", () => {
-	test("scopes outbound handlers before launching the bounded runner", async () => {
-		const store = new D1JobStore(env.DB);
-		await store.create(input, "2026-08-28T00:00:00.000Z");
-		const job = await store.claimRun(
-			input.id,
-			"run-token-1",
-			"2026-08-28T00:00:01.000Z",
-		);
-		if (!job) {
-			throw new Error("Expected a claimed job");
-		}
-		const handlerCalls: unknown[][] = [];
-		let sandboxId: string | undefined;
-		let launchEnv: Record<string, string> | undefined;
-		let destroyed = false;
-		let browserClosed = false;
-		const sandbox: AgentSandboxLike = {
-			async closeBrowser() {
-				browserClosed = true;
-			},
-			async setAllowedHosts(hosts) {
-				handlerCalls.push(["allowed", hosts]);
-			},
-			async setOutboundByHost(host, handler, params) {
-				handlerCalls.push([host, handler, params]);
-			},
-			async exec(_command, options) {
-				launchEnv = options.env;
-				return {
-					async output() {
-						return {
-							stdout: JSON.stringify({
-								outcome: "failed",
-								reasonCode: "FORM_NOT_FOUND",
-								reason: "No compatible form was found.",
-								retryable: false,
-							}),
-							stderr: "",
-							exitCode: 0,
-							timedOut: false,
-							truncated: false,
-						};
-					},
-					async kill() {},
-				};
-			},
-			async destroy() {
-				destroyed = true;
-			},
-		};
-		const executor = new SandboxAgentExecutor((id) => {
-			sandboxId = id;
-			return sandbox;
-		}, "gpt-5.4-mini");
-
-		const result = await executor.execute(
-			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
-			new AbortController().signal,
-		);
-
-		expect(result.outcome).toBe("failed");
-		expect(handlerCalls).toContainEqual([
-			"agent-tools.internal",
-			"agentTools",
-			{
-				jobId: input.id,
-				runToken: "run-token-1",
-				sandboxId: await sandboxIdForJob(input.id),
-			},
-		]);
-		expect(handlerCalls).toContainEqual([
-			"api.openai.com",
-			"openai",
-			{
-				jobId: input.id,
-				runToken: "run-token-1",
-				model: "gpt-5.4-mini",
-				maxRequests: 16,
-				maxOutputTokens: 4_096,
-			},
-		]);
-		expect(sandboxId).toBe(await sandboxIdForJob(input.id));
-		expect(launchEnv).toEqual({
-			FORM_AGENT_MODEL: "gpt-5.4-mini",
-			FORM_AGENT_MAX_OUTPUT_TOKENS: "4096",
-			FORM_AGENT_TOOL_BASE_URL: "http://agent-tools.internal",
-			OPENAI_API_KEY: "injected-by-worker-outbound-handler",
-		});
-		expect(destroyed).toBe(true);
-		expect(browserClosed).toBe(true);
-	});
-
-	test("kills a process obtained after the deadline before returning", async () => {
-		let resolveProcess:
-			| ((process: Awaited<ReturnType<AgentSandboxLike["exec"]>>) => void)
-			| undefined;
-		let markExecStarted: (() => void) | undefined;
-		const execStarted = new Promise<void>((resolve) => {
-			markExecStarted = resolve;
-		});
-		let killCount = 0;
-		let destroyed = false;
-		const sandbox: AgentSandboxLike = {
-			async setAllowedHosts() {},
-			async setOutboundByHost() {},
-			exec() {
-				markExecStarted?.();
-				return new Promise((resolve) => {
-					resolveProcess = resolve;
-				});
-			},
-			async destroy() {
-				destroyed = true;
-			},
-		};
-		const controller = new AbortController();
-		const executor = new SandboxAgentExecutor(() => sandbox, "gpt-5.4-mini");
-		const execution = executor.execute(
-			{
-				job: {
-					...input,
-					status: "running",
-					attemptCount: 1,
-					runToken: "run-token-1",
-					result: null,
-					createdAt: "2026-08-28T00:00:00.000Z",
-					updatedAt: "2026-08-28T00:00:01.000Z",
-				},
-				runToken: "run-token-1",
-				maxDurationMs: 60_000,
-			},
-			controller.signal,
-		);
-		await execStarted;
-		controller.abort();
-		resolveProcess?.({
-			async output() {
-				throw new Error("output must not be read after abort");
-			},
-			async kill() {
-				killCount += 1;
-			},
-		});
-
-		const error = await execution.catch((caught) => caught);
-
-		expect(error).toBeInstanceOf(AgentExecutionError);
-		expect(error.reasonCode).toBe("AGENT_TIMEOUT");
-		expect(killCount).toBe(1);
-		expect(destroyed).toBe(true);
-	});
-
-	test("derives valid collision-resistant sandbox IDs from arbitrary job IDs", async () => {
-		const reserved = await sandboxIdForJob("api");
-		const long = await sandboxIdForJob("x".repeat(1_000));
-
-		expect(reserved).toMatch(/^job-[a-f0-9]{48}$/);
-		expect(long).toMatch(/^job-[a-f0-9]{48}$/);
-		expect(reserved).not.toBe(long);
-		expect(await sandboxIdForJob("api")).toBe(reserved);
-	});
-
-	test("rejects a runner result containing an outside form URL", () => {
-		let error: unknown;
-		try {
-			parseRunnerResult(
-				JSON.stringify({ outcome: "sent", formUrl: "https://evil.test" }),
-				input.targetDomain,
-			);
-		} catch (caught) {
-			error = caught;
-		}
-
-		expect(error).toBeInstanceOf(AgentExecutionError);
-		expect((error as AgentExecutionError).reasonCode).toBe(
-			"AGENT_RESULT_INVALID",
-		);
-	});
-});
-
 describe("BrowserToolCoordinator", () => {
 	test("keeps one run-scoped browser and persists submit through RestrictedBrowserTools", async () => {
 		const store = new D1JobStore(env.DB);
@@ -812,6 +363,390 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	async submit(): Promise<BrowserSubmitResult> {
 		return { outcome: "sent", formUrl: this.url };
 	}
+}
+
+describe("ResponsesAgentExecutor", () => {
+	test.each([408, 409])(
+		"retries transient provider status %i",
+		async (status) => {
+			const store = new D1JobStore(env.DB);
+			await store.create(input, "2026-08-28T00:00:00.000Z");
+			const job = await store.claimRun(
+				input.id,
+				"run-token-1",
+				"2026-08-28T00:00:01.000Z",
+			);
+			if (!job) throw new Error("Expected a claimed job");
+			const executor = new ResponsesAgentExecutor({
+				db: env.DB,
+				model: "gpt-5.4-mini",
+				openAiApiKey: "openai-secret",
+				browserUseApiKey: "browser-secret",
+				fetcher: (async () => new Response(null, { status })) as typeof fetch,
+				createBrowserDriver: async () => new WorkerFakeBrowserDriver(),
+			});
+
+			const error = await executor
+				.execute(
+					{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+					new AbortController().signal,
+				)
+				.catch((caught) => caught);
+
+			expect(error).toBeInstanceOf(AgentExecutionError);
+			expect(error.reasonCode).toBe("PROVIDER_REQUEST_REJECTED");
+			expect(error.retryable).toBe(true);
+		},
+	);
+
+	test("retries infrastructure failures instead of asking the model to classify them", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			model: "gpt-5.4-mini",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () =>
+				Response.json(
+					functionResponse("call-observe", "observe", {}),
+				)) as typeof fetch,
+			createBrowserDriver: async () => {
+				throw new Error("BrowserUse is temporarily unavailable");
+			},
+		});
+
+		const error = await executor
+			.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				new AbortController().signal,
+			)
+			.catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(error.reasonCode).toBe("BROWSER_TOOL_UNAVAILABLE");
+		expect(error.retryable).toBe(true);
+	});
+
+	test("waits for an active browser operation to stop after abort", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		let markObserveStarted: (() => void) | undefined;
+		let releaseObserve: (() => void) | undefined;
+		const observeStarted = new Promise<void>((resolve) => {
+			markObserveStarted = resolve;
+		});
+		const driver = new WorkerFakeBrowserDriver();
+		driver.observe = async () => {
+			markObserveStarted?.();
+			await new Promise<void>((resolve) => {
+				releaseObserve = resolve;
+			});
+			return { url: driver.url, forms: [] };
+		};
+		driver.close = async () => {
+			driver.closed = true;
+			releaseObserve?.();
+		};
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			model: "gpt-5.4-mini",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () =>
+				Response.json(
+					functionResponse("call-observe", "observe", {}),
+				)) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+		const controller = new AbortController();
+		const execution = executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			controller.signal,
+		);
+		await observeStarted;
+
+		controller.abort();
+		const error = await execution.catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(error.reasonCode).toBe("AGENT_TIMEOUT");
+		expect(driver.closed).toBe(true);
+		expect(executor.terminationGraceMs).toBe(30_000);
+	});
+
+	test("runs strict sequential Responses tools and finishes without submitting", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+
+		const requests: Array<{ url: string; headers: Headers; body: unknown }> =
+			[];
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-finish", "finish", {
+				outcome: "prohibited",
+				formUrl: input.targetUrl,
+				reasonCode: "NO_FORM_PRESENT",
+				reason: "No inquiry form is present.",
+				retryable: null,
+			}),
+		];
+		const fetcher = (async (
+			resource: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			requests.push({
+				url: String(resource),
+				headers: new Headers(init?.headers),
+				body: JSON.parse(String(init?.body)),
+			});
+			const response = responses.shift();
+			if (!response) throw new Error("Unexpected provider request");
+			return Response.json(response);
+		}) as typeof fetch;
+		const driver = new WorkerFakeBrowserDriver();
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			model: "gpt-5.4-mini",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher,
+			createBrowserDriver: async (apiKey) => {
+				expect(apiKey).toBe("browser-secret");
+				return driver;
+			},
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toEqual({
+			outcome: "prohibited",
+			formUrl: input.targetUrl,
+			reasonCode: "NO_FORM_PRESENT",
+			reason: "No inquiry form is present.",
+		});
+		expect(requests).toHaveLength(2);
+		expect(requests[0]?.url).toBe("https://api.openai.com/v1/responses");
+		expect(requests[0]?.headers.get("authorization")).toBe(
+			"Bearer openai-secret",
+		);
+		expect(requests[0]?.body).toMatchObject({
+			model: "gpt-5.4-mini",
+			tool_choice: "required",
+			parallel_tool_calls: false,
+			max_output_tokens: 4_096,
+			store: false,
+		});
+		expect(JSON.stringify(requests[0]?.body)).not.toContain("run-token-1");
+		expect(requests[1]?.body).toMatchObject({
+			input: expect.arrayContaining([
+				expect.objectContaining({
+					type: "function_call_output",
+					call_id: "call-observe",
+				}),
+			]),
+		});
+		const counter = await env.DB.prepare(
+			"SELECT provider_request_count FROM jobs WHERE id = ?",
+		)
+			.bind(input.id)
+			.first<{ provider_request_count: number }>();
+		expect(counter?.provider_request_count).toBe(2);
+		expect(driver.closed).toBe(true);
+	});
+
+	test("lets the model recover when click is used for a submit control", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-click", "click", { elementId: "fa-0-1" }),
+			functionResponse("call-finish", "finish", {
+				outcome: "failed",
+				formUrl: null,
+				reasonCode: "CORRECTED_TOOL_SELECTION",
+				reason: "The submit control requires the submit tool.",
+				retryable: false,
+			}),
+		];
+		const requests: unknown[] = [];
+		const driver = new WorkerFakeBrowserDriver();
+		driver.clickNonSubmit = async () => {
+			throw new BrowserElementError();
+		};
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			model: "gpt-5.4-mini",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async (_resource, init) => {
+				requests.push(JSON.parse(String(init?.body)));
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toMatchObject({
+			outcome: "failed",
+			reasonCode: "CORRECTED_TOOL_SELECTION",
+		});
+		expect(requests).toHaveLength(2);
+		expect(requests[1]).toMatchObject({
+			input: expect.arrayContaining([
+				expect.objectContaining({
+					type: "function_call_output",
+					call_id: "call-click",
+					output: JSON.stringify({ error: "INVALID_TOOL_INPUT" }),
+				}),
+			]),
+		});
+	});
+
+	test("reports sent only from the restricted browser persisted result", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const driver = new WorkerFakeBrowserDriver();
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			model: "gpt-5.4-mini",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () =>
+				Response.json(
+					functionResponse("call-submit", "submit", {
+						elementId: "fa-0-1",
+					}),
+				)) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toEqual({ outcome: "sent", formUrl: input.targetUrl });
+		expect((await store.find(input.id))?.status).toBe("sent");
+		expect(driver.closed).toBe(true);
+	});
+
+	test("rejects a finish result containing a form URL outside the target domain", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-invalid", "finish", {
+				outcome: "prohibited",
+				formUrl: "https://evil.test/contact",
+				reasonCode: "NO_FORM_PRESENT",
+				reason: "No inquiry form is present.",
+				retryable: null,
+			}),
+			functionResponse("call-valid", "finish", {
+				outcome: "prohibited",
+				formUrl: input.targetUrl,
+				reasonCode: "NO_FORM_PRESENT",
+				reason: "No inquiry form is present.",
+				retryable: null,
+			}),
+		];
+		const requests: unknown[] = [];
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			model: "gpt-5.4-mini",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async (_resource, init) => {
+				requests.push(JSON.parse(String(init?.body)));
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => new WorkerFakeBrowserDriver(),
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toMatchObject({
+			outcome: "prohibited",
+			formUrl: input.targetUrl,
+		});
+		expect(requests).toHaveLength(2);
+		expect(requests[1]).toMatchObject({
+			input: expect.arrayContaining([
+				expect.objectContaining({
+					type: "function_call_output",
+					call_id: "call-invalid",
+					output: JSON.stringify({ error: "INVALID_TOOL_INPUT" }),
+				}),
+			]),
+		});
+	});
+});
+
+function functionResponse(
+	callId: string,
+	name: string,
+	parameters: Record<string, unknown>,
+) {
+	return {
+		status: "completed",
+		output: [
+			{
+				type: "function_call",
+				call_id: callId,
+				name,
+				arguments: JSON.stringify(parameters),
+			},
+		],
+	};
 }
 
 describe("Queue orchestration", () => {

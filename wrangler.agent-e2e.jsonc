@@ -4,26 +4,6 @@
   "main": "test/e2e-worker.ts",
   "compatibility_date": "2026-08-27",
   "compatibility_flags": ["nodejs_compat"],
-  "containers": [
-    {
-      "class_name": "FormAgentSandbox",
-      "image": "./Dockerfile"
-    }
-  ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "class_name": "FormAgentSandbox",
-        "name": "SANDBOX"
-      }
-    ]
-  },
-  "migrations": [
-    {
-      "new_sqlite_classes": ["FormAgentSandbox"],
-      "tag": "v1"
-    }
-  ],
   "d1_databases": [
     {
       "binding": "DB",
