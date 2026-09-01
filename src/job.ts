@@ -14,6 +14,7 @@ export interface JobInput {
 	companyName: string;
 	targetUrl: string;
 	targetDomain: string;
+	allowedHosts: string[];
 	payload: Record<string, unknown>;
 }
 

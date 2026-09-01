@@ -38,6 +38,34 @@ deploymentが1つのversionへ100%配信されていること、そのactive ver
 ./node_modules/.bin/wrangler queues resume-delivery form-agent-jobs
 ```
 
+## D1 schema migrationを含むデプロイ
+
+D1 migrationはWorker deployでは自動適用されない。新しい列を参照するコードを先にdeployすると全ジョブの読み書きが失敗するため、必ず次の順序で実施する。
+
+1. Queue配送をpauseする。
+2. `running` / `submitting`が0件になるまで確認する。残っている場合はmigrationを開始しない。
+3. remote D1 migrationを適用する。
+4. schemaとmigration一覧を確認する。
+5. Workerをdeployする。
+6. active versionが1つ・100%で、`AGENT_DRY_RUN ("true")`であることを確認する。
+7. 1〜6がすべて成功した場合だけQueue配送をresumeする。
+
+```bash
+./node_modules/.bin/wrangler queues pause-delivery form-agent-jobs
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT status,COUNT(*) AS count FROM jobs WHERE status IN ('running','submitting') GROUP BY status;"
+./node_modules/.bin/wrangler d1 migrations apply form-agent --remote
+./node_modules/.bin/wrangler d1 migrations list form-agent --remote
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT name FROM pragma_table_info('jobs') WHERE name='allowed_hosts_json';"
+./node_modules/.bin/wrangler deploy
+./node_modules/.bin/wrangler deployments status --json
+./node_modules/.bin/wrangler versions view <ACTIVE_VERSION_ID>
+./node_modules/.bin/wrangler queues resume-delivery form-agent-jobs
+```
+
+途中で失敗した場合はQueueをpauseしたままにする。migration適用後にdeployが失敗しても、`allowed_hosts_json`はdefault `[]`付きの追加列なので旧Workerは継続利用できる。
+
 ## `submitting` / `uncertain`の照合
 
 対象ジョブと保存結果を取得する。

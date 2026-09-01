@@ -34,6 +34,7 @@ const input: JobInput = {
 	companyName: "Example Inc.",
 	targetUrl: "https://form-agent.dev/contact",
 	targetDomain: "form-agent.dev",
+	allowedHosts: [],
 	payload: { formValues: { message: "Hello" } },
 };
 
@@ -196,6 +197,27 @@ describe("Job HTTP API", () => {
 		expect(fetchedBody.job).not.toHaveProperty("runToken");
 	});
 
+	test("persists a normalized job-specific external host scope", async () => {
+		const external = {
+			...input,
+			targetUrl: "https://forms.gle/example",
+			allowedHosts: ["DOCS.GOOGLE.COM.", "forms.gle", "forms.gle"],
+		};
+		const created = await handleHttpRequest(
+			jobRequest("POST", "/jobs", external, apiToken),
+			apiEnv,
+		);
+		const body = (await created.json()) as {
+			job: { allowedHosts: string[] };
+		};
+
+		expect(created.status).toBe(201);
+		expect(body.job.allowedHosts).toEqual(["docs.google.com", "forms.gle"]);
+		expect((await new D1JobStore(env.DB).find(input.id))?.allowedHosts).toEqual(
+			["docs.google.com", "forms.gle"],
+		);
+	});
+
 	test("returns the existing pending job for duplicate registration", async () => {
 		const first = await handleHttpRequest(
 			jobRequest("POST", "/jobs", input, apiToken),
@@ -267,6 +289,20 @@ describe("Job HTTP API", () => {
 			),
 			apiEnv,
 		);
+		const unsafeAllowedHost = await handleHttpRequest(
+			jobRequest(
+				"POST",
+				"/jobs",
+				{
+					...input,
+					id: "job-004",
+					targetUrl: "http://127.0.0.1/contact",
+					allowedHosts: ["127.0.0.1"],
+				},
+				apiToken,
+			),
+			apiEnv,
+		);
 
 		expect(invalidDomain.status).toBe(400);
 		expect(await invalidDomain.json()).toEqual({ error: "INVALID_JOB" });
@@ -274,6 +310,8 @@ describe("Job HTTP API", () => {
 		expect(await invalidPayload.json()).toEqual({ error: "INVALID_JOB" });
 		expect(legacyPayload.status).toBe(400);
 		expect(await legacyPayload.json()).toEqual({ error: "INVALID_JOB" });
+		expect(unsafeAllowedHost.status).toBe(400);
+		expect(await unsafeAllowedHost.json()).toEqual({ error: "INVALID_JOB" });
 		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
 		expect(queued).toEqual([]);
 	});

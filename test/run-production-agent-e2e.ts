@@ -39,6 +39,7 @@ const created = await fetch(`${baseUrl}/jobs`, {
 		companyName: `${target.hostname} E2E Fixture`,
 		targetUrl,
 		targetDomain: target.hostname,
+		allowedHosts: [],
 		payload: {
 			_formAgentDryRun: true,
 			scenario: "safe-no-submit",

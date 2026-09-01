@@ -13,13 +13,14 @@ export function assertAllowedBrowserRequest(
 	submissionAuthorized: boolean,
 	allowExternalRead = false,
 	blockRequest = false,
+	allowedHosts: readonly string[] = [],
 ): void {
 	if (blockRequest) throw new NavigationPolicyError();
 	const safeMethod = SAFE_METHODS.has(method.toUpperCase());
 	if (allowExternalRead && safeMethod) {
 		assertPublicBrowserResourceUrl(url);
 	} else {
-		assertAllowedTargetUrl(url, targetDomain);
+		assertAllowedTargetUrl(url, targetDomain, allowedHosts);
 	}
 	if (!submissionAuthorized && !safeMethod) {
 		throw new NavigationPolicyError();

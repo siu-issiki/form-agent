@@ -1,27 +1,30 @@
 {
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
-    "noEmit": true,
-    "skipLibCheck": true,
-    "types": ["bun"]
-  },
-  "include": [
-    "src/job.ts",
-    "src/agent-runtime.ts",
-    "src/agent-executor.ts",
-    "src/browser-use-client.ts",
-    "src/restricted-browser.ts",
-    "test/job.test.ts",
-    "test/agent-executor.test.ts",
-    "test/browser-use-client.test.ts",
-    "test/restricted-browser.test.ts",
-    "vitest.config.ts",
-    "vitest.browser-use.config.ts",
-    "test/run-agent-e2e.ts"
-  ]
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "ESNext",
+		"moduleResolution": "Bundler",
+		"strict": true,
+		"noUncheckedIndexedAccess": true,
+		"exactOptionalPropertyTypes": true,
+		"noEmit": true,
+		"skipLibCheck": true,
+		"types": ["bun"]
+	},
+	"include": [
+		"src/job.ts",
+		"src/agent-runtime.ts",
+		"src/agent-executor.ts",
+		"src/browser-use-client.ts",
+		"src/restricted-browser.ts",
+		"src/campaign-import.ts",
+		"test/job.test.ts",
+		"test/agent-executor.test.ts",
+		"test/browser-use-client.test.ts",
+		"test/restricted-browser.test.ts",
+		"test/campaign-import.test.ts",
+		"tools/campaign-dry-run.ts",
+		"vitest.config.ts",
+		"vitest.browser-use.config.ts",
+		"test/run-agent-e2e.ts"
+	]
 }

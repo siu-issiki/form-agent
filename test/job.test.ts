@@ -7,6 +7,7 @@ const input: JobInput = {
 	companyName: "Example Inc.",
 	targetUrl: "https://example.com/contact",
 	targetDomain: "example.com",
+	allowedHosts: [],
 	payload: { message: "Hello" },
 };
 
