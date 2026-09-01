@@ -19,8 +19,6 @@ import {
 	type BrowserSubmitResult,
 	type RestrictedBrowserDriver,
 } from "../src/restricted-browser";
-import { TEST_FIXTURE_FORM_VALUES } from "../src/test-fixture-contract";
-import { handleTestFixtureRequest } from "../src/test-fixture-worker";
 import worker, {
 	consumeJobBatch,
 	handleHttpRequest,
@@ -46,7 +44,6 @@ test("keeps agent dry-run enabled unless production submission is explicitly ena
 
 beforeEach(async () => {
 	await env.DB.batch([
-		env.DB.prepare("DELETE FROM test_fixture_submissions"),
 		env.DB.prepare("DELETE FROM events"),
 		env.DB.prepare("DELETE FROM results"),
 		env.DB.prepare("DELETE FROM jobs"),
@@ -324,123 +321,6 @@ function jobRequest(
 	if (body !== undefined) init.body = JSON.stringify(body);
 	return new Request(`https://form-agent.test${pathname}`, init);
 }
-
-function fixturePost(url: string, values: Record<string, string>): Request {
-	return new Request(url, {
-		method: "POST",
-		headers: { "content-type": "application/x-www-form-urlencoded" },
-		body: new URLSearchParams(values),
-	});
-}
-
-describe("managed test fixture", () => {
-	const fixtureToken = "fixture-api-token";
-	const fixtureJobId = "agent-submit-e2e-00000000-0000-4000-8000-000000000001";
-	const fixtureUrl = `https://form-agent-test-fixture.test/contact?jobId=${fixtureJobId}`;
-	const fixtureInput: JobInput = {
-		id: fixtureJobId,
-		companyId: "managed-test-fixture",
-		companyName: "Form Agent managed fixture",
-		targetUrl: fixtureUrl,
-		targetDomain: "form-agent-test-fixture.test",
-		payload: { formValues: TEST_FIXTURE_FORM_VALUES },
-	};
-	const fixtureEnv = { DB: env.DB, FIXTURE_API_TOKEN: fixtureToken };
-
-	test("serves an empty form only for the matching managed job", async () => {
-		const missing = await handleTestFixtureRequest(
-			new Request(fixtureUrl),
-			fixtureEnv,
-		);
-		expect(missing.status).toBe(404);
-
-		const store = new D1JobStore(env.DB);
-		await store.create(fixtureInput, "2026-08-28T00:00:00.000Z");
-		await store.claimRun(
-			fixtureJobId,
-			"run-token-1",
-			"2026-08-28T00:00:01.000Z",
-		);
-		const response = await handleTestFixtureRequest(
-			new Request(fixtureUrl),
-			fixtureEnv,
-		);
-		const html = await response.text();
-
-		expect(response.status).toBe(200);
-		expect(response.headers.get("content-security-policy")).toContain(
-			"form-action 'self'",
-		);
-		expect(html).toContain('name="email"');
-		expect(html).toContain('name="message"');
-		expect(html).not.toContain(TEST_FIXTURE_FORM_VALUES.email);
-		expect(html).not.toContain(TEST_FIXTURE_FORM_VALUES.message);
-	});
-
-	test("accepts only exact fixture values after submission authorization", async () => {
-		const store = new D1JobStore(env.DB);
-		await store.create(fixtureInput, "2026-08-28T00:00:00.000Z");
-		await store.claimRun(
-			fixtureJobId,
-			"run-token-1",
-			"2026-08-28T00:00:01.000Z",
-		);
-		const submitUrl = fixtureUrl.replace("/contact?", "/contact/submit?");
-		const unauthorized = await handleTestFixtureRequest(
-			fixturePost(submitUrl, TEST_FIXTURE_FORM_VALUES),
-			fixtureEnv,
-		);
-		expect(unauthorized.status).toBe(409);
-
-		await store.claimSubmission(
-			fixtureJobId,
-			"run-token-1",
-			"2026-08-28T00:00:02.000Z",
-		);
-		const invalid = await handleTestFixtureRequest(
-			fixturePost(submitUrl, {
-				...TEST_FIXTURE_FORM_VALUES,
-				message: "invented",
-			}),
-			fixtureEnv,
-		);
-		expect(invalid.status).toBe(400);
-		const oversized = await handleTestFixtureRequest(
-			fixturePost(submitUrl, {
-				...TEST_FIXTURE_FORM_VALUES,
-				message: "x".repeat(16 * 1024 + 1),
-			}),
-			fixtureEnv,
-		);
-		expect(oversized.status).toBe(400);
-
-		const submitted = await handleTestFixtureRequest(
-			fixturePost(submitUrl, TEST_FIXTURE_FORM_VALUES),
-			fixtureEnv,
-		);
-		expect(submitted.status).toBe(200);
-		expect(await submitted.text()).toContain("送信が完了しました");
-
-		const unauthenticatedStatus = await handleTestFixtureRequest(
-			new Request(
-				`https://form-agent-test-fixture.test/submissions/${fixtureJobId}`,
-			),
-			fixtureEnv,
-		);
-		expect(unauthenticatedStatus.status).toBe(401);
-		const status = await handleTestFixtureRequest(
-			new Request(
-				`https://form-agent-test-fixture.test/submissions/${fixtureJobId}`,
-				{ headers: { authorization: `Bearer ${fixtureToken}` } },
-			),
-			fixtureEnv,
-		);
-		expect(await status.json()).toMatchObject({
-			jobId: fixtureJobId,
-			postCount: 1,
-		});
-	});
-});
 
 describe("BrowserToolCoordinator", () => {
 	test("keeps one run-scoped browser and persists submit through RestrictedBrowserTools", async () => {
