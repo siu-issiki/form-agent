@@ -11,6 +11,7 @@ import {
 	BrowserElementError,
 	type BrowserObservation,
 	type BrowserSubmitResult,
+	createBrowserSubmitDiagnosticError,
 	type RestrictedBrowserDriver,
 } from "./restricted-browser";
 
@@ -349,13 +350,29 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async submit(elementId: string): Promise<BrowserSubmitResult> {
-		await this.validateSubmit(elementId);
+		try {
+			await this.validateSubmit(elementId);
+		} catch (error) {
+			throw createBrowserSubmitDiagnosticError("SUBMIT_VALIDATE", error);
+		}
 		this.#interactionStarted = true;
-		const beforeText = await this.#bodyText();
+		let beforeText: string;
+		try {
+			beforeText = await this.#bodyText();
+		} catch (error) {
+			throw createBrowserSubmitDiagnosticError(
+				"SUBMIT_READ_BEFORE_TEXT",
+				error,
+			);
+		}
 		this.#submissionRequestAllowed = true;
 		this.#submissionRequestCount = 0;
 		try {
-			await this.#clickElement(this.#element(elementId).backendNodeId);
+			try {
+				await this.#clickElement(this.#element(elementId).backendNodeId);
+			} catch (error) {
+				throw createBrowserSubmitDiagnosticError("SUBMIT_CLICK", error);
+			}
 			const deadline = Date.now() + CONFIRMATION_WAIT_MS;
 			while (Date.now() < deadline) {
 				const afterText = await this.#bodyText().catch(() => "");

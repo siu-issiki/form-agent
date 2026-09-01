@@ -4,7 +4,9 @@ import { assertAllowedBrowserRequest } from "../src/browser-network-policy";
 import { InMemoryJobStore, type JobInput } from "../src/job";
 import {
 	BrowserElementError,
+	BrowserSubmitDiagnosticError,
 	type BrowserSubmitResult,
+	createBrowserSubmitDiagnosticError,
 	NavigationPolicyError,
 	type RestrictedBrowserDriver,
 	RestrictedBrowserTools,
@@ -200,10 +202,51 @@ describe("RestrictedBrowserTools", () => {
 		const persisted = await store.find(input.id);
 		expect(persisted?.status).toBe("uncertain");
 		expect(persisted?.result?.reasonCode).toBe("SUBMIT_RESULT_UNKNOWN");
+		expect(persisted?.result?.reason).toContain(
+			"Diagnostic: SUBMIT_OPERATION/UNKNOWN.",
+		);
 		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
 			SubmissionNotAuthorizedError,
 		);
 		expect(driver.submitCount).toBe(1);
+	});
+
+	test("persists only allowlisted browser submit diagnostics", async () => {
+		const driver = new FakeDriver();
+		driver.submitError = createBrowserSubmitDiagnosticError(
+			"SUBMIT_CLICK",
+			new Error("Browser Use CDP command timed out"),
+		);
+		const store = new InMemoryJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const tools = await RestrictedBrowserTools.create(
+			driver,
+			store,
+			input.id,
+			"run-token-1",
+		);
+		await tools.fill("fa-0-0", "Hello");
+
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			SubmissionResultUncertainError,
+		);
+
+		expect((await store.find(input.id))?.result?.reason).toBe(
+			"The browser operation failed after submission permission was granted. Diagnostic: SUBMIT_CLICK/CDP_COMMAND_TIMEOUT.",
+		);
+	});
+
+	test("does not persist arbitrary browser error details", async () => {
+		const diagnostic = createBrowserSubmitDiagnosticError(
+			"SUBMIT_CLICK",
+			new Error("failed for secret@example.com with entered form body"),
+		);
+
+		expect(diagnostic).toBeInstanceOf(BrowserSubmitDiagnosticError);
+		expect(diagnostic.diagnosticCode).toBe("UNKNOWN");
+		expect(diagnostic.message).not.toContain("secret@example.com");
+		expect(diagnostic.message).not.toContain("entered form body");
 	});
 
 	test("derives the domain from the persisted job and installs a network policy", async () => {

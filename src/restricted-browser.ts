@@ -56,6 +56,41 @@ export class SubmissionResultUncertainError extends Error {
 	}
 }
 
+export type BrowserSubmitFailureStage =
+	| "SUBMIT_OPERATION"
+	| "SUBMIT_VALIDATE"
+	| "SUBMIT_READ_BEFORE_TEXT"
+	| "SUBMIT_CLICK"
+	| "POST_SUBMIT_URL_CHECK";
+
+export type BrowserSubmitFailureCode =
+	| "ELEMENT_UNAVAILABLE"
+	| "NAVIGATION_POLICY"
+	| "CDP_CONNECTION_CLOSED"
+	| "CDP_COMMAND_TIMEOUT"
+	| "CDP_COMMAND_SEND_FAILED"
+	| "CDP_COMMAND_FAILED"
+	| "CDP_PAYLOAD_TOO_LARGE"
+	| "PAGE_EVALUATION_FAILED"
+	| "UNKNOWN";
+
+export class BrowserSubmitDiagnosticError extends Error {
+	constructor(
+		readonly stage: BrowserSubmitFailureStage,
+		readonly diagnosticCode: BrowserSubmitFailureCode,
+	) {
+		super("The browser submit operation failed");
+		this.name = "BrowserSubmitDiagnosticError";
+	}
+}
+
+export function createBrowserSubmitDiagnosticError(
+	stage: BrowserSubmitFailureStage,
+	error: unknown,
+): BrowserSubmitDiagnosticError {
+	return new BrowserSubmitDiagnosticError(stage, classifyBrowserFailure(error));
+}
+
 export class RestrictedBrowserTools {
 	readonly #targetDomain: string;
 	readonly #successfulInputElementIds = new Set<string>();
@@ -159,11 +194,25 @@ export class RestrictedBrowserTools {
 		let result: BrowserSubmitResult;
 		try {
 			result = await this.driver.submit(elementId);
-			await this.#assertCurrentUrlAllowed();
-		} catch {
+		} catch (error) {
+			const diagnostic =
+				error instanceof BrowserSubmitDiagnosticError
+					? error
+					: createBrowserSubmitDiagnosticError("SUBMIT_OPERATION", error);
 			await this.#recordUncertain(
 				"SUBMIT_RESULT_UNKNOWN",
-				"The browser operation failed after submission permission was granted.",
+				submitFailureReason(diagnostic),
+			);
+			throw new SubmissionResultUncertainError();
+		}
+		try {
+			await this.#assertCurrentUrlAllowed();
+		} catch (error) {
+			await this.#recordUncertain(
+				"SUBMIT_RESULT_UNKNOWN",
+				submitFailureReason(
+					createBrowserSubmitDiagnosticError("POST_SUBMIT_URL_CHECK", error),
+				),
 			);
 			throw new SubmissionResultUncertainError();
 		}
@@ -232,6 +281,34 @@ export class RestrictedBrowserTools {
 		} catch {
 			// The caller still receives an uncertain result and must never retry submit.
 		}
+	}
+}
+
+function submitFailureReason(error: BrowserSubmitDiagnosticError): string {
+	return `The browser operation failed after submission permission was granted. Diagnostic: ${error.stage}/${error.diagnosticCode}.`;
+}
+
+function classifyBrowserFailure(error: unknown): BrowserSubmitFailureCode {
+	if (error instanceof BrowserElementError) return "ELEMENT_UNAVAILABLE";
+	if (error instanceof NavigationPolicyError) return "NAVIGATION_POLICY";
+	if (!(error instanceof Error)) return "UNKNOWN";
+	if (error.name === "BrowserUseCdpPayloadTooLargeError") {
+		return "CDP_PAYLOAD_TOO_LARGE";
+	}
+	switch (error.message) {
+		case "Browser Use CDP connection is closed":
+		case "Browser Use CDP connection closed":
+			return "CDP_CONNECTION_CLOSED";
+		case "Browser Use CDP command timed out":
+			return "CDP_COMMAND_TIMEOUT";
+		case "Browser Use CDP command could not be sent":
+			return "CDP_COMMAND_SEND_FAILED";
+		case "Browser Use CDP command failed":
+			return "CDP_COMMAND_FAILED";
+		case "Browser page evaluation failed":
+			return "PAGE_EVALUATION_FAILED";
+		default:
+			return "UNKNOWN";
 	}
 }
 
