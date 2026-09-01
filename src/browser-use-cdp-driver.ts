@@ -365,8 +365,6 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				error,
 			);
 		}
-		this.#submissionRequestAllowed = true;
-		this.#submissionRequestCount = 0;
 		try {
 			try {
 				await this.#activateSubmitElement(
@@ -706,24 +704,43 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 
 	async #activateSubmitElement(backendNodeId: number): Promise<void> {
 		await this.#send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
-		const unobscured = await this.#callFunctionOnElement<boolean>(
-			backendNodeId,
-			IS_SUBMIT_UNOBSCURED_FUNCTION,
-		);
-		if (!unobscured) throw new BrowserElementError();
+		await this.#nextAnimationFrame();
+		if (
+			!(await this.#callFunctionOnElement<boolean>(
+				backendNodeId,
+				IS_SUBMIT_UNOBSCURED_FUNCTION,
+			))
+		) {
+			throw new BrowserElementError();
+		}
 		await this.#send("DOM.focus", { backendNodeId });
-		const focused = await this.#callFunctionOnElement<boolean>(
-			backendNodeId,
-			IS_ELEMENT_FOCUSED_FUNCTION,
-		);
-		if (!focused) throw new BrowserElementError();
-		await this.#send("Input.dispatchKeyEvent", {
-			type: "keyDown",
-			key: "Enter",
-			code: "Enter",
-			windowsVirtualKeyCode: 13,
-			nativeVirtualKeyCode: 13,
-		});
+		await this.#nextAnimationFrame();
+		const [unobscured, focused] = await Promise.all([
+			this.#callFunctionOnElement<boolean>(
+				backendNodeId,
+				IS_SUBMIT_UNOBSCURED_FUNCTION,
+			),
+			this.#callFunctionOnElement<boolean>(
+				backendNodeId,
+				IS_ELEMENT_FOCUSED_FUNCTION,
+			),
+		]);
+		if (!unobscured || !focused) throw new BrowserElementError();
+
+		this.#submissionRequestCount = 0;
+		this.#submissionRequestAllowed = true;
+		try {
+			await this.#send("Input.dispatchKeyEvent", {
+				type: "keyDown",
+				key: "Enter",
+				code: "Enter",
+				windowsVirtualKeyCode: 13,
+				nativeVirtualKeyCode: 13,
+			});
+			await this.#nextAnimationFrame().catch(() => undefined);
+		} finally {
+			this.#submissionRequestAllowed = false;
+		}
 		await this.#send("Input.dispatchKeyEvent", {
 			type: "keyUp",
 			key: "Enter",
@@ -731,6 +748,12 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			windowsVirtualKeyCode: 13,
 			nativeVirtualKeyCode: 13,
 		}).catch(() => undefined);
+	}
+
+	#nextAnimationFrame(): Promise<unknown> {
+		return this.#evaluate(
+			"new Promise((resolve) => requestAnimationFrame(() => resolve()))",
+		);
 	}
 
 	async #isComposedDescendant(
