@@ -399,6 +399,7 @@ describe("BrowserUseCdpDriver submission confirmation", () => {
 	test("retries submit mouse preparation for transient element mismatches", async () => {
 		let attempts = 0;
 		let waits = 0;
+		const reportedAttempts: number[] = [];
 		const point = await retrySubmitMousePreparation(
 			async () => {
 				attempts += 1;
@@ -408,11 +409,13 @@ describe("BrowserUseCdpDriver submission confirmation", () => {
 			async () => {
 				waits += 1;
 			},
+			(attempt) => reportedAttempts.push(attempt),
 		);
 
 		expect(point).toEqual({ x: 10, y: 20 });
 		expect(attempts).toBe(3);
 		expect(waits).toBe(2);
+		expect(reportedAttempts).toEqual([1, 2, 3]);
 	});
 
 	test("stops submit mouse preparation after three mismatches", async () => {
