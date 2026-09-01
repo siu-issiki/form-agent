@@ -6,6 +6,7 @@ import {
 	BrowserToolInputError,
 	type BrowserToolName,
 } from "./browser-tool-handler";
+import { BrowserUseCdpPayloadTooLargeError } from "./browser-use-cdp";
 import { BrowserUseCdpDriver } from "./browser-use-cdp-driver";
 import { D1JobStore } from "./d1-job-store";
 import type { Job } from "./job";
@@ -39,6 +40,7 @@ interface ResponsesAgentExecutorOptions {
 	model: string;
 	openAiApiKey: string;
 	browserUseApiKey: string;
+	dryRun?: boolean;
 	fetcher?: typeof fetch;
 	createBrowserDriver?: (
 		apiKey: string,
@@ -58,6 +60,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 	readonly #model: string;
 	readonly #openAiApiKey: string;
 	readonly #browserUseApiKey: string;
+	readonly #dryRun: boolean;
 	readonly #fetcher: typeof fetch;
 	readonly #createBrowserDriver: (
 		apiKey: string,
@@ -75,7 +78,9 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 		this.#model = options.model;
 		this.#openAiApiKey = options.openAiApiKey;
 		this.#browserUseApiKey = options.browserUseApiKey;
-		this.#fetcher = options.fetcher ?? fetch;
+		this.#dryRun = options.dryRun ?? false;
+		const fetcher = options.fetcher ?? fetch;
+		this.#fetcher = (resource, init) => fetcher(resource, init);
 		this.#createBrowserDriver =
 			options.createBrowserDriver ?? BrowserUseCdpDriver.connect;
 	}
@@ -123,7 +128,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 			throwIfAborted(signal);
 			const body = JSON.stringify({
 				model: this.#model,
-				instructions: systemPrompt(),
+				instructions: systemPrompt(this.#dryRun),
 				input: history,
 				tools: AGENT_TOOLS,
 				tool_choice: "required",
@@ -165,6 +170,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 				input.runToken,
 				signal,
 				this.#db,
+				this.#dryRun,
 			);
 			if (execution.result) return execution.result;
 			history.push({
@@ -225,6 +231,7 @@ async function executeToolCall(
 	runToken: string,
 	signal: AbortSignal,
 	db: D1Database,
+	dryRun: boolean,
 ): Promise<ToolExecution> {
 	throwIfAborted(signal);
 	let params: JsonObject;
@@ -242,6 +249,21 @@ async function executeToolCall(
 			? { output: JSON.stringify({ outcome: result.outcome }), result }
 			: toolError("INVALID_TOOL_INPUT");
 	}
+	if (call.name === "submit" && dryRun) {
+		if (!isElementId(params.elementId)) {
+			return toolError("INVALID_TOOL_INPUT");
+		}
+		return {
+			output: JSON.stringify({ status: "dry_run", submitted: false }),
+			result: {
+				outcome: "prohibited",
+				formUrl: job.targetUrl,
+				reasonCode: "DRY_RUN_COMPLETE",
+				reason:
+					"Dry-run intercepted the submit tool before submission authorization or browser interaction.",
+			},
+		};
+	}
 
 	const tool = browserToolName(call.name);
 	if (!tool) return toolError("UNKNOWN_TOOL");
@@ -257,6 +279,13 @@ async function executeToolCall(
 		return { output: JSON.stringify(value) };
 	} catch (error) {
 		throwIfAborted(signal);
+		if (error instanceof BrowserUseCdpPayloadTooLargeError) {
+			throw new AgentExecutionError(
+				"BROWSER_PAYLOAD_TOO_LARGE",
+				"The browser document exceeded the safe processing limit.",
+				false,
+			);
+		}
 		if (
 			error instanceof SubmissionResultUncertainError ||
 			error instanceof SubmissionNotAuthorizedError
@@ -283,7 +312,6 @@ async function executeToolCall(
 		);
 	}
 }
-
 function terminalResultFromJob(
 	job: Omit<Job, "runToken">,
 ): AgentRunResult | null {
@@ -354,6 +382,14 @@ function browserToolName(value: string): BrowserToolName | null {
 		default:
 			return null;
 	}
+}
+
+function isElementId(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length <= 64 &&
+		/^fa-[a-z0-9-]+$/.test(value)
+	);
 }
 
 function readResponseOutput(value: JsonObject): JsonObject[] {
@@ -457,8 +493,8 @@ function isRecord(value: unknown): value is JsonObject {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function systemPrompt(): string {
-	return [
+function systemPrompt(dryRun: boolean): string {
+	const instructions = [
 		"You operate one company's inquiry form using only the provided tools.",
 		"Stay on the persisted target domain. Never use another company or arbitrary URL.",
 		"Observe the page before acting and check for sales, solicitation, or purpose restrictions.",
@@ -467,7 +503,13 @@ function systemPrompt(): string {
 		"Before submit, re-observe and verify the target, all values, required fields, and that submit has not been attempted.",
 		"Use submit exactly once. Only submit can report sent.",
 		"If meaning or submission outcome is unclear, call finish with uncertain. For technical failures, call finish with failed.",
-	].join(" ");
+	];
+	if (dryRun) {
+		instructions.push(
+			"This is a dry-run. Inspect and fill the form, then call submit normally after validation. The trusted handler will intercept submit before authorization or browser submission.",
+		);
+	}
+	return instructions.join(" ");
 }
 
 const AGENT_TOOLS = [

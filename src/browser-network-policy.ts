@@ -1,3 +1,4 @@
+import { parse } from "tldts";
 import {
 	assertAllowedTargetUrl,
 	NavigationPolicyError,
@@ -10,9 +11,40 @@ export function assertAllowedBrowserRequest(
 	targetDomain: string,
 	method: string,
 	submissionAuthorized: boolean,
+	allowExternalRead = false,
 ): void {
-	assertAllowedTargetUrl(url, targetDomain);
-	if (!submissionAuthorized && !SAFE_METHODS.has(method.toUpperCase())) {
+	const safeMethod = SAFE_METHODS.has(method.toUpperCase());
+	if (allowExternalRead && safeMethod) {
+		assertPublicBrowserResourceUrl(url);
+	} else {
+		assertAllowedTargetUrl(url, targetDomain);
+	}
+	if (!submissionAuthorized && !safeMethod) {
+		throw new NavigationPolicyError();
+	}
+}
+
+function assertPublicBrowserResourceUrl(rawUrl: string): void {
+	let url: URL;
+	try {
+		url = new URL(rawUrl);
+	} catch {
+		throw new NavigationPolicyError();
+	}
+	const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+	const parsed = parse(hostname, {
+		allowPrivateDomains: true,
+		detectSpecialUse: true,
+		extractHostname: false,
+	});
+	if (
+		url.protocol !== "https:" ||
+		url.username ||
+		url.password ||
+		parsed.isIp ||
+		parsed.isSpecialUse ||
+		(!parsed.isIcann && !parsed.isPrivate)
+	) {
 		throw new NavigationPolicyError();
 	}
 }

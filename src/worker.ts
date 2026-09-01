@@ -18,6 +18,7 @@ export interface Env {
 	JOB_QUEUE: Queue<JobMessage>;
 	AGENT_EXECUTOR_ENABLED?: string;
 	AGENT_MODEL?: string;
+	AGENT_DRY_RUN?: string;
 	OPENAI_API_KEY?: string;
 	BROWSER_USE_API_KEY?: string;
 	JOB_API_TOKEN?: string;
@@ -392,6 +393,17 @@ async function executeClaimedJob(
 			maxDurationMs: MAX_AGENT_DURATION_MS,
 		});
 	} catch (error) {
+		console.warn(
+			JSON.stringify({
+				event: "agent_execution_error",
+				reasonCode:
+					error instanceof AgentExecutionError
+						? error.reasonCode
+						: "UNEXPECTED_AGENT_ERROR",
+				retryable:
+					error instanceof AgentExecutionError ? error.retryable : true,
+			}),
+		);
 		const current = await store.find(job.id);
 		if (current?.status === "submitting") {
 			await store.recordUncertain(
@@ -418,6 +430,14 @@ async function executeClaimedJob(
 		);
 		return "ack";
 	}
+	console.info(
+		JSON.stringify({
+			event: "agent_execution_result",
+			outcome: result.outcome,
+			reasonCode: "reasonCode" in result ? result.reasonCode : null,
+			retryable: result.outcome === "failed" ? result.retryable : false,
+		}),
+	);
 
 	switch (result.outcome) {
 		case "sent": {
@@ -509,6 +529,7 @@ function createAgentExecutor(env: Env): AgentExecutor {
 			model: env.AGENT_MODEL,
 			openAiApiKey: env.OPENAI_API_KEY,
 			browserUseApiKey: env.BROWSER_USE_API_KEY,
+			dryRun: isAgentDryRun(env.AGENT_DRY_RUN),
 		});
 	}
 	return {
@@ -521,6 +542,10 @@ function createAgentExecutor(env: Env): AgentExecutor {
 			};
 		},
 	};
+}
+
+export function isAgentDryRun(value: string | undefined): boolean {
+	return value !== "false";
 }
 
 function isJobMessage(value: unknown): value is JobMessage {

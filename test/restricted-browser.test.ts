@@ -39,6 +39,36 @@ describe("RestrictedBrowserTools", () => {
 			),
 		).not.toThrow();
 	});
+
+	test("allows only public HTTPS read-only subresources before form input", () => {
+		expect(() =>
+			assertAllowedBrowserRequest(
+				"https://cdn.jsdelivr.net/form.js",
+				"form-agent.dev",
+				"GET",
+				false,
+				true,
+			),
+		).not.toThrow();
+		expect(() =>
+			assertAllowedBrowserRequest(
+				"https://cdn.jsdelivr.net/collect",
+				"form-agent.dev",
+				"POST",
+				false,
+				true,
+			),
+		).toThrow();
+		expect(() =>
+			assertAllowedBrowserRequest(
+				"https://localhost/form.js",
+				"form-agent.dev",
+				"GET",
+				false,
+				true,
+			),
+		).toThrow();
+	});
 	test("allows only the target domain and its subdomains", async () => {
 		const driver = new FakeDriver();
 		const tools = await createTools(driver);

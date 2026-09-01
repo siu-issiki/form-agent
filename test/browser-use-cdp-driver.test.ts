@@ -2,9 +2,82 @@ import { describe, expect, test } from "bun:test";
 import { runInNewContext } from "node:vm";
 import { hasNewSubmissionConfirmation } from "../src/browser-submit-confirmation";
 import {
+	assertCdpMessageWithinLimit,
+	BrowserUseCdpPayloadTooLargeError,
+	MAX_CDP_MESSAGE_CHARACTERS,
+} from "../src/browser-use-cdp";
+import { discoverCdpForms } from "../src/browser-use-cdp-dom";
+import {
 	BLOCK_BROWSER_ESCAPE_EXPRESSION,
 	denyRelatedBrowserTargets,
 } from "../src/browser-use-cdp-driver";
+
+describe("BrowserUse CDP payload and DOM discovery", () => {
+	test("discovers controls inside a closed shadow root", () => {
+		const discovery = discoverCdpForms(
+			{
+				backendNodeId: 1,
+				nodeName: "#document",
+				children: [
+					{
+						backendNodeId: 2,
+						nodeName: "FORM",
+						attributes: ["id", "contact", "action", "/send", "method", "post"],
+						children: [
+							{ backendNodeId: 3, nodeName: "INPUT" },
+							{
+								backendNodeId: 4,
+								nodeName: "CONTACT-FIELDS",
+								shadowRoots: [
+									{
+										backendNodeId: 5,
+										nodeName: "#document-fragment",
+										shadowRootType: "closed",
+										children: [
+											{ backendNodeId: 6, nodeName: "TEXTAREA" },
+											{ backendNodeId: 7, nodeName: "BUTTON" },
+										],
+									},
+								],
+							},
+						],
+					},
+					{
+						backendNodeId: 8,
+						nodeName: "INPUT",
+						attributes: ["form", "contact"],
+					},
+				],
+			},
+			"https://example.com/contact",
+		);
+
+		expect(discovery.closedShadowRootCount).toBe(1);
+		expect(discovery.shadowRootCount).toBe(1);
+		expect(discovery.forms).toEqual([
+			{
+				backendNodeId: 2,
+				action: "https://example.com/send",
+				method: "post",
+				fields: [
+					{ backendNodeId: 3, tag: "input" },
+					{ backendNodeId: 6, tag: "textarea" },
+					{ backendNodeId: 7, tag: "button" },
+					{ backendNodeId: 8, tag: "input" },
+				],
+			},
+		]);
+	});
+
+	test("rejects a CDP message before parsing beyond the Worker-safe cap", () => {
+		expect(() =>
+			assertCdpMessageWithinLimit("x".repeat(MAX_CDP_MESSAGE_CHARACTERS)),
+		).not.toThrow();
+		expect(() =>
+			assertCdpMessageWithinLimit("x".repeat(MAX_CDP_MESSAGE_CHARACTERS + 1)),
+		).toThrow(BrowserUseCdpPayloadTooLargeError);
+	});
+});
 
 describe("BrowserUseCdpDriver child target policy", () => {
 	test("pauses and closes related worker and popup targets", async () => {

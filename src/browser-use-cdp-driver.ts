@@ -1,6 +1,11 @@
 import { assertAllowedBrowserRequest } from "./browser-network-policy";
 import { hasNewSubmissionConfirmation } from "./browser-submit-confirmation";
 import { BrowserUseCdpConnection } from "./browser-use-cdp";
+import {
+	type CdpDomNode,
+	type CdpFormDiscovery,
+	discoverCdpForms,
+} from "./browser-use-cdp-dom";
 import type { Job } from "./job";
 import {
 	BrowserElementError,
@@ -10,6 +15,10 @@ import {
 } from "./restricted-browser";
 
 const MAX_PAGE_TEXT = 20_000;
+const MAX_OBSERVED_FORMS = 10;
+const MAX_OBSERVED_FIELDS = 100;
+const MAX_DOM_DISCOVERY_ATTEMPTS = 5;
+const DOM_DISCOVERY_RETRY_DELAY_MS = 500;
 const CONFIRMATION_WAIT_MS = 5_000;
 
 interface TargetInfo {
@@ -24,12 +33,45 @@ interface AttachedTarget {
 }
 
 interface EvaluateResult {
-	result: { value?: unknown };
+	result: { objectId?: string; value?: unknown };
 	exceptionDetails?: unknown;
+}
+
+interface ResolvedNode {
+	object: { objectId?: string };
+}
+
+interface AxNode {
+	backendDOMNodeId?: number;
+	name?: { value?: unknown };
+	role?: { value?: unknown };
+}
+
+interface ElementState {
+	ok: boolean;
+	visible: boolean;
+	tag: string;
+	type: string;
+	name: string | null;
+	label: string;
+	placeholder: string | null;
+	required: boolean;
+	value: string;
+	options: Array<{ value: string; label: string }>;
+	submitLike: boolean;
+	target: string;
+	disabled: boolean;
+	readOnly: boolean;
+	checked: boolean;
+}
+
+interface ElementReference {
+	backendNodeId: number;
 }
 
 interface PausedRequest {
 	requestId: string;
+	resourceType?: string;
 	request: { url: string; method: string };
 }
 
@@ -38,6 +80,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#submissionRequestAllowed = false;
 	#submissionRequestCount = 0;
 	#targetPolicyError: Error | undefined;
+	#elementGeneration = 0;
+	#elements = new Map<string, ElementReference>();
+	#formDataEntered = false;
 
 	private constructor(
 		private readonly connection: BrowserUseCdpConnection,
@@ -102,6 +147,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async navigate(url: string): Promise<void> {
+		this.#clearElements();
 		const result = await this.#send<{ errorText?: string }>("Page.navigate", {
 			url,
 		});
@@ -110,48 +156,157 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async observe(): Promise<BrowserObservation> {
-		const snapshot = await this.#evaluate<{
-			forms: unknown[];
-			pageText: string;
-		}>(OBSERVE_EXPRESSION);
-		return { url: await this.currentUrl(), ...snapshot };
+		const startedAt = Date.now();
+		const url = await this.currentUrl();
+		const { discovery, attempts: discoveryAttempts } =
+			await this.#discoverForms(url);
+
+		const generation = ++this.#elementGeneration;
+		const elements = new Map<string, ElementReference>();
+		const forms: Array<{
+			action: string;
+			method: string;
+			fields: unknown[];
+		}> = [];
+		let fieldIndex = 0;
+
+		for (const candidateForm of discovery.forms) {
+			if (
+				forms.length >= MAX_OBSERVED_FORMS ||
+				fieldIndex >= MAX_OBSERVED_FIELDS
+			) {
+				break;
+			}
+			const fields: unknown[] = [];
+			for (const candidate of candidateForm.fields) {
+				if (fieldIndex >= MAX_OBSERVED_FIELDS) break;
+				const state = await this.#inspectElement(candidate.backendNodeId).catch(
+					() => null,
+				);
+				if (!state?.ok || !state.visible) continue;
+				const accessible = await this.#accessibleElement(
+					candidate.backendNodeId,
+				).catch(() => null);
+				const elementId = `fa-${generation.toString(36)}-${fieldIndex.toString(36)}`;
+				fieldIndex += 1;
+				elements.set(elementId, {
+					backendNodeId: candidate.backendNodeId,
+				});
+				fields.push({
+					elementId,
+					tag: state.tag,
+					type: state.type || null,
+					name: state.name,
+					role: accessible?.role ?? null,
+					label: accessible?.name || state.label,
+					placeholder: state.placeholder,
+					required: state.required,
+					value: state.type === "password" ? "" : state.value,
+					options: state.options,
+				});
+			}
+			if (fields.length > 0) {
+				forms.push({
+					action: candidateForm.action,
+					method: candidateForm.method,
+					fields,
+				});
+			}
+		}
+
+		this.#elements = elements;
+		const pageText = await this.#bodyText();
+		console.log(
+			JSON.stringify({
+				event: "browser_dom_observation",
+				cdpResponseCharacters:
+					this.connection.lastResponseCharacters("DOM.getDocument") ?? null,
+				nodeCount: discovery.nodeCount,
+				shadowRootCount: discovery.shadowRootCount,
+				closedShadowRootCount: discovery.closedShadowRootCount,
+				candidateFieldCount: discovery.candidateFieldCount,
+				observedFieldCount: fieldIndex,
+				discoveryAttempts,
+				durationMs: Date.now() - startedAt,
+			}),
+		);
+		return { url, forms, pageText };
 	}
 
 	async clickNonSubmit(elementId: string): Promise<void> {
-		const result = await this.#evaluateElementAction<{
-			ok: boolean;
-			submitLike: boolean;
-		}>(elementId, CLICK_EXPRESSION);
-		if (!result.ok) throw new BrowserElementError();
-		if (result.submitLike) {
+		const reference = this.#element(elementId);
+		const state = await this.#inspectElement(reference.backendNodeId);
+		if (!state.ok || !state.visible || state.disabled || state.submitLike) {
 			throw new BrowserElementError();
 		}
+		await this.#clickElement(reference.backendNodeId);
 	}
 
 	async fill(elementId: string, value: string): Promise<void> {
-		const result = await this.#evaluateElementAction<{ ok: boolean }>(
-			elementId,
-			FILL_EXPRESSION,
-			value,
-		);
-		if (!result.ok) throw new BrowserElementError();
+		const reference = this.#element(elementId);
+		const state = await this.#inspectElement(reference.backendNodeId);
+		if (
+			!state.ok ||
+			!state.visible ||
+			state.disabled ||
+			state.readOnly ||
+			!isFillable(state.tag, state.type)
+		) {
+			throw new BrowserElementError();
+		}
+		this.#formDataEntered = true;
+		await this.#send("DOM.scrollIntoViewIfNeeded", {
+			backendNodeId: reference.backendNodeId,
+		});
+		await this.#send("DOM.focus", {
+			backendNodeId: reference.backendNodeId,
+		});
+		await this.#replaceFocusedText(value);
 	}
 
 	async select(elementId: string, value: string): Promise<void> {
-		const result = await this.#evaluateElementAction<{ ok: boolean }>(
-			elementId,
-			SELECT_EXPRESSION,
-			value,
-		);
-		if (!result.ok) throw new BrowserElementError();
+		const reference = this.#element(elementId);
+		const state = await this.#inspectElement(reference.backendNodeId);
+		if (!state.ok || !state.visible || state.disabled) {
+			throw new BrowserElementError();
+		}
+		this.#formDataEntered = true;
+		if (state.tag === "select") {
+			const changed = await this.#callFunctionOnElement<boolean>(
+				reference.backendNodeId,
+				SET_SELECT_VALUE_FUNCTION,
+				[value],
+			);
+			if (!changed) throw new BrowserElementError();
+			return;
+		}
+		const desiredChecked =
+			value === "true" || value === "checked" || value === state.value;
+		if (state.type === "checkbox") {
+			if (state.checked !== desiredChecked) {
+				await this.#clickElement(reference.backendNodeId);
+			}
+			return;
+		}
+		if (state.type === "radio" && value === state.value) {
+			if (!state.checked) await this.#clickElement(reference.backendNodeId);
+			return;
+		}
+		throw new BrowserElementError();
 	}
 
 	async validateSubmit(elementId: string): Promise<void> {
-		const valid = await this.#evaluateElementAction<boolean>(
-			elementId,
-			VALIDATE_SUBMIT_EXPRESSION,
-		);
-		if (!valid) throw new BrowserElementError();
+		const reference = this.#element(elementId);
+		const state = await this.#inspectElement(reference.backendNodeId);
+		if (
+			!state.ok ||
+			!state.visible ||
+			state.disabled ||
+			!state.submitLike ||
+			(state.target !== "" && state.target !== "_self")
+		) {
+			throw new BrowserElementError();
+		}
 	}
 
 	async submit(elementId: string): Promise<BrowserSubmitResult> {
@@ -160,11 +315,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		this.#submissionRequestAllowed = true;
 		this.#submissionRequestCount = 0;
 		try {
-			const clicked = await this.#evaluateElementAction<boolean>(
-				elementId,
-				SUBMIT_EXPRESSION,
-			);
-			if (!clicked) throw new BrowserElementError();
+			await this.#clickElement(this.#element(elementId).backendNodeId);
 			const deadline = Date.now() + CONFIRMATION_WAIT_MS;
 			while (Date.now() < deadline) {
 				const afterText = await this.#bodyText().catch(() => "");
@@ -196,8 +347,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				void this.#handlePausedRequest(params as PausedRequest);
 			}
 		});
+		this.connection.on("DOM.documentUpdated", (_params, sessionId) => {
+			if (sessionId === this.sessionId) this.#clearElements();
+		});
 		await this.#send("Page.enable");
 		await this.#send("Runtime.enable");
+		await this.#send("DOM.enable", { includeWhitespace: "none" });
+		await this.#send("Accessibility.enable");
 		await this.#send("Network.enable");
 		await this.#send("Network.setBypassServiceWorker", { bypass: true });
 		await this.#send("Fetch.enable", { patterns: [{ urlPattern: "*" }] });
@@ -220,6 +376,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				this.#targetDomain,
 				paused.request.method,
 				this.#submissionRequestAllowed && this.#submissionRequestCount === 0,
+				!this.#formDataEntered && paused.resourceType !== "Document",
 			);
 			if (unsafeRequest) this.#submissionRequestCount += 1;
 			await this.#send("Fetch.continueRequest", {
@@ -251,14 +408,171 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		);
 	}
 
-	#evaluateElementAction<TResult>(
-		elementId: string,
-		actionExpression: string,
-		value?: string,
-	): Promise<TResult> {
-		return this.#evaluate<TResult>(
-			`(${actionExpression})(${JSON.stringify(elementId)}, ${JSON.stringify(value ?? "")})`,
+	#element(elementId: string): ElementReference {
+		const reference = this.#elements.get(elementId);
+		if (!reference) throw new BrowserElementError();
+		return reference;
+	}
+
+	#clearElements(): void {
+		this.#elements.clear();
+	}
+
+	async #discoverForms(
+		url: string,
+	): Promise<{ discovery: CdpFormDiscovery; attempts: number }> {
+		for (let attempt = 1; attempt <= MAX_DOM_DISCOVERY_ATTEMPTS; attempt += 1) {
+			const discovery = discoverCdpForms(
+				(
+					await this.#send<{ root: CdpDomNode }>("DOM.getDocument", {
+						depth: -1,
+						pierce: true,
+					})
+				).root,
+				url,
+			);
+			if (
+				discovery.candidateFieldCount > 0 ||
+				attempt === MAX_DOM_DISCOVERY_ATTEMPTS
+			) {
+				return { discovery, attempts: attempt };
+			}
+			await delay(DOM_DISCOVERY_RETRY_DELAY_MS);
+		}
+		throw new Error("Browser DOM discovery failed");
+	}
+
+	async #inspectElement(backendNodeId: number): Promise<ElementState> {
+		return this.#callFunctionOnElement<ElementState>(
+			backendNodeId,
+			INSPECT_ELEMENT_FUNCTION,
 		);
+	}
+
+	async #accessibleElement(
+		backendNodeId: number,
+	): Promise<{ name: string; role: string | null } | null> {
+		const result = await this.#send<{ nodes: AxNode[] }>(
+			"Accessibility.getPartialAXTree",
+			{ backendNodeId, fetchRelatives: false },
+		);
+		const node = result.nodes.find(
+			(candidate) => candidate.backendDOMNodeId === backendNodeId,
+		);
+		if (!node) return null;
+		return {
+			name:
+				typeof node.name?.value === "string"
+					? node.name.value.slice(0, 500)
+					: "",
+			role:
+				typeof node.role?.value === "string"
+					? node.role.value.slice(0, 100)
+					: null,
+		};
+	}
+
+	async #callFunctionOnElement<TResult>(
+		backendNodeId: number,
+		functionDeclaration: string,
+		args: unknown[] = [],
+	): Promise<TResult> {
+		const resolved = await this.#send<ResolvedNode>("DOM.resolveNode", {
+			backendNodeId,
+			objectGroup: "form-agent-elements",
+		});
+		const objectId = resolved.object.objectId;
+		if (!objectId) throw new BrowserElementError();
+		try {
+			const result = await this.#send<EvaluateResult>(
+				"Runtime.callFunctionOn",
+				{
+					objectId,
+					functionDeclaration,
+					arguments: args.map((value) => ({ value })),
+					returnByValue: true,
+				},
+			);
+			if (result.exceptionDetails) throw new BrowserElementError();
+			return result.result.value as TResult;
+		} finally {
+			await this.#send("Runtime.releaseObject", { objectId }).catch(
+				() => undefined,
+			);
+		}
+	}
+
+	async #replaceFocusedText(value: string): Promise<void> {
+		await this.#send("Input.dispatchKeyEvent", {
+			type: "keyDown",
+			key: "Control",
+			code: "ControlLeft",
+			windowsVirtualKeyCode: 17,
+			modifiers: 2,
+		});
+		await this.#send("Input.dispatchKeyEvent", {
+			type: "keyDown",
+			key: "a",
+			code: "KeyA",
+			windowsVirtualKeyCode: 65,
+			modifiers: 2,
+		});
+		await this.#send("Input.dispatchKeyEvent", {
+			type: "keyUp",
+			key: "a",
+			code: "KeyA",
+			windowsVirtualKeyCode: 65,
+			modifiers: 2,
+		});
+		await this.#send("Input.dispatchKeyEvent", {
+			type: "keyUp",
+			key: "Control",
+			code: "ControlLeft",
+			windowsVirtualKeyCode: 17,
+		});
+		await this.#send("Input.dispatchKeyEvent", {
+			type: "keyDown",
+			key: "Backspace",
+			code: "Backspace",
+			windowsVirtualKeyCode: 8,
+		});
+		await this.#send("Input.dispatchKeyEvent", {
+			type: "keyUp",
+			key: "Backspace",
+			code: "Backspace",
+			windowsVirtualKeyCode: 8,
+		});
+		await this.#send("Input.insertText", { text: value });
+	}
+
+	async #clickElement(backendNodeId: number): Promise<void> {
+		await this.#send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
+		const { model } = await this.#send<{
+			model: { border: number[] };
+		}>("DOM.getBoxModel", { backendNodeId });
+		const point = centerOfQuad(model.border);
+		if (!point) throw new BrowserElementError();
+		await this.#send("Input.dispatchMouseEvent", {
+			type: "mouseMoved",
+			x: point.x,
+			y: point.y,
+		});
+		await this.#send("Input.dispatchMouseEvent", {
+			type: "mousePressed",
+			x: point.x,
+			y: point.y,
+			button: "left",
+			buttons: 1,
+			clickCount: 1,
+		});
+		await this.#send("Input.dispatchMouseEvent", {
+			type: "mouseReleased",
+			x: point.x,
+			y: point.y,
+			button: "left",
+			buttons: 0,
+			clickCount: 1,
+		});
 	}
 
 	async #evaluate<TResult>(expression: string): Promise<TResult> {
@@ -349,101 +663,83 @@ export const BLOCK_BROWSER_ESCAPE_EXPRESSION = `(() => {
   } catch {}
 })()`;
 
-const OBSERVE_EXPRESSION = `(() => {
-  const visible = (element) => {
-    const rect = element.getBoundingClientRect();
-    const style = getComputedStyle(element);
-    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-  };
-  const labelFor = (element) => {
-    const explicit = element.id ? document.querySelector('label[for="' + CSS.escape(element.id) + '"]') : null;
-    return (explicit?.textContent?.trim() || element.closest("label")?.textContent?.trim() || element.getAttribute("aria-label") || "").slice(0, 500);
-  };
-  let fieldIndex = 0;
-  const forms = Array.from(document.forms).filter(visible).slice(0, 10).map((form, formIndex) => {
-    const fields = Array.from(form.querySelectorAll("input, textarea, select, button"))
-      .filter(visible).slice(0, Math.max(0, 100 - fieldIndex)).map((element) => {
-        const elementId = "fa-" + formIndex + "-" + fieldIndex++;
-        element.dataset.formAgentId = elementId;
-        return {
-          elementId,
-          tag: element.tagName.toLowerCase(),
-          type: element.type || null,
-          name: element.name || null,
-          label: labelFor(element),
-          placeholder: element.placeholder || null,
-          required: Boolean(element.required),
-          value: element.type === "password" ? "" : element.value || "",
-          options: element.tagName === "SELECT" ? Array.from(element.options).slice(0, 100).map((option) => ({ value: option.value, label: option.text.slice(0, 500) })) : []
-        };
-      });
-    return { action: form.action, method: form.method, fields };
-  });
-  return { forms, pageText: (document.body?.innerText ?? "").slice(0, ${MAX_PAGE_TEXT}) };
-})()`;
-
-const ELEMENT_LOOKUP = `
-  const elements = Array.from(document.querySelectorAll("[data-form-agent-id]"))
-    .filter((element) => element.dataset.formAgentId === elementId)
-    .filter((element) => {
-      const rect = element.getBoundingClientRect();
-      const style = getComputedStyle(element);
-      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-    });
-  const element = elements.length === 1 ? elements[0] : null;`;
-
-const CLICK_EXPRESSION = `(elementId) => {${ELEMENT_LOOKUP}
-  if (!element) return { ok: false, submitLike: false };
-  const submitLike = (element.tagName === "BUTTON" && (!element.type || element.type === "submit")) || (element.tagName === "INPUT" && ["submit", "image"].includes(element.type));
-  if (!submitLike) element.click();
-  return { ok: true, submitLike };
-}`;
-
-const FILL_EXPRESSION = `(elementId, value) => {${ELEMENT_LOOKUP}
-  if (!element || !["INPUT", "TEXTAREA"].includes(element.tagName)) return { ok: false };
-  const prototype = element.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-  const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
-  if (!setter) return { ok: false };
-  setter.call(element, value);
-  element.dispatchEvent(new Event("input", { bubbles: true }));
-  element.dispatchEvent(new Event("change", { bubbles: true }));
-  return { ok: true };
-}`;
-
-const SELECT_EXPRESSION = `(elementId, value) => {${ELEMENT_LOOKUP}
-  if (!element) return { ok: false };
-  if (element.tagName === "SELECT") {
-    element.value = value;
-    element.dispatchEvent(new Event("change", { bubbles: true }));
-    return { ok: true };
-  }
-  if (element.type === "checkbox") {
-    element.checked = value === "true" || value === "checked" || value === element.value;
-    element.dispatchEvent(new Event("change", { bubbles: true }));
-    return { ok: true };
-  }
-  if (element.type === "radio" && value === element.value) {
-    element.checked = true;
-    element.dispatchEvent(new Event("change", { bubbles: true }));
-    return { ok: true };
-  }
-  return { ok: false };
-}`;
-
-const VALIDATE_SUBMIT_EXPRESSION = `(elementId) => {${ELEMENT_LOOKUP}
-  if (!element) return false;
-  const submitLike = (element.tagName === "BUTTON" && (!element.type || element.type === "submit")) || (element.tagName === "INPUT" && ["submit", "image"].includes(element.type));
+const INSPECT_ELEMENT_FUNCTION = String.raw`function() {
+  const element = this;
+  if (!element || typeof element.tagName !== "string") return { ok: false };
+  const tag = element.tagName.toLowerCase();
+  const type = typeof element.type === "string" ? element.type.toLowerCase() : "";
+  const rect = element.getBoundingClientRect();
+  const style = getComputedStyle(element);
+  const visible = rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
+  const labels = Array.from(element.labels ?? []).map((label) => label.textContent?.trim() ?? "").filter(Boolean).join(" ");
+  const labelledBy = (element.getAttribute("aria-labelledby") ?? "").split(/\s+/).filter(Boolean).map((id) => element.getRootNode().getElementById?.(id)?.textContent?.trim() ?? "").filter(Boolean).join(" ");
+  const label = (element.getAttribute("aria-label") || labelledBy || labels || element.closest("label")?.textContent?.trim() || "").slice(0, 500);
+  const submitLike = (tag === "button" && (!type || type === "submit")) || (tag === "input" && ["submit", "image"].includes(type));
   const target = (element.getAttribute("formtarget") ?? element.form?.getAttribute("target") ?? "").trim().toLowerCase();
-  return submitLike && (target === "" || target === "_self");
+  return {
+    ok: true,
+    visible,
+    tag,
+    type,
+    name: typeof element.name === "string" && element.name ? element.name.slice(0, 500) : null,
+    label,
+    placeholder: typeof element.placeholder === "string" && element.placeholder ? element.placeholder.slice(0, 500) : null,
+    required: Boolean(element.required),
+    value: typeof element.value === "string" ? element.value.slice(0, 8192) : "",
+    options: tag === "select" ? Array.from(element.options).slice(0, 100).map((option) => ({ value: option.value.slice(0, 2048), label: option.text.slice(0, 500) })) : [],
+    submitLike,
+    target,
+    disabled: Boolean(element.disabled),
+    readOnly: Boolean(element.readOnly),
+    checked: Boolean(element.checked)
+  };
 }`;
 
-const SUBMIT_EXPRESSION = `(elementId) => {${ELEMENT_LOOKUP}
-  if (!element) return false;
-  const target = (element.getAttribute("formtarget") ?? element.form?.getAttribute("target") ?? "").trim().toLowerCase();
-  if (target !== "" && target !== "_self") return false;
-  element.click();
+const SET_SELECT_VALUE_FUNCTION = `function(value) {
+  if (this.tagName !== "SELECT" || !Array.from(this.options).some((option) => option.value === value)) return false;
+  this.value = value;
+  this.dispatchEvent(new Event("input", { bubbles: true }));
+  this.dispatchEvent(new Event("change", { bubbles: true }));
   return true;
 }`;
+
+function centerOfQuad(quad: number[]): { x: number; y: number } | null {
+	if (quad.length !== 8 || !quad.every(Number.isFinite)) return null;
+	const [x1, y1, x2, y2, x3, y3, x4, y4] = quad;
+	if (
+		x1 === undefined ||
+		y1 === undefined ||
+		x2 === undefined ||
+		y2 === undefined ||
+		x3 === undefined ||
+		y3 === undefined ||
+		x4 === undefined ||
+		y4 === undefined
+	) {
+		return null;
+	}
+	return {
+		x: (x1 + x2 + x3 + x4) / 4,
+		y: (y1 + y2 + y3 + y4) / 4,
+	};
+}
+
+function isFillable(tag: string, type: string): boolean {
+	if (tag === "textarea") return true;
+	return (
+		tag === "input" &&
+		![
+			"button",
+			"checkbox",
+			"file",
+			"hidden",
+			"image",
+			"radio",
+			"reset",
+			"submit",
+		].includes(type)
+	);
+}
 
 function delay(milliseconds: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, milliseconds));

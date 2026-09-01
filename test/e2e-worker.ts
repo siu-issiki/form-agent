@@ -4,9 +4,11 @@ import worker, { type Env, type JobMessage, registerJob } from "../src/worker";
 
 interface E2eEnv extends Env {
 	E2E_TOKEN?: string;
+	E2E_TARGET_URL?: string;
 }
 
 const JOB_ID_PATTERN = /^agent-e2e-[a-f0-9-]{36}$/;
+const DEFAULT_TARGET_URL = "https://www.selenium.dev/selenium/web/blank.html";
 
 const e2eWorker: ExportedHandler<E2eEnv, JobMessage> = {
 	async fetch(request, env) {
@@ -26,16 +28,28 @@ const e2eWorker: ExportedHandler<E2eEnv, JobMessage> = {
 			if (typeof body.jobId !== "string" || !JOB_ID_PATTERN.test(body.jobId)) {
 				return Response.json({ error: "INVALID_JOB_ID" }, { status: 400 });
 			}
+			const targetUrl = env.E2E_TARGET_URL ?? DEFAULT_TARGET_URL;
+			let target: URL;
+			try {
+				target = new URL(targetUrl);
+				if (target.protocol !== "https:") throw new TypeError();
+			} catch {
+				return Response.json({ error: "INVALID_TARGET_URL" }, { status: 500 });
+			}
 			const input: JobInput = {
 				id: body.jobId,
-				companyId: "agent-e2e-selenium",
-				companyName: "Selenium Blank Page E2E Fixture",
-				targetUrl: "https://www.selenium.dev/selenium/web/blank.html",
-				targetDomain: "selenium.dev",
+				companyId: "agent-e2e-target",
+				companyName: `${target.hostname} E2E Fixture`,
+				targetUrl,
+				targetDomain: target.hostname,
 				payload: {
 					scenario: "safe-no-submit",
+					name: "送信なしテスト",
+					companyName: "Form Agent E2E",
+					email: "no-reply@example.com",
+					message: "これは送信しないフォーム動作確認です。",
 					instruction:
-						"Inspect the target. It intentionally has no inquiry form. Do not submit anything.",
+						"Inspect the target and fill a compatible inquiry form using only these payload values. Call submit after validation; dry-run mode must intercept it without sending.",
 				},
 			};
 			const registered = await registerJob(

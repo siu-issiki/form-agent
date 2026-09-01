@@ -4,6 +4,7 @@ import type { Job, JobStore } from "./job";
 export interface BrowserObservation {
 	url: string;
 	forms: unknown[];
+	pageText?: string;
 }
 
 export type BrowserSubmitResult =
