@@ -6,9 +6,10 @@
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.workers.json && tsc --noEmit -p tsconfig.runner.json",
     "lint": "biome check src runner test vitest.config.ts vitest.browser-use.config.ts",
     "test": "bun run test:unit && bun run test:workers",
-    "test:unit": "bun test test/job.test.ts test/browser-use-client.test.ts test/browser-use-cdp-driver.test.ts test/restricted-browser.test.ts test/agent-executor.test.ts runner/tool-client.test.ts runner/agent-tools.test.ts",
+    "test:unit": "bun test test/job.test.ts test/browser-use-client.test.ts test/browser-use-cdp-driver.test.ts test/restricted-browser.test.ts test/agent-executor.test.ts runner/tool-client.test.ts runner/agent-tools.test.ts runner/provider-payload.test.ts",
     "test:workers": "vitest run",
     "test:browser-use-smoke": "vitest run --config vitest.browser-use.config.ts",
+    "test:agent-e2e": "bun run test/run-agent-e2e.ts",
     "db:migrate:local": "wrangler d1 migrations apply DB --local",
     "dev": "wrangler dev"
   },
