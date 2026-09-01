@@ -369,11 +369,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		this.#submissionRequestCount = 0;
 		try {
 			try {
-				const activated = await this.#callFunctionOnElement<boolean>(
+				await this.#activateSubmitElement(
 					this.#element(elementId).backendNodeId,
-					ACTIVATE_SUBMIT_FUNCTION,
 				);
-				if (!activated) throw new BrowserElementError();
 			} catch (error) {
 				throw createBrowserSubmitDiagnosticError("SUBMIT_ACTIVATE", error);
 			}
@@ -706,6 +704,34 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		});
 	}
 
+	async #activateSubmitElement(backendNodeId: number): Promise<void> {
+		const unobscured = await this.#callFunctionOnElement<boolean>(
+			backendNodeId,
+			IS_SUBMIT_UNOBSCURED_FUNCTION,
+		);
+		if (!unobscured) throw new BrowserElementError();
+		await this.#send("DOM.focus", { backendNodeId });
+		const focused = await this.#callFunctionOnElement<boolean>(
+			backendNodeId,
+			IS_ELEMENT_FOCUSED_FUNCTION,
+		);
+		if (!focused) throw new BrowserElementError();
+		await this.#send("Input.dispatchKeyEvent", {
+			type: "keyDown",
+			key: "Enter",
+			code: "Enter",
+			windowsVirtualKeyCode: 13,
+			nativeVirtualKeyCode: 13,
+		});
+		await this.#send("Input.dispatchKeyEvent", {
+			type: "keyUp",
+			key: "Enter",
+			code: "Enter",
+			windowsVirtualKeyCode: 13,
+			nativeVirtualKeyCode: 13,
+		}).catch(() => undefined);
+	}
+
 	async #isComposedDescendant(
 		ancestorBackendNodeId: number,
 		candidateBackendNodeId: number,
@@ -903,10 +929,27 @@ const SET_SELECT_VALUE_FUNCTION = `function(value) {
   return true;
 }`;
 
-export const ACTIVATE_SUBMIT_FUNCTION = `function() {
-  if (!this.isConnected || typeof this.click !== "function") return false;
-  this.click();
-  return true;
+export const IS_SUBMIT_UNOBSCURED_FUNCTION = `function() {
+  if (!this.isConnected || typeof this.getBoundingClientRect !== "function") return false;
+  const rect = this.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return false;
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const root = this.getRootNode?.();
+  const hitTestRoot = root && typeof root.elementFromPoint === "function" ? root : this.ownerDocument;
+  const hit = hitTestRoot?.elementFromPoint?.(x, y);
+  let current = hit;
+  while (current) {
+    if (current === this) return true;
+    const currentRoot = current.getRootNode?.();
+    current = current.parentElement ?? currentRoot?.host ?? null;
+  }
+  return false;
+}`;
+
+export const IS_ELEMENT_FOCUSED_FUNCTION = `function() {
+  const root = this.getRootNode?.();
+  return Boolean(this.isConnected && root && root.activeElement === this);
 }`;
 
 export const CHECK_FORM_VALIDITY_FUNCTION = `function() {

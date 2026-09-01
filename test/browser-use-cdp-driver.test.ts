@@ -8,7 +8,6 @@ import {
 } from "../src/browser-use-cdp";
 import { discoverCdpForms } from "../src/browser-use-cdp-dom";
 import {
-	ACTIVATE_SUBMIT_FUNCTION,
 	assertDryRunNavigationAllowed,
 	BLOCK_BROWSER_ESCAPE_EXPRESSION,
 	CHECK_FORM_VALIDITY_FUNCTION,
@@ -16,6 +15,8 @@ import {
 	denyRelatedBrowserTargets,
 	HAS_SAME_FORM_OWNER_FUNCTION,
 	IS_COMPOSED_DESCENDANT_FUNCTION,
+	IS_ELEMENT_FOCUSED_FUNCTION,
+	IS_SUBMIT_UNOBSCURED_FUNCTION,
 	isPayloadIndependentClickTarget,
 	readSubmissionConfirmation,
 } from "../src/browser-use-cdp-driver";
@@ -89,22 +90,63 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 });
 
 describe("BrowserUseCdpDriver child target policy", () => {
-	test("activates exactly the resolved connected submit element", () => {
-		const activateSubmit = runInNewContext(
-			`(${ACTIVATE_SUBMIT_FUNCTION})`,
-		) as (this: { isConnected: boolean; click?(): void }) => boolean;
-		let clickCount = 0;
+	test("requires the resolved submit element to be unobscured", () => {
+		const isUnobscured = runInNewContext(
+			`(${IS_SUBMIT_UNOBSCURED_FUNCTION})`,
+		) as (this: {
+			isConnected: boolean;
+			getBoundingClientRect(): {
+				left: number;
+				top: number;
+				width: number;
+				height: number;
+			};
+			getRootNode(): { elementFromPoint(): object };
+		}) => boolean;
+		const overlay = {};
 		const button = {
 			isConnected: true,
-			click: () => {
-				clickCount += 1;
+			getBoundingClientRect: () => ({
+				left: 10,
+				top: 20,
+				width: 100,
+				height: 40,
+			}),
+			getRootNode() {
+				return { elementFromPoint: () => this };
 			},
 		};
 
-		expect(activateSubmit.call(button)).toBe(true);
-		expect(clickCount).toBe(1);
-		expect(activateSubmit.call({ ...button, isConnected: false })).toBe(false);
-		expect(clickCount).toBe(1);
+		expect(isUnobscured.call(button)).toBe(true);
+		expect(
+			isUnobscured.call({
+				...button,
+				getRootNode: () => ({ elementFromPoint: () => overlay }),
+			}),
+		).toBe(false);
+	});
+
+	test("requires the resolved submit element to retain focus", () => {
+		const isFocused = runInNewContext(
+			`(${IS_ELEMENT_FOCUSED_FUNCTION})`,
+		) as (this: {
+			isConnected: boolean;
+			getRootNode(): { activeElement: object };
+		}) => boolean;
+		const button = {
+			isConnected: true,
+			getRootNode() {
+				return { activeElement: this };
+			},
+		};
+
+		expect(isFocused.call(button)).toBe(true);
+		expect(
+			isFocused.call({
+				...button,
+				getRootNode: () => ({ activeElement: {} }),
+			}),
+		).toBe(false);
 	});
 
 	test("rounds hit-test coordinates to CDP integers", () => {
