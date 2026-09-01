@@ -187,6 +187,27 @@ describe("Job HTTP API", () => {
 		expect(queued).toEqual([{ jobId: input.id }, { jobId: input.id }]);
 	});
 
+	test("rejects a duplicate id with different input without leaking the job", async () => {
+		await handleHttpRequest(
+			jobRequest("POST", "/jobs", input, apiToken),
+			apiEnv,
+		);
+		const conflict = await handleHttpRequest(
+			jobRequest(
+				"POST",
+				"/jobs",
+				{ ...input, companyName: "Other Inc.", payload: { message: "Other" } },
+				apiToken,
+			),
+			apiEnv,
+		);
+
+		expect(conflict.status).toBe(409);
+		expect(await conflict.json()).toEqual({ error: "JOB_ID_CONFLICT" });
+		expect(queued).toEqual([{ jobId: input.id }]);
+		expect(await new D1JobStore(env.DB).find(input.id)).toMatchObject(input);
+	});
+
 	test("rejects malformed jobs before persistence", async () => {
 		const mismatchedDomain = {
 			...input,
@@ -221,6 +242,24 @@ describe("Job HTTP API", () => {
 		);
 
 		expect(response.status).toBe(401);
+	});
+
+	test("stops reading a body when it exceeds the request limit", async () => {
+		const response = await handleHttpRequest(
+			new Request("https://form-agent.test/jobs", {
+				method: "POST",
+				headers: {
+					authorization: `Bearer ${apiToken}`,
+					"content-type": "application/json",
+				},
+				body: "x".repeat(64 * 1024 + 1),
+			}),
+			apiEnv,
+		);
+
+		expect(response.status).toBe(413);
+		expect(await response.json()).toEqual({ error: "REQUEST_TOO_LARGE" });
+		expect(queued).toEqual([]);
 	});
 });
 

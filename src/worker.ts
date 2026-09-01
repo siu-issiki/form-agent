@@ -65,6 +65,9 @@ export async function registerJob(
 		if (!existing) {
 			throw new Error(`Duplicate job could not be loaded: ${input.id}`);
 		}
+		if (!hasSameInput(existing, input)) {
+			throw new ConflictingJobError(input.id);
+		}
 		job = existing;
 	}
 
@@ -111,12 +114,20 @@ export async function handleHttpRequest(
 			throw error;
 		}
 
-		const registered = await registerJob(
-			env.DB,
-			env.JOB_QUEUE,
-			input,
-			new Date().toISOString(),
-		);
+		let registered: RegisterJobResult;
+		try {
+			registered = await registerJob(
+				env.DB,
+				env.JOB_QUEUE,
+				input,
+				new Date().toISOString(),
+			);
+		} catch (error) {
+			if (error instanceof ConflictingJobError) {
+				return apiJson({ error: "JOB_ID_CONFLICT" }, 409);
+			}
+			throw error;
+		}
 		return apiJson(
 			{
 				created: registered.created,
@@ -189,10 +200,7 @@ async function parseJobInput(request: Request): Promise<JobInput> {
 		throw new InvalidJobRequestError("REQUEST_TOO_LARGE", 413);
 	}
 
-	const rawBody = await request.text();
-	if (new TextEncoder().encode(rawBody).byteLength > MAX_JOB_REQUEST_BYTES) {
-		throw new InvalidJobRequestError("REQUEST_TOO_LARGE", 413);
-	}
+	const rawBody = await readBoundedBody(request);
 
 	let body: unknown;
 	try {
@@ -226,6 +234,30 @@ async function parseJobInput(request: Request): Promise<JobInput> {
 	return { id, companyId, companyName, targetUrl, targetDomain, payload };
 }
 
+async function readBoundedBody(request: Request): Promise<string> {
+	if (!request.body) return "";
+
+	const reader = request.body.getReader();
+	const decoder = new TextDecoder();
+	let totalBytes = 0;
+	let body = "";
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			totalBytes += value.byteLength;
+			if (totalBytes > MAX_JOB_REQUEST_BYTES) {
+				await reader.cancel().catch(() => undefined);
+				throw new InvalidJobRequestError("REQUEST_TOO_LARGE", 413);
+			}
+			body += decoder.decode(value, { stream: true });
+		}
+		return body + decoder.decode();
+	} finally {
+		reader.releaseLock();
+	}
+}
+
 function validRequiredString(
 	value: unknown,
 	maxLength: number,
@@ -248,6 +280,45 @@ class InvalidJobRequestError extends Error {
 	) {
 		super(code);
 	}
+}
+
+class ConflictingJobError extends Error {
+	constructor(id: string) {
+		super(`Job input conflicts with the existing job: ${id}`);
+	}
+}
+
+function hasSameInput(job: Job, input: JobInput): boolean {
+	return (
+		job.companyId === input.companyId &&
+		job.companyName === input.companyName &&
+		job.targetUrl === input.targetUrl &&
+		job.targetDomain === input.targetDomain &&
+		hasSameJsonValue(job.payload, input.payload)
+	);
+}
+
+function hasSameJsonValue(left: unknown, right: unknown): boolean {
+	if (Object.is(left, right)) return true;
+	if (Array.isArray(left) || Array.isArray(right)) {
+		return (
+			Array.isArray(left) &&
+			Array.isArray(right) &&
+			left.length === right.length &&
+			left.every((value, index) => hasSameJsonValue(value, right[index]))
+		);
+	}
+	if (!isRecord(left) || !isRecord(right)) return false;
+
+	const leftKeys = Object.keys(left).sort();
+	const rightKeys = Object.keys(right).sort();
+	return (
+		leftKeys.length === rightKeys.length &&
+		leftKeys.every(
+			(key, index) =>
+				key === rightKeys[index] && hasSameJsonValue(left[key], right[key]),
+		)
+	);
 }
 
 export async function consumeJobBatch(
