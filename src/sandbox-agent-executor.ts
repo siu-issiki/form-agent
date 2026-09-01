@@ -108,6 +108,7 @@ export class SandboxAgentExecutor implements AgentExecutor {
 			process = await sandbox.exec(["bun", "run", RUNNER_PATH], {
 				env: {
 					FORM_AGENT_MODEL: this.model,
+					FORM_AGENT_MAX_OUTPUT_TOKENS: String(MAX_PROVIDER_OUTPUT_TOKENS),
 					FORM_AGENT_TOOL_BASE_URL: `http://${FORM_AGENT_TOOL_HOST}`,
 					OPENAI_API_KEY: "injected-by-worker-outbound-handler",
 				},

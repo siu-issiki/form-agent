@@ -21,6 +21,8 @@ BrowserUse は Agent API ではなく standalone browser API だけを使用し�
 
 実BrowserUse/CDPの送信なしスモークテストは、追跡対象外の`.env`へ`BROWSER_USE_API_KEY`を設定して`bun run test:browser-use-smoke`で実行します。このテストは公開テストフォームの観察と入力、送信ボタンの通常click拒否、対象外ドメイン遷移拒否を確認し、フォーム送信は行いません。通常の`bun run test`には含めず、外部セッションを明示実行時だけ作成します。
 
+実Queue/D1/Sandbox/Pi/OpenAI/BrowserUseを通す送信なしE2Eは、`.env`へ`OPENAI_API_KEY`と`BROWSER_USE_API_KEY`を設定して`bun run test:agent-e2e`で実行します。専用の`wrangler dev`環境を一時ディレクトリへ起動し、Selenium公式サイトの空ページに固定した1ジョブをQueue bindingへ登録します。ジョブが送信以外の終端状態へ遷移すること、Provider呼び出しがD1へ記録されること、再試行がないことを確認し、終了時にWorker・Container・一時データを破棄します。外部API利用料が発生するため、通常の`bun run test`には含めません。
+
 ## エージェント実行境界
 
 Queue Consumer は `AgentRuntime` の結果契約を使います。Cloudflare Sandbox 1.0 preview上でPi 0.74.0 runnerを起動し、D1操作とProvider認証情報はコンテナへ渡さずoutbound handler内に保持します。コンテナの外向き通信は内部tool hostとOpenAI APIだけを許可します。

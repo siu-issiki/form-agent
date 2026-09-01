@@ -2,6 +2,7 @@ import { Agent } from "@earendil-works/pi-agent-core";
 import { getModels } from "@earendil-works/pi-ai";
 import { createAgentTools } from "./agent-tools";
 import type { RunnerResult } from "./contracts";
+import { capProviderOutputTokens } from "./provider-payload";
 import { AgentToolClient, AgentToolHttpError } from "./tool-client";
 
 const MAX_TURNS = 12;
@@ -9,6 +10,10 @@ const MAX_JOB_PROMPT_LENGTH = 64_000;
 
 async function run(): Promise<RunnerResult> {
 	const modelId = requiredEnv("FORM_AGENT_MODEL");
+	const maxOutputTokens = requiredIntegerEnv(
+		"FORM_AGENT_MAX_OUTPUT_TOKENS",
+		8_192,
+	);
 	const model = getModels("openai").find(
 		(candidate) => candidate.id === modelId,
 	);
@@ -42,6 +47,7 @@ async function run(): Promise<RunnerResult> {
 		},
 		toolExecution: "sequential",
 		maxRetryDelayMs: 30_000,
+		onPayload: (payload) => capProviderOutputTokens(payload, maxOutputTokens),
 	});
 	agent.subscribe((event) => {
 		if (event.type === "turn_end" && ++turns >= MAX_TURNS && !result) {
@@ -62,7 +68,10 @@ async function run(): Promise<RunnerResult> {
 			);
 		}
 	}
-	return result ?? failed("AGENT_DID_NOT_FINISH", false);
+	if (result) return result;
+	return agent.state.errorMessage
+		? failed("AGENT_RUNTIME_FAILED", true)
+		: failed("AGENT_DID_NOT_FINISH", false);
 }
 
 function systemPrompt(): string {
@@ -82,6 +91,14 @@ function requiredEnv(name: string): string {
 	const value = process.env[name];
 	if (!value) {
 		throw new Error(`Missing ${name}`);
+	}
+	return value;
+}
+
+function requiredIntegerEnv(name: string, maximum: number): number {
+	const value = Number(requiredEnv(name));
+	if (!Number.isInteger(value) || value < 1 || value > maximum) {
+		throw new Error(`Invalid ${name}`);
 	}
 	return value;
 }

@@ -472,6 +472,7 @@ describe("SandboxAgentExecutor", () => {
 		expect(sandboxId).toBe(await sandboxIdForJob(input.id));
 		expect(launchEnv).toEqual({
 			FORM_AGENT_MODEL: "gpt-5.4-mini",
+			FORM_AGENT_MAX_OUTPUT_TOKENS: "4096",
 			FORM_AGENT_TOOL_BASE_URL: "http://agent-tools.internal",
 			OPENAI_API_KEY: "injected-by-worker-outbound-handler",
 		});
