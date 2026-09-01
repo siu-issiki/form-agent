@@ -6,6 +6,7 @@ import {
 import type { AgentRunResult } from "./agent-runtime";
 import { D1JobStore } from "./d1-job-store";
 import { DuplicateJobError, type Job, type JobInput } from "./job";
+import { assertAllowedTargetUrl } from "./restricted-browser";
 import { createSandboxAgentExecutor } from "./sandbox-agent-executor";
 
 export { AgentToolService } from "./agent-tool-service";
@@ -25,6 +26,7 @@ export interface Env {
 	AGENT_MODEL?: string;
 	OPENAI_API_KEY?: string;
 	BROWSER_USE_API_KEY?: string;
+	JOB_API_TOKEN?: string;
 }
 
 export interface RegisterJobResult {
@@ -38,6 +40,8 @@ interface JobQueue {
 
 const DEAD_LETTER_QUEUE = "form-agent-jobs-dlq";
 const MAX_AGENT_DURATION_MS = 10 * 60 * 1000;
+const MAX_JOB_REQUEST_BYTES = 64 * 1024;
+const JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 export async function registerJob(
 	db: D1Database,
@@ -72,12 +76,8 @@ export async function registerJob(
 }
 
 const worker: ExportedHandler<Env, JobMessage> = {
-	async fetch(request) {
-		const url = new URL(request.url);
-		if (request.method === "GET" && url.pathname === "/health") {
-			return Response.json({ status: "ok" });
-		}
-		return new Response("Not Found", { status: 404 });
+	async fetch(request, env) {
+		return handleHttpRequest(request, env);
 	},
 
 	async queue(batch, env) {
@@ -86,6 +86,169 @@ const worker: ExportedHandler<Env, JobMessage> = {
 };
 
 export default worker;
+
+export async function handleHttpRequest(
+	request: Request,
+	env: Env,
+): Promise<Response> {
+	const url = new URL(request.url);
+	if (request.method === "GET" && url.pathname === "/health") {
+		return Response.json({ status: "ok" });
+	}
+
+	if (url.pathname === "/jobs" && request.method === "POST") {
+		if (!isAuthorized(request, env.JOB_API_TOKEN)) {
+			return unauthorizedResponse();
+		}
+
+		let input: JobInput;
+		try {
+			input = await parseJobInput(request);
+		} catch (error) {
+			if (error instanceof InvalidJobRequestError) {
+				return apiJson({ error: error.code }, error.status);
+			}
+			throw error;
+		}
+
+		const registered = await registerJob(
+			env.DB,
+			env.JOB_QUEUE,
+			input,
+			new Date().toISOString(),
+		);
+		return apiJson(
+			{
+				created: registered.created,
+				job: toPublicJob(registered.job),
+			},
+			registered.created ? 201 : 200,
+		);
+	}
+
+	const jobId = jobIdFromPath(url.pathname);
+	if (jobId && request.method === "GET") {
+		if (!isAuthorized(request, env.JOB_API_TOKEN)) {
+			return unauthorizedResponse();
+		}
+		const job = await new D1JobStore(env.DB).find(jobId);
+		return job
+			? apiJson({ job: toPublicJob(job) }, 200)
+			: apiJson({ error: "NOT_FOUND" }, 404);
+	}
+
+	return new Response("Not Found", { status: 404 });
+}
+
+function isAuthorized(request: Request, token: string | undefined): boolean {
+	return Boolean(
+		token && request.headers.get("authorization") === `Bearer ${token}`,
+	);
+}
+
+function unauthorizedResponse(): Response {
+	return apiJson({ error: "UNAUTHORIZED" }, 401, {
+		"www-authenticate": "Bearer",
+	});
+}
+
+function apiJson(
+	body: unknown,
+	status: number,
+	headers?: HeadersInit,
+): Response {
+	const responseHeaders = new Headers(headers);
+	responseHeaders.set("cache-control", "no-store");
+	return Response.json(body, { status, headers: responseHeaders });
+}
+
+function jobIdFromPath(pathname: string): string | null {
+	const match = /^\/jobs\/([^/]+)$/.exec(pathname);
+	if (!match?.[1]) return null;
+	try {
+		const jobId = decodeURIComponent(match[1]);
+		return JOB_ID_PATTERN.test(jobId) ? jobId : null;
+	} catch {
+		return null;
+	}
+}
+
+function toPublicJob(job: Job): Omit<Job, "runToken"> {
+	const { runToken: _runToken, ...publicJob } = job;
+	return publicJob;
+}
+
+async function parseJobInput(request: Request): Promise<JobInput> {
+	const contentType = request.headers.get("content-type")?.split(";", 1)[0];
+	if (contentType?.trim().toLowerCase() !== "application/json") {
+		throw new InvalidJobRequestError("UNSUPPORTED_MEDIA_TYPE", 415);
+	}
+
+	const contentLength = Number(request.headers.get("content-length"));
+	if (Number.isFinite(contentLength) && contentLength > MAX_JOB_REQUEST_BYTES) {
+		throw new InvalidJobRequestError("REQUEST_TOO_LARGE", 413);
+	}
+
+	const rawBody = await request.text();
+	if (new TextEncoder().encode(rawBody).byteLength > MAX_JOB_REQUEST_BYTES) {
+		throw new InvalidJobRequestError("REQUEST_TOO_LARGE", 413);
+	}
+
+	let body: unknown;
+	try {
+		body = JSON.parse(rawBody);
+	} catch {
+		throw new InvalidJobRequestError("INVALID_JSON", 400);
+	}
+	if (!isRecord(body)) {
+		throw new InvalidJobRequestError("INVALID_JOB", 400);
+	}
+
+	const { id, companyId, companyName, targetUrl, targetDomain, payload } = body;
+	if (
+		typeof id !== "string" ||
+		!JOB_ID_PATTERN.test(id) ||
+		!validRequiredString(companyId, 128) ||
+		!validRequiredString(companyName, 256) ||
+		!validRequiredString(targetUrl, 2_048) ||
+		!validRequiredString(targetDomain, 253) ||
+		!isRecord(payload)
+	) {
+		throw new InvalidJobRequestError("INVALID_JOB", 400);
+	}
+
+	try {
+		assertAllowedTargetUrl(targetUrl, targetDomain);
+	} catch {
+		throw new InvalidJobRequestError("INVALID_JOB", 400);
+	}
+
+	return { id, companyId, companyName, targetUrl, targetDomain, payload };
+}
+
+function validRequiredString(
+	value: unknown,
+	maxLength: number,
+): value is string {
+	return (
+		typeof value === "string" &&
+		value.trim().length > 0 &&
+		value.length <= maxLength
+	);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+class InvalidJobRequestError extends Error {
+	constructor(
+		readonly code: string,
+		readonly status: number,
+	) {
+		super(code);
+	}
+}
 
 export async function consumeJobBatch(
 	batch: MessageBatch<JobMessage>,

@@ -17,6 +17,27 @@ bun run dev
 
 ローカル開発では Miniflare 上の D1 と Queue を使用します。Queue の最大並列数はローカル実行では再現されないため、D1 の条件付き更新と重複配信テストで二重実行を防ぎます。
 
+## ジョブ API
+
+`JOB_API_TOKEN`をCloudflare Secret（ローカルでは追跡対象外の`.env`）へ設定すると、Bearer認証付きの登録・取得APIを利用できます。未設定時はAPIをfail-closedで拒否し、`GET /health`だけを認証なしで公開します。
+
+```http
+POST /jobs
+Authorization: Bearer <JOB_API_TOKEN>
+Content-Type: application/json
+
+{
+  "id": "job-001",
+  "companyId": "company-001",
+  "companyName": "Example Inc.",
+  "targetUrl": "https://example.com/contact",
+  "targetDomain": "example.com",
+  "payload": { "message": "お問い合わせ内容" }
+}
+```
+
+登録成功は`201`、同じIDのジョブが既に存在する場合は`200`を返します。既存ジョブが`pending`なら、作成後のQueue投入失敗から復旧できるよう再度Queueへ投入します。`GET /jobs/:id`は同じBearer認証で現在状態を返します。いずれのレスポンスにも実行権を表す`runToken`は含めません。一覧・キャンセルAPIは未実装です。
+
 BrowserUse は Agent API ではなく standalone browser API だけを使用します。ブラウザ操作層は対象ドメイン内のみに制限し、送信は D1 上で `running` から `submitting` へ遷移できたジョブにだけ許可します。
 
 実BrowserUse/CDPの送信なしスモークテストは、追跡対象外の`.env`へ`BROWSER_USE_API_KEY`を設定して`bun run test:browser-use-smoke`で実行します。このテストは公開テストフォームの観察と入力、送信ボタンの通常click拒否、対象外ドメイン遷移拒否を確認し、フォーム送信は行いません。通常の`bun run test`には含めず、外部セッションを明示実行時だけ作成します。

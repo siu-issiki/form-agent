@@ -20,7 +20,7 @@
 | 推論 Provider | 部分実装 | OpenAI API のみ。モデル、回数、本文、出力 token を Worker 側で制限 |
 | BrowserUse | 実装済み | standalone browser へ CDP 接続し、用途限定ツールだけを公開 |
 | E2E | 部分実装 | 実 Queue / D1 / Sandbox / Pi / OpenAI / BrowserUse の送信なし E2E 成功 |
-| HTTP API | 未実装 | 本番 Worker は `GET /health` のみ。ジョブ登録関数は内部実装済み |
+| HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。一覧・キャンセルは未実装 |
 | Cloudflare 配備 | 未実施 | ローカル設定のみ。staging / production の Worker、D1、Queue は未作成 |
 | 監査・メトリクス | 部分実装 | Provider 呼び出し回数と DLQ イベントのみ |
 | 並列検証 | 未実施 | `max_concurrency: 5` は設定済みだが、Cloudflare 上の 5 並列は未検証 |
@@ -38,8 +38,8 @@
 ## 現行の全体構成
 
 ```text
-ジョブ登録関数
-（認証付き HTTP API / バッチは未実装）
+Bearer 認証付き HTTP API
+（登録・取得を実装。バッチ / 一覧 / キャンセルは未実装）
         │
         ├─ D1 に pending を作成
         └─ jobId を Queue へ登録
@@ -78,6 +78,8 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、ロ�
 ### Cloudflare Worker / Queue Consumer
 
 - ジョブ登録時に D1 へ `pending` を作成し、Queue へ `jobId` を登録する。
+- `JOB_API_TOKEN` による Bearer 認証を必須とし、未設定時はジョブ API を fail-closed で拒否する。
+- ジョブ取得レスポンスから実行権を表す `runToken` を除外し、キャッシュを禁止する。
 - Queue の at-least-once 配信を前提に、D1 の条件付き更新で実行権を 1 つの Consumer だけに与える。
 - Agent の構造化結果を D1 の終端状態へ反映する。
 - 再試行可能な失敗は Queue retry、再試行上限超過は DLQ へ送る。
@@ -274,8 +276,9 @@ Pi の system prompt では、営業禁止・用途制限の確認、payload に
 
 ### API / 運用
 
-- 本番 Worker の HTTP endpoint は `GET /health` だけである。
-- 認証付きジョブ登録、取得、一覧、キャンセル API は未実装である。
+- Worker は認証不要の `GET /health`、Bearer 認証付きの `POST /jobs` と `GET /jobs/:id` を持つ。
+- `JOB_API_TOKEN` は単一の共有 secret であり、利用者別の認証・権限・失効管理は行わない。
+- ジョブ一覧、キャンセル API は未実装である。
 - `submitting` / `uncertain` の照合、DLQ の確認・再投入、緊急停止の運用機能は未実装である。
 - payload、理由、ログ、DOM snapshot の保存期間・マスキング方針は未決定である。
 
@@ -325,7 +328,7 @@ PoC は 5 並列から開始し、観測結果をもとに 20、50 へ段階的�
 
 未完了:
 
-- [ ] 認証付きジョブ登録・取得 API を実装する。
+- [x] 認証付きジョブ登録・取得 API を実装する。
 - [ ] staging の D1、Queue、DLQ、Secrets、Worker を作成する。
 - [ ] 管理下のテストフォームで `submitting` から `sent` まで検証する。
 - [ ] Queue 重複配信時に実 POST が 1 回だけであることを検証する。
@@ -355,7 +358,7 @@ PoC は 5 並列から開始し、観測結果をもとに 20、50 へ段階的�
 
 ### 実装
 
-- 認証付きジョブ登録・取得・一覧・キャンセル API。
+- 利用者別の認証・権限管理と、ジョブ一覧・キャンセル API。
 - staging / production の Cloudflare resource と環境分離。
 - 管理下テストフォームを使う実送信 E2E。
 - 禁止判定の証跡、送信前確認、payload 由来入力を信頼済み handler で検証する境界。
