@@ -19,6 +19,7 @@ import {
 	IS_SUBMIT_UNOBSCURED_FUNCTION,
 	isPayloadIndependentClickTarget,
 	readSubmissionConfirmation,
+	waitForSubmissionPermissionWindow,
 } from "../src/browser-use-cdp-driver";
 import { BrowserSubmitDiagnosticError } from "../src/restricted-browser";
 
@@ -361,6 +362,20 @@ describe("BrowserUseCdpDriver child target policy", () => {
 });
 
 describe("BrowserUseCdpDriver submission confirmation", () => {
+	test("bounds the submission request permission window independently of the page", async () => {
+		let waitedMilliseconds: number | null = null;
+		const neverResolvingBrowserTick = new Promise<never>(() => undefined);
+
+		await waitForSubmissionPermissionWindow(
+			neverResolvingBrowserTick,
+			async (milliseconds) => {
+				waitedMilliseconds = milliseconds;
+			},
+		);
+
+		expect(waitedMilliseconds).toBe(250);
+	});
+
 	test("classifies a confirmation read failure without persisting its message", async () => {
 		const failure = readSubmissionConfirmation(
 			"Contact form",

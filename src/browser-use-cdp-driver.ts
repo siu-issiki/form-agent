@@ -21,6 +21,7 @@ const MAX_OBSERVED_FIELDS = 100;
 const MAX_DOM_DISCOVERY_ATTEMPTS = 5;
 const DOM_DISCOVERY_RETRY_DELAY_MS = 500;
 const CONFIRMATION_WAIT_MS = 5_000;
+const SUBMISSION_PERMISSION_WINDOW_MS = 250;
 
 interface TargetInfo {
 	targetId: string;
@@ -737,7 +738,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				windowsVirtualKeyCode: 13,
 				nativeVirtualKeyCode: 13,
 			});
-			await this.#nextAnimationFrame().catch(() => undefined);
+			await waitForSubmissionPermissionWindow(this.#nextAnimationFrame());
 		} finally {
 			this.#submissionRequestAllowed = false;
 		}
@@ -820,6 +821,16 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 		return this.connection.send<TResult>(method, params, this.sessionId);
 	}
+}
+
+export async function waitForSubmissionPermissionWindow(
+	browserTick: Promise<unknown>,
+	wait: (milliseconds: number) => Promise<void> = delay,
+): Promise<void> {
+	await Promise.race([
+		browserTick.catch(() => undefined),
+		wait(SUBMISSION_PERMISSION_WINDOW_MS),
+	]);
 }
 
 export async function readSubmissionConfirmation(
