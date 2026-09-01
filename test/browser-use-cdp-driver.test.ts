@@ -15,7 +15,9 @@ import {
 	HAS_SAME_FORM_OWNER_FUNCTION,
 	IS_COMPOSED_DESCENDANT_FUNCTION,
 	isPayloadIndependentClickTarget,
+	readSubmissionConfirmation,
 } from "../src/browser-use-cdp-driver";
+import { BrowserSubmitDiagnosticError } from "../src/restricted-browser";
 
 describe("BrowserUse CDP payload and DOM discovery", () => {
 	test("discovers controls inside a closed shadow root", () => {
@@ -291,6 +293,39 @@ describe("BrowserUseCdpDriver child target policy", () => {
 });
 
 describe("BrowserUseCdpDriver submission confirmation", () => {
+	test("classifies a confirmation read failure without persisting its message", async () => {
+		const failure = readSubmissionConfirmation(
+			"Contact form",
+			async () => {
+				throw new Error("Browser Use CDP connection closed");
+			},
+			async () => "https://example.com/contact",
+		);
+
+		await expect(failure).rejects.toMatchObject({
+			name: "BrowserSubmitDiagnosticError",
+			stage: "SUBMIT_READ_AFTER_TEXT",
+			diagnosticCode: "CDP_CONNECTION_CLOSED",
+		});
+		await expect(failure).rejects.not.toThrow("connection closed");
+	});
+
+	test("classifies a confirmation URL failure", async () => {
+		const failure = readSubmissionConfirmation(
+			"Contact form",
+			async () => "送信が完了しました。ありがとうございました。",
+			async () => {
+				throw new Error("Browser Use CDP command timed out");
+			},
+		);
+
+		await expect(failure).rejects.toBeInstanceOf(BrowserSubmitDiagnosticError);
+		await expect(failure).rejects.toMatchObject({
+			stage: "POST_SUBMIT_URL_CHECK",
+			diagnosticCode: "CDP_COMMAND_TIMEOUT",
+		});
+	});
+
 	test("accepts a confirmation that appears after submit", () => {
 		expect(
 			hasNewSubmissionConfirmation(

@@ -11,6 +11,7 @@ import {
 	BrowserElementError,
 	type BrowserObservation,
 	type BrowserSubmitResult,
+	createBrowserSubmitDiagnosticError,
 	type RestrictedBrowserDriver,
 } from "./restricted-browser";
 
@@ -349,19 +350,37 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async submit(elementId: string): Promise<BrowserSubmitResult> {
-		await this.validateSubmit(elementId);
+		try {
+			await this.validateSubmit(elementId);
+		} catch (error) {
+			throw createBrowserSubmitDiagnosticError("SUBMIT_VALIDATE", error);
+		}
 		this.#interactionStarted = true;
-		const beforeText = await this.#bodyText();
+		let beforeText: string;
+		try {
+			beforeText = await this.#bodyText();
+		} catch (error) {
+			throw createBrowserSubmitDiagnosticError(
+				"SUBMIT_READ_BEFORE_TEXT",
+				error,
+			);
+		}
 		this.#submissionRequestAllowed = true;
 		this.#submissionRequestCount = 0;
 		try {
-			await this.#clickElement(this.#element(elementId).backendNodeId);
+			try {
+				await this.#clickElement(this.#element(elementId).backendNodeId);
+			} catch (error) {
+				throw createBrowserSubmitDiagnosticError("SUBMIT_CLICK", error);
+			}
 			const deadline = Date.now() + CONFIRMATION_WAIT_MS;
 			while (Date.now() < deadline) {
-				const afterText = await this.#bodyText().catch(() => "");
-				if (hasNewSubmissionConfirmation(beforeText, afterText)) {
-					return { outcome: "sent", formUrl: await this.currentUrl() };
-				}
+				const confirmation = await readSubmissionConfirmation(
+					beforeText,
+					() => this.#bodyText(),
+					() => this.currentUrl(),
+				);
+				if (confirmation) return confirmation;
 				await delay(250);
 			}
 		} finally {
@@ -746,6 +765,25 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			return Promise.reject(this.#targetPolicyError);
 		}
 		return this.connection.send<TResult>(method, params, this.sessionId);
+	}
+}
+
+export async function readSubmissionConfirmation(
+	beforeText: string,
+	readAfterText: () => Promise<string>,
+	readCurrentUrl: () => Promise<string>,
+): Promise<BrowserSubmitResult | null> {
+	let afterText: string;
+	try {
+		afterText = await readAfterText();
+	} catch (error) {
+		throw createBrowserSubmitDiagnosticError("SUBMIT_READ_AFTER_TEXT", error);
+	}
+	if (!hasNewSubmissionConfirmation(beforeText, afterText)) return null;
+	try {
+		return { outcome: "sent", formUrl: await readCurrentUrl() };
+	} catch (error) {
+		throw createBrowserSubmitDiagnosticError("POST_SUBMIT_URL_CHECK", error);
 	}
 }
 
