@@ -23,6 +23,7 @@ const MAX_DOM_DISCOVERY_ATTEMPTS = 5;
 const DOM_DISCOVERY_RETRY_DELAY_MS = 500;
 const CONFIRMATION_WAIT_MS = 5_000;
 const SUBMISSION_PERMISSION_WINDOW_MS = 2_000;
+const MAX_SUBMIT_MOUSE_PREPARATION_ATTEMPTS = 3;
 
 export const ENTER_KEY_DOWN_EVENT = {
 	type: "keyDown",
@@ -101,6 +102,7 @@ export type SubmitActivationStage =
 	| "box_model"
 	| "pointer_move"
 	| "hit_test"
+	| "retry_wait"
 	| "unobscured_before_focus"
 	| "focus"
 	| "render_after_focus"
@@ -724,34 +726,41 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		let stage: SubmitActivationStage = "scroll";
 		try {
 			await this.#send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
-			stage = "box_model";
-			const { model } = await this.#send<{
-				model: { border: number[] };
-			}>("DOM.getBoxModel", { backendNodeId });
-			const point = centerOfQuad(model.border);
-			if (!point) throw new BrowserElementError();
-			stage = "pointer_move";
-			await this.#send("Input.dispatchMouseEvent", {
-				type: "mouseMoved",
-				x: point.x,
-				y: point.y,
-			});
-			stage = "hit_test";
-			const hit = await this.#send<{ backendNodeId?: number }>(
-				"DOM.getNodeForLocation",
-				{
+			const prepare = async () => {
+				stage = "box_model";
+				const { model } = await this.#send<{
+					model: { border: number[] };
+				}>("DOM.getBoxModel", { backendNodeId });
+				const point = centerOfQuad(model.border);
+				if (!point) throw new BrowserElementError();
+				stage = "pointer_move";
+				await this.#send("Input.dispatchMouseEvent", {
+					type: "mouseMoved",
 					x: point.x,
 					y: point.y,
-					includeUserAgentShadowDOM: true,
-				},
-			);
-			if (
-				!hit.backendNodeId ||
-				!(await this.#isComposedDescendant(backendNodeId, hit.backendNodeId))
-			) {
-				throw new BrowserElementError();
-			}
-			return point;
+				});
+				stage = "hit_test";
+				const hit = await this.#send<{ backendNodeId?: number }>(
+					"DOM.getNodeForLocation",
+					{
+						x: point.x,
+						y: point.y,
+						includeUserAgentShadowDOM: true,
+					},
+				);
+				if (
+					!hit.backendNodeId ||
+					!(await this.#isComposedDescendant(backendNodeId, hit.backendNodeId))
+				) {
+					throw new BrowserElementError();
+				}
+				return point;
+			};
+			if (!activationStrategy) return await prepare();
+			return await retrySubmitMousePreparation(prepare, async () => {
+				stage = "retry_wait";
+				await this.#nextAnimationFrame();
+			});
 		} catch (error) {
 			if (activationStrategy) {
 				console.log(
@@ -980,6 +989,30 @@ export function createSubmitActivationFailureLog(
 		activationStrategy,
 		stage,
 	});
+}
+
+export async function retrySubmitMousePreparation<TResult>(
+	prepare: () => Promise<TResult>,
+	waitForNextFrame: () => Promise<unknown>,
+): Promise<TResult> {
+	for (
+		let attempt = 1;
+		attempt <= MAX_SUBMIT_MOUSE_PREPARATION_ATTEMPTS;
+		attempt += 1
+	) {
+		try {
+			return await prepare();
+		} catch (error) {
+			if (
+				!(error instanceof BrowserElementError) ||
+				attempt === MAX_SUBMIT_MOUSE_PREPARATION_ATTEMPTS
+			) {
+				throw error;
+			}
+			await waitForNextFrame();
+		}
+	}
+	throw new BrowserElementError();
 }
 
 export async function runSubmissionActivationWithinPermissionWindow(
