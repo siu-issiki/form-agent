@@ -5,7 +5,7 @@ import {
 } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, test } from "vitest";
-import type { AgentExecutor } from "../src/agent-executor";
+import { AgentExecutionError, type AgentExecutor } from "../src/agent-executor";
 import { BrowserToolCoordinator } from "../src/browser-tool-handler";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobInput } from "../src/job";
@@ -365,6 +365,94 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 }
 
 describe("ResponsesAgentExecutor", () => {
+	test("retries infrastructure failures instead of asking the model to classify them", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			model: "gpt-5.4-mini",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () =>
+				Response.json(
+					functionResponse("call-observe", "observe", {}),
+				)) as typeof fetch,
+			createBrowserDriver: async () => {
+				throw new Error("BrowserUse is temporarily unavailable");
+			},
+		});
+
+		const error = await executor
+			.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				new AbortController().signal,
+			)
+			.catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(error.reasonCode).toBe("BROWSER_TOOL_UNAVAILABLE");
+		expect(error.retryable).toBe(true);
+	});
+
+	test("waits for an active browser operation to stop after abort", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		let markObserveStarted: (() => void) | undefined;
+		let releaseObserve: (() => void) | undefined;
+		const observeStarted = new Promise<void>((resolve) => {
+			markObserveStarted = resolve;
+		});
+		const driver = new WorkerFakeBrowserDriver();
+		driver.observe = async () => {
+			markObserveStarted?.();
+			await new Promise<void>((resolve) => {
+				releaseObserve = resolve;
+			});
+			return { url: driver.url, forms: [] };
+		};
+		driver.close = async () => {
+			driver.closed = true;
+			releaseObserve?.();
+		};
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			model: "gpt-5.4-mini",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () =>
+				Response.json(
+					functionResponse("call-observe", "observe", {}),
+				)) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+		const controller = new AbortController();
+		const execution = executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			controller.signal,
+		);
+		await observeStarted;
+
+		controller.abort();
+		const error = await execution.catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(error.reasonCode).toBe("AGENT_TIMEOUT");
+		expect(driver.closed).toBe(true);
+		expect(executor.terminationGraceMs).toBe(30_000);
+	});
+
 	test("runs strict sequential Responses tools and finishes without submitting", async () => {
 		const store = new D1JobStore(env.DB);
 		await store.create(input, "2026-08-28T00:00:00.000Z");

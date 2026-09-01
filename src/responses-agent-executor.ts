@@ -52,6 +52,8 @@ interface ToolExecution {
 }
 
 export class ResponsesAgentExecutor implements AgentExecutor {
+	readonly terminationGraceMs = 30_000;
+
 	readonly #db: D1Database;
 	readonly #model: string;
 	readonly #openAiApiKey: string;
@@ -274,7 +276,11 @@ async function executeToolCall(
 		) {
 			return toolError("INVALID_TOOL_INPUT");
 		}
-		return toolError("TOOL_UNAVAILABLE");
+		throw new AgentExecutionError(
+			"BROWSER_TOOL_UNAVAILABLE",
+			"The browser provider or tool became unavailable.",
+			true,
+		);
 	}
 }
 
