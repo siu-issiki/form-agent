@@ -25,13 +25,14 @@
   "SELECT id,status,attempt_count,updated_at FROM jobs WHERE status IN ('pending','running','submitting') ORDER BY updated_at;"
 ```
 
-`submitting`は強制再送せず、後述の照合対象にする。新規送信を再開する前に、現在のproduction設定を確認する。
+`submitting`は強制再送せず、後述の照合対象にする。新規送信を再開する前に、現在のproduction deploymentを確認する。
 
 ```bash
-./node_modules/.bin/wrangler versions view <VERSION_ID>
+./node_modules/.bin/wrangler deployments status --json
+./node_modules/.bin/wrangler versions view <ACTIVE_VERSION_ID>
 ```
 
-`AGENT_DRY_RUN ("true")`を確認してから配送を再開する。
+deploymentが1つのversionへ100%配信されていること、そのactive versionで`AGENT_DRY_RUN ("true")`であることを確認してから配送を再開する。確認できない場合はpauseのまま停止する。
 
 ```bash
 ./node_modules/.bin/wrangler queues resume-delivery form-agent-jobs
@@ -43,8 +44,10 @@
 
 ```bash
 ./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
-  "SELECT jobs.id,jobs.status,jobs.attempt_count,jobs.provider_request_count,jobs.target_url,jobs.updated_at,results.outcome,results.form_url,results.reason_code,results.reason FROM jobs LEFT JOIN results ON results.job_id=jobs.id WHERE jobs.status IN ('submitting','uncertain') ORDER BY jobs.updated_at;"
+  "SELECT jobs.id,jobs.status,jobs.attempt_count,jobs.provider_request_count,jobs.updated_at,results.outcome,results.reason_code FROM jobs LEFT JOIN results ON results.job_id=jobs.id WHERE jobs.status IN ('submitting','uncertain') ORDER BY jobs.updated_at;"
 ```
+
+完全な`target_url`、`form_url`、自由文の`reason`は一括出力しない。query tokenやフォーム値を含む可能性があるため、必要な場合だけ対象IDを限定し、標準出力の保存先と閲覧者を確認して取得する。
 
 次の外部証跡を照合する。
 
@@ -69,7 +72,23 @@ DLQへ移動したジョブを確認する。
 
 ## 重複Queue配送の検証
 
-使い捨てサイトだけを対象にする。実行中ジョブが0件であることを確認後、配送をpauseし、同一内容・同一IDの`POST /jobs`を2回実行する。1回目が`201`、2回目が`200`であることを確認してから配送をresumeする。
+使い捨てサイトだけを対象とし、他のproducerがジョブを登録しない排他的な保守時間に実行する。最初に配送をpauseし、Cloudflare Queuesのbacklogが0件であることをDashboardで確認する。次にD1を確認し、`pending`、`running`、`submitting`がすべて0件でなければ検証を中止する。
+
+```bash
+./node_modules/.bin/wrangler queues pause-delivery form-agent-jobs
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT status,COUNT(*) AS count FROM jobs WHERE status IN ('pending','running','submitting') GROUP BY status;"
+```
+
+pause中に同一内容・同一IDの`POST /jobs`を2回実行し、1回目が`201`、2回目が`200`であることを確認する。resume直前にD1上のclaim可能なジョブが対象テストIDの1件だけであることを確認する。他のジョブまたは想定外のbacklogがあれば、dry-run解除もresumeも行わない。
+
+復旧処理は必ず次の順序にする。
+
+1. Queueをpauseする。既にpause中でも続行する。
+2. 通常設定でWorkerを再デプロイする。
+3. `wrangler deployments status --json`でactive versionが1つ、100%であることを確認する。
+4. `wrangler versions view <ACTIVE_VERSION_ID>`で`AGENT_DRY_RUN ("true")`を確認する。
+5. 1〜4がすべて成功した場合だけQueue配送をresumeする。いずれかが失敗した場合はpauseを維持する。
 
 合格条件は次のとおり。
 
@@ -78,4 +97,4 @@ DLQへ移動したジョブを確認する。
 - 受信側POSTが1件
 - 同じジョブIDの追加送信がない
 
-検証コマンドはproduction secretを標準出力へ出さず、終了trapでQueue配送再開と`AGENT_DRY_RUN=true`の再デプロイを必ず行う。
+検証コマンドはproduction secretを標準出力へ出さない。終了trapでも先にpauseし、`AGENT_DRY_RUN=true`のactive deployment確認前にresumeしてはならない。
