@@ -23,9 +23,13 @@ import {
 	IS_SUBMIT_UNOBSCURED_FUNCTION,
 	isPayloadIndependentClickTarget,
 	readSubmissionConfirmation,
+	retrySubmitMousePreparation,
 	runSubmissionActivationWithinPermissionWindow,
 } from "../src/browser-use-cdp-driver";
-import { BrowserSubmitDiagnosticError } from "../src/restricted-browser";
+import {
+	BrowserElementError,
+	BrowserSubmitDiagnosticError,
+} from "../src/restricted-browser";
 
 describe("BrowserUse CDP payload and DOM discovery", () => {
 	test("discovers controls inside a closed shadow root", () => {
@@ -392,6 +396,77 @@ describe("BrowserUseCdpDriver child target policy", () => {
 });
 
 describe("BrowserUseCdpDriver submission confirmation", () => {
+	test("retries submit mouse preparation for transient element mismatches", async () => {
+		let attempts = 0;
+		let waits = 0;
+		const point = await retrySubmitMousePreparation(
+			async () => {
+				attempts += 1;
+				if (attempts < 3) throw new BrowserElementError();
+				return { x: 10, y: 20 };
+			},
+			async () => {
+				waits += 1;
+			},
+		);
+
+		expect(point).toEqual({ x: 10, y: 20 });
+		expect(attempts).toBe(3);
+		expect(waits).toBe(2);
+	});
+
+	test("stops submit mouse preparation after three mismatches", async () => {
+		let attempts = 0;
+		let waits = 0;
+		const preparation = retrySubmitMousePreparation(
+			async () => {
+				attempts += 1;
+				throw new BrowserElementError();
+			},
+			async () => {
+				waits += 1;
+			},
+		);
+
+		await expect(preparation).rejects.toBeInstanceOf(BrowserElementError);
+		expect(attempts).toBe(3);
+		expect(waits).toBe(2);
+	});
+
+	test("does not retry a successful submit mouse preparation", async () => {
+		let attempts = 0;
+		let waits = 0;
+		await retrySubmitMousePreparation(
+			async () => {
+				attempts += 1;
+			},
+			async () => {
+				waits += 1;
+			},
+		);
+
+		expect(attempts).toBe(1);
+		expect(waits).toBe(0);
+	});
+
+	test("does not retry a non-element submit preparation failure", async () => {
+		let attempts = 0;
+		let waits = 0;
+		const preparation = retrySubmitMousePreparation(
+			async () => {
+				attempts += 1;
+				throw new Error("CDP connection closed");
+			},
+			async () => {
+				waits += 1;
+			},
+		);
+
+		await expect(preparation).rejects.toThrow("CDP connection closed");
+		expect(attempts).toBe(1);
+		expect(waits).toBe(0);
+	});
+
 	test("logs only the activation strategy and allowlisted failure stage", () => {
 		expect(
 			JSON.parse(createSubmitActivationFailureLog("mouse", "hit_test")),
