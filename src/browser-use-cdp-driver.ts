@@ -917,7 +917,7 @@ export const IS_COMPOSED_DESCENDANT_FUNCTION = `function(candidate) {
   return false;
 }`;
 
-function centerOfQuad(quad: number[]): { x: number; y: number } | null {
+export function centerOfQuad(quad: number[]): { x: number; y: number } | null {
 	if (quad.length !== 8 || !quad.every(Number.isFinite)) return null;
 	const [x1, y1, x2, y2, x3, y3, x4, y4] = quad;
 	if (
@@ -933,8 +933,8 @@ function centerOfQuad(quad: number[]): { x: number; y: number } | null {
 		return null;
 	}
 	return {
-		x: (x1 + x2 + x3 + x4) / 4,
-		y: (y1 + y2 + y3 + y4) / 4,
+		x: Math.round((x1 + x2 + x3 + x4) / 4),
+		y: Math.round((y1 + y2 + y3 + y4) / 4),
 	};
 }
 

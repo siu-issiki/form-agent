@@ -11,6 +11,7 @@ import {
 	assertDryRunNavigationAllowed,
 	BLOCK_BROWSER_ESCAPE_EXPRESSION,
 	CHECK_FORM_VALIDITY_FUNCTION,
+	centerOfQuad,
 	denyRelatedBrowserTargets,
 	HAS_SAME_FORM_OWNER_FUNCTION,
 	IS_COMPOSED_DESCENDANT_FUNCTION,
@@ -87,6 +88,12 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 });
 
 describe("BrowserUseCdpDriver child target policy", () => {
+	test("rounds hit-test coordinates to CDP integers", () => {
+		expect(
+			centerOfQuad([10.25, 20.75, 20.25, 20.75, 20.25, 30.75, 10.25, 30.75]),
+		).toEqual({ x: 15, y: 26 });
+	});
+
 	test("requires the submit control's form to pass native validity", () => {
 		const checkFormValidity = runInNewContext(
 			`(${CHECK_FORM_VALIDITY_FUNCTION})`,
