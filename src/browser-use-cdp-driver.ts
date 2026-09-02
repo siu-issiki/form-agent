@@ -1,6 +1,7 @@
 import { assertAllowedBrowserRequest } from "./browser-network-policy";
 import { SUBMISSION_CONFIRMATION_PATTERN } from "./browser-submit-confirmation";
 import {
+	BrowserUseCdpClosedError,
 	BrowserUseCdpConnection,
 	BrowserUseCdpUpgradeRejectedError,
 } from "./browser-use-cdp";
@@ -49,6 +50,7 @@ const RETRYABLE_CONNECT_ERROR_MESSAGES = new Set([
 export interface BrowserUseConnectOptions {
 	retryDelaysMs?: readonly number[];
 	sleep?: (ms: number) => Promise<void>;
+	signal?: AbortSignal;
 	connectConnection?: (
 		webSocketUrl: string,
 	) => Promise<BrowserUseCdpConnection>;
@@ -58,10 +60,21 @@ function isRetryableConnectError(error: unknown): boolean {
 	if (error instanceof BrowserUseCdpUpgradeRejectedError) {
 		return error.retryable;
 	}
+	if (error instanceof BrowserUseCdpClosedError) {
+		return error.retryable;
+	}
 	return (
 		error instanceof Error &&
 		RETRYABLE_CONNECT_ERROR_MESSAGES.has(error.message)
 	);
+}
+
+function connectAbortedError(): Error {
+	return new Error("Browser Use CDP connection aborted");
+}
+
+function assertConnectNotAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw connectAbortedError();
 }
 
 export function connectFailureDetail(error: unknown): {
@@ -85,8 +98,23 @@ export function connectFailureDetail(error: unknown): {
 	}
 }
 
-function sleepMs(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) {
+			reject(connectAbortedError());
+			return;
+		}
+		let timeout: ReturnType<typeof setTimeout>;
+		const onAbort = () => {
+			clearTimeout(timeout);
+			reject(connectAbortedError());
+		};
+		timeout = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
 }
 
 export const ENTER_KEY_DOWN_EVENT = {
@@ -258,7 +286,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		const webSocketUrl = url.toString();
 
 		const retryDelaysMs = options.retryDelaysMs ?? CONNECT_RETRY_DELAYS_MS;
-		const sleep = options.sleep ?? sleepMs;
+		const signal = options.signal;
+		const sleep = options.sleep ?? ((ms: number) => sleepMs(ms, signal));
 		const openConnection =
 			options.connectConnection ??
 			((target: string) => BrowserUseCdpConnection.connect(target));
@@ -277,6 +306,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				);
 				await sleep(delayMs);
 			}
+			assertConnectNotAborted(signal);
 			try {
 				return await BrowserUseCdpDriver.#establish(
 					webSocketUrl,

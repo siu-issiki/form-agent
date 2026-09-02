@@ -3,6 +3,7 @@ import { runInNewContext } from "node:vm";
 import { hasNewSubmissionConfirmation } from "../src/browser-submit-confirmation";
 import {
 	assertCdpMessageWithinLimit,
+	BrowserUseCdpClosedError,
 	BrowserUseCdpConnection,
 	BrowserUseCdpPayloadTooLargeError,
 	BrowserUseCdpUpgradeRejectedError,
@@ -1906,7 +1907,14 @@ describe("BrowserUseCdpConnection close logging", () => {
 			captured.restore();
 		}
 
-		await expect(pending).rejects.toThrow("Browser Use CDP connection closed");
+		const rejection = await pending.catch((error: unknown) => error);
+		expect(rejection).toBeInstanceOf(BrowserUseCdpClosedError);
+		expect((rejection as BrowserUseCdpClosedError).code).toBe(1006);
+		expect((rejection as BrowserUseCdpClosedError).reasonHint).toBe("LIMIT");
+		expect((rejection as BrowserUseCdpClosedError).retryable).toBe(true);
+		expect((rejection as Error).message).toBe(
+			"Browser Use CDP connection closed",
+		);
 		expect(captured.warnings).toHaveLength(1);
 		expect(JSON.parse(captured.warnings[0] ?? "{}")).toEqual({
 			event: "browser_use_cdp_closed",
@@ -2174,5 +2182,83 @@ describe("classifyCdpCloseReason", () => {
 		expect(classifyCdpCloseReason("https://example.com/session/secret")).toBe(
 			"OTHER",
 		);
+	});
+});
+
+describe("BrowserUseCdpDriver.connect close classification", () => {
+	async function connectWithClose(
+		failure: Error,
+		options: { signal?: AbortSignal; retryDelaysMs?: number[] } = {},
+	): Promise<{ connections: FakeCdpConnection[]; caught: unknown }> {
+		const connections: FakeCdpConnection[] = [];
+		const captured = captureWarnings();
+		let caught: unknown;
+		try {
+			await BrowserUseCdpDriver.connect(
+				"api-key",
+				connectJob,
+				true,
+				"wss://connect.browser-use.com",
+				{
+					retryDelaysMs: options.retryDelaysMs ?? [10, 20, 30],
+					...(options.signal ? { signal: options.signal } : {}),
+					...(options.signal ? {} : { sleep: async () => {} }),
+					connectConnection: async () => {
+						const connection = new FakeCdpConnection(failure);
+						connections.push(connection);
+						return asConnection(connection);
+					},
+				},
+			);
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+		return { connections, caught };
+	}
+
+	test("does not retry a policy violation close", async () => {
+		const failure = new BrowserUseCdpClosedError(1008, "OTHER");
+		const { connections, caught } = await connectWithClose(failure);
+
+		expect(caught).toBe(failure);
+		expect(connections).toHaveLength(1);
+		expect(connections[0]?.closeCount).toBe(1);
+	});
+
+	test("does not retry a close that names an authentication reason", async () => {
+		const failure = new BrowserUseCdpClosedError(1006, "AUTH");
+		const { connections, caught } = await connectWithClose(failure);
+
+		expect(caught).toBe(failure);
+		expect(connections).toHaveLength(1);
+	});
+
+	test("retries a close that names a limit reason", async () => {
+		const failure = new BrowserUseCdpClosedError(1006, "LIMIT");
+		const { connections, caught } = await connectWithClose(failure);
+
+		expect(caught).toBe(failure);
+		expect(connections).toHaveLength(4);
+		expect(connections.map((connection) => connection.closeCount)).toEqual([
+			1, 1, 1, 1,
+		]);
+	});
+
+	test("stops waiting for the next attempt when the run is aborted", async () => {
+		const controller = new AbortController();
+		setTimeout(() => controller.abort(), 50);
+		const startedAt = Date.now();
+		const { connections, caught } = await connectWithClose(
+			new BrowserUseCdpClosedError(1006, "LIMIT"),
+			{ signal: controller.signal, retryDelaysMs: [5_000, 5_000, 5_000] },
+		);
+
+		expect((caught as Error).message).toBe(
+			"Browser Use CDP connection aborted",
+		);
+		expect(connections).toHaveLength(1);
+		expect(Date.now() - startedAt).toBeLessThan(1_000);
 	});
 });

@@ -156,15 +156,16 @@ export class BrowserUseCdpConnection {
 	}
 
 	#onClose(event: CloseEvent): void {
+		const reason = event.reason ?? "";
+		const reasonHint = classifyCdpCloseReason(reason);
 		if (!this.#closeRequested && !this.#closeLogged) {
 			this.#closeLogged = true;
-			const reason = event.reason ?? "";
 			console.warn(
 				JSON.stringify({
 					event: "browser_use_cdp_closed",
 					code: event.code,
 					reasonLength: reason.length,
-					reasonHint: classifyCdpCloseReason(reason),
+					reasonHint,
 					wasClean: event.wasClean,
 					pending: this.#pendingAtFailure ?? this.#pending.size,
 				}),
@@ -172,7 +173,7 @@ export class BrowserUseCdpConnection {
 		}
 		if (this.#closed) return;
 		this.#closed = true;
-		this.#rejectPending();
+		this.#rejectPending(new BrowserUseCdpClosedError(event.code, reasonHint));
 	}
 
 	#onError(): void {
@@ -216,6 +217,24 @@ export function classifyCdpCloseReason(reason: string): CdpCloseReasonHint {
 		if (needles.some((needle) => normalized.includes(needle))) return hint;
 	}
 	return "OTHER";
+}
+
+export class BrowserUseCdpClosedError extends Error {
+	constructor(
+		readonly code: number,
+		readonly reasonHint: CdpCloseReasonHint,
+	) {
+		super("Browser Use CDP connection closed");
+		this.name = "BrowserUseCdpClosedError";
+	}
+
+	/**
+	 * A policy violation or an authentication reason will not succeed on a
+	 * second connection, so those closures end the run instead of retrying.
+	 */
+	get retryable(): boolean {
+		return this.code !== 1008 && this.reasonHint !== "AUTH";
+	}
 }
 
 export class BrowserUseCdpUpgradeRejectedError extends Error {

@@ -8,6 +8,7 @@ import {
 	BrowserToolSetupError,
 } from "./browser-tool-handler";
 import {
+	BrowserUseCdpClosedError,
 	BrowserUseCdpPayloadTooLargeError,
 	BrowserUseCdpUpgradeRejectedError,
 } from "./browser-use-cdp";
@@ -74,6 +75,7 @@ interface ResponsesAgentExecutorOptions {
 		apiKey: string,
 		job: Job,
 		dryRun: boolean,
+		signal?: AbortSignal,
 	) => ReturnType<BrowserDriverFactory>;
 }
 
@@ -100,6 +102,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 		apiKey: string,
 		job: Job,
 		dryRun: boolean,
+		signal?: AbortSignal,
 	) => ReturnType<BrowserDriverFactory>;
 
 	constructor(options: ResponsesAgentExecutorOptions) {
@@ -122,7 +125,15 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 		const fetcher = options.fetcher ?? fetch;
 		this.#fetcher = (resource, init) => fetcher(resource, init);
 		this.#createBrowserDriver =
-			options.createBrowserDriver ?? BrowserUseCdpDriver.connect;
+			options.createBrowserDriver ??
+			((apiKey, job, dryRun, signal) =>
+				BrowserUseCdpDriver.connect(
+					apiKey,
+					job,
+					dryRun,
+					undefined,
+					signal ? { signal } : {},
+				));
 	}
 
 	async execute(
@@ -132,7 +143,8 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 		const dryRun = isJobDryRun(input.job.payload, this.#dryRun);
 		const coordinator = new BrowserToolCoordinator(
 			this.#db,
-			(job) => this.#createBrowserDriver(this.#browserUseApiKey, job, dryRun),
+			(job) =>
+				this.#createBrowserDriver(this.#browserUseApiKey, job, dryRun, signal),
 			this.#evidenceStore,
 			(job) => this.#createReviewer(job, input.runToken, signal),
 		);
@@ -567,6 +579,16 @@ async function executeToolCall(
 		) {
 			throw new AgentExecutionError(
 				"BROWSER_UPGRADE_REJECTED",
+				"The browser provider rejected the connection.",
+				false,
+			);
+		}
+		if (
+			originalError instanceof BrowserUseCdpClosedError &&
+			!originalError.retryable
+		) {
+			throw new AgentExecutionError(
+				"BROWSER_CONNECTION_REJECTED",
 				"The browser provider rejected the connection.",
 				false,
 			);
