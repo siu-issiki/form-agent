@@ -172,19 +172,59 @@ export function discoverCdpNavigationLinks(
 	return links;
 }
 
-export function discoverCdpBodyBackendNodeIds(
+export function findCdpFrameOwnerBackendNodeId(
 	root: CdpDomNode,
-	maxBodies = 20,
-): number[] {
-	const backendNodeIds: number[] = [];
+	frameId: string,
+): number | undefined {
+	let ownerBackendNodeId: number | undefined;
 	const visit = (node: CdpDomNode) => {
-		if (backendNodeIds.length >= maxBodies) return;
-		if (node.nodeName.toLowerCase() === "body") {
-			backendNodeIds.push(node.backendNodeId);
+		if (ownerBackendNodeId !== undefined) return;
+		if (
+			node.nodeName.toLowerCase() === "iframe" &&
+			(node.frameId === frameId || node.contentDocument?.frameId === frameId)
+		) {
+			ownerBackendNodeId = node.backendNodeId;
+			return;
 		}
 		for (const child of composedChildren(node)) visit(child);
 	};
 	visit(root);
+	return ownerBackendNodeId;
+}
+
+export function discoverCdpBodyBackendNodeIds(
+	root: CdpDomNode,
+	maxBodies = 20,
+	targetFrameId?: string,
+): number[] {
+	const backendNodeIds: number[] = [];
+	const visit = (node: CdpDomNode, inheritedFrameId?: string) => {
+		if (backendNodeIds.length >= maxBodies) return;
+		const frameId =
+			node.nodeName.toLowerCase() === "#document"
+				? (node.frameId ?? inheritedFrameId)
+				: inheritedFrameId;
+		if (
+			node.nodeName.toLowerCase() === "body" &&
+			(targetFrameId === undefined || frameId === targetFrameId)
+		) {
+			backendNodeIds.push(node.backendNodeId);
+		}
+		for (const child of [
+			...(node.children ?? []),
+			...(node.shadowRoots ?? []),
+		]) {
+			visit(child, frameId);
+		}
+		if (node.contentDocument) {
+			visit(
+				node.contentDocument,
+				node.frameId ?? node.contentDocument.frameId ?? frameId,
+			);
+		}
+		if (node.templateContent) visit(node.templateContent, frameId);
+	};
+	visit(root, root.frameId);
 	return backendNodeIds;
 }
 

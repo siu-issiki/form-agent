@@ -11,7 +11,13 @@ export interface BrowserObservation {
 	forms: unknown[];
 	pageText?: string;
 	navigationLinks?: Array<{ url: string; text: string }>;
+	prohibitedReasonCodes?: ProhibitedReasonCode[];
 }
+
+export type ProhibitedReasonCode =
+	| "NO_FORM_PRESENT"
+	| "SALES_PROHIBITED"
+	| "FORM_PURPOSE_INCOMPATIBLE";
 
 export type BrowserSubmitResult =
 	| { outcome: "sent"; formUrl: string }
@@ -126,6 +132,10 @@ export class RestrictedBrowserTools {
 	readonly #targetDomain: string;
 	readonly #allowedHosts: string[];
 	readonly #successfulInputElementIds = new Set<string>();
+	readonly #allowedNavigationUrls = new Set<string>();
+	#latestObservation: BrowserObservation | undefined;
+	#inputRevision = 0;
+	#observationRevision = -1;
 	#submitAttempted = false;
 
 	private constructor(
@@ -136,10 +146,12 @@ export class RestrictedBrowserTools {
 		private readonly recorder: SubmissionEvidenceRecorder,
 		targetDomain: string,
 		allowedHosts: readonly string[],
+		targetUrl: string,
 		private readonly now: () => string = () => new Date().toISOString(),
 	) {
 		this.#targetDomain = normalizeTargetDomain(targetDomain);
 		this.#allowedHosts = normalizeAllowedHosts(allowedHosts);
+		this.#allowedNavigationUrls.add(canonicalNavigationUrl(targetUrl));
 	}
 
 	static async create(
@@ -175,6 +187,7 @@ export class RestrictedBrowserTools {
 			),
 			targetDomain,
 			allowedHosts,
+			job.targetUrl,
 			now,
 		);
 	}
@@ -185,53 +198,111 @@ export class RestrictedBrowserTools {
 
 	async navigate(url: string): Promise<void> {
 		this.#assertAllowedUrl(url);
+		if (
+			!this.#allowedNavigationUrls.has(canonicalNavigationPermissionUrl(url))
+		) {
+			throw new NavigationPolicyError();
+		}
 		await this.driver.navigate(url);
 		await this.#assertCurrentUrlAllowed();
 		this.#successfulInputElementIds.clear();
+		this.#latestObservation = undefined;
+		this.#allowedNavigationUrls.clear();
+		this.#inputRevision += 1;
 	}
 
 	async observe(): Promise<BrowserObservation> {
 		await this.#assertCurrentUrlAllowed();
 		const observation = await this.driver.observe();
 		this.#assertAllowedUrl(observation.url);
-		if (!observation.navigationLinks) return observation;
-		return {
+		const navigationLinks = observation.navigationLinks?.filter((link) => {
+			try {
+				this.#assertAllowedUrl(link.url);
+				return true;
+			} catch {
+				return false;
+			}
+		});
+		const trustedForms = trustObservedForms(observation.forms);
+		const trustedObservation: BrowserObservation = {
 			...observation,
-			navigationLinks: observation.navigationLinks.filter((link) => {
-				try {
-					this.#assertAllowedUrl(link.url);
-					return true;
-				} catch {
-					return false;
-				}
+			forms: trustedForms,
+			...(navigationLinks ? { navigationLinks } : {}),
+			prohibitedReasonCodes: detectProhibitedReasonCodes({
+				forms: trustedForms,
+				...(observation.pageText === undefined
+					? {}
+					: { pageText: observation.pageText }),
 			}),
 		};
+		this.#latestObservation = trustedObservation;
+		this.#observationRevision = this.#inputRevision;
+		this.#allowedNavigationUrls.clear();
+		this.#allowedNavigationUrls.add(
+			canonicalNavigationPermissionUrl(trustedObservation.url),
+		);
+		for (const link of trustedObservation.navigationLinks ?? []) {
+			this.#allowedNavigationUrls.add(
+				canonicalNavigationPermissionUrl(link.url),
+			);
+		}
+		return trustedObservation;
 	}
 
 	async click(elementId: string): Promise<void> {
 		await this.driver.clickNonSubmit(elementId);
 		await this.#assertCurrentUrlAllowed();
+		this.#inputRevision += 1;
 	}
 
 	async fill(elementId: string, value: string): Promise<void> {
 		await this.driver.fill(elementId, value);
 		await this.#assertCurrentUrlAllowed();
 		this.#successfulInputElementIds.add(elementId);
+		this.#inputRevision += 1;
 	}
 
 	async select(elementId: string, value: string): Promise<void> {
 		await this.driver.select(elementId, value);
 		await this.#assertCurrentUrlAllowed();
 		this.#successfulInputElementIds.add(elementId);
+		this.#inputRevision += 1;
 	}
 
 	async validateSubmit(elementId: string): Promise<void> {
 		if (this.#successfulInputElementIds.size < 1) {
 			throw new BrowserElementError();
 		}
+		if (this.#observationRevision !== this.#inputRevision) {
+			throw new BrowserElementError();
+		}
+		if (
+			prohibitedReasonCodesForElement(this.#latestObservation, elementId)
+				.length > 0
+		) {
+			throw new BrowserElementError();
+		}
 		await this.#assertCurrentUrlAllowed();
 		await this.driver.validateSubmit(elementId);
 		await this.#assertCurrentUrlAllowed();
+	}
+
+	async validateProhibited(
+		reasonCode: ProhibitedReasonCode,
+		formUrl: string | null,
+	): Promise<void> {
+		const observation = this.#latestObservation;
+		if (
+			this.#observationRevision !== this.#inputRevision ||
+			!observation?.prohibitedReasonCodes?.includes(reasonCode) ||
+			(formUrl !== null &&
+				canonicalNavigationUrl(formUrl) !==
+					canonicalNavigationUrl(observation.url)) ||
+			canonicalNavigationPermissionUrl(await this.driver.currentUrl()) !==
+				canonicalNavigationPermissionUrl(observation.url)
+		) {
+			throw new BrowserElementError();
+		}
 	}
 
 	async submit(
@@ -379,6 +450,163 @@ export class RestrictedBrowserTools {
 			// The caller still receives an uncertain result and must never retry submit.
 		}
 	}
+}
+
+export function detectProhibitedReasonCodes(
+	observation: Pick<BrowserObservation, "forms" | "pageText">,
+): ProhibitedReasonCode[] {
+	const codes: ProhibitedReasonCode[] = [];
+	if (observation.forms.length === 0) return ["NO_FORM_PRESENT"];
+	if (observation.forms.every(hasTrustedFormProhibitionMetadata)) {
+		const formCodes = observation.forms.map(readProhibitedReasonCodes);
+		if (formCodes.every((formCode) => formCode.length > 0)) {
+			for (const formCode of formCodes) {
+				for (const code of formCode) {
+					if (!codes.includes(code)) codes.push(code);
+				}
+			}
+		}
+		return codes;
+	}
+	return detectProhibitedTextReasonCodes(observation.pageText ?? "");
+}
+
+export const PROHIBITION_TEXT_PATTERN_SOURCES = {
+	explicitAllowances: [
+		"(営業|勧誘|セールス).{0,40}(も|を)?受け付け(?:て)?(?:います|ております)",
+		"(営業|勧誘|セールス).{0,40}禁止して(?:い|おり)?ません",
+		"(sales|solicitation).{0,40}(?:is|are) not prohibited",
+	],
+	salesProhibited: [
+		"(営業|勧誘|セールス).{0,40}(禁止|お断り|受け付け(?:て)?(?:おりません|いません|ません|ない)|ご遠慮)",
+		"(禁止|お断り|受け付け(?:て)?(?:おりません|いません|ません|ない)|ご遠慮).{0,40}(営業|勧誘|セールス)",
+		"(sales|solicitation).{0,40}(prohibited|not accepted|do not use)",
+	],
+	formPurposeIncompatible: [
+		"(採用|サポート|報道|サンプル|資料請求).{0,30}(専用|のみ)",
+		"(専用|のみ).{0,30}(採用|サポート|報道|サンプル|資料請求)",
+	],
+} as const;
+
+export function detectProhibitedTextReasonCodes(
+	rawText: string,
+): ProhibitedReasonCode[] {
+	const codes: ProhibitedReasonCode[] = [];
+	const text = rawText.replace(/\s+/g, " ").toLowerCase();
+	const withoutExplicitAllowances =
+		PROHIBITION_TEXT_PATTERN_SOURCES.explicitAllowances.reduce(
+			(value, source) => value.replace(new RegExp(source, "g"), " "),
+			text,
+		);
+	if (
+		PROHIBITION_TEXT_PATTERN_SOURCES.salesProhibited.some((source) =>
+			new RegExp(source).test(withoutExplicitAllowances),
+		)
+	) {
+		codes.push("SALES_PROHIBITED");
+	}
+	if (
+		PROHIBITION_TEXT_PATTERN_SOURCES.formPurposeIncompatible.some((source) =>
+			new RegExp(source).test(text),
+		)
+	) {
+		codes.push("FORM_PURPOSE_INCOMPATIBLE");
+	}
+	return codes;
+}
+
+function trustObservedForms(forms: unknown[]): unknown[] {
+	return forms.map((form) => {
+		if (!isRecord(form)) return form;
+		const {
+			prohibitionText,
+			prohibitionTexts,
+			prohibitedReasonCodes,
+			...visibleForm
+		} = form;
+		const texts = Array.isArray(prohibitionTexts)
+			? prohibitionTexts.filter(
+					(value): value is string => typeof value === "string",
+				)
+			: typeof prohibitionText === "string"
+				? [prohibitionText]
+				: null;
+		if (!texts) {
+			return {
+				...visibleForm,
+				...(Array.isArray(prohibitedReasonCodes)
+					? {
+							prohibitedReasonCodes: prohibitedReasonCodes.filter(
+								isProhibitedReasonCode,
+							),
+						}
+					: {}),
+			};
+		}
+		const codes: ProhibitedReasonCode[] = [];
+		const detectionTexts = [...texts];
+		for (let index = 1; index < texts.length; index += 1) {
+			const previous = texts[index - 1];
+			const current = texts[index];
+			if (previous !== undefined && current !== undefined) {
+				detectionTexts.push(`${previous.slice(-128)} ${current.slice(0, 128)}`);
+			}
+		}
+		for (const text of detectionTexts) {
+			for (const code of detectProhibitedTextReasonCodes(text)) {
+				if (!codes.includes(code)) codes.push(code);
+			}
+		}
+		return {
+			...visibleForm,
+			prohibitedReasonCodes: codes,
+		};
+	});
+}
+
+function prohibitedReasonCodesForElement(
+	observation: BrowserObservation | undefined,
+	elementId: string,
+): ProhibitedReasonCode[] {
+	for (const form of observation?.forms ?? []) {
+		if (!isRecord(form) || !Array.isArray(form.fields)) continue;
+		const ownsElement = form.fields.some(
+			(field) => isRecord(field) && field.elementId === elementId,
+		);
+		if (ownsElement) return readProhibitedReasonCodes(form);
+	}
+	throw new BrowserElementError();
+}
+
+function hasTrustedFormProhibitionMetadata(form: unknown): boolean {
+	return isRecord(form) && Array.isArray(form.prohibitedReasonCodes);
+}
+
+function readProhibitedReasonCodes(form: unknown): ProhibitedReasonCode[] {
+	if (!isRecord(form) || !Array.isArray(form.prohibitedReasonCodes)) return [];
+	return form.prohibitedReasonCodes.filter(isProhibitedReasonCode);
+}
+
+function isProhibitedReasonCode(value: unknown): value is ProhibitedReasonCode {
+	return (
+		value === "NO_FORM_PRESENT" ||
+		value === "SALES_PROHIBITED" ||
+		value === "FORM_PURPOSE_INCOMPATIBLE"
+	);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function canonicalNavigationUrl(rawUrl: string): string {
+	const url = new URL(rawUrl);
+	url.hash = "";
+	return url.toString();
+}
+
+function canonicalNavigationPermissionUrl(rawUrl: string): string {
+	return new URL(rawUrl).toString();
 }
 
 function submitFailureReason(error: BrowserSubmitDiagnosticError): string {

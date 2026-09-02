@@ -698,6 +698,7 @@ describe("BrowserToolCoordinator", () => {
 			payloadKey: "message",
 		});
 		expect(filled).toEqual({ result: { ok: true } });
+		await coordinator.execute(input.id, "run-token-1", "observe", {});
 		const submitResult = await coordinator.execute(
 			input.id,
 			"run-token-1",
@@ -710,7 +711,11 @@ describe("BrowserToolCoordinator", () => {
 		await coordinator.close();
 
 		expect(observed).toEqual({
-			result: { url: input.targetUrl, forms: [] },
+			result: {
+				url: input.targetUrl,
+				forms: workerObservedForms(),
+				prohibitedReasonCodes: [],
+			},
 		});
 		expect(submitResult).toMatchObject({ job: { status: "sent" } });
 		expect("runToken" in (submitResult as { job: object }).job).toBe(false);
@@ -875,6 +880,8 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	screenshotError: Error | null = null;
 	submitActivationStrategies: SubmitActivationStrategy[] = [];
 	filledValues: string[] = [];
+	observationForms: unknown[] = workerObservedForms();
+	pageText: string | undefined;
 
 	async close(): Promise<void> {
 		this.closed = true;
@@ -890,7 +897,11 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	}
 	async observe() {
 		this.observed = true;
-		return { url: this.url, forms: [] };
+		return {
+			url: this.url,
+			forms: this.observationForms,
+			...(this.pageText ? { pageText: this.pageText } : {}),
+		};
 	}
 	async clickNonSubmit(): Promise<void> {}
 	async fill(_elementId: string, value: string): Promise<void> {
@@ -916,6 +927,14 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 		this.submitActivationStrategies.push(activationStrategy);
 		return { outcome: "sent", formUrl: this.url };
 	}
+}
+
+function workerObservedForms(): unknown[] {
+	return [
+		{
+			fields: [{ elementId: "fa-0-0" }, { elementId: "fa-0-1" }],
+		},
+	];
 }
 
 describe("ResponsesAgentExecutor", () => {
@@ -946,6 +965,7 @@ describe("ResponsesAgentExecutor", () => {
 				elementId: "fa-0-0",
 				payloadKey: "message",
 			}),
+			functionResponse("call-confirm", "observe", {}),
 			functionResponse("call-submit", "submit", {
 				elementId: "fa-0-1",
 				activationStrategy: "mouse",
@@ -1036,6 +1056,12 @@ describe("ResponsesAgentExecutor", () => {
 			},
 			{
 				turn: 3,
+				toolName: "observe",
+				stage: "observe",
+				resultCode: "OK",
+			},
+			{
+				turn: 4,
 				toolName: "submit",
 				stage: "submit_validate",
 				resultCode: "DRY_RUN_COMPLETE",
@@ -1315,6 +1341,7 @@ describe("ResponsesAgentExecutor", () => {
 			return Response.json(response);
 		} as typeof fetch;
 		const driver = new WorkerFakeBrowserDriver();
+		driver.observationForms = [];
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
 			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
@@ -1378,23 +1405,30 @@ describe("ResponsesAgentExecutor", () => {
 			"2026-08-28T00:00:01.000Z",
 		);
 		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-finish", "finish", {
+				outcome: "prohibited",
+				formUrl: input.targetUrl,
+				reasonCode: "NO_INQUIRY_FORM",
+				reason: "No inquiry form is present.",
+				retryable: null,
+			}),
+		];
+		const driver = new WorkerFakeBrowserDriver();
+		driver.observationForms = [];
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
 			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
-			fetcher: (async () =>
-				Response.json(
-					functionResponse("call-finish", "finish", {
-						outcome: "prohibited",
-						formUrl: input.targetUrl,
-						reasonCode: "NO_INQUIRY_FORM",
-						reason: "No inquiry form is present.",
-						retryable: null,
-					}),
-				)) as typeof fetch,
-			createBrowserDriver: async () => new WorkerFakeBrowserDriver(),
+			fetcher: (async () => {
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
 		});
 
 		const result = await executor.execute(
@@ -1408,7 +1442,7 @@ describe("ResponsesAgentExecutor", () => {
 		});
 	});
 
-	test("rejects an unknown prohibited reason code", async () => {
+	test("rejects a prohibited outcome not corroborated by the observation", async () => {
 		const store = new D1JobStore(env.DB);
 		await store.create(input, "2026-08-28T00:00:00.000Z");
 		const job = await store.claimRun(
@@ -1418,19 +1452,20 @@ describe("ResponsesAgentExecutor", () => {
 		);
 		if (!job) throw new Error("Expected a claimed job");
 		const responses = [
-			functionResponse("call-invalid", "finish", {
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-unverified", "finish", {
 				outcome: "prohibited",
 				formUrl: input.targetUrl,
-				reasonCode: "ARBITRARY_PROHIBITED_REASON",
-				reason: "The form must not be submitted.",
+				reasonCode: "NO_FORM_PRESENT",
+				reason: "No inquiry form is present.",
 				retryable: null,
 			}),
-			functionResponse("call-valid", "finish", {
-				outcome: "prohibited",
-				formUrl: input.targetUrl,
-				reasonCode: "SALES_PROHIBITED",
-				reason: "Sales inquiries are prohibited.",
-				retryable: null,
+			functionResponse("call-failed", "finish", {
+				outcome: "failed",
+				formUrl: null,
+				reasonCode: "PROHIBITION_NOT_VERIFIED",
+				reason: "The trusted handler could not verify the prohibition.",
+				retryable: false,
 			}),
 		];
 		const executor = new ResponsesAgentExecutor({
@@ -1453,6 +1488,79 @@ describe("ResponsesAgentExecutor", () => {
 		);
 
 		expect(result).toMatchObject({
+			outcome: "failed",
+			reasonCode: "PROHIBITION_NOT_VERIFIED",
+		});
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{
+				turn: 1,
+				toolName: "observe",
+				stage: "observe",
+				resultCode: "OK",
+			},
+			{
+				turn: 2,
+				toolName: "finish",
+				stage: "finish_validation",
+				resultCode: "FINISH_PROHIBITION_NOT_VERIFIED",
+			},
+			{
+				turn: 3,
+				toolName: "finish",
+				stage: "finish_validation",
+				resultCode: "OK",
+			},
+		]);
+	});
+
+	test("rejects an unknown prohibited reason code", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-invalid", "finish", {
+				outcome: "prohibited",
+				formUrl: input.targetUrl,
+				reasonCode: "ARBITRARY_PROHIBITED_REASON",
+				reason: "The form must not be submitted.",
+				retryable: null,
+			}),
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-valid", "finish", {
+				outcome: "prohibited",
+				formUrl: input.targetUrl,
+				reasonCode: "SALES_PROHIBITED",
+				reason: "Sales inquiries are prohibited.",
+				retryable: null,
+			}),
+		];
+		const driver = new WorkerFakeBrowserDriver();
+		driver.pageText = "Sales solicitations are prohibited.";
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () => {
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toMatchObject({
 			outcome: "prohibited",
 			reasonCode: "SALES_PROHIBITED",
 		});
@@ -1465,6 +1573,12 @@ describe("ResponsesAgentExecutor", () => {
 			},
 			{
 				turn: 2,
+				toolName: "observe",
+				stage: "observe",
+				resultCode: "OK",
+			},
+			{
+				turn: 3,
 				toolName: "finish",
 				stage: "finish_validation",
 				resultCode: "OK",
@@ -1547,6 +1661,7 @@ describe("ResponsesAgentExecutor", () => {
 				elementId: "fa-0-0",
 				payloadKey: "message",
 			}),
+			functionResponse("call-confirm", "observe", {}),
 			functionResponse("call-submit", "submit", {
 				elementId: "fa-0-1",
 				activationStrategy: "mouse",
@@ -1583,6 +1698,12 @@ describe("ResponsesAgentExecutor", () => {
 			},
 			{
 				turn: 2,
+				toolName: "observe",
+				stage: "observe",
+				resultCode: "OK",
+			},
+			{
+				turn: 3,
 				toolName: "submit",
 				stage: "submit",
 				resultCode: "OK",
@@ -1608,6 +1729,7 @@ describe("ResponsesAgentExecutor", () => {
 				elementId: "fa-0-0",
 				payloadKey: "message",
 			}),
+			functionResponse("call-confirm", "observe", {}),
 			functionResponse("call-submit", "submit", {
 				elementId: "fa-0-1",
 				activationStrategy: "mouse",
@@ -1644,6 +1766,12 @@ describe("ResponsesAgentExecutor", () => {
 			},
 			{
 				turn: 2,
+				toolName: "observe",
+				stage: "observe",
+				resultCode: "OK",
+			},
+			{
+				turn: 3,
 				toolName: "submit",
 				stage: "submit",
 				resultCode: "SUBMISSION_RESULT_UNCERTAIN",
@@ -1671,6 +1799,7 @@ describe("ResponsesAgentExecutor", () => {
 				reason: "No inquiry form is present.",
 				retryable: null,
 			}),
+			functionResponse("call-observe", "observe", {}),
 			functionResponse("call-valid", "finish", {
 				outcome: "prohibited",
 				formUrl: input.targetUrl,
@@ -1680,6 +1809,8 @@ describe("ResponsesAgentExecutor", () => {
 			}),
 		];
 		const requests: unknown[] = [];
+		const driver = new WorkerFakeBrowserDriver();
+		driver.observationForms = [];
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
 			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
@@ -1692,7 +1823,7 @@ describe("ResponsesAgentExecutor", () => {
 				if (!response) throw new Error("Unexpected provider request");
 				return Response.json(response);
 			}) as typeof fetch,
-			createBrowserDriver: async () => new WorkerFakeBrowserDriver(),
+			createBrowserDriver: async () => driver,
 		});
 
 		const result = await executor.execute(
@@ -1704,7 +1835,7 @@ describe("ResponsesAgentExecutor", () => {
 			outcome: "prohibited",
 			formUrl: input.targetUrl,
 		});
-		expect(requests).toHaveLength(2);
+		expect(requests).toHaveLength(3);
 		expect(requests[1]).toMatchObject({
 			input: expect.arrayContaining([
 				expect.objectContaining({
@@ -1723,6 +1854,12 @@ describe("ResponsesAgentExecutor", () => {
 			},
 			{
 				turn: 2,
+				toolName: "observe",
+				stage: "observe",
+				resultCode: "OK",
+			},
+			{
+				turn: 3,
 				toolName: "finish",
 				stage: "finish_validation",
 				resultCode: "OK",
@@ -1751,6 +1888,7 @@ describe("ResponsesAgentExecutor", () => {
 			}),
 		];
 		const driver = new WorkerFakeBrowserDriver();
+		driver.pageText = "営業、提案、勧誘目的での利用は禁止しています。";
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
 			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
@@ -1807,6 +1945,7 @@ describe("ResponsesAgentExecutor", () => {
 				elementId: "fa-0-0",
 				payloadKey: "message",
 			}),
+			functionResponse("call-confirm", "observe", {}),
 			functionResponse("call-submit", "submit", {
 				elementId: "fa-0-1",
 				activationStrategy: "mouse",

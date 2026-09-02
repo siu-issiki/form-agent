@@ -7,6 +7,7 @@ import {
 	discoverCdpBodyBackendNodeIds,
 	discoverCdpForms,
 	discoverCdpNavigationLinks,
+	findCdpFrameOwnerBackendNodeId,
 } from "./browser-use-cdp-dom";
 import type { Job } from "./job";
 import {
@@ -17,6 +18,7 @@ import {
 	type BrowserSubmitResult,
 	createBrowserSubmitDiagnosticError,
 	normalizeAllowedHosts,
+	PROHIBITION_TEXT_PATTERN_SOURCES,
 	type RestrictedBrowserDriver,
 	type SubmitActivationStrategy,
 } from "./restricted-browser";
@@ -61,6 +63,11 @@ interface ResolvedNode {
 	object: { objectId?: string };
 }
 
+export interface CdpFrameTree {
+	frame: { id: string; parentId?: string };
+	childFrames?: CdpFrameTree[];
+}
+
 interface AxNode {
 	backendDOMNodeId?: number;
 	name?: { value?: unknown };
@@ -92,14 +99,15 @@ interface ElementReference {
 	frameId?: string;
 }
 
-interface PausedRequest {
+export interface PausedRequest {
 	requestId: string;
+	redirectedRequestId?: string;
 	resourceType?: string;
 	frameId?: string;
 	request: { url: string; method: string };
 }
 
-interface ExpectedSubmissionRequest {
+export interface ExpectedSubmissionRequest {
 	url: string;
 	method: string;
 }
@@ -122,12 +130,32 @@ export type SubmitActivationStage =
 	| "focus_retained"
 	| "dispatch";
 
+export function collectCdpFrameParentIds(
+	frameTree: CdpFrameTree,
+): Map<string, string | undefined> {
+	const parents = new Map<string, string | undefined>();
+	const visit = (tree: CdpFrameTree, inheritedParentId?: string) => {
+		const parentId = tree.frame.parentId ?? inheritedParentId;
+		parents.set(tree.frame.id, parentId);
+		for (const child of tree.childFrames ?? []) {
+			visit(child, tree.frame.id);
+		}
+	};
+	visit(frameTree);
+	return parents;
+}
+
 export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#topFrameId: string | undefined;
 	#targetDomain: string | undefined;
 	#allowedHosts: string[] = [];
 	#submissionRequestAllowed = false;
+	#blockNonSubmitRequests = false;
+	#expectedNavigationRequest:
+		| { url: string; frameId?: string; claimed: boolean }
+		| undefined;
 	#submissionRequestInFlight = false;
+	#submissionRedirectRequestId: string | undefined;
 	#submissionRequestCount = 0;
 	#submissionRequestObserved: (() => void) | undefined;
 	#expectedSubmissionRequest: ExpectedSubmissionRequest | undefined;
@@ -140,6 +168,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#validatedSubmitInputBackendNodeId: number | undefined;
 	#targetPolicyError: Error | undefined;
 	readonly #frameNavigationRevisions = new Map<string, number>();
+	readonly #frameParentIds = new Map<string, string | undefined>();
+	readonly #isolatedWorldContexts = new Map<string, number>();
 	#elementGeneration = 0;
 	#elements = new Map<string, ElementReference>();
 	#formDataEntered = false;
@@ -231,13 +261,24 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 
 	async navigate(url: string): Promise<void> {
 		assertDryRunNavigationAllowed(this.dryRun, this.#navigationCount);
+		this.#expectedNavigationRequest = this.#blockNonSubmitRequests
+			? {
+					url: canonicalHttpRequestUrl(url),
+					...(this.#topFrameId ? { frameId: this.#topFrameId } : {}),
+					claimed: false,
+				}
+			: undefined;
 		this.#navigationCount += 1;
 		this.#clearElements();
-		const result = await this.#send<{ errorText?: string }>("Page.navigate", {
-			url,
-		});
-		if (result.errorText) throw new Error("Browser navigation failed");
-		await this.#waitForReadyState();
+		try {
+			const result = await this.#send<{ errorText?: string }>("Page.navigate", {
+				url,
+			});
+			if (result.errorText) throw new Error("Browser navigation failed");
+			await this.#waitForReadyState();
+		} finally {
+			this.#expectedNavigationRequest = undefined;
+		}
 	}
 
 	async observe(): Promise<BrowserObservation> {
@@ -255,6 +296,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			action: string;
 			method: string;
 			fields: unknown[];
+			prohibitedReasonCodes: string[];
 		}> = [];
 		let fieldIndex = 0;
 
@@ -295,10 +337,46 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				});
 			}
 			if (fields.length > 0) {
+				const formFrameId = candidateForm.frameId ?? this.#topFrameId;
+				if (!formFrameId) throw new BrowserElementError();
+				const formExecutionContextId =
+					await this.#prohibitionExecutionContext(formFrameId);
+				const formProhibitedReasonCodes = await this.#callFunctionOnElement<
+					string[]
+				>(
+					candidateForm.backendNodeId,
+					READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
+					[],
+					formExecutionContextId,
+				);
+				const frameOwnerBackendNodeId = candidateForm.frameId
+					? findCdpFrameOwnerBackendNodeId(root, candidateForm.frameId)
+					: undefined;
+				const parentFrameId = candidateForm.frameId
+					? this.#frameParentIds.get(candidateForm.frameId)
+					: undefined;
+				const parentExecutionContextId = parentFrameId
+					? await this.#prohibitionExecutionContext(parentFrameId)
+					: undefined;
+				const parentProhibitedReasonCodes =
+					frameOwnerBackendNodeId && parentExecutionContextId !== undefined
+						? await this.#callFunctionOnElement<string[]>(
+								frameOwnerBackendNodeId,
+								READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
+								[],
+								parentExecutionContextId,
+							)
+						: [];
 				forms.push({
 					action: candidateForm.action,
 					method: candidateForm.method,
 					fields,
+					prohibitedReasonCodes: [
+						...new Set([
+							...formProhibitedReasonCodes,
+							...parentProhibitedReasonCodes,
+						]),
+					],
 				});
 			}
 		}
@@ -344,6 +422,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			throw new BrowserElementError();
 		}
 		this.#interactionStarted = true;
+		this.#blockNonSubmitRequests = true;
 		await this.#clickElement(reference.backendNodeId);
 	}
 
@@ -361,6 +440,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 		this.#interactionStarted = true;
 		this.#formDataEntered = true;
+		this.#blockNonSubmitRequests = true;
 		await this.#send("DOM.scrollIntoViewIfNeeded", {
 			backendNodeId: reference.backendNodeId,
 		});
@@ -379,6 +459,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 		this.#interactionStarted = true;
 		this.#formDataEntered = true;
+		this.#blockNonSubmitRequests = true;
 		if (state.tag === "select") {
 			const changed = await this.#callFunctionOnElement<boolean>(
 				reference.backendNodeId,
@@ -430,17 +511,15 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 		let hasInputInSubmitForm = false;
 		for (const inputBackendNodeId of this.#successfulInputBackendNodeIds) {
-			if (
+			const hasSameFormOwner =
 				await this.#callFunctionOnElementWithElementArgument<boolean>(
 					reference.backendNodeId,
 					inputBackendNodeId,
 					HAS_SAME_FORM_OWNER_FUNCTION,
-				)
-			) {
-				hasInputInSubmitForm = true;
-				this.#validatedSubmitInputBackendNodeId = inputBackendNodeId;
-				break;
-			}
+				);
+			if (!hasSameFormOwner) throw new BrowserElementError();
+			hasInputInSubmitForm = true;
+			this.#validatedSubmitInputBackendNodeId ??= inputBackendNodeId;
 		}
 		if (!hasInputInSubmitForm) throw new BrowserElementError();
 		const formValid = await this.#callFunctionOnElement<boolean>(
@@ -464,6 +543,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		} catch (error) {
 			throw createBrowserSubmitDiagnosticError("SUBMIT_VALIDATE", error);
 		}
+		this.#blockNonSubmitRequests = true;
+		this.#submissionRedirectRequestId = undefined;
 		this.#interactionStarted = true;
 		if (this.#expectedSubmissionRequest?.method === "GET") {
 			this.#getSubmissionGuard ??= {
@@ -479,7 +560,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				: undefined;
 		let beforeConfirmationCount: number;
 		try {
-			beforeConfirmationCount = await this.#confirmationBodyCount();
+			beforeConfirmationCount = await this.#confirmationBodyCount(
+				expectedDocumentGetFrameId,
+			);
 		} catch (error) {
 			throw createBrowserSubmitDiagnosticError(
 				"SUBMIT_READ_BEFORE_TEXT",
@@ -509,7 +592,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				const confirmation = await readSubmissionConfirmation(
 					beforeConfirmationCount,
 					this.#submissionRequestCount > 0,
-					() => this.#confirmationBodyCount(),
+					() => this.#confirmationBodyCount(expectedDocumentGetFrameId),
 					() => this.currentUrl(),
 					hasExpectedFrameNavigated(
 						expectedDocumentGetFrameId,
@@ -549,23 +632,46 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			}
 		});
 		this.connection.on("DOM.documentUpdated", (_params, sessionId) => {
-			if (sessionId === this.sessionId) this.#clearElements();
+			if (sessionId !== this.sessionId) return;
+			this.#clearElements();
+			this.#isolatedWorldContexts.clear();
+		});
+		this.connection.on("Page.frameAttached", (params, sessionId) => {
+			if (sessionId !== this.sessionId) return;
+			const { frameId, parentFrameId } = params as {
+				frameId?: unknown;
+				parentFrameId?: unknown;
+			};
+			if (typeof frameId === "string" && typeof parentFrameId === "string") {
+				this.#frameParentIds.set(frameId, parentFrameId);
+			}
 		});
 		this.connection.on("Page.frameNavigated", (params, sessionId) => {
 			if (sessionId !== this.sessionId) return;
-			const frameId = (params as { frame?: { id?: unknown } }).frame?.id;
+			const frame = (params as { frame?: { id?: unknown; parentId?: unknown } })
+				.frame;
+			const frameId = frame?.id;
 			if (typeof frameId !== "string") return;
+			this.#frameParentIds.set(
+				frameId,
+				typeof frame?.parentId === "string" ? frame.parentId : undefined,
+			);
+			this.#isolatedWorldContexts.delete(frameId);
 			this.#frameNavigationRevisions.set(
 				frameId,
 				(this.#frameNavigationRevisions.get(frameId) ?? 0) + 1,
 			);
 		});
 		await this.#send("Page.enable");
-		this.#topFrameId = (
-			await this.#send<{ frameTree: { frame: { id: string } } }>(
-				"Page.getFrameTree",
-			)
-		).frameTree.frame.id;
+		const frameTree = (
+			await this.#send<{ frameTree: CdpFrameTree }>("Page.getFrameTree")
+		).frameTree;
+		this.#topFrameId = frameTree.frame.id;
+		for (const [frameId, parentFrameId] of collectCdpFrameParentIds(
+			frameTree,
+		)) {
+			this.#frameParentIds.set(frameId, parentFrameId);
+		}
 		await this.#send("Runtime.enable");
 		await this.#send("DOM.enable", { includeWhitespace: "none" });
 		await this.#send("Accessibility.enable");
@@ -590,18 +696,27 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				throw new Error("Browser domain scope is not configured");
 			}
 			let expectedSubmissionRequest = false;
+			const canContinueSubmissionRedirect =
+				this.#submissionAttemptInProgress &&
+				isAuthorizedSubmissionRedirect(
+					paused,
+					this.#submissionRedirectRequestId,
+					this.#expectedSubmissionFrameId,
+				);
 			const getSubmissionGuard = this.#getSubmissionGuard;
-			const getSubmissionDisposition = getSubmissionRequestDisposition(
-				paused.request,
-				paused.resourceType,
-				paused.frameId,
-				getSubmissionGuard?.request,
-				getSubmissionGuard?.frameId,
-				getSubmissionGuard !== undefined,
-				this.#submissionRequestAllowed,
-				this.#submissionRequestCount,
-				this.#submissionRequestInFlight,
-			);
+			const getSubmissionDisposition = canContinueSubmissionRedirect
+				? "ignore"
+				: getSubmissionRequestDisposition(
+						paused.request,
+						paused.resourceType,
+						paused.frameId,
+						getSubmissionGuard?.request,
+						getSubmissionGuard?.frameId,
+						getSubmissionGuard !== undefined,
+						this.#submissionRequestAllowed,
+						this.#submissionRequestCount,
+						this.#submissionRequestInFlight,
+					);
 			submissionRelatedRequest ||= getSubmissionDisposition !== "ignore";
 			if (getSubmissionDisposition === "block") {
 				blockStage = "expected_request";
@@ -624,6 +739,20 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				expectedSubmissionRequest &&
 				this.#submissionRequestCount === 0 &&
 				!this.#submissionRequestInFlight;
+			submissionRelatedRequest ||= canContinueSubmissionRedirect;
+			const expectedNavigationRequest = this.#expectedNavigationRequest;
+			const canClaimNavigationRequest =
+				expectedNavigationRequest !== undefined &&
+				!expectedNavigationRequest.claimed &&
+				isExpectedNavigationDocumentRequest(
+					paused.request,
+					paused.resourceType,
+					paused.frameId,
+					expectedNavigationRequest,
+				);
+			if (canClaimNavigationRequest && expectedNavigationRequest) {
+				expectedNavigationRequest.claimed = true;
+			}
 			blockStage = "network_policy";
 			assertAllowedBrowserRequest(
 				paused.request.url,
@@ -631,12 +760,21 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				paused.request.method,
 				canClaimSubmissionRequest,
 				!this.#formDataEntered && paused.resourceType !== "Document",
-				this.dryRun && this.#interactionStarted,
+				(this.dryRun && this.#interactionStarted) ||
+					shouldBlockNonSubmitRequest(
+						this.#blockNonSubmitRequests,
+						canClaimSubmissionRequest,
+						canClaimNavigationRequest,
+						canContinueSubmissionRedirect,
+					),
 				this.#allowedHosts,
 			);
 			if (canClaimSubmissionRequest) {
 				this.#submissionRequestInFlight = true;
+				this.#submissionRedirectRequestId = paused.requestId;
 				claimedSubmissionRequest = true;
+			} else if (canContinueSubmissionRedirect) {
+				this.#submissionRedirectRequestId = paused.requestId;
 			}
 			await continueSubmissionRequest(
 				() =>
@@ -680,13 +818,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		);
 	}
 
-	async #confirmationBodyCount(): Promise<number> {
+	async #confirmationBodyCount(frameId?: string): Promise<number> {
 		const { root } = await this.#send<{ root: CdpDomNode }>("DOM.getDocument", {
 			depth: -1,
 			pierce: true,
 		});
 		const matches = await Promise.all(
-			discoverCdpBodyBackendNodeIds(root).map((backendNodeId) =>
+			discoverCdpBodyBackendNodeIds(root, 20, frameId).map((backendNodeId) =>
 				this.#callFunctionOnElement<boolean>(
 					backendNodeId,
 					HAS_CONFIRMATION_TEXT_FUNCTION,
@@ -700,6 +838,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				event: "browser_confirmation_snapshot",
 				bodyCount: matches.length,
 				matchingBodyCount,
+				frameScoped: frameId !== undefined,
 			}),
 		);
 		return matchingBodyCount;
@@ -775,10 +914,12 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		backendNodeId: number,
 		functionDeclaration: string,
 		args: unknown[] = [],
+		executionContextId?: number,
 	): Promise<TResult> {
 		const resolved = await this.#send<ResolvedNode>("DOM.resolveNode", {
 			backendNodeId,
 			objectGroup: "form-agent-elements",
+			...(executionContextId === undefined ? {} : { executionContextId }),
 		});
 		const objectId = resolved.object.objectId;
 		if (!objectId) throw new BrowserElementError();
@@ -799,6 +940,20 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				() => undefined,
 			);
 		}
+	}
+
+	async #prohibitionExecutionContext(frameId: string): Promise<number> {
+		const existing = this.#isolatedWorldContexts.get(frameId);
+		if (existing !== undefined) return existing;
+		const { executionContextId } = await this.#send<{
+			executionContextId: number;
+		}>("Page.createIsolatedWorld", {
+			frameId,
+			worldName: "form-agent-prohibition",
+			grantUniveralAccess: false,
+		});
+		this.#isolatedWorldContexts.set(frameId, executionContextId);
+		return executionContextId;
 	}
 
 	async #callFunctionOnElementWithElementArgument<TResult>(
@@ -1198,6 +1353,54 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 		return this.connection.send<TResult>(method, params, this.sessionId);
 	}
+}
+
+export function shouldBlockNonSubmitRequest(
+	blockNonSubmitRequests: boolean,
+	submissionRequestAuthorized: boolean,
+	navigationRequestAuthorized: boolean,
+	submissionRedirectAuthorized = false,
+): boolean {
+	return (
+		blockNonSubmitRequests &&
+		!submissionRequestAuthorized &&
+		!navigationRequestAuthorized &&
+		!submissionRedirectAuthorized
+	);
+}
+
+export function isAuthorizedSubmissionRedirect(
+	paused: PausedRequest,
+	previousRequestId: string | undefined,
+	expectedFrameId: string | undefined,
+): boolean {
+	return (
+		previousRequestId !== undefined &&
+		paused.redirectedRequestId === previousRequestId &&
+		["GET", "HEAD"].includes(paused.request.method.toUpperCase()) &&
+		["Document", "Fetch", "XHR"].includes(paused.resourceType ?? "") &&
+		(expectedFrameId === undefined || paused.frameId === expectedFrameId)
+	);
+}
+
+export function isExpectedNavigationDocumentRequest(
+	request: ExpectedSubmissionRequest,
+	resourceType: string | undefined,
+	frameId: string | undefined,
+	expected: { url: string; frameId?: string },
+): boolean {
+	return (
+		request.method.toUpperCase() === "GET" &&
+		resourceType === "Document" &&
+		(expected.frameId === undefined || frameId === expected.frameId) &&
+		canonicalHttpRequestUrl(request.url) === expected.url
+	);
+}
+
+function canonicalHttpRequestUrl(rawUrl: string): string {
+	const url = new URL(rawUrl);
+	url.hash = "";
+	return url.toString();
 }
 
 export interface CdpScreenshotResult {
@@ -1602,6 +1805,65 @@ export const IS_ELEMENT_FOCUSED_FUNCTION = `function() {
 
 export const CHECK_FORM_VALIDITY_FUNCTION = `function() {
   return Boolean(this.form && typeof this.form.checkValidity === "function" && this.form.checkValidity());
+}`;
+
+export const READ_FORM_PROHIBITION_REASON_CODES_FUNCTION = `function() {
+  const patternSources = ${JSON.stringify(PROHIBITION_TEXT_PATTERN_SOURCES)};
+  const texts = [];
+  const appendText = (value) => {
+    texts.push(String(value ?? ""));
+  };
+  appendText(this.innerText);
+	const appendPrevious = (element, limit) => {
+		let sibling = element?.previousElementSibling;
+		for (let count = 0; count < limit && sibling; count += 1) {
+			if (sibling.matches?.("form") || sibling.querySelector?.("form")) break;
+			if (!["HEADER", "NAV", "FOOTER"].includes(sibling.tagName)) {
+				appendText(sibling.innerText);
+			}
+			sibling = sibling.previousElementSibling;
+		}
+	};
+	appendPrevious(this, 3);
+	let current = this.parentElement;
+	for (let depth = 0; depth < 2 && current && current.tagName !== "BODY"; depth += 1) {
+		appendPrevious(current, 1);
+		current = current.parentElement;
+	}
+	const host = this.getRootNode?.()?.host ?? null;
+	if (host) {
+		appendPrevious(host, 1);
+		current = host.parentElement;
+		for (let depth = 0; depth < 2 && current && current.tagName !== "BODY"; depth += 1) {
+			appendPrevious(current, 1);
+			current = current.parentElement;
+		}
+	}
+  const detectionTexts = [...texts];
+  for (let index = 1; index < texts.length; index += 1) {
+    detectionTexts.push(texts[index - 1].slice(-128) + " " + texts[index].slice(0, 128));
+  }
+  const codes = [];
+  for (const rawText of detectionTexts) {
+    const text = rawText.replace(/\\s+/g, " ").toLowerCase();
+    const withoutExplicitAllowances = patternSources.explicitAllowances.reduce(
+      (value, source) => value.replace(new RegExp(source, "g"), " "),
+      text,
+    );
+    if (
+      !codes.includes("SALES_PROHIBITED") &&
+      patternSources.salesProhibited.some((source) => new RegExp(source).test(withoutExplicitAllowances))
+    ) {
+      codes.push("SALES_PROHIBITED");
+    }
+    if (
+      !codes.includes("FORM_PURPOSE_INCOMPATIBLE") &&
+      patternSources.formPurposeIncompatible.some((source) => new RegExp(source).test(text))
+    ) {
+      codes.push("FORM_PURPOSE_INCOMPATIBLE");
+    }
+  }
+  return codes;
 }`;
 
 export const HAS_SAME_FORM_OWNER_FUNCTION = `function(input) {

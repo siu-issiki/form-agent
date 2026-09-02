@@ -2,6 +2,7 @@ import { D1JobStore } from "./d1-job-store";
 import type { Job } from "./job";
 import {
 	type BrowserObservation,
+	type ProhibitedReasonCode,
 	type RestrictedBrowserDriver,
 	RestrictedBrowserTools,
 	type SubmitActivationStrategy,
@@ -81,6 +82,24 @@ export class BrowserToolCoordinator {
 			const { tools } = await this.#getToolsAndJob(jobId, runToken);
 			readSubmitActivationStrategy(params);
 			await tools.validateSubmit(readElementId(params));
+		});
+		this.#operationTail = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation;
+	}
+
+	async validateProhibited(
+		jobId: string,
+		runToken: string,
+		reasonCode: ProhibitedReasonCode,
+		formUrl: string | null,
+	): Promise<void> {
+		const operation = this.#operationTail.then(async () => {
+			if (this.#closed) throw new BrowserToolInputError();
+			const { tools } = await this.#getToolsAndJob(jobId, runToken);
+			await tools.validateProhibited(reasonCode, formUrl);
 		});
 		this.#operationTail = operation.then(
 			() => undefined,
