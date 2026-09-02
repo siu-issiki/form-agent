@@ -1,4 +1,5 @@
 const CDP_COMMAND_TIMEOUT_MS = 15_000;
+const ERROR_CLOSE_FALLBACK_MS = 1_000;
 export const MAX_CDP_MESSAGE_CHARACTERS = 4 * 1024 * 1024;
 
 interface CdpMessage {
@@ -31,8 +32,12 @@ export class BrowserUseCdpConnection {
 	#closeRequested = false;
 	#closeLogged = false;
 	#pendingAtFailure: number | undefined;
+	#errorFallback: ReturnType<typeof setTimeout> | undefined;
 
-	private constructor(private readonly webSocket: WebSocket) {
+	private constructor(
+		private readonly webSocket: WebSocket,
+		private readonly errorCloseFallbackMs: number,
+	) {
 		webSocket.addEventListener("message", (event) => this.#onMessage(event));
 		webSocket.addEventListener("close", (event) => this.#onClose(event));
 		webSocket.addEventListener("error", () => this.#onError());
@@ -41,6 +46,7 @@ export class BrowserUseCdpConnection {
 	static async connect(
 		webSocketUrl: string,
 		fetchImpl: typeof fetch = fetch,
+		errorCloseFallbackMs = ERROR_CLOSE_FALLBACK_MS,
 	): Promise<BrowserUseCdpConnection> {
 		const url = new URL(webSocketUrl);
 		if (url.protocol !== "wss:") {
@@ -60,7 +66,10 @@ export class BrowserUseCdpConnection {
 			throw new BrowserUseCdpUpgradeRejectedError(response.status);
 		}
 		response.webSocket.accept();
-		return new BrowserUseCdpConnection(response.webSocket);
+		return new BrowserUseCdpConnection(
+			response.webSocket,
+			errorCloseFallbackMs,
+		);
 	}
 
 	send<TResult>(
@@ -171,22 +180,33 @@ export class BrowserUseCdpConnection {
 				}),
 			);
 		}
-		if (this.#closed) return;
+		if (this.#closeRequested) return;
 		this.#closed = true;
 		this.#rejectPending(new BrowserUseCdpClosedError(event.code, reasonHint));
 	}
 
+	/**
+	 * The close event carries the diagnosis, so an error only records what it
+	 * saw and waits for it. The timer only covers a close that never arrives.
+	 */
 	#onError(): void {
 		if (this.#closed) return;
 		this.#pendingAtFailure = this.#pending.size;
 		console.warn(JSON.stringify({ event: "browser_use_cdp_error" }));
 		this.#closed = true;
-		this.#rejectPending();
+		this.#errorFallback = setTimeout(() => {
+			this.#errorFallback = undefined;
+			this.#rejectPending();
+		}, this.errorCloseFallbackMs);
 	}
 
 	#rejectPending(
 		error: Error = new Error("Browser Use CDP connection closed"),
 	): void {
+		if (this.#errorFallback !== undefined) {
+			clearTimeout(this.#errorFallback);
+			this.#errorFallback = undefined;
+		}
 		for (const pending of this.#pending.values()) {
 			clearTimeout(pending.timeout);
 			pending.reject(error);

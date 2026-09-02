@@ -2262,3 +2262,104 @@ describe("BrowserUseCdpDriver.connect close classification", () => {
 		expect(Date.now() - startedAt).toBeLessThan(1_000);
 	});
 });
+
+describe("BrowserUseCdpConnection error before close", () => {
+	test("rejects with the close classification when an error precedes the close", async () => {
+		const webSocket = new FakeWebSocket();
+		const connection = await BrowserUseCdpConnection.connect(
+			"wss://connect.browser-use.com/session",
+			stubUpgradeFetch(webSocket),
+			20,
+		);
+		const pending = connection.send("Page.enable");
+		const captured = captureWarnings();
+		try {
+			webSocket.emit("error", {});
+			webSocket.emit("close", {
+				code: 1008,
+				reason: "policy violation",
+				wasClean: false,
+			});
+		} finally {
+			captured.restore();
+		}
+
+		const rejection = await pending.catch((error: unknown) => error);
+		expect(rejection).toBeInstanceOf(BrowserUseCdpClosedError);
+		expect((rejection as BrowserUseCdpClosedError).code).toBe(1008);
+		expect((rejection as BrowserUseCdpClosedError).retryable).toBe(false);
+	});
+
+	test("falls back to a generic rejection when no close follows the error", async () => {
+		const webSocket = new FakeWebSocket();
+		const connection = await BrowserUseCdpConnection.connect(
+			"wss://connect.browser-use.com/session",
+			stubUpgradeFetch(webSocket),
+			20,
+		);
+		const pending = connection.send("Page.enable");
+		const captured = captureWarnings();
+		try {
+			webSocket.emit("error", {});
+		} finally {
+			captured.restore();
+		}
+
+		const rejection = await pending.catch((error: unknown) => error);
+		expect(rejection).toBeInstanceOf(Error);
+		expect(rejection).not.toBeInstanceOf(BrowserUseCdpClosedError);
+		expect((rejection as Error).message).toBe(
+			"Browser Use CDP connection closed",
+		);
+		expect(
+			captured.warnings.map((warning) => JSON.parse(warning).event),
+		).toEqual(["browser_use_cdp_error"]);
+	});
+
+	test("does not retry a connect attempt that errors before a policy close", async () => {
+		const sockets: FakeWebSocket[] = [];
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await BrowserUseCdpDriver.connect(
+				"api-key",
+				connectJob,
+				true,
+				"wss://connect.browser-use.com",
+				{
+					retryDelaysMs: [10, 20, 30],
+					sleep: async () => {},
+					connectConnection: async () => {
+						const webSocket = new FakeWebSocket();
+						sockets.push(webSocket);
+						const connection = await BrowserUseCdpConnection.connect(
+							"wss://connect.browser-use.com/session",
+							stubUpgradeFetch(webSocket),
+							20,
+						);
+						setTimeout(() => {
+							webSocket.emit("error", {});
+							webSocket.emit("close", {
+								code: 1008,
+								reason: "policy violation",
+								wasClean: false,
+							});
+						}, 0);
+						return connection;
+					},
+				},
+			);
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect(caught).toBeInstanceOf(BrowserUseCdpClosedError);
+		expect((caught as BrowserUseCdpClosedError).code).toBe(1008);
+		expect(sockets).toHaveLength(1);
+		// The remote already closed the socket, so the driver does not close it again.
+		expect(sockets[0]?.closeCalls).toEqual([]);
+	});
+});
