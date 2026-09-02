@@ -7,7 +7,7 @@
 	"vars": {
 		"AGENT_EXECUTOR_ENABLED": "true",
 		"AGENT_MODEL": "gpt-5.6-luna",
-		"AGENT_DRY_RUN": "true"
+		"AGENT_DRY_RUN": "false"
 	},
 	"migrations": [
 		{

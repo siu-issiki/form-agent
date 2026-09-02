@@ -76,6 +76,6 @@ Worker内の信頼済みhandlerがBrowserUseへCDP接続し、モデルには`na
 
 production executorは`AGENT_EXECUTOR_ENABLED=true`、`AGENT_MODEL`、`OPENAI_API_KEY`、`BROWSER_USE_API_KEY`がすべて設定された場合だけ有効になります。いずれかが不足する場合は`EXECUTOR_NOT_CONFIGURED`でfail-closedに終了します。
 
-`AGENT_DRY_RUN`が明示的な`false`以外の場合は`submit`ツール自体をモデルへ公開したまま、信頼済みWorker handlerが送信権取得・ブラウザsubmitより前にearly-returnします。production設定も現在はdry-runを有効にしており、明示的に解除するまで実送信しません。
+`AGENT_DRY_RUN`が明示的な`false`以外の場合は`submit`ツール自体をモデルへ公開したまま、信頼済みWorker handlerが送信権取得・ブラウザsubmitより前にearly-returnします。productionは実送信を有効にしています。送信なし検証ではジョブpayloadへ`_formAgentDryRun: true`を指定すると、production設定より優先してdry-runを強制できます。
 
 executor は `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返します。`sent` は制限付き `submit` ツールが D1 へ結果を保存済みの場合だけ確定し、送信権取得後の切断や矛盾した結果は `uncertain` として自動再試行を止めます。
