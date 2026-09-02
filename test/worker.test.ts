@@ -62,7 +62,7 @@ const input: JobInput = {
 	targetUrl: "https://form-agent.dev/contact",
 	targetDomain: "form-agent.dev",
 	allowedHosts: [],
-	payload: { formValues: { message: "Hello" } },
+	payload: { formValues: { message: "Hello", subject: "Introduction" } },
 };
 
 test("keeps agent dry-run enabled unless production submission is explicitly enabled", () => {
@@ -921,6 +921,8 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	filledValues: string[] = [];
 	observationForms: unknown[] = workerObservedForms();
 	fieldStates: ObservedFieldState[] = workerFieldStates();
+	/** Replayed in order; the last entry repeats. */
+	formSnapshots: string[] = ['["form"]'];
 	pageText: string | undefined;
 	pageTextTruncated = false;
 	validateSubmitError: Error | null = null;
@@ -941,16 +943,35 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 		this.observed = true;
 		return {
 			url: this.url,
-			forms: this.observationForms,
+			// A real observation is a snapshot, not a live view of the page.
+			forms: structuredClone(this.observationForms),
 			...(this.pageText ? { pageText: this.pageText } : {}),
 			...(this.pageTextTruncated ? { pageTextTruncated: true } : {}),
 		};
 	}
 	async clickNonSubmit(): Promise<void> {}
-	async fill(_elementId: string, value: string): Promise<void> {
+	async fill(elementId: string, value: string): Promise<void> {
 		this.filledValues.push(value);
+		this.#applyValue(elementId, value);
 	}
-	async select(): Promise<void> {}
+	async select(elementId: string, value: string): Promise<void> {
+		this.#applyValue(elementId, value);
+	}
+	/** Mirrors what a real browser shows on the next observation. */
+	#applyValue(elementId: string, value: string): void {
+		for (const form of this.observationForms) {
+			if (typeof form !== "object" || form === null) continue;
+			const fields = (form as { fields?: unknown }).fields;
+			if (!Array.isArray(fields)) continue;
+			for (const field of fields) {
+				const record = field as { elementId?: string; value?: string };
+				if (record.elementId === elementId) record.value = value;
+			}
+		}
+		for (const state of this.fieldStates) {
+			if (state.elementId === elementId) state.value = value;
+		}
+	}
 	async validateSubmit(): Promise<void> {
 		this.validateSubmitCount += 1;
 		if (this.validateSubmitError) throw this.validateSubmitError;
@@ -960,6 +981,11 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	}
 	async readObservedFieldStates(): Promise<ObservedFieldState[]> {
 		return this.fieldStates;
+	}
+	async readFormSnapshot(): Promise<string> {
+		return this.formSnapshots.length > 1
+			? (this.formSnapshots.shift() as string)
+			: (this.formSnapshots[0] as string);
 	}
 	async captureScreenshot(): Promise<Uint8Array> {
 		this.screenshotCount += 1;
@@ -982,6 +1008,7 @@ function workerObservedForms(): unknown[] {
 			fields: [
 				{ elementId: "fa-0-0", tag: "input", type: "text", value: "" },
 				{ elementId: "fa-0-1", tag: "input", type: "submit", value: "Send" },
+				{ elementId: "fa-0-2", tag: "input", type: "text", value: "" },
 			],
 		},
 	];
@@ -989,7 +1016,10 @@ function workerObservedForms(): unknown[] {
 
 /** Matches `workerObservedForms`, minus the submit control. */
 function workerFieldStates(): ObservedFieldState[] {
-	return [{ elementId: "fa-0-0", value: "", checked: false }];
+	return [
+		{ elementId: "fa-0-0", value: "", checked: false },
+		{ elementId: "fa-0-2", value: "", checked: false },
+	];
 }
 
 describe("ResponsesAgentExecutor", () => {
@@ -2078,8 +2108,8 @@ describe("ResponsesAgentExecutor", () => {
 				"A value is in the wrong field.",
 			),
 			functionResponse("call-correct", "fill", {
-				elementId: "fa-0-0",
-				payloadKey: "message",
+				elementId: "fa-0-2",
+				payloadKey: "subject",
 			}),
 			functionResponse("call-reobserve", "observe", {}),
 			functionResponse("call-resubmit", "submit", {
@@ -2387,6 +2417,14 @@ describe("ResponsesAgentExecutor", () => {
 			}),
 			true,
 		],
+		[
+			"FORM_STATE_CHANGED_HIDDEN" as const,
+			functionResponse("call-tool", "submit", {
+				elementId: "fa-0-1",
+				activationStrategy: "mouse",
+			}),
+			true,
+		],
 	])("returns fixed guidance with %s", async (code, call, observeFirst) => {
 		const store = new D1JobStore(env.DB);
 		await store.create(input, "2026-08-28T00:00:00.000Z");
@@ -2396,6 +2434,8 @@ describe("ResponsesAgentExecutor", () => {
 			"2026-08-28T00:00:01.000Z",
 		);
 		if (!job) throw new Error("Expected a claimed job");
+		const expectedCode =
+			code === "FORM_STATE_CHANGED_HIDDEN" ? "FORM_STATE_CHANGED" : code;
 		const driver = new WorkerFakeBrowserDriver();
 		if (code === "FORM_INVALID") {
 			driver.validateSubmitError = new BrowserFormInvalidError();
@@ -2405,6 +2445,10 @@ describe("ResponsesAgentExecutor", () => {
 			driver.fieldStates = [
 				{ elementId: "fa-0-0", value: "rewritten", checked: false },
 			];
+		}
+		if (code === "FORM_STATE_CHANGED_HIDDEN") {
+			// The untrusted page adds a hidden input while the review runs.
+			driver.formSnapshots = ['["form"]', '["form","hidden"]'];
 		}
 		const responses = [
 			functionResponse("call-fill", "fill", {
@@ -2459,7 +2503,10 @@ describe("ResponsesAgentExecutor", () => {
 					item.type === "function_call_output" && item.call_id === "call-tool",
 			)?.output,
 		).toBe(
-			JSON.stringify({ error: code, guidance: TOOL_ERROR_GUIDANCE[code] }),
+			JSON.stringify({
+				error: expectedCode,
+				guidance: TOOL_ERROR_GUIDANCE[expectedCode],
+			}),
 		);
 		expect(driver.submitCount).toBe(0);
 	});

@@ -437,6 +437,33 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		return states;
 	}
 
+	/**
+	 * Rediscovers the form that owns the submit control and describes every
+	 * control it holds. Unlike `observe`, nothing is dropped for being hidden
+	 * or disabled, so a control the page adds during the review is visible in
+	 * the comparison.
+	 */
+	async readFormSnapshot(elementId: string): Promise<string> {
+		const reference = this.#element(elementId);
+		const { discovery } = await this.#discoverForms(await this.currentUrl());
+		const owner = discovery.forms.find(
+			(form) =>
+				(form.frameId ?? this.#topFrameId) ===
+					(reference.frameId ?? this.#topFrameId) &&
+				form.fields.some(
+					(field) => field.backendNodeId === reference.backendNodeId,
+				),
+		);
+		if (!owner) throw new BrowserElementError();
+		const states: Array<FormSnapshotElement | null> = [];
+		for (const field of owner.fields) {
+			states.push(
+				await this.#inspectElement(field.backendNodeId).catch(() => null),
+			);
+		}
+		return toFormSnapshot(states);
+	}
+
 	async clickNonSubmit(elementId: string): Promise<void> {
 		const reference = this.#element(elementId);
 		const state = await this.#inspectElement(reference.backendNodeId);
@@ -1708,6 +1735,40 @@ export function createExpectedSubmissionRequest(
  * whether the page held more. Truncation is decided in the Worker so that an
  * untrusted page cannot claim its text was complete.
  */
+export interface FormSnapshotElement {
+	ok: boolean;
+	tag: string;
+	type: string;
+	name: string | null;
+	value: string;
+	checked: boolean;
+	disabled: boolean;
+}
+
+/**
+ * Canonical string for one form's controls, in DOM order. Password values are
+ * masked, and an element that no longer resolves becomes null so that its
+ * disappearance still changes the snapshot.
+ */
+export function toFormSnapshot(
+	states: ReadonlyArray<FormSnapshotElement | null>,
+): string {
+	return JSON.stringify(
+		states.map((state) =>
+			state?.ok
+				? [
+						state.tag,
+						state.type || "",
+						state.name ?? "",
+						state.type === "password" ? "" : state.value,
+						state.checked,
+						state.disabled,
+					]
+				: null,
+		),
+	);
+}
+
 /**
  * Narrows one inspected element to the state the pre-submit comparison uses,
  * or null when the element is not comparable (unusable, or a submit control

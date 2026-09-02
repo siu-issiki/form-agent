@@ -828,7 +828,7 @@ export const TOOL_ERROR_GUIDANCE = {
 	OBSERVATION_STALE:
 		"Call observe again after the last click, fill, or select, then retry.",
 	CORRECTION_REQUIRED:
-		"The review denied the inputs. Change at least one field with fill or select using a payloadKey, observe again, then submit once more.",
+		"The review denied the inputs. Change at least one field value with fill or select using a payloadKey so that the observed values differ, observe again, then submit once more.",
 	FORM_STATE_CHANGED:
 		"The page changed after it was reviewed. Observe again, verify every value, and submit once more.",
 	FORM_INVALID:

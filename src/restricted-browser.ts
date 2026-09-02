@@ -63,6 +63,45 @@ export interface ObservedFieldState {
  * read-back always describe the same set of elements. Submit controls and
  * buttons are excluded because activating them is what `submit` does.
  */
+/**
+ * Canonical description of the values a reviewer judged, used to require that
+ * a correction actually changed something. Element ids are excluded so that a
+ * re-render which only renumbers elements does not read as a correction.
+ */
+export function observationFingerprint(
+	observation: BrowserObservation,
+): string {
+	const forms: unknown[] = [];
+	for (const form of observation.forms) {
+		if (!isRecord(form) || !Array.isArray(form.fields)) {
+			forms.push(null);
+			continue;
+		}
+		const fields: unknown[] = [];
+		for (const field of form.fields) {
+			if (!isRecord(field)) continue;
+			if (!isReviewComparableField(field.tag, field.type)) continue;
+			fields.push([
+				fingerprintValue(field.tag),
+				fingerprintValue(field.type),
+				fingerprintValue(field.name),
+				fingerprintValue(field.label),
+				fingerprintValue(field.value),
+				fingerprintValue(field.checked),
+			]);
+		}
+		forms.push(fields);
+	}
+	return JSON.stringify(forms);
+}
+
+/** Keeps the fingerprint canonical by reducing page data to scalars. */
+function fingerprintValue(value: unknown): string | boolean | null {
+	if (typeof value === "string") return value;
+	if (typeof value === "boolean") return value;
+	return null;
+}
+
 export function isReviewComparableField(tag: unknown, type: unknown): boolean {
 	if (tag === "button") return false;
 	if (tag === "input" && (type === "submit" || type === "image")) return false;
@@ -148,6 +187,14 @@ export interface RestrictedBrowserDriver {
 	 * changed itself between the review and the submission.
 	 */
 	readObservedFieldStates(): Promise<ObservedFieldState[]>;
+	/**
+	 * Rediscovers the form that owns the submit control and returns a canonical
+	 * string covering every control it holds, hidden and disabled included.
+	 * Comparing two snapshots detects elements added, removed, or altered
+	 * between the review and the submission, which a read-back limited to the
+	 * previously observed elements cannot see.
+	 */
+	readFormSnapshot(elementId: string): Promise<string>;
 	captureScreenshot(): Promise<Uint8Array>;
 	submit(
 		elementId: string,
@@ -269,7 +316,8 @@ export class RestrictedBrowserTools {
 	#inputRevision = 0;
 	#observationRevision = -1;
 	#submitAttempted = false;
-	#correctionRequired = false;
+	#deniedFingerprint: string | undefined;
+	#correctionInputApplied = false;
 
 	private constructor(
 		private readonly driver: RestrictedBrowserDriver,
@@ -400,8 +448,9 @@ export class RestrictedBrowserTools {
 		await this.#assertCurrentUrlAllowed();
 		this.#successfulInputElementIds.add(elementId);
 		this.#inputRevision += 1;
-		// A denied review is only cleared by an actual input change.
-		this.#correctionRequired = false;
+		// A denied review is only cleared once an input actually changed the
+		// observed values, which `validateSubmit` decides from the fingerprint.
+		this.#correctionInputApplied = true;
 	}
 
 	async select(elementId: string, value: string): Promise<void> {
@@ -409,14 +458,14 @@ export class RestrictedBrowserTools {
 		await this.#assertCurrentUrlAllowed();
 		this.#successfulInputElementIds.add(elementId);
 		this.#inputRevision += 1;
-		this.#correctionRequired = false;
+		this.#correctionInputApplied = true;
 	}
 
 	async validateSubmit(elementId: string): Promise<void> {
 		if (this.#successfulInputElementIds.size < 1) {
 			throw new BrowserElementError();
 		}
-		if (this.#correctionRequired) {
+		if (this.#deniedFingerprint !== undefined && !this.#hasCorrectedInputs()) {
 			throw new CorrectionRequiredError();
 		}
 		if (this.#observationRevision !== this.#inputRevision) {
@@ -509,6 +558,10 @@ export class RestrictedBrowserTools {
 			throw new SubmissionEvidenceError();
 		}
 
+		// Taken before the review so that anything the page adds, removes, or
+		// alters while the review runs shows up as a different snapshot.
+		const snapshotBefore = await this.driver.readFormSnapshot(elementId);
+
 		const decision = await this.reviewSubmit(elementId, {
 			contentType: EVIDENCE_CONTENT_TYPE,
 			bytes: before.body,
@@ -522,7 +575,12 @@ export class RestrictedBrowserTools {
 			if (correctable && denialCount < MAX_SUBMIT_REVIEW_DENIALS) {
 				// Force both a real input change and a fresh observation so the
 				// next review sees corrected values instead of the denied ones.
-				this.#correctionRequired = true;
+				// The fingerprint makes a re-entry of the same values visible as
+				// the non-correction it is.
+				this.#deniedFingerprint = observationFingerprint(
+					this.#latestObservation ?? { url: this.#targetUrl, forms: [] },
+				);
+				this.#correctionInputApplied = false;
 				this.#inputRevision += 1;
 				throw new SubmitReviewDeniedError(decision.reasonCode);
 			}
@@ -535,7 +593,7 @@ export class RestrictedBrowserTools {
 
 		// The reviewed page is not the page that gets submitted unless nothing
 		// moved in between. Untrusted page scripts run during the review.
-		await this.#assertReviewedStateUnchanged();
+		await this.#assertReviewedStateUnchanged(elementId, snapshotBefore);
 		this.#submitAttempted = true;
 
 		const authorized = await this.jobs.claimSubmission(
@@ -681,6 +739,13 @@ export class RestrictedBrowserTools {
 		return denialCount;
 	}
 
+	/** True once an input changed the values a denied review looked at. */
+	#hasCorrectedInputs(): boolean {
+		const observation = this.#latestObservation;
+		if (!observation || !this.#correctionInputApplied) return false;
+		return observationFingerprint(observation) !== this.#deniedFingerprint;
+	}
+
 	async #assertCurrentUrlAllowed(): Promise<void> {
 		this.#assertAllowedUrl(await this.driver.currentUrl());
 	}
@@ -690,18 +755,26 @@ export class RestrictedBrowserTools {
 	 * A mismatch forces a fresh observation instead of submitting content that
 	 * was never reviewed.
 	 */
-	async #assertReviewedStateUnchanged(): Promise<void> {
+	async #assertReviewedStateUnchanged(
+		elementId: string,
+		snapshotBefore: string,
+	): Promise<void> {
 		const observation = this.#latestObservation;
 		if (!observation) throw new FormStateChangedError();
 		let unchanged: boolean;
 		try {
 			const currentUrl = await this.driver.currentUrl();
 			this.#assertAllowedUrl(currentUrl);
+			// The observed-field read-back ties the reviewed observation to the
+			// live values; the form snapshot covers everything the observation
+			// never showed, including hidden and disabled controls.
 			const states = await this.driver.readObservedFieldStates();
+			const snapshotAfter = await this.driver.readFormSnapshot(elementId);
 			unchanged =
 				canonicalNavigationPermissionUrl(currentUrl) ===
 					canonicalNavigationPermissionUrl(observation.url) &&
-				hasSameObservedFieldStates(observation, states);
+				hasSameObservedFieldStates(observation, states) &&
+				snapshotAfter === snapshotBefore;
 		} catch (error) {
 			if (error instanceof NavigationPolicyError) throw error;
 			unchanged = false;

@@ -14,6 +14,7 @@ import {
 	NavigationPolicyError,
 	ObservationStaleError,
 	type ObservedFieldState,
+	observationFingerprint,
 	type RestrictedBrowserDriver,
 	RestrictedBrowserTools,
 	readTrustedFormValues,
@@ -878,7 +879,15 @@ describe("RestrictedBrowserTools", () => {
 		expect(reviewInput?.targetDomain).toBe(input.targetDomain);
 		expect(reviewInput?.targetUrl).toBe(input.targetUrl);
 		expect(reviewInput?.currentUrl).toBe(input.targetUrl);
-		expect(reviewInput?.observation.forms).toEqual(defaultObservedForms());
+		expect(reviewInput?.observation.forms).toEqual([
+			{
+				fields: [
+					{ elementId: "fa-0-0", tag: "input", type: "text", value: "Hello" },
+					{ elementId: "fa-0-1", tag: "input", type: "submit", value: "Send" },
+					{ elementId: "fa-0-2", tag: "input", type: "text", value: "" },
+				],
+			},
+		]);
 		expect(reviewInput?.screenshot?.contentType).toBe("image/jpeg");
 		expect(reviewInput?.screenshot?.bytes).toEqual(new Uint8Array([1, 2, 3]));
 	});
@@ -915,9 +924,10 @@ describe("RestrictedBrowserTools", () => {
 			CorrectionRequiredError,
 		);
 
+		// The change only counts once a fresh observation shows it.
 		await tools.fill("fa-0-2", "Corrected");
 		await expect(tools.validateSubmit("fa-0-1")).rejects.toBeInstanceOf(
-			ObservationStaleError,
+			CorrectionRequiredError,
 		);
 		await tools.observe();
 		const sent = await tools.submit("fa-0-1");
@@ -925,6 +935,60 @@ describe("RestrictedBrowserTools", () => {
 		expect(sent.status).toBe("sent");
 		expect(reviewer.reviewCount).toBe(2);
 		expect(driver.submitCount).toBe(1);
+	});
+
+	test("rejects a correction that re-enters the same values", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const reviewer = new StubSubmitReviewer(denyDecision());
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			evidence,
+			reviewer,
+		);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			SubmitReviewDeniedError,
+		);
+
+		// Re-entering the same value leaves the reviewed content identical.
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			CorrectionRequiredError,
+		);
+
+		expect(reviewer.reviewCount).toBe(1);
+		expect(driver.submitCount).toBe(0);
+		expect((await store.find(input.id))?.status).toBe("running");
+	});
+
+	test("does not submit when the form changed outside the observed fields", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		// The page adds a hidden input while the review is running.
+		driver.formSnapshots = ['["form"]', '["form","hidden"]'];
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			evidence,
+			new StubSubmitReviewer(),
+		);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			FormStateChangedError,
+		);
+
+		expect(driver.formSnapshotCount).toBe(2);
+		expect(driver.submitCount).toBe(0);
+		expect((await store.find(input.id))?.status).toBe("running");
 	});
 
 	test("does not offer a correction for a denial the agent cannot fix", async () => {
@@ -1170,6 +1234,90 @@ describe("RestrictedBrowserTools", () => {
 	});
 });
 
+describe("observationFingerprint", () => {
+	test("ignores element ids and non-comparable controls", () => {
+		const withSubmit = observationFingerprint({
+			url: input.targetUrl,
+			forms: [
+				{
+					fields: [
+						{ elementId: "fa-0-0", tag: "input", type: "text", value: "a" },
+						{ elementId: "fa-0-1", tag: "input", type: "submit", value: "Go" },
+					],
+				},
+			],
+		});
+		const renumberedWithoutSubmit = observationFingerprint({
+			url: input.targetUrl,
+			forms: [
+				{
+					fields: [
+						{ elementId: "fa-9-7", tag: "input", type: "text", value: "a" },
+					],
+				},
+			],
+		});
+
+		expect(withSubmit).toBe(renumberedWithoutSubmit);
+	});
+
+	test("changes when a value or checked state changes", () => {
+		const base = {
+			url: input.targetUrl,
+			forms: [
+				{
+					fields: [
+						{ elementId: "fa-0-0", tag: "input", type: "text", value: "a" },
+						{
+							elementId: "fa-0-1",
+							tag: "input",
+							type: "checkbox",
+							checked: false,
+						},
+					],
+				},
+			],
+		};
+
+		expect(observationFingerprint(base)).not.toBe(
+			observationFingerprint({
+				...base,
+				forms: [
+					{
+						fields: [
+							{ elementId: "fa-0-0", tag: "input", type: "text", value: "b" },
+							{
+								elementId: "fa-0-1",
+								tag: "input",
+								type: "checkbox",
+								checked: false,
+							},
+						],
+					},
+				],
+			}),
+		);
+		expect(observationFingerprint(base)).not.toBe(
+			observationFingerprint({
+				...base,
+				forms: [
+					{
+						fields: [
+							{ elementId: "fa-0-0", tag: "input", type: "text", value: "a" },
+							{
+								elementId: "fa-0-1",
+								tag: "input",
+								type: "checkbox",
+								checked: true,
+							},
+						],
+					},
+				],
+			}),
+		);
+	});
+});
+
 describe("readTrustedFormValues", () => {
 	test("keeps only string payload values with a safe key", () => {
 		expect(
@@ -1280,6 +1428,10 @@ function denyDecision(
 	return { decision: "deny", reasonCode, reason };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
 function defaultObservedForms(prohibitionText?: string): unknown[] {
 	return [
 		{
@@ -1317,6 +1469,9 @@ class FakeDriver implements RestrictedBrowserDriver {
 	observationForms: unknown[] = defaultObservedForms();
 	fieldStates: ObservedFieldState[] = defaultFieldStates();
 	fieldStatesError: Error | null = null;
+	/** Replayed in order; the last entry repeats. */
+	formSnapshots: string[] = ['["form"]'];
+	formSnapshotCount = 0;
 	pageText: string | undefined;
 	submitResult: BrowserSubmitResult = {
 		outcome: "sent",
@@ -1341,7 +1496,8 @@ class FakeDriver implements RestrictedBrowserDriver {
 	async observe() {
 		return {
 			url: this.url,
-			forms: this.observationForms,
+			// A real observation is a snapshot, not a live view of the page.
+			forms: structuredClone(this.observationForms),
 			...(this.pageText ? { pageText: this.pageText } : {}),
 			...(this.navigationLinks
 				? { navigationLinks: this.navigationLinks }
@@ -1351,9 +1507,28 @@ class FakeDriver implements RestrictedBrowserDriver {
 
 	async clickNonSubmit(): Promise<void> {}
 
-	async fill(): Promise<void> {}
+	async fill(elementId: string, value: string): Promise<void> {
+		this.applyValue(elementId, value);
+	}
 
-	async select(): Promise<void> {}
+	async select(elementId: string, value: string): Promise<void> {
+		this.applyValue(elementId, value);
+	}
+
+	/** Mirrors what a real browser shows on the next observation. */
+	applyValue(elementId: string, value: string): void {
+		for (const form of this.observationForms) {
+			if (!isRecord(form) || !Array.isArray(form.fields)) continue;
+			for (const field of form.fields) {
+				if (isRecord(field) && field.elementId === elementId) {
+					field.value = value;
+				}
+			}
+		}
+		for (const state of this.fieldStates) {
+			if (state.elementId === elementId) state.value = value;
+		}
+	}
 
 	async captureScreenshot(): Promise<Uint8Array> {
 		this.screenshotCount += 1;
@@ -1375,6 +1550,13 @@ class FakeDriver implements RestrictedBrowserDriver {
 	async readObservedFieldStates(): Promise<ObservedFieldState[]> {
 		if (this.fieldStatesError) throw this.fieldStatesError;
 		return this.fieldStates;
+	}
+
+	async readFormSnapshot(): Promise<string> {
+		this.formSnapshotCount += 1;
+		return this.formSnapshots.length > 1
+			? (this.formSnapshots.shift() as string)
+			: (this.formSnapshots[0] as string);
 	}
 
 	async submit(

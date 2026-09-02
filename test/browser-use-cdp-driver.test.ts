@@ -44,6 +44,7 @@ import {
 	SET_CHECKED_VALUE_FUNCTION,
 	shouldBlockNonSubmitRequest,
 	submitUncertainReasonCode,
+	toFormSnapshot,
 	toObservedFieldState,
 } from "../src/browser-use-cdp-driver";
 import {
@@ -1492,6 +1493,72 @@ function elementState(
 		value: "",
 		checked: false,
 		submitLike: false,
+		...overrides,
+	};
+}
+
+describe("BrowserUseCdpDriver form snapshot", () => {
+	test("keeps DOM order and includes hidden and disabled controls", () => {
+		const snapshot = toFormSnapshot([
+			snapshotElement({ type: "hidden", name: "csrf", value: "token" }),
+			snapshotElement({ name: "message", value: "Hello" }),
+			snapshotElement({ tag: "button", type: "submit", value: "Send" }),
+		]);
+
+		expect(JSON.parse(snapshot)).toEqual([
+			["input", "hidden", "csrf", "token", false, false],
+			["input", "text", "message", "Hello", false, false],
+			["button", "submit", "", "Send", false, false],
+		]);
+		expect(snapshot).not.toBe(
+			toFormSnapshot([
+				snapshotElement({ name: "message", value: "Hello" }),
+				snapshotElement({ type: "hidden", name: "csrf", value: "token" }),
+				snapshotElement({ tag: "button", type: "submit", value: "Send" }),
+			]),
+		);
+	});
+
+	test("changes when a control is added, disabled, or renamed", () => {
+		const base = [snapshotElement({ name: "message", value: "Hello" })];
+
+		expect(toFormSnapshot(base)).not.toBe(
+			toFormSnapshot([...base, snapshotElement({ type: "hidden" })]),
+		);
+		expect(toFormSnapshot(base)).not.toBe(
+			toFormSnapshot([
+				snapshotElement({ name: "message", value: "Hello", disabled: true }),
+			]),
+		);
+		expect(toFormSnapshot(base)).not.toBe(
+			toFormSnapshot([snapshotElement({ name: "renamed", value: "Hello" })]),
+		);
+	});
+
+	test("masks a password value and records an unresolvable control", () => {
+		expect(
+			JSON.parse(
+				toFormSnapshot([
+					snapshotElement({ type: "password", value: "secret" }),
+					snapshotElement({ ok: false }),
+					null,
+				]),
+			),
+		).toEqual([["input", "password", "", "", false, false], null, null]);
+	});
+});
+
+function snapshotElement(
+	overrides: Partial<Parameters<typeof toFormSnapshot>[0][number]> = {},
+) {
+	return {
+		ok: true,
+		tag: "input",
+		type: "text",
+		name: null,
+		value: "",
+		checked: false,
+		disabled: false,
 		...overrides,
 	};
 }
