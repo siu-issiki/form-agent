@@ -8,7 +8,8 @@
 - 受信側に記録がないことだけを「未送信」の証明にしない。
 - D1の既存ジョブを手作業で`pending`へ戻さない。
 - 再実行が必要な場合は、人間の明示承認後に新しいジョブIDを発行する。
-- 通常時は`AGENT_DRY_RUN=true`を維持する。
+- 通常時は`AGENT_DRY_RUN=false`とし、送信なしジョブはpayloadの`_formAgentDryRun: true`で固定する。
+- 実効dry-run値は登録時にジョブへ保存し、deploy後に既存ジョブの意味を変えない。
 
 ## 緊急停止
 
@@ -25,7 +26,16 @@
   "SELECT id,status,attempt_count,updated_at FROM jobs WHERE status IN ('pending','running','submitting') ORDER BY updated_at;"
 ```
 
-`submitting`は強制再送せず、後述の照合対象にする。新規送信を再開する前に、現在のproduction deploymentを確認する。
+`submitting`は強制再送せず、後述の照合対象にする。`running` / `submitting`が0件になったら、明示的な安全停止設定でWorkerをdeployする。
+
+```bash
+./node_modules/.bin/wrangler deploy \
+  --var AGENT_EXECUTOR_ENABLED:true \
+  --var AGENT_MODEL:gpt-5.6-luna \
+  --var AGENT_DRY_RUN:true
+```
+
+新規送信を再開する前に、現在のproduction deploymentを確認する。
 
 ```bash
 ./node_modules/.bin/wrangler deployments status --json
@@ -38,6 +48,25 @@ deploymentが1つのversionへ100%配信されていること、そのactive ver
 ./node_modules/.bin/wrangler queues resume-delivery form-agent-jobs
 ```
 
+通常の実送信運用へ戻す場合は、Queueをpauseした状態で通常設定をdeployし、active versionの`AGENT_DRY_RUN ("false")`を確認してからresumeする。
+
+```bash
+./node_modules/.bin/wrangler deploy
+./node_modules/.bin/wrangler deployments status --json
+./node_modules/.bin/wrangler versions view <ACTIVE_VERSION_ID>
+./node_modules/.bin/wrangler queues resume-delivery form-agent-jobs
+```
+
+## 初回実送信切替
+
+1. Queue配送をpauseする。
+2. D1の`pending` / `running` / `submitting`が0件であることを確認する。
+3. 通常設定をdeployする。
+4. active versionが1つ・100%で、`AGENT_DRY_RUN ("false")`であることを確認する。
+5. 1〜4が成功した場合だけQueue配送をresumeする。
+
+切替前に登録された旧ジョブには実効モードが保存されていないため、Consumerは必ずdry-runとして扱う。切替後に登録されたジョブだけが登録時の`false`を保存し、実送信できる。
+
 ## D1 schema migrationを含むデプロイ
 
 D1 migrationはWorker deployでは自動適用されない。新しい列を参照するコードを先にdeployすると全ジョブの読み書きが失敗するため、必ず次の順序で実施する。
@@ -47,7 +76,7 @@ D1 migrationはWorker deployでは自動適用されない。新しい列を参�
 3. remote D1 migrationを適用する。
 4. schemaとmigration一覧を確認する。
 5. Workerをdeployする。
-6. active versionが1つ・100%で、`AGENT_DRY_RUN ("true")`であることを確認する。
+6. active versionが1つ・100%で、通常運用では`AGENT_DRY_RUN ("false")`であることを確認する。
 7. 1〜6がすべて成功した場合だけQueue配送をresumeする。
 
 ```bash
@@ -126,7 +155,7 @@ pause中に同一内容・同一IDの`POST /jobs`を2回実行し、1回目が`2
 1. Queueをpauseする。既にpause中でも続行する。
 2. 通常設定でWorkerを再デプロイする。
 3. `wrangler deployments status --json`でactive versionが1つ、100%であることを確認する。
-4. `wrangler versions view <ACTIVE_VERSION_ID>`で`AGENT_DRY_RUN ("true")`を確認する。
+4. `wrangler versions view <ACTIVE_VERSION_ID>`で`AGENT_DRY_RUN ("false")`を確認する。
 5. 1〜4がすべて成功した場合だけQueue配送をresumeする。いずれかが失敗した場合はpauseを維持する。
 
 合格条件は次のとおり。
@@ -136,4 +165,4 @@ pause中に同一内容・同一IDの`POST /jobs`を2回実行し、1回目が`2
 - 受信側POSTが1件
 - 同じジョブIDの追加送信がない
 
-検証コマンドはproduction secretを標準出力へ出さない。終了trapでも先にpauseし、`AGENT_DRY_RUN=true`のactive deployment確認前にresumeしてはならない。
+検証コマンドはproduction secretを標準出力へ出さない。終了trapでも先にpauseし、通常運用へ戻す場合は`AGENT_DRY_RUN=false`、安全停止を継続する場合は`AGENT_DRY_RUN=true`のactive deployment確認前にresumeしてはならない。

@@ -13,7 +13,10 @@ import {
 import { BrowserUseCdpPayloadTooLargeError } from "../src/browser-use-cdp";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobInput } from "../src/job";
-import { ResponsesAgentExecutor } from "../src/responses-agent-executor";
+import {
+	isJobDryRun,
+	ResponsesAgentExecutor,
+} from "../src/responses-agent-executor";
 import {
 	BrowserElementError,
 	type BrowserSubmitResult,
@@ -42,6 +45,18 @@ test("keeps agent dry-run enabled unless production submission is explicitly ena
 	expect(isAgentDryRun(undefined)).toBe(true);
 	expect(isAgentDryRun("true")).toBe(true);
 	expect(isAgentDryRun("false")).toBe(false);
+});
+
+test("uses the persisted job mode and keeps legacy jobs dry-run", () => {
+	expect(isJobDryRun({ _formAgentEffectiveDryRun: false }, true)).toBe(false);
+	expect(isJobDryRun({ _formAgentEffectiveDryRun: true }, false)).toBe(true);
+	expect(isJobDryRun({}, true)).toBe(true);
+	expect(
+		isJobDryRun(
+			{ _formAgentEffectiveDryRun: false, _formAgentDryRun: true },
+			false,
+		),
+	).toBe(true);
 });
 
 beforeEach(async () => {
@@ -191,10 +206,91 @@ describe("Job HTTP API", () => {
 		expect(fetched.status).toBe(200);
 		expect(fetchedBody.job).toMatchObject({
 			id: input.id,
-			payload: input.payload,
+			payload: {
+				...input.payload,
+				_formAgentEffectiveDryRun: true,
+			},
 			status: "pending",
 		});
 		expect(fetchedBody.job).not.toHaveProperty("runToken");
+	});
+
+	test("freezes the effective submission mode when the job is registered", async () => {
+		const realSubmit = await handleHttpRequest(
+			jobRequest("POST", "/jobs", input, apiToken),
+			{ ...apiEnv, AGENT_DRY_RUN: "false" },
+		);
+		expect(realSubmit.status).toBe(201);
+		expect(
+			(await new D1JobStore(env.DB).find(input.id))?.payload,
+		).toMatchObject({
+			_formAgentEffectiveDryRun: false,
+		});
+
+		const dryRunInput = {
+			...input,
+			id: "job-dry-run",
+			payload: { ...input.payload, _formAgentDryRun: true },
+		};
+		const dryRun = await handleHttpRequest(
+			jobRequest("POST", "/jobs", dryRunInput, apiToken),
+			{ ...apiEnv, AGENT_DRY_RUN: "false" },
+		);
+		expect(dryRun.status).toBe(201);
+		expect(
+			(await new D1JobStore(env.DB).find(dryRunInput.id))?.payload,
+		).toMatchObject({
+			_formAgentDryRun: true,
+			_formAgentEffectiveDryRun: true,
+		});
+	});
+
+	test.each(["true", 1, null, {}])(
+		"rejects a non-boolean job dry-run value %#",
+		async (value) => {
+			const invalid = await handleHttpRequest(
+				jobRequest(
+					"POST",
+					"/jobs",
+					{
+						...input,
+						payload: { ...input.payload, _formAgentDryRun: value },
+					},
+					apiToken,
+				),
+				{ ...apiEnv, AGENT_DRY_RUN: "false" },
+			);
+
+			expect(invalid.status).toBe(400);
+			expect(await invalid.json()).toEqual({ error: "INVALID_JOB" });
+			expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
+			expect(queued).toEqual([]);
+		},
+	);
+
+	test("overwrites a caller-supplied effective mode", async () => {
+		const response = await handleHttpRequest(
+			jobRequest(
+				"POST",
+				"/jobs",
+				{
+					...input,
+					payload: {
+						...input.payload,
+						_formAgentEffectiveDryRun: false,
+					},
+				},
+				apiToken,
+			),
+			{ ...apiEnv, AGENT_DRY_RUN: "true" },
+		);
+
+		expect(response.status).toBe(201);
+		expect(
+			(await new D1JobStore(env.DB).find(input.id))?.payload,
+		).toMatchObject({
+			_formAgentEffectiveDryRun: true,
+		});
 	});
 
 	test("persists a normalized job-specific external host scope", async () => {

@@ -1,6 +1,6 @@
 # フォーム営業自動化アーキテクチャ
 
-- ステータス: PoC 実装中（production dry-run / 使い捨てサイト実送信 E2E 完了）
+- ステータス: PoC 実装中（production実送信有効 / 管理下サイト実送信E2Eを整備中）
 - 最終更新: 2026-09-02
 - 対象: `siu-issiki/form-agent`
 
@@ -99,7 +99,7 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 - Queue から受け取った 1 ジョブについて Responses API と browser tool の反復を制御する。
 - 1 回の実行で 1 社だけを処理する。
 - `parallel_tool_calls: false` と strict schema により、1 turn で最大 1 tool だけを処理する。
-- `AGENT_DRY_RUN`が明示的な`false`以外、またはジョブpayloadが`_formAgentDryRun: true`の場合は、`submit`をモデルへ公開したまま、送信対象と同じフォームへの入力成功、現在のsubmit要素、`form.checkValidity()`の成功を実ブラウザで検証し、送信権取得とブラウザsubmitより前に`DRY_RUN_COMPLETE`で終了する。
+- `AGENT_DRY_RUN`とbooleanの`_formAgentDryRun`から実効モードをジョブ登録時に保存する。旧形式のジョブは常にdry-runとし、deployment切替で既存ジョブの意味を変えない。dry-runでは`submit`をモデルへ公開したまま、送信対象と同じフォームへの入力成功、現在のsubmit要素、`form.checkValidity()`の成功を実ブラウザで検証し、送信権取得とブラウザsubmitより前に`DRY_RUN_COMPLETE`で終了する。
 - 最大 12 turn、ジョブ prompt 最大 64,000 文字とする。
 - `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返す。
 - Agent 終了時または timeout 時に browser 接続を閉じる。
@@ -290,7 +290,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 
 ## 並列・リトライ方針
 
-PoC はまず 1 並列の production dry-run で開始し、観測結果をもとに 5、20、50 へ段階的に引き上げる。設定値だけで並列対応済みとせず、Cloudflare 上での実測を完了条件とする。
+PoC はまず 1 並列の production で開始し、管理下テストサイトへの実送信結果を観測してから 5、20、50 へ段階的に引き上げる。設定値だけで並列対応済みとせず、Cloudflare 上での実測を完了条件とする。
 
 | 分類 | 例 | 現在の方針 |
 | --- | --- | --- |
@@ -313,7 +313,7 @@ PoC はまず 1 並列の production dry-run で開始し、観測結果をも�
 
 ## PoC 計画と進捗
 
-### フェーズ 1: production / 1 並列 dry-run
+### フェーズ 1: production / 1 並列
 
 完了済み:
 
