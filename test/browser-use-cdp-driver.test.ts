@@ -247,6 +247,21 @@ describe("BrowserUseCdpDriver child target policy", () => {
 				expected,
 			),
 		).toThrow();
+		expect(() =>
+			assertExpectedSubmissionRequest(
+				{
+					url: "https://example.com/search?company=AnyReach",
+					method: "GET",
+				},
+				createExpectedSubmissionRequest("https://example.com/search", "get"),
+			),
+		).not.toThrow();
+		expect(() =>
+			assertExpectedSubmissionRequest(
+				{ url: "https://example.com/other", method: "GET" },
+				createExpectedSubmissionRequest("https://example.com/search", "get"),
+			),
+		).toThrow();
 	});
 
 	test("classifies uncertain submissions without persisting request data", () => {

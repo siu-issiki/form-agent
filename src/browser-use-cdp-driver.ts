@@ -537,26 +537,37 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			if (!this.#targetDomain) {
 				throw new Error("Browser domain scope is not configured");
 			}
-			if (unsafeRequest && this.#submissionRequestAllowed) {
-				blockStage = "expected_request";
-				assertExpectedSubmissionRequest(
-					paused.request,
-					this.#expectedSubmissionRequest,
-				);
+			let expectedSubmissionRequest = false;
+			if (this.#submissionRequestAllowed) {
+				if (unsafeRequest) {
+					blockStage = "expected_request";
+					assertExpectedSubmissionRequest(
+						paused.request,
+						this.#expectedSubmissionRequest,
+					);
+					expectedSubmissionRequest = true;
+				} else {
+					expectedSubmissionRequest = isExpectedSubmissionRequest(
+						paused.request,
+						this.#expectedSubmissionRequest,
+					);
+				}
 			}
+			const canClaimSubmissionRequest =
+				expectedSubmissionRequest &&
+				this.#submissionRequestCount === 0 &&
+				!this.#submissionRequestInFlight;
 			blockStage = "network_policy";
 			assertAllowedBrowserRequest(
 				paused.request.url,
 				this.#targetDomain,
 				paused.request.method,
-				this.#submissionRequestAllowed &&
-					this.#submissionRequestCount === 0 &&
-					!this.#submissionRequestInFlight,
+				canClaimSubmissionRequest,
 				!this.#formDataEntered && paused.resourceType !== "Document",
 				this.dryRun && this.#interactionStarted,
 				this.#allowedHosts,
 			);
-			if (unsafeRequest) {
+			if (canClaimSubmissionRequest) {
 				this.#submissionRequestInFlight = true;
 				claimedSubmissionRequest = true;
 			}
@@ -566,7 +577,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 						requestId: paused.requestId,
 					}),
 				() => {
-					if (!unsafeRequest) return;
+					if (!claimedSubmissionRequest) return;
 					this.#submissionRequestCount += 1;
 					this.#submissionRequestObserved?.();
 				},
@@ -1340,15 +1351,24 @@ export function assertExpectedSubmissionRequest(
 	request: { url: string; method: string },
 	expected: ExpectedSubmissionRequest | undefined,
 ): void {
-	const url = new URL(request.url);
-	url.hash = "";
-	if (
-		!expected ||
-		request.method.toUpperCase() !== expected.method ||
-		url.toString() !== expected.url
-	) {
+	if (!isExpectedSubmissionRequest(request, expected)) {
 		throw new BrowserElementError();
 	}
+}
+
+export function isExpectedSubmissionRequest(
+	request: { url: string; method: string },
+	expected: ExpectedSubmissionRequest | undefined,
+): boolean {
+	const url = new URL(request.url);
+	url.hash = "";
+	if (!expected || request.method.toUpperCase() !== expected.method)
+		return false;
+	if (expected.method !== "GET") return url.toString() === expected.url;
+	const expectedUrl = new URL(expected.url);
+	return (
+		url.origin === expectedUrl.origin && url.pathname === expectedUrl.pathname
+	);
 }
 
 const SET_SELECT_VALUE_FUNCTION = `function(value) {
