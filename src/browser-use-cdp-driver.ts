@@ -828,12 +828,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			pierce: true,
 		});
 		const matches = await Promise.all(
-			discoverCdpBodyBackendNodeIds(root, 20, frameId).map((backendNodeId) =>
-				this.#callFunctionOnElement<boolean>(
-					backendNodeId,
-					HAS_CONFIRMATION_TEXT_FUNCTION,
-					[SUBMISSION_CONFIRMATION_PATTERN],
-				),
+			discoverCdpBodyBackendNodeIds(root, 20, frameId, this.#topFrameId).map(
+				(backendNodeId) =>
+					this.#callFunctionOnElement<boolean>(
+						backendNodeId,
+						HAS_CONFIRMATION_TEXT_FUNCTION,
+						[SUBMISSION_CONFIRMATION_PATTERN],
+					),
 			),
 		);
 		const matchingBodyCount = matches.filter(Boolean).length;
