@@ -1232,18 +1232,18 @@ export function submitUncertainReasonCode(
 	requestObserved: boolean,
 	blockStage?: SubmissionRequestBlockStage,
 ): string {
+	if (requestObserved) {
+		return "SUBMIT_CONFIRMATION_NOT_OBSERVED";
+	}
 	if (blockStage === "expected_request") {
 		return "SUBMIT_EXPECTED_REQUEST_BLOCKED";
 	}
 	if (blockStage === "network_policy") {
 		return "SUBMIT_NETWORK_POLICY_BLOCKED";
 	}
-	if (!requestObserved) {
-		return activationStrategy === "mouse"
-			? "SUBMIT_MOUSE_REQUEST_NOT_OBSERVED"
-			: "SUBMIT_ENTER_REQUEST_NOT_OBSERVED";
-	}
-	return "SUBMIT_CONFIRMATION_NOT_OBSERVED";
+	return activationStrategy === "mouse"
+		? "SUBMIT_MOUSE_REQUEST_NOT_OBSERVED"
+		: "SUBMIT_ENTER_REQUEST_NOT_OBSERVED";
 }
 
 export function assertExpectedSubmissionRequest(

@@ -143,6 +143,9 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		expect(submitUncertainReasonCode("mouse", false, "network_policy")).toBe(
 			"SUBMIT_NETWORK_POLICY_BLOCKED",
 		);
+		expect(submitUncertainReasonCode("mouse", true, "expected_request")).toBe(
+			"SUBMIT_CONFIRMATION_NOT_OBSERVED",
+		);
 	});
 
 	test("requires the resolved submit element to be unobscured", () => {
