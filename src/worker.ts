@@ -23,6 +23,7 @@ export interface Env {
 	EVIDENCE_BUCKET: R2Bucket;
 	AGENT_EXECUTOR_ENABLED?: string;
 	AGENT_MODEL?: string;
+	AGENT_SUBMIT_REVIEW_MODEL?: string;
 	AGENT_DRY_RUN?: string;
 	OPENAI_API_KEY?: string;
 	BROWSER_USE_API_KEY?: string;
@@ -740,6 +741,7 @@ function createAgentExecutor(env: Env): AgentExecutor {
 			db: env.DB,
 			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 			model: env.AGENT_MODEL,
+			reviewModel: env.AGENT_SUBMIT_REVIEW_MODEL || env.AGENT_MODEL,
 			openAiApiKey: env.OPENAI_API_KEY,
 			browserUseApiKey: env.BROWSER_USE_API_KEY,
 			// Jobs created before effective mode persistence must remain dry-run.

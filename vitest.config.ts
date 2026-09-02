@@ -18,7 +18,7 @@ export default defineConfig({
 		}),
 	],
 	test: {
-		include: ["test/worker.test.ts"],
+		include: ["test/worker.test.ts", "test/submit-reviewer.test.ts"],
 		setupFiles: ["./test/apply-migrations.ts"],
 	},
 });

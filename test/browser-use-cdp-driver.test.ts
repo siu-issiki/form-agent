@@ -37,17 +37,21 @@ import {
 	isExpectedNavigationDocumentRequest,
 	isPayloadIndependentClickTarget,
 	READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
+	readPageText,
 	readSubmissionConfirmation,
 	retrySubmitMousePreparation,
 	runSubmissionActivationWithinPermissionWindow,
 	SET_CHECKED_VALUE_FUNCTION,
 	shouldBlockNonSubmitRequest,
 	submitUncertainReasonCode,
+	toFormSnapshot,
+	toObservedFieldState,
 	waitForSubmissionConfirmation,
 } from "../src/browser-use-cdp-driver";
 import {
 	BrowserElementError,
 	BrowserSubmitDiagnosticError,
+	isReviewComparableField,
 } from "../src/restricted-browser";
 
 describe("BrowserUse CDP payload and DOM discovery", () => {
@@ -1459,3 +1463,154 @@ describe("BrowserUseCdpDriver screenshot capture", () => {
 		expect(attempts).toBe(1);
 	});
 });
+
+describe("BrowserUseCdpDriver page text", () => {
+	test("keeps a short page text untruncated", () => {
+		expect(readPageText("Contact us")).toEqual({
+			text: "Contact us",
+			truncated: false,
+		});
+	});
+
+	test("reports truncation at the observation limit", () => {
+		const raw = "a".repeat(20_001);
+
+		const result = readPageText(raw);
+
+		expect(result.truncated).toBe(true);
+		expect(result.text).toHaveLength(20_000);
+	});
+
+	test("does not report truncation for text exactly at the limit", () => {
+		const result = readPageText("a".repeat(20_000));
+
+		expect(result.truncated).toBe(false);
+		expect(result.text).toHaveLength(20_000);
+	});
+});
+
+describe("BrowserUseCdpDriver reviewed field comparison", () => {
+	test("excludes the controls that submit the form", () => {
+		expect(isReviewComparableField("input", "text")).toBe(true);
+		expect(isReviewComparableField("input", "checkbox")).toBe(true);
+		expect(isReviewComparableField("textarea", null)).toBe(true);
+		expect(isReviewComparableField("select", null)).toBe(true);
+		expect(isReviewComparableField("input", "submit")).toBe(false);
+		expect(isReviewComparableField("input", "image")).toBe(false);
+		expect(isReviewComparableField("button", null)).toBe(false);
+		expect(isReviewComparableField("button", "button")).toBe(false);
+	});
+
+	test("reads the live value and checked state of a comparable element", () => {
+		expect(
+			toObservedFieldState("fa-0-0", elementState({ value: "Hello" })),
+		).toEqual({ elementId: "fa-0-0", value: "Hello", checked: false });
+		expect(
+			toObservedFieldState(
+				"fa-0-2",
+				elementState({ type: "checkbox", checked: true }),
+			),
+		).toEqual({ elementId: "fa-0-2", value: "", checked: true });
+	});
+
+	test("never exposes a password value to the comparison", () => {
+		expect(
+			toObservedFieldState(
+				"fa-0-3",
+				elementState({ type: "password", value: "secret" }),
+			),
+		).toEqual({ elementId: "fa-0-3", value: "", checked: false });
+	});
+
+	test("drops a submit control and an unusable element", () => {
+		expect(
+			toObservedFieldState(
+				"fa-0-1",
+				elementState({ type: "submit", submitLike: true }),
+			),
+		).toBeNull();
+		expect(
+			toObservedFieldState("fa-0-4", elementState({ ok: false })),
+		).toBeNull();
+	});
+});
+
+function elementState(
+	overrides: Partial<Parameters<typeof toObservedFieldState>[1]> = {},
+) {
+	return {
+		ok: true,
+		tag: "input",
+		type: "text",
+		value: "",
+		checked: false,
+		submitLike: false,
+		...overrides,
+	};
+}
+
+describe("BrowserUseCdpDriver form snapshot", () => {
+	test("keeps DOM order and includes hidden and disabled controls", () => {
+		const snapshot = toFormSnapshot([
+			snapshotElement({ type: "hidden", name: "csrf", value: "token" }),
+			snapshotElement({ name: "message", value: "Hello" }),
+			snapshotElement({ tag: "button", type: "submit", value: "Send" }),
+		]);
+
+		expect(JSON.parse(snapshot)).toEqual([
+			["input", "hidden", "csrf", "token", false, false],
+			["input", "text", "message", "Hello", false, false],
+			["button", "submit", "", "Send", false, false],
+		]);
+		expect(snapshot).not.toBe(
+			toFormSnapshot([
+				snapshotElement({ name: "message", value: "Hello" }),
+				snapshotElement({ type: "hidden", name: "csrf", value: "token" }),
+				snapshotElement({ tag: "button", type: "submit", value: "Send" }),
+			]),
+		);
+	});
+
+	test("changes when a control is added, disabled, or renamed", () => {
+		const base = [snapshotElement({ name: "message", value: "Hello" })];
+
+		expect(toFormSnapshot(base)).not.toBe(
+			toFormSnapshot([...base, snapshotElement({ type: "hidden" })]),
+		);
+		expect(toFormSnapshot(base)).not.toBe(
+			toFormSnapshot([
+				snapshotElement({ name: "message", value: "Hello", disabled: true }),
+			]),
+		);
+		expect(toFormSnapshot(base)).not.toBe(
+			toFormSnapshot([snapshotElement({ name: "renamed", value: "Hello" })]),
+		);
+	});
+
+	test("masks a password value and records an unresolvable control", () => {
+		expect(
+			JSON.parse(
+				toFormSnapshot([
+					snapshotElement({ type: "password", value: "secret" }),
+					snapshotElement({ ok: false }),
+					null,
+				]),
+			),
+		).toEqual([["input", "password", "", "", false, false], null, null]);
+	});
+});
+
+function snapshotElement(
+	overrides: Partial<Parameters<typeof toFormSnapshot>[0][number]> = {},
+) {
+	return {
+		ok: true,
+		tag: "input",
+		type: "text",
+		name: null,
+		value: "",
+		checked: false,
+		disabled: false,
+		...overrides,
+	};
+}

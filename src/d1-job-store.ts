@@ -20,6 +20,7 @@ interface StoredJobRow {
 	payload_json: string;
 	status: JobStatus;
 	attempt_count: number;
+	submit_review_denial_count: number;
 	run_token: string | null;
 	created_at: string;
 	updated_at: string;
@@ -58,7 +59,8 @@ export type AgentToolDiagnosticStage =
 	| "fill"
 	| "select"
 	| "submit"
-	| "submit_validate";
+	| "submit_validate"
+	| "submit_review";
 
 export type AgentToolDiagnosticCode =
 	| "OK"
@@ -70,6 +72,9 @@ export type AgentToolDiagnosticCode =
 	| "FINISH_OUTCOME_INVALID"
 	| "FINISH_PROHIBITION_NOT_VERIFIED"
 	| "SUBMIT_RESULT_NOT_PERSISTED"
+	| "SUBMIT_REVIEW_ALLOWED"
+	| "SUBMIT_REVIEW_DENIED"
+	| "SUBMIT_REVIEW_UNAVAILABLE"
 	| "JOB_STATE_CONFLICT"
 	| "CDP_CONNECTION_FAILED"
 	| "CDP_CONNECTION_CLOSED"
@@ -190,6 +195,29 @@ export class D1JobStore implements JobStore {
 			.run();
 
 		return result.meta.changes === 1;
+	}
+
+	/**
+	 * Counts one pre-submit review denial on the job row so that the "one
+	 * correction only" budget survives a Queue redelivery.
+	 */
+	async recordSubmitReviewDenial(
+		id: string,
+		runToken: string,
+		now: string,
+	): Promise<number | null> {
+		const row = await this.db
+			.prepare(
+				`UPDATE jobs
+         SET submit_review_denial_count = submit_review_denial_count + 1,
+             updated_at = ?
+         WHERE id = ? AND status = 'running' AND run_token = ?
+         RETURNING submit_review_denial_count`,
+			)
+			.bind(now, id, runToken)
+			.first<{ submit_review_denial_count: number }>();
+
+		return row?.submit_review_denial_count ?? null;
 	}
 
 	async recordRunAttempt(
@@ -610,6 +638,7 @@ function mapStoredJob(row: StoredJobRow): Job {
 		payload: JSON.parse(row.payload_json) as Record<string, unknown>,
 		status: row.status,
 		attemptCount: row.attempt_count,
+		submitReviewDenialCount: row.submit_review_denial_count,
 		runToken: row.run_token,
 		result: null,
 		createdAt: row.created_at,

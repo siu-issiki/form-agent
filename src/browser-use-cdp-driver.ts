@@ -17,7 +17,9 @@ import {
 	type BrowserObservation,
 	type BrowserSubmitResult,
 	createBrowserSubmitDiagnosticError,
+	isReviewComparableField,
 	normalizeAllowedHosts,
+	type ObservedFieldState,
 	PROHIBITION_TEXT_PATTERN_SOURCES,
 	type RestrictedBrowserDriver,
 	type SubmitActivationStrategy,
@@ -335,6 +337,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 					placeholder: state.placeholder,
 					required: state.required,
 					value: state.type === "password" ? "" : state.value,
+					...(state.type === "checkbox" || state.type === "radio"
+						? { checked: state.checked }
+						: {}),
 					options: state.options,
 				});
 			}
@@ -408,7 +413,57 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				durationMs: Date.now() - startedAt,
 			}),
 		);
-		return { url, forms, pageText, navigationLinks };
+		return {
+			url,
+			forms,
+			pageText: pageText.text,
+			...(pageText.truncated ? { pageTextTruncated: true } : {}),
+			navigationLinks,
+		};
+	}
+
+	/**
+	 * Re-reads every element the latest observation named, so the caller can
+	 * confirm the page still holds the reviewed content. Elements that no
+	 * longer resolve are omitted, which the caller sees as a set mismatch.
+	 */
+	async readObservedFieldStates(): Promise<ObservedFieldState[]> {
+		const states: ObservedFieldState[] = [];
+		for (const [elementId, reference] of this.#elements) {
+			const state = await this.#inspectElement(reference.backendNodeId).catch(
+				() => null,
+			);
+			const comparable = state && toObservedFieldState(elementId, state);
+			if (comparable) states.push(comparable);
+		}
+		return states;
+	}
+
+	/**
+	 * Rediscovers the form that owns the submit control and describes every
+	 * control it holds. Unlike `observe`, nothing is dropped for being hidden
+	 * or disabled, so a control the page adds during the review is visible in
+	 * the comparison.
+	 */
+	async readFormSnapshot(elementId: string): Promise<string> {
+		const reference = this.#element(elementId);
+		const { discovery } = await this.#discoverForms(await this.currentUrl());
+		const owner = discovery.forms.find(
+			(form) =>
+				(form.frameId ?? this.#topFrameId) ===
+					(reference.frameId ?? this.#topFrameId) &&
+				form.fields.some(
+					(field) => field.backendNodeId === reference.backendNodeId,
+				),
+		);
+		if (!owner) throw new BrowserElementError();
+		const states: Array<FormSnapshotElement | null> = [];
+		for (const field of owner.fields) {
+			states.push(
+				await this.#inspectElement(field.backendNodeId).catch(() => null),
+			);
+		}
+		return toFormSnapshot(states);
 	}
 
 	async clickNonSubmit(elementId: string): Promise<void> {
@@ -816,9 +871,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		throw new Error("Browser page did not become ready");
 	}
 
-	#bodyText(): Promise<string> {
-		return this.#evaluate<string>(
-			`(document.body?.innerText ?? "").slice(0, ${MAX_PAGE_TEXT})`,
+	async #bodyText(): Promise<{ text: string; truncated: boolean }> {
+		// One extra character makes the truncation detectable in the Worker
+		// instead of trusting a value computed inside the page.
+		return readPageText(
+			await this.#evaluate<string>(
+				`(document.body?.innerText ?? "").slice(0, ${MAX_PAGE_TEXT + 1})`,
+			),
 		);
 	}
 
@@ -1709,6 +1768,79 @@ export function createExpectedSubmissionRequest(
 	}
 	url.hash = "";
 	return { url: url.toString(), method: formMethod.toUpperCase() };
+}
+
+/**
+ * Splits the raw body text into the value the model may see and a flag saying
+ * whether the page held more. Truncation is decided in the Worker so that an
+ * untrusted page cannot claim its text was complete.
+ */
+export interface FormSnapshotElement {
+	ok: boolean;
+	tag: string;
+	type: string;
+	name: string | null;
+	value: string;
+	checked: boolean;
+	disabled: boolean;
+}
+
+/**
+ * Canonical string for one form's controls, in DOM order. Password values are
+ * masked, and an element that no longer resolves becomes null so that its
+ * disappearance still changes the snapshot.
+ */
+export function toFormSnapshot(
+	states: ReadonlyArray<FormSnapshotElement | null>,
+): string {
+	return JSON.stringify(
+		states.map((state) =>
+			state?.ok
+				? [
+						state.tag,
+						state.type || "",
+						state.name ?? "",
+						state.type === "password" ? "" : state.value,
+						state.checked,
+						state.disabled,
+					]
+				: null,
+		),
+	);
+}
+
+/**
+ * Narrows one inspected element to the state the pre-submit comparison uses,
+ * or null when the element is not comparable (unusable, or a submit control
+ * whose activation is what `submit` does).
+ */
+export function toObservedFieldState(
+	elementId: string,
+	state: {
+		ok: boolean;
+		tag: string;
+		type: string;
+		value: string;
+		checked: boolean;
+		submitLike: boolean;
+	},
+): ObservedFieldState | null {
+	if (!state.ok || state.submitLike) return null;
+	if (!isReviewComparableField(state.tag, state.type || null)) return null;
+	return {
+		elementId,
+		value: state.type === "password" ? "" : state.value,
+		checked: state.checked,
+	};
+}
+
+export function readPageText(raw: string): {
+	text: string;
+	truncated: boolean;
+} {
+	return raw.length > MAX_PAGE_TEXT
+		? { text: raw.slice(0, MAX_PAGE_TEXT), truncated: true }
+		: { text: raw, truncated: false };
 }
 
 export function submitUncertainReasonCode(
