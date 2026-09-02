@@ -104,7 +104,10 @@ export async function handleHttpRequest(
 
 		let input: JobInput;
 		try {
-			input = await parseJobInput(request);
+			input = freezeDryRunMode(
+				await parseJobInput(request),
+				isAgentDryRun(env.AGENT_DRY_RUN),
+			);
 		} catch (error) {
 			if (error instanceof InvalidJobRequestError) {
 				return apiJson({ error: error.code }, error.status);
@@ -147,6 +150,20 @@ export async function handleHttpRequest(
 	}
 
 	return new Response("Not Found", { status: 404 });
+}
+
+function freezeDryRunMode(
+	input: JobInput,
+	environmentDryRun: boolean,
+): JobInput {
+	return {
+		...input,
+		payload: {
+			...input.payload,
+			_formAgentEffectiveDryRun:
+				environmentDryRun || input.payload._formAgentDryRun === true,
+		},
+	};
 }
 
 function isAuthorized(request: Request, token: string | undefined): boolean {
@@ -251,6 +268,10 @@ async function parseJobInput(request: Request): Promise<JobInput> {
 }
 
 function hasValidFormValues(payload: Record<string, unknown>): boolean {
+	const requestedDryRun = payload._formAgentDryRun;
+	if (requestedDryRun !== undefined && typeof requestedDryRun !== "boolean") {
+		return false;
+	}
 	const maxAttempts = payload._formAgentMaxAttempts;
 	if (
 		maxAttempts !== undefined &&
@@ -717,7 +738,8 @@ function createAgentExecutor(env: Env): AgentExecutor {
 			model: env.AGENT_MODEL,
 			openAiApiKey: env.OPENAI_API_KEY,
 			browserUseApiKey: env.BROWSER_USE_API_KEY,
-			dryRun: isAgentDryRun(env.AGENT_DRY_RUN),
+			// Jobs created before effective mode persistence must remain dry-run.
+			dryRun: true,
 		});
 	}
 	return {

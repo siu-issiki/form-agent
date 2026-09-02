@@ -97,7 +97,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 		input: AgentRunInput,
 		signal: AbortSignal,
 	): Promise<AgentRunResult> {
-		const dryRun = this.#dryRun || input.job.payload._formAgentDryRun === true;
+		const dryRun = isJobDryRun(input.job.payload, this.#dryRun);
 		const coordinator = new BrowserToolCoordinator(this.#db, (job) =>
 			this.#createBrowserDriver(this.#browserUseApiKey, job, dryRun),
 		);
@@ -233,6 +233,18 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 		}
 		return value;
 	}
+}
+
+export function isJobDryRun(
+	payload: Record<string, unknown>,
+	legacyDryRun: boolean,
+): boolean {
+	const effectiveDryRun = payload._formAgentEffectiveDryRun;
+	return (
+		effectiveDryRun === true ||
+		payload._formAgentDryRun === true ||
+		(effectiveDryRun === undefined && legacyDryRun)
+	);
 }
 
 async function executeToolCall(
