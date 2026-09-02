@@ -21,6 +21,7 @@ import {
 	CHECK_FORM_VALIDITY_FUNCTION,
 	captureCdpScreenshot,
 	centerOfQuad,
+	collectCdpFrameParentIds,
 	continueSubmissionRequest,
 	createExpectedSubmissionRequest,
 	createSubmitActivationFailureLog,
@@ -92,6 +93,23 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 				parentElement: { tagName: "BODY" },
 			}),
 		).toEqual(["SALES_PROHIBITED"]);
+	});
+
+	test("uses pristine intrinsics outside a page realm with modified prototypes", () => {
+		const pageRealm = runInNewContext(`(() => {
+			Array.prototype.some = () => false;
+			Array.prototype.includes = () => true;
+			return {
+				innerText: "営業目的での利用は禁止です",
+				previousElementSibling: null,
+				parentElement: { tagName: "BODY" },
+			};
+		})()`);
+		const isolatedReadContext = runInNewContext(
+			`(${READ_FORM_PROHIBITION_REASON_CODES_FUNCTION})`,
+		) as (this: object) => string[];
+
+		expect(isolatedReadContext.call(pageRealm)).toEqual(["SALES_PROHIBITED"]);
 	});
 
 	test("crosses a shadow host but excludes unrelated header context", () => {
@@ -190,6 +208,26 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 				"child-frame",
 			),
 		).toBe(2);
+	});
+
+	test("maps nested frames to the isolated world of their parent", () => {
+		expect(
+			collectCdpFrameParentIds({
+				frame: { id: "top" },
+				childFrames: [
+					{
+						frame: { id: "child" },
+						childFrames: [{ frame: { id: "grandchild" } }],
+					},
+				],
+			}),
+		).toEqual(
+			new Map([
+				["top", undefined],
+				["child", "top"],
+				["grandchild", "child"],
+			]),
+		);
 	});
 
 	test("discovers controls inside a closed shadow root", () => {
