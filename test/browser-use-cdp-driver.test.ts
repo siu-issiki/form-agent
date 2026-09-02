@@ -205,19 +205,14 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		expect(checkFormValidity.call({})).toBe(false);
 	});
 
-	test("sets checkbox state through DOM events without coordinate clicks", () => {
+	test("activates checkbox and radio inputs through their DOM click semantics", () => {
 		const events: string[] = [];
-		class TestEvent {
-			constructor(readonly type: string) {}
-		}
-		const setChecked = runInNewContext(`(${SET_CHECKED_VALUE_FUNCTION})`, {
-			Event: TestEvent,
-		}) as (
+		const setChecked = runInNewContext(`(${SET_CHECKED_VALUE_FUNCTION})`) as (
 			this: {
 				tagName: string;
 				type: string;
 				checked: boolean;
-				dispatchEvent(event: TestEvent): void;
+				click(): void;
 			},
 			checked: boolean,
 		) => boolean;
@@ -225,16 +220,33 @@ describe("BrowserUseCdpDriver child target policy", () => {
 			tagName: "INPUT",
 			type: "checkbox",
 			checked: false,
-			dispatchEvent(event: TestEvent) {
-				events.push(event.type);
+			click() {
+				this.checked = !this.checked;
+				events.push("click", "input", "change");
 			},
 		};
 
 		expect(setChecked.call(checkbox, true)).toBe(true);
 		expect(checkbox.checked).toBe(true);
-		expect(events).toEqual(["input", "change"]);
+		expect(events).toEqual(["click", "input", "change"]);
 		expect(setChecked.call(checkbox, true)).toBe(true);
-		expect(events).toEqual(["input", "change"]);
+		expect(events).toEqual(["click", "input", "change"]);
+		expect(setChecked.call(checkbox, false)).toBe(true);
+		expect(checkbox.checked).toBe(false);
+
+		const radio = { ...checkbox, type: "radio", checked: false };
+		expect(setChecked.call(radio, true)).toBe(true);
+		expect(setChecked.call(radio, false)).toBe(false);
+
+		const controlledCheckbox = {
+			...checkbox,
+			checked: false,
+			click() {
+				this.checked = true;
+				this.checked = false;
+			},
+		};
+		expect(setChecked.call(controlledCheckbox, true)).toBe(false);
 		expect(setChecked.call({ ...checkbox, type: "text" }, true)).toBe(false);
 	});
 

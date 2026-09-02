@@ -1235,11 +1235,7 @@ const SET_SELECT_VALUE_FUNCTION = `function(value) {
 export const SET_CHECKED_VALUE_FUNCTION = `function(checked) {
   if (this.tagName !== "INPUT" || !["checkbox", "radio"].includes(this.type) || typeof checked !== "boolean") return false;
   if (this.type === "radio" && !checked) return false;
-  if (this.checked !== checked) {
-    this.checked = checked;
-    this.dispatchEvent(new Event("input", { bubbles: true }));
-    this.dispatchEvent(new Event("change", { bubbles: true }));
-  }
+  if (this.checked !== checked) this.click();
   return this.checked === checked;
 }`;
 
