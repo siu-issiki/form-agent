@@ -7,6 +7,7 @@ export interface CdpDomNode {
 	nodeValue?: string;
 	baseURL?: string;
 	documentURL?: string;
+	frameId?: string;
 	attributes?: string[];
 	children?: CdpDomNode[];
 	shadowRoots?: CdpDomNode[];
@@ -29,6 +30,7 @@ export interface CdpFormCandidate {
 	backendNodeId: number;
 	action: string;
 	method: string;
+	frameId?: string;
 	fields: CdpFieldCandidate[];
 }
 
@@ -54,8 +56,16 @@ export function discoverCdpForms(
 	let closedShadowRootCount = 0;
 	let nodeCount = 0;
 
-	const visit = (node: CdpDomNode, parentBackendNodeId: number | null) => {
+	const visit = (
+		node: CdpDomNode,
+		parentBackendNodeId: number | null,
+		inheritedFrameId?: string,
+	) => {
 		nodeCount += 1;
+		const frameId =
+			node.nodeName.toLowerCase() === "#document"
+				? (node.frameId ?? inheritedFrameId)
+				: inheritedFrameId;
 		parentByBackendId.set(node.backendNodeId, parentBackendNodeId);
 		if (node.shadowRootType) {
 			shadowRootCount += 1;
@@ -69,6 +79,7 @@ export function discoverCdpForms(
 				backendNodeId: node.backendNodeId,
 				action: resolveFormAction(attributes.action, currentUrl),
 				method: (attributes.method || "get").toLowerCase(),
+				...(frameId ? { frameId } : {}),
 				fields: [],
 			};
 			formsByBackendId.set(node.backendNodeId, form);
@@ -79,7 +90,7 @@ export function discoverCdpForms(
 		}
 
 		for (const child of composedChildren(node)) {
-			visit(child, node.backendNodeId);
+			visit(child, node.backendNodeId, frameId);
 		}
 	};
 

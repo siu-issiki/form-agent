@@ -89,11 +89,13 @@ interface ElementState {
 
 interface ElementReference {
 	backendNodeId: number;
+	frameId?: string;
 }
 
 interface PausedRequest {
 	requestId: string;
 	resourceType?: string;
+	frameId?: string;
 	request: { url: string; method: string };
 }
 
@@ -129,6 +131,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#submissionRequestObserved: (() => void) | undefined;
 	#expectedSubmissionRequest: ExpectedSubmissionRequest | undefined;
 	#submissionAttemptInProgress = false;
+	#getSubmissionGuardActive = false;
+	#expectedSubmissionFrameId: string | undefined;
 	#submissionRequestBlockStage: SubmissionRequestBlockStage | undefined;
 	#validatedSubmitInputBackendNodeId: number | undefined;
 	#targetPolicyError: Error | undefined;
@@ -265,6 +269,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				fieldIndex += 1;
 				elements.set(elementId, {
 					backendNodeId: candidate.backendNodeId,
+					...(candidateForm.frameId ? { frameId: candidateForm.frameId } : {}),
 				});
 				fields.push({
 					elementId,
@@ -437,6 +442,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			state.formAction,
 			state.formMethod,
 		);
+		this.#expectedSubmissionFrameId = reference.frameId;
 	}
 
 	async submit(
@@ -449,6 +455,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			throw createBrowserSubmitDiagnosticError("SUBMIT_VALIDATE", error);
 		}
 		this.#interactionStarted = true;
+		this.#getSubmissionGuardActive =
+			this.#expectedSubmissionRequest?.method === "GET";
 		let beforeConfirmationCount: number;
 		try {
 			beforeConfirmationCount = await this.#confirmationBodyCount();
@@ -543,8 +551,10 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			const getSubmissionDisposition = getSubmissionRequestDisposition(
 				paused.request,
 				paused.resourceType,
+				paused.frameId,
 				this.#expectedSubmissionRequest,
-				this.#submissionAttemptInProgress,
+				this.#expectedSubmissionFrameId,
+				this.#getSubmissionGuardActive,
 				this.#submissionRequestAllowed,
 				this.#submissionRequestCount,
 				this.#submissionRequestInFlight,
@@ -655,6 +665,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		this.#successfulInputBackendNodeIds.clear();
 		this.#expectedSubmissionRequest = undefined;
 		this.#validatedSubmitInputBackendNodeId = undefined;
+		this.#expectedSubmissionFrameId = undefined;
 	}
 
 	async #discoverForms(url: string): Promise<{
@@ -1388,15 +1399,19 @@ export function isExpectedSubmissionRequest(
 export function getSubmissionRequestDisposition(
 	request: { url: string; method: string },
 	resourceType: string | undefined,
+	requestFrameId: string | undefined,
 	expected: ExpectedSubmissionRequest | undefined,
-	submissionAttemptInProgress: boolean,
+	expectedFrameId: string | undefined,
+	getSubmissionGuardActive: boolean,
 	submissionRequestAllowed: boolean,
 	submissionRequestCount: number,
 	submissionRequestInFlight: boolean,
 ): GetSubmissionRequestDisposition {
 	if (
-		!submissionAttemptInProgress ||
+		!getSubmissionGuardActive ||
 		resourceType !== "Document" ||
+		!requestFrameId ||
+		requestFrameId !== expectedFrameId ||
 		expected?.method !== "GET" ||
 		!isExpectedSubmissionRequest(request, expected)
 	) {

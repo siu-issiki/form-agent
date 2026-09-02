@@ -46,6 +46,7 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 			{
 				backendNodeId: 1,
 				nodeName: "#document",
+				frameId: "frame-main",
 				children: [
 					{
 						backendNodeId: 2,
@@ -87,6 +88,7 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 				backendNodeId: 2,
 				action: "https://example.com/send",
 				method: "post",
+				frameId: "frame-main",
 				fields: [
 					{ backendNodeId: 3, tag: "input" },
 					{ backendNodeId: 6, tag: "textarea" },
@@ -276,25 +278,29 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		};
 		const disposition = (
 			resourceType: string,
+			frameId: string,
 			count: number,
 			inFlight: boolean,
 		) =>
 			getSubmissionRequestDisposition(
 				request,
 				resourceType,
+				frameId,
 				expected,
+				"form-frame",
 				true,
 				true,
 				count,
 				inFlight,
 			);
 
-		expect(disposition("Document", 0, false)).toBe("claim");
-		expect(disposition("Fetch", 0, false)).toBe("ignore");
-		expect(disposition("Image", 0, false)).toBe("ignore");
-		expect(disposition("Script", 0, false)).toBe("ignore");
-		expect(disposition("Document", 0, true)).toBe("block");
-		expect(disposition("Document", 1, false)).toBe("block");
+		expect(disposition("Document", "form-frame", 0, false)).toBe("claim");
+		expect(disposition("Document", "other-frame", 0, false)).toBe("ignore");
+		expect(disposition("Fetch", "form-frame", 0, false)).toBe("ignore");
+		expect(disposition("Image", "form-frame", 0, false)).toBe("ignore");
+		expect(disposition("Script", "form-frame", 0, false)).toBe("ignore");
+		expect(disposition("Document", "form-frame", 0, true)).toBe("block");
+		expect(disposition("Document", "form-frame", 1, false)).toBe("block");
 	});
 
 	test("classifies uncertain submissions without persisting request data", () => {
