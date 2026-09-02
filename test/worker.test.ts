@@ -10,7 +10,11 @@ import {
 	BrowserToolCoordinator,
 	BrowserToolInputError,
 } from "../src/browser-tool-handler";
-import { BrowserUseCdpPayloadTooLargeError } from "../src/browser-use-cdp";
+import {
+	BrowserUseCdpClosedError,
+	BrowserUseCdpPayloadTooLargeError,
+	BrowserUseCdpUpgradeRejectedError,
+} from "../src/browser-use-cdp";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobInput } from "../src/job";
 import {
@@ -1284,6 +1288,187 @@ describe("ResponsesAgentExecutor", () => {
 			expect(error.retryable).toBe(true);
 		},
 	);
+
+	test("fails a job without retrying when the browser provider rejects the connection", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () =>
+				Response.json(
+					functionResponse("call-observe", "observe", {}),
+				)) as typeof fetch,
+			createBrowserDriver: async () => {
+				throw new BrowserUseCdpUpgradeRejectedError(403);
+			},
+		});
+
+		const error = await executor
+			.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				new AbortController().signal,
+			)
+			.catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(error.reasonCode).toBe("BROWSER_UPGRADE_REJECTED");
+		expect(error.retryable).toBe(false);
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{
+				turn: 1,
+				toolName: "observe",
+				stage: "driver_connect",
+				resultCode: "CDP_UPGRADE_REJECTED",
+			},
+		]);
+	});
+
+	test("retries a job when the browser provider is temporarily overloaded", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () =>
+				Response.json(
+					functionResponse("call-observe", "observe", {}),
+				)) as typeof fetch,
+			createBrowserDriver: async () => {
+				throw new BrowserUseCdpUpgradeRejectedError(503);
+			},
+		});
+
+		const error = await executor
+			.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				new AbortController().signal,
+			)
+			.catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(error.reasonCode).toBe("BROWSER_TOOL_UNAVAILABLE");
+		expect(error.retryable).toBe(true);
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{
+				turn: 1,
+				toolName: "observe",
+				stage: "driver_connect",
+				resultCode: "CDP_UPGRADE_REJECTED",
+			},
+		]);
+	});
+
+	test("fails a job without retrying when the browser provider closes the connection for policy", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () =>
+				Response.json(
+					functionResponse("call-observe", "observe", {}),
+				)) as typeof fetch,
+			createBrowserDriver: async () => {
+				throw new BrowserUseCdpClosedError(1008, "OTHER");
+			},
+		});
+
+		const error = await executor
+			.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				new AbortController().signal,
+			)
+			.catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(error.reasonCode).toBe("BROWSER_CONNECTION_REJECTED");
+		expect(error.retryable).toBe(false);
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{
+				turn: 1,
+				toolName: "observe",
+				stage: "driver_connect",
+				resultCode: "CDP_CONNECTION_CLOSED",
+			},
+		]);
+	});
+
+	test("stops a browser connection attempt when the run deadline passes", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		let driverAttempts = 0;
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () =>
+				Response.json(
+					functionResponse("call-observe", "observe", {}),
+				)) as typeof fetch,
+			createBrowserDriver: async (_apiKey, _job, _dryRun, signal) => {
+				driverAttempts += 1;
+				await new Promise<void>((resolve) => {
+					if (signal?.aborted) {
+						resolve();
+						return;
+					}
+					signal?.addEventListener("abort", () => resolve(), { once: true });
+				});
+				throw new Error("Browser Use CDP connection aborted");
+			},
+		});
+
+		const controller = new AbortController();
+		setTimeout(() => controller.abort(), 50);
+		const startedAt = Date.now();
+		const error = await executor
+			.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				controller.signal,
+			)
+			.catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(error.reasonCode).toBe("AGENT_TIMEOUT");
+		expect(driverAttempts).toBe(1);
+		expect(Date.now() - startedAt).toBeLessThan(1_000);
+	});
 
 	test("retries infrastructure failures instead of asking the model to classify them", async () => {
 		const store = new D1JobStore(env.DB);

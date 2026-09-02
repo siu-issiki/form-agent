@@ -23,7 +23,7 @@
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値を検証。一覧・キャンセルは未実装 |
 | Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
 | 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ、値を含まないagent tool診断イベント。送信前・送信後・禁止判定時のスクリーンショット証跡を Cloudflare R2 へ保存し、D1 の `events` へ sha256 付きで記録する |
-| 並列検証 | 部分実施 | 安全確認中は `max_concurrency: 1`。Cloudflare 上の単一ジョブを検証済みで、5 並列以上は未検証 |
+| 並列検証 | 部分実施 | 2026-09-03 に 5 並列で管理下 12 シナリオを実行し 8 件合格。接続段階の `CDP_CONNECTION_CLOSED` が 10 秒間に 3 件発生したため、consumer は `max_concurrency: 5` のままとし、接続段階だけ再接続する |
 
 本書では、実装済みの構成を現在形で記述し、未実装または未検証の内容は「現在の制約」「PoC 計画」「残タスク・未決事項」に明示する。
 
@@ -137,7 +137,13 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 - BrowserUse Agent ではなく、standalone browser へ CDP 接続する。
 - BrowserUse API key と CDP URL はモデルへ渡さない。
 - 1 試行につき最大 1 browser session とし、終了時に接続を閉じる。Queue retry では同じジョブに対して新しい Agent 実行と session を開始する。
-- proxy country は `jp`、session timeout は 15 分とする。
+- proxy country は `jp`、session timeout は 15 分とする。CDP URL の `timeout=15` は session の寿命が 15 分であることを意味する。
+- CDP WebSocket が自発的に閉じた場合、close code、reason の文字数、reason を固定分類した hint（`NONE` / `LIMIT` / `AUTH` / `TIMEOUT` / `OTHER`）、`wasClean`、未完了コマンド数を記録する。相手から渡された reason の自由文そのものはログに残さない。
+- 接続確立（CDP 接続から初期化完了まで）が一過性の障害で失敗した場合だけ、10 秒 → 20 秒 → 30 秒の待機を挟んで最大 3 回再接続する。再試行は送信前の接続段階に限定し、フォームへの副作用はない。
+- 再試行の可否は失敗の種別で決める。WebSocket upgrade が拒否された場合は HTTP status が 408、429、5xx のときだけ再試行し、401 / 403 / 404 等の恒久的な拒否は即座に失敗させる。upgrade 要求自体が失敗したネットワーク障害、接続断、コマンド timeout は再試行する。endpoint 不正や API key 未設定は接続を試みずに失敗させる。
+- 恒久的な upgrade 拒否（401 / 403 / 404 等）は `BROWSER_UPGRADE_REJECTED` として再試行不可の failed にし、Queue の再配信を行わない。診断イベントには `CDP_UPGRADE_REJECTED` を記録する。
+- upgrade 成功後の close も、close code 1008（policy violation）または reason が認証を示す場合は再試行しない。`BROWSER_CONNECTION_REJECTED` として再試行不可の failed にする。
+- 再試行の待機は agent の deadline で中断される。実行が abort された時点で待機と接続試行を打ち切り、`AGENT_TIMEOUT` として終了するため、termination grace を待機で消費しない。
 - popup、Worker、Service Worker、WebSocket 等の迂回経路を遮断する。
 - CDP の `DOM.getDocument` を `pierce: true` で取得し、通常 DOM と open / closed Shadow DOM を Worker 側で走査する。
 - 観測した同一ページ・許可hostのリンクを最大20件までモデルへ返し、サイト内別ページのフォーム探索に利用する。
@@ -363,6 +369,12 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 
 PoC はまず 1 並列の production で開始し、管理下テストサイトへの実送信結果を観測してから 5、20、50 へ段階的に引き上げる。設定値だけで並列対応済みとせず、Cloudflare 上での実測を完了条件とする。
 
+2026-09-03 に 5 並列で管理下テストシステムの 12 シナリオを実行し、8 件が合格した。残りのうち 3 件は Worker 診断が stage `driver_connect`、code `CDP_CONNECTION_CLOSED` で、10 秒間に連続して発生した。発生時点で BrowserUse 側に既存 session が 3〜4 件あり、直前 2 分 40 秒で 9 session を作成していた。前後の接続は成功しているため、BrowserUse の同時 session 上限（プラン上 10）または session 作成レートの上限に達したと推定するが、当時は WebSocket の close code / reason を記録していなかったため原因は未確定である。
+
+consumer は `max_concurrency: 5` とする。5 並列の管理下計測で接続段階の切断が 3 件観測されたため、接続再試行（10 / 20 / 30 秒、最大 3 回）を緩和策として入れた。再試行でも接続できない場合は再試行可能エラーとして Queue の retry / DLQ へ進む。deploy 後に 19 シナリオの並列計測で `browser_use_connect_retry` と `browser_use_cdp_closed` の件数を確認する。BrowserUse のプラン上限（10）まで引き上げるのは、切断後の session 解放挙動を close code で確定してからとする。
+
+再接続は送信前の接続確立に限定するため、フォームへの副作用は発生しない。
+
 | 分類 | 例 | 現在の方針 |
 | --- | --- | --- |
 | 再試行可能 | Provider / BrowserUse の一時障害、timeout | `running` を維持し、30 秒後に Queue retry |
@@ -420,7 +432,7 @@ PoC はまず 1 並列の production で開始し、管理下テストサイト�
 ### フェーズ 2: 5 並列
 
 - [ ] 送信なし5並列で二重実行、rate limit、BrowserUse session、原価を計測する。
-- [ ] `max_concurrency`を観測結果に基づいて1から5へ引き上げる。
+- [x] `max_concurrency`を観測結果に基づいて1から5へ引き上げる。
 
 ### フェーズ 3: 20 並列
 
@@ -454,6 +466,7 @@ PoC はまず 1 並列の production で開始し、管理下テストサイト�
 - CSVから抽出した外部form hostをジョブ単位の完全一致allowlistへ安全に反映する運用検証。
 - Provider abstraction と fallback。
 - 外部 API E2E は GitHub Actions の通常 CI に含めず、手動実行に限定する。
+- BrowserUse の同時 session 上限と、切断後に session が解放されるまでの遅延を、ダッシュボードまたは記録した close code で確定する。
 - R2 アップロード後・D1 記録前に Worker が停止した場合の孤児オブジェクトは検出できない。intent イベントの先行記録または R2 ライフサイクルルールで対処する。
 - 送信前レビューの残存リスク対応: `dom` activation で照合と `requestSubmit` を同一 JS 実行内で行い、`mouse` / `enter` は activation 直前に再照合する。snapshot に禁止文言・label・option・action / method を含める。修正の証明を変更したコントロールの value / checked 差分に限定する。form 再探索の切り詰めを検出して fail-closed にする。いずれも管理下テストシステムでの E2E と併せて実施する。
 
