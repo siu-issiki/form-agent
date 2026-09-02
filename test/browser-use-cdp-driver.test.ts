@@ -6,6 +6,7 @@ import {
 	BrowserUseCdpConnection,
 	BrowserUseCdpPayloadTooLargeError,
 	BrowserUseCdpUpgradeRejectedError,
+	classifyCdpCloseReason,
 	MAX_CDP_MESSAGE_CHARACTERS,
 } from "../src/browser-use-cdp";
 import {
@@ -1886,18 +1887,19 @@ class FakeWebSocket {
 }
 
 describe("BrowserUseCdpConnection close logging", () => {
-	test("records the close code, reason and pending command count", async () => {
+	test("records the close code, reason hint and pending command count", async () => {
 		const webSocket = new FakeWebSocket();
 		const connection = await BrowserUseCdpConnection.connect(
 			"wss://connect.browser-use.com/session",
 			stubUpgradeFetch(webSocket),
 		);
 		const pending = connection.send("Page.enable");
+		const closeReason = "Concurrency limit exceeded for session s-123";
 		const captured = captureWarnings();
 		try {
 			webSocket.emit("close", {
 				code: 1006,
-				reason: "abnormal closure",
+				reason: closeReason,
 				wasClean: false,
 			});
 		} finally {
@@ -1909,10 +1911,12 @@ describe("BrowserUseCdpConnection close logging", () => {
 		expect(JSON.parse(captured.warnings[0] ?? "{}")).toEqual({
 			event: "browser_use_cdp_closed",
 			code: 1006,
-			reason: "abnormal closure",
+			reasonLength: closeReason.length,
+			reasonHint: "LIMIT",
 			wasClean: false,
 			pending: 1,
 		});
+		expect(captured.warnings[0]).not.toContain("s-123");
 	});
 
 	test("does not record a close that follows an intentional close", async () => {
@@ -2108,7 +2112,8 @@ describe("BrowserUseCdpConnection close diagnostics", () => {
 		expect(JSON.parse(captured.warnings[1] ?? "{}")).toEqual({
 			event: "browser_use_cdp_closed",
 			code: 1006,
-			reason: "abnormal closure",
+			reasonLength: "abnormal closure".length,
+			reasonHint: "OTHER",
 			wasClean: false,
 			pending: 0,
 		});
@@ -2138,9 +2143,31 @@ describe("BrowserUseCdpConnection close diagnostics", () => {
 		expect(JSON.parse(captured.warnings[0] ?? "{}")).toEqual({
 			event: "browser_use_cdp_closed",
 			code: 1011,
-			reason: "server error",
+			reasonLength: "server error".length,
+			reasonHint: "OTHER",
 			wasClean: false,
 			pending: 1,
 		});
+	});
+});
+
+describe("classifyCdpCloseReason", () => {
+	test("maps a supplied reason to a fixed hint without keeping its text", () => {
+		expect(classifyCdpCloseReason("")).toBe("NONE");
+		expect(classifyCdpCloseReason("   ")).toBe("NONE");
+		expect(classifyCdpCloseReason("Concurrency limit reached")).toBe("LIMIT");
+		expect(classifyCdpCloseReason("too many concurrent sessions")).toBe(
+			"LIMIT",
+		);
+		expect(classifyCdpCloseReason("Rate exceeded")).toBe("LIMIT");
+		expect(classifyCdpCloseReason("monthly quota used")).toBe("LIMIT");
+		expect(classifyCdpCloseReason("Unauthorized")).toBe("AUTH");
+		expect(classifyCdpCloseReason("forbidden")).toBe("AUTH");
+		expect(classifyCdpCloseReason("invalid API key abc123")).toBe("AUTH");
+		expect(classifyCdpCloseReason("session timed out")).toBe("TIMEOUT");
+		expect(classifyCdpCloseReason("Idle timeout")).toBe("TIMEOUT");
+		expect(classifyCdpCloseReason("https://example.com/session/secret")).toBe(
+			"OTHER",
+		);
 	});
 });

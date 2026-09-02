@@ -1,6 +1,5 @@
 const CDP_COMMAND_TIMEOUT_MS = 15_000;
 export const MAX_CDP_MESSAGE_CHARACTERS = 4 * 1024 * 1024;
-const MAX_CLOSE_REASON_CHARACTERS = 200;
 
 interface CdpMessage {
 	id?: number;
@@ -158,11 +157,13 @@ export class BrowserUseCdpConnection {
 	#onClose(event: CloseEvent): void {
 		if (!this.#closeRequested && !this.#closeLogged) {
 			this.#closeLogged = true;
+			const reason = event.reason ?? "";
 			console.warn(
 				JSON.stringify({
 					event: "browser_use_cdp_closed",
 					code: event.code,
-					reason: (event.reason ?? "").slice(0, MAX_CLOSE_REASON_CHARACTERS),
+					reasonLength: reason.length,
+					reasonHint: classifyCdpCloseReason(reason),
 					wasClean: event.wasClean,
 					pending: this.#pending.size,
 				}),
@@ -189,6 +190,30 @@ export class BrowserUseCdpConnection {
 		}
 		this.#pending.clear();
 	}
+}
+
+export type CdpCloseReasonHint =
+	| "NONE"
+	| "LIMIT"
+	| "AUTH"
+	| "TIMEOUT"
+	| "OTHER";
+
+const CLOSE_REASON_HINT_PATTERNS: ReadonlyArray<
+	readonly [CdpCloseReasonHint, readonly string[]]
+> = [
+	["LIMIT", ["limit", "concurren", "rate", "quota"]],
+	["AUTH", ["unauthori", "forbidden", "api key"]],
+	["TIMEOUT", ["timeout", "timed out"]],
+];
+
+export function classifyCdpCloseReason(reason: string): CdpCloseReasonHint {
+	const normalized = reason.trim().toLowerCase();
+	if (!normalized) return "NONE";
+	for (const [hint, needles] of CLOSE_REASON_HINT_PATTERNS) {
+		if (needles.some((needle) => normalized.includes(needle))) return hint;
+	}
+	return "OTHER";
 }
 
 export class BrowserUseCdpUpgradeRejectedError extends Error {
