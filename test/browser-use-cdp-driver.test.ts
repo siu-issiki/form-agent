@@ -99,6 +99,45 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 		]);
 	});
 
+	test("tracks the owning frame for top and iframe forms", () => {
+		const discovery = discoverCdpForms(
+			{
+				backendNodeId: 1,
+				nodeName: "#document",
+				children: [
+					{
+						backendNodeId: 2,
+						nodeName: "FORM",
+						children: [{ backendNodeId: 3, nodeName: "INPUT" }],
+					},
+					{
+						backendNodeId: 4,
+						nodeName: "IFRAME",
+						frameId: "frame-child",
+						contentDocument: {
+							backendNodeId: 5,
+							nodeName: "#document",
+							children: [
+								{
+									backendNodeId: 6,
+									nodeName: "FORM",
+									children: [{ backendNodeId: 7, nodeName: "INPUT" }],
+								},
+							],
+						},
+					},
+				],
+			},
+			"https://example.com/",
+			"frame-main",
+		);
+
+		expect(discovery.forms.map(({ frameId }) => frameId)).toEqual([
+			"frame-main",
+			"frame-child",
+		]);
+	});
+
 	test("rejects a CDP message before parsing beyond the Worker-safe cap", () => {
 		expect(() =>
 			assertCdpMessageWithinLimit("x".repeat(MAX_CDP_MESSAGE_CHARACTERS)),
@@ -296,6 +335,7 @@ describe("BrowserUseCdpDriver child target policy", () => {
 
 		expect(disposition("Document", "form-frame", 0, false)).toBe("claim");
 		expect(disposition("Document", "other-frame", 0, false)).toBe("ignore");
+		expect(disposition("Document", "", 0, false)).toBe("block");
 		expect(disposition("Fetch", "form-frame", 0, false)).toBe("ignore");
 		expect(disposition("Image", "form-frame", 0, false)).toBe("ignore");
 		expect(disposition("Script", "form-frame", 0, false)).toBe("ignore");

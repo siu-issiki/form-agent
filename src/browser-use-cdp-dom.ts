@@ -47,6 +47,7 @@ const FIELD_TAGS = new Set(["input", "textarea", "select", "button"]);
 export function discoverCdpForms(
 	root: CdpDomNode,
 	currentUrl: string,
+	topFrameId?: string,
 ): CdpFormDiscovery {
 	const parentByBackendId = new Map<number, number | null>();
 	const formsByBackendId = new Map<number, CdpFormCandidate>();
@@ -89,12 +90,25 @@ export function discoverCdpForms(
 			fields.push({ node, tag });
 		}
 
-		for (const child of composedChildren(node)) {
+		for (const child of [
+			...(node.children ?? []),
+			...(node.shadowRoots ?? []),
+		]) {
 			visit(child, node.backendNodeId, frameId);
+		}
+		if (node.contentDocument) {
+			visit(
+				node.contentDocument,
+				node.backendNodeId,
+				node.frameId ?? node.contentDocument.frameId ?? frameId,
+			);
+		}
+		if (node.templateContent) {
+			visit(node.templateContent, node.backendNodeId, frameId);
 		}
 	};
 
-	visit(root, null);
+	visit(root, null, root.frameId ?? topFrameId);
 
 	for (const { node, tag } of fields) {
 		const attributes = parseAttributes(node.attributes);

@@ -123,6 +123,7 @@ export type SubmitActivationStage =
 	| "dispatch";
 
 export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
+	#topFrameId: string | undefined;
 	#targetDomain: string | undefined;
 	#allowedHosts: string[] = [];
 	#submissionRequestAllowed = false;
@@ -131,8 +132,10 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#submissionRequestObserved: (() => void) | undefined;
 	#expectedSubmissionRequest: ExpectedSubmissionRequest | undefined;
 	#submissionAttemptInProgress = false;
-	#getSubmissionGuardActive = false;
 	#expectedSubmissionFrameId: string | undefined;
+	#getSubmissionGuard:
+		| { request: ExpectedSubmissionRequest; frameId?: string }
+		| undefined;
 	#submissionRequestBlockStage: SubmissionRequestBlockStage | undefined;
 	#validatedSubmitInputBackendNodeId: number | undefined;
 	#targetPolicyError: Error | undefined;
@@ -455,8 +458,14 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			throw createBrowserSubmitDiagnosticError("SUBMIT_VALIDATE", error);
 		}
 		this.#interactionStarted = true;
-		this.#getSubmissionGuardActive =
-			this.#expectedSubmissionRequest?.method === "GET";
+		if (this.#expectedSubmissionRequest?.method === "GET") {
+			this.#getSubmissionGuard ??= {
+				request: this.#expectedSubmissionRequest,
+				...(this.#expectedSubmissionFrameId
+					? { frameId: this.#expectedSubmissionFrameId }
+					: {}),
+			};
+		}
 		let beforeConfirmationCount: number;
 		try {
 			beforeConfirmationCount = await this.#confirmationBodyCount();
@@ -524,6 +533,11 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			if (sessionId === this.sessionId) this.#clearElements();
 		});
 		await this.#send("Page.enable");
+		this.#topFrameId = (
+			await this.#send<{ frameTree: { frame: { id: string } } }>(
+				"Page.getFrameTree",
+			)
+		).frameTree.frame.id;
 		await this.#send("Runtime.enable");
 		await this.#send("DOM.enable", { includeWhitespace: "none" });
 		await this.#send("Accessibility.enable");
@@ -548,13 +562,14 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				throw new Error("Browser domain scope is not configured");
 			}
 			let expectedSubmissionRequest = false;
+			const getSubmissionGuard = this.#getSubmissionGuard;
 			const getSubmissionDisposition = getSubmissionRequestDisposition(
 				paused.request,
 				paused.resourceType,
 				paused.frameId,
-				this.#expectedSubmissionRequest,
-				this.#expectedSubmissionFrameId,
-				this.#getSubmissionGuardActive,
+				getSubmissionGuard?.request,
+				getSubmissionGuard?.frameId,
+				getSubmissionGuard !== undefined,
 				this.#submissionRequestAllowed,
 				this.#submissionRequestCount,
 				this.#submissionRequestInFlight,
@@ -678,7 +693,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				"DOM.getDocument",
 				{ depth: -1, pierce: true },
 			);
-			const discovery = discoverCdpForms(root, url);
+			const discovery = discoverCdpForms(root, url, this.#topFrameId);
 			if (
 				discovery.candidateFieldCount > 0 ||
 				attempt === MAX_DOM_DISCOVERY_ATTEMPTS
@@ -1410,13 +1425,13 @@ export function getSubmissionRequestDisposition(
 	if (
 		!getSubmissionGuardActive ||
 		resourceType !== "Document" ||
-		!requestFrameId ||
-		requestFrameId !== expectedFrameId ||
 		expected?.method !== "GET" ||
 		!isExpectedSubmissionRequest(request, expected)
 	) {
 		return "ignore";
 	}
+	if (!requestFrameId || !expectedFrameId) return "block";
+	if (requestFrameId !== expectedFrameId) return "ignore";
 	return submissionRequestAllowed &&
 		submissionRequestCount === 0 &&
 		!submissionRequestInFlight
