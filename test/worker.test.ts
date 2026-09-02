@@ -660,6 +660,7 @@ describe("ResponsesAgentExecutor", () => {
 		const requestBodies: Array<{
 			tools?: Array<{
 				name?: string;
+				description?: string;
 				parameters?: { properties?: Record<string, unknown> };
 			}>;
 			instructions?: string;
@@ -722,6 +723,17 @@ describe("ResponsesAgentExecutor", () => {
 			"activationStrategy",
 		);
 		expect(requestBodies[0]?.instructions).toContain("This is a dry-run");
+		expect(requestBodies[0]?.instructions).toContain(
+			"Use select for select elements, checkboxes, and radio controls",
+		);
+		expect(
+			requestBodies[0]?.tools?.find((tool) => tool.name === "select")
+				?.description,
+		).toContain("checkbox");
+		expect(
+			requestBodies[0]?.tools?.find((tool) => tool.name === "click")
+				?.description,
+		).toContain("type=button");
 		expect(driver.validateSubmitCount).toBe(1);
 		expect(driver.submitCount).toBe(0);
 		expect(driver.closed).toBe(true);
