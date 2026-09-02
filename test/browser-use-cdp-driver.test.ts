@@ -25,6 +25,7 @@ import {
 	readSubmissionConfirmation,
 	retrySubmitMousePreparation,
 	runSubmissionActivationWithinPermissionWindow,
+	SET_CHECKED_VALUE_FUNCTION,
 } from "../src/browser-use-cdp-driver";
 import {
 	BrowserElementError,
@@ -202,6 +203,39 @@ describe("BrowserUseCdpDriver child target policy", () => {
 			checkFormValidity.call({ form: { checkValidity: () => false } }),
 		).toBe(false);
 		expect(checkFormValidity.call({})).toBe(false);
+	});
+
+	test("sets checkbox state through DOM events without coordinate clicks", () => {
+		const events: string[] = [];
+		class TestEvent {
+			constructor(readonly type: string) {}
+		}
+		const setChecked = runInNewContext(`(${SET_CHECKED_VALUE_FUNCTION})`, {
+			Event: TestEvent,
+		}) as (
+			this: {
+				tagName: string;
+				type: string;
+				checked: boolean;
+				dispatchEvent(event: TestEvent): void;
+			},
+			checked: boolean,
+		) => boolean;
+		const checkbox = {
+			tagName: "INPUT",
+			type: "checkbox",
+			checked: false,
+			dispatchEvent(event: TestEvent) {
+				events.push(event.type);
+			},
+		};
+
+		expect(setChecked.call(checkbox, true)).toBe(true);
+		expect(checkbox.checked).toBe(true);
+		expect(events).toEqual(["input", "change"]);
+		expect(setChecked.call(checkbox, true)).toBe(true);
+		expect(events).toEqual(["input", "change"]);
+		expect(setChecked.call({ ...checkbox, type: "text" }, true)).toBe(false);
 	});
 
 	test("requires a successful input owned by the submit control's form", () => {

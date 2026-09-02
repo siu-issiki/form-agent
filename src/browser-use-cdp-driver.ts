@@ -354,14 +354,22 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		const desiredChecked =
 			value === "true" || value === "checked" || value === state.value;
 		if (state.type === "checkbox") {
-			if (state.checked !== desiredChecked) {
-				await this.#clickElement(reference.backendNodeId);
-			}
+			const changed = await this.#callFunctionOnElement<boolean>(
+				reference.backendNodeId,
+				SET_CHECKED_VALUE_FUNCTION,
+				[desiredChecked],
+			);
+			if (!changed) throw new BrowserElementError();
 			this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
 			return;
 		}
 		if (state.type === "radio" && value === state.value) {
-			if (!state.checked) await this.#clickElement(reference.backendNodeId);
+			const changed = await this.#callFunctionOnElement<boolean>(
+				reference.backendNodeId,
+				SET_CHECKED_VALUE_FUNCTION,
+				[true],
+			);
+			if (!changed) throw new BrowserElementError();
 			this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
 			return;
 		}
@@ -1222,6 +1230,17 @@ const SET_SELECT_VALUE_FUNCTION = `function(value) {
   this.dispatchEvent(new Event("input", { bubbles: true }));
   this.dispatchEvent(new Event("change", { bubbles: true }));
   return true;
+}`;
+
+export const SET_CHECKED_VALUE_FUNCTION = `function(checked) {
+  if (this.tagName !== "INPUT" || !["checkbox", "radio"].includes(this.type) || typeof checked !== "boolean") return false;
+  if (this.type === "radio" && !checked) return false;
+  if (this.checked !== checked) {
+    this.checked = checked;
+    this.dispatchEvent(new Event("input", { bubbles: true }));
+    this.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  return this.checked === checked;
 }`;
 
 export const IS_SUBMIT_UNOBSCURED_FUNCTION = `function() {
