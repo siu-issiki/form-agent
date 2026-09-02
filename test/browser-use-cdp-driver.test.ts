@@ -153,33 +153,95 @@ describe("BrowserUseCdpDriver child target policy", () => {
 	});
 
 	test("activates only a connected native submit control through the DOM", () => {
-		const activateSubmit = runInNewContext(
-			`(${ACTIVATE_SUBMIT_FUNCTION})`,
-		) as (this: {
-			isConnected: boolean;
-			disabled: boolean;
-			form: object | null;
-			tagName: string;
-			type: string;
-			click(): void;
-		}) => boolean;
-		let clickCount = 0;
-		const submit = {
+		let nativeClickCount = 0;
+		class TestHTMLElement {
+			click() {
+				nativeClickCount += 1;
+			}
+		}
+		const activateSubmit = runInNewContext(`(${ACTIVATE_SUBMIT_FUNCTION})`, {
+			getComputedStyle: (element: { visible?: boolean }) => ({
+				display: element.visible === false ? "none" : "block",
+				visibility: "visible",
+				opacity: "1",
+			}),
+			HTMLElement: TestHTMLElement,
+			URL,
+		}) as (
+			this: {
+				isConnected: boolean;
+				disabled: boolean;
+				form: {
+					action: string;
+					method: string;
+					getAttribute(name: string): string | null;
+				} | null;
+				tagName: string;
+				type: string;
+				visible?: boolean;
+				getBoundingClientRect(): { width: number; height: number };
+				getAttribute(name: string): string | null;
+				hasAttribute(name: string): boolean;
+				click(): void;
+			},
+			input: { isConnected: boolean; form: object },
+			action: string,
+			method: string,
+		) => boolean;
+		const form = {
+			action: "https://example.com/submit#fragment",
+			method: "post",
+			getAttribute: () => null,
+		};
+		let instanceClickCount = 0;
+		const submit = Object.assign(new TestHTMLElement(), {
 			isConnected: true,
 			disabled: false,
-			form: {},
+			form,
 			tagName: "BUTTON",
 			type: "submit",
+			getBoundingClientRect: () => ({ width: 100, height: 40 }),
+			getAttribute: () => null,
+			hasAttribute: () => false,
 			click() {
-				clickCount += 1;
+				instanceClickCount += 1;
 			},
-		};
+		});
+		const input = { isConnected: true, form };
+		const activate = (candidate = submit, candidateInput = input) =>
+			activateSubmit.call(
+				candidate,
+				candidateInput,
+				"https://example.com/submit",
+				"POST",
+			);
 
-		expect(activateSubmit.call(submit)).toBe(true);
-		expect(clickCount).toBe(1);
-		expect(activateSubmit.call({ ...submit, disabled: true })).toBe(false);
-		expect(activateSubmit.call({ ...submit, type: "button" })).toBe(false);
-		expect(activateSubmit.call({ ...submit, form: null })).toBe(false);
+		expect(activate()).toBe(true);
+		expect(nativeClickCount).toBe(1);
+		expect(instanceClickCount).toBe(0);
+		expect(
+			activate(
+				Object.assign(new TestHTMLElement(), submit, { disabled: true }),
+			),
+		).toBe(false);
+		expect(
+			activate(
+				Object.assign(new TestHTMLElement(), submit, { type: "button" }),
+			),
+		).toBe(false);
+		expect(
+			activate(
+				Object.assign(new TestHTMLElement(), submit, { visible: false }),
+			),
+		).toBe(false);
+		expect(activate(submit, { ...input, form: {} })).toBe(false);
+		expect(
+			activate(
+				Object.assign(new TestHTMLElement(), submit, {
+					form: { ...form, action: "https://example.com/other" },
+				}),
+			),
+		).toBe(false);
 	});
 
 	test("requires the resolved submit element to be unobscured", () => {
