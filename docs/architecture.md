@@ -22,7 +22,7 @@
 | E2E | 管理下範囲を実装済み | 常設テストシステムの13シナリオ、重複配送、送信後`uncertain`をproductionで検証済み。外部の実サイト送信は未実施 |
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値を検証。一覧・キャンセルは未実装 |
 | Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
-| 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ、値を含まないbrowser tool診断イベント |
+| 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ、値を含まないagent tool診断イベント |
 | 並列検証 | 部分実施 | 安全確認中は `max_concurrency: 1`。Cloudflare 上の単一ジョブを検証済みで、5 並列以上は未検証 |
 
 本書では、実装済みの構成を現在形で記述し、未実装または未検証の内容は「現在の制約」「PoC 計画」「残タスク・未決事項」に明示する。
@@ -65,7 +65,7 @@ Worker-native Agent executor
 Cloudflare D1
   ├─ jobs
   ├─ results
-  └─ events（retry / DLQ / browser tool診断）
+  └─ events（retry / DLQ / agent tool診断）
 ```
 
 PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外部の OpenAI / BrowserUse を組み合わせる。本番は production 環境だけを対象とし、D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済みである。2026-09-02 に `https://anyreach.co.jp/contact` を対象とした production dry-run を実行し、`pending → running → prohibited`、`DRY_RUN_COMPLETE`、1 attempt、8 Provider requests、BrowserUse active session 0 件を確認した。`submitting` / `sent` には遷移しておらず、フォーム送信は行っていない。
@@ -163,7 +163,7 @@ driver が submit control と識別した要素は通常の `click` で操作で
 - Provider 呼び出し回数を D1 の条件付き更新で制限する。
 - DLQ 到達をイベントとして記録する。
 
-状態遷移と結果保存は D1 session / batch と条件付き `UPDATE` を使う。retry / DLQとbrowser tool診断はイベントへ保存するが、全状態遷移、token、全体処理時間、BrowserUse待ち時間、費用の記録は未実装である。
+状態遷移と結果保存は D1 session / batch と条件付き `UPDATE` を使う。retry / DLQとagent tool診断はイベントへ保存するが、全状態遷移、token、全体処理時間、BrowserUse待ち時間、費用の記録は未実装である。
 
 ## ジョブライフサイクル
 
@@ -295,7 +295,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 
 - Provider は OpenAI 固定である。
 - Provider 呼び出し回数以外のtoken、rate limit、費用を保存しない。retryイベント以外の全体処理時間とBrowserUse待ち時間も保存しない。
-- browser tool診断の`data_json`にはturn、固定tool名、stage、固定result codeだけを保存し、イベント共通列にはjob ID、attempt、記録時刻を保存する。入力値、URL、自由記述エラー、全状態遷移は保存しない。
+- agent tool診断はbrowser tool、`finish`、unknown tool dispatchを対象とする。`data_json`にはturn、固定tool名、stage、固定result codeだけを保存し、イベント共通列にはjob ID、attempt、記録時刻を保存する。入力値、URL、自由記述エラー、全状態遷移は保存しない。
 - retry delay は 30 秒固定で、指数 backoff と jitter は未実装である。
 
 ## 並列・リトライ方針
