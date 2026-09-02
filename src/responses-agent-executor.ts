@@ -542,6 +542,15 @@ type FinishParseResult =
 				| "FINISH_OUTCOME_INVALID";
 	  };
 
+const PROHIBITED_REASON_CODES = {
+	NO_FORM: "NO_FORM_PRESENT",
+	NO_FORM_PRESENT: "NO_FORM_PRESENT",
+	NO_INQUIRY_FORM: "NO_FORM_PRESENT",
+	OUTREACH_PROHIBITED: "SALES_PROHIBITED",
+	SALES_PROHIBITED: "SALES_PROHIBITED",
+	FORM_PURPOSE_INCOMPATIBLE: "FORM_PURPOSE_INCOMPATIBLE",
+} as const;
+
 function parseFinishResult(
 	params: JsonObject,
 	targetDomain: string,
@@ -561,6 +570,13 @@ function parseFinishResult(
 	}
 
 	if (outcome === "prohibited" && retryable === null) {
+		const prohibitedReasonCode =
+			PROHIBITED_REASON_CODES[
+				reasonCode as keyof typeof PROHIBITED_REASON_CODES
+			];
+		if (!prohibitedReasonCode) {
+			return { result: null, diagnosticCode: "FINISH_FIELDS_INVALID" };
+		}
 		try {
 			if (formUrl) {
 				assertAllowedTargetUrl(formUrl, targetDomain, allowedHosts);
@@ -572,7 +588,7 @@ function parseFinishResult(
 			};
 		}
 		return {
-			result: { outcome, formUrl, reasonCode, reason },
+			result: { outcome, formUrl, reasonCode: prohibitedReasonCode, reason },
 			diagnosticCode: "OK",
 		};
 	}
@@ -730,6 +746,7 @@ function systemPrompt(dryRun: boolean): string {
 		"Stay on the persisted target domain. Never use another company or arbitrary URL.",
 		"Observe the page before acting and check for sales, solicitation, or purpose restrictions.",
 		"If outreach is prohibited or the form purpose is incompatible, do not submit; call finish with prohibited.",
+		"For prohibited, use reasonCode NO_FORM_PRESENT when no inquiry form exists, SALES_PROHIBITED when sales or outreach is prohibited, or FORM_PURPOSE_INCOMPATIBLE when the form purpose is incompatible.",
 		"For fill and select, choose only a payloadKey from payload.formValues. The trusted handler resolves its value; never invent personal or company data.",
 		"Use select for select elements, checkboxes, and radio controls. Click is only for a non-submit button with type=button.",
 		"Before submit, re-observe and verify the target, all values, required fields, and that submit has not been attempted.",
@@ -802,7 +819,7 @@ const AGENT_TOOLS = [
 	),
 	functionTool(
 		"finish",
-		"Finish without sending when prohibited, uncertain, or technically failed. This tool cannot report sent.",
+		"Finish without sending when prohibited, uncertain, or technically failed. This tool cannot report sent. For prohibited, use only NO_FORM_PRESENT, SALES_PROHIBITED, or FORM_PURPOSE_INCOMPATIBLE as reasonCode.",
 		{
 			outcome: { type: "string", enum: ["prohibited", "uncertain", "failed"] },
 			formUrl: { type: ["string", "null"], maxLength: 2_048 },
