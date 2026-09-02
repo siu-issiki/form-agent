@@ -272,6 +272,19 @@ export class RestrictedBrowserTools {
 		} catch (error) {
 			submitError = error;
 		}
+		// The post-submit URL is read before the screenshot capture. If the
+		// screenshot fails and closes the CDP connection, the already-captured
+		// URL still lets us validate a successful submission instead of
+		// letting a best-effort capture failure change the submission result.
+		let postSubmitUrl: string | undefined;
+		let postSubmitUrlError: unknown;
+		if (submitError === undefined && result) {
+			try {
+				postSubmitUrl = await this.driver.currentUrl();
+			} catch (error) {
+				postSubmitUrlError = error;
+			}
+		}
 		// The post-submission evidence is best effort and never changes the result.
 		await this.recorder.capture("after_submit");
 		if (submitError !== undefined || !result) {
@@ -286,7 +299,10 @@ export class RestrictedBrowserTools {
 			throw new SubmissionResultUncertainError();
 		}
 		try {
-			await this.#assertCurrentUrlAllowed();
+			if (postSubmitUrlError !== undefined) {
+				throw postSubmitUrlError;
+			}
+			this.#assertAllowedUrl(postSubmitUrl as string);
 		} catch (error) {
 			await this.#recordUncertain(
 				"SUBMIT_RESULT_UNKNOWN",

@@ -535,6 +535,32 @@ describe("RestrictedBrowserTools", () => {
 		]);
 	});
 
+	test("keeps the sent result when the after_submit capture failure closes the connection", async () => {
+		const driver = new FakeDriver();
+		driver.failScreenshotAt = 2;
+		driver.closeConnectionOnScreenshotFailure = true;
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const tools = await createToolsWithEvidence(driver, store, evidence);
+		await tools.fill("fa-0-0", "Hello");
+
+		const sent = await tools.submit("fa-0-1");
+
+		expect(sent.status).toBe("sent");
+		expect(driver.submitCount).toBe(1);
+		expect(evidence.objects.size).toBe(1);
+		expect(
+			store.events.map((event) => [
+				event.type,
+				event.data.stage,
+				event.data.failureCode,
+			]),
+		).toEqual([
+			["evidence.captured", "before_submit", undefined],
+			["evidence.capture_failed", "after_submit", "SCREENSHOT_FAILED"],
+		]);
+	});
+
 	test("captures evidence after a browser submit failure", async () => {
 		const driver = new FakeDriver();
 		driver.submitError = new Error("connection lost");
@@ -621,6 +647,8 @@ class FakeDriver implements RestrictedBrowserDriver {
 	submitValidationError: Error | null = null;
 	screenshotCount = 0;
 	failScreenshotAt: number | null = null;
+	closeConnectionOnScreenshotFailure = false;
+	connectionClosed = false;
 	navigationLinks: Array<{ url: string; text: string }> | undefined;
 	submitResult: BrowserSubmitResult = {
 		outcome: "sent",
@@ -632,6 +660,9 @@ class FakeDriver implements RestrictedBrowserDriver {
 	}
 
 	async currentUrl(): Promise<string> {
+		if (this.connectionClosed) {
+			throw new Error("Browser Use CDP connection is closed");
+		}
 		return this.url;
 	}
 
@@ -658,6 +689,9 @@ class FakeDriver implements RestrictedBrowserDriver {
 	async captureScreenshot(): Promise<Uint8Array> {
 		this.screenshotCount += 1;
 		if (this.failScreenshotAt === this.screenshotCount) {
+			if (this.closeConnectionOnScreenshotFailure) {
+				this.connectionClosed = true;
+			}
 			throw new Error("Browser screenshot failed");
 		}
 		return new Uint8Array([this.screenshotCount, 2, 3]);
