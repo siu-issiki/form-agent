@@ -1060,7 +1060,7 @@ describe("BrowserUseCdpDriver submission confirmation", () => {
 });
 
 describe("BrowserUseCdpDriver screenshot capture", () => {
-	test("captures a JPEG beyond the viewport and decodes the payload", async () => {
+	test("captures a viewport-only JPEG and decodes the payload", async () => {
 		const requests: Array<Record<string, unknown>> = [];
 
 		const bytes = await captureCdpScreenshot(async (params) => {
@@ -1072,33 +1072,14 @@ describe("BrowserUseCdpDriver screenshot capture", () => {
 			{
 				format: "jpeg",
 				quality: 80,
-				captureBeyondViewport: true,
+				captureBeyondViewport: false,
 				fromSurface: true,
 			},
 		]);
 		expect([...bytes]).toEqual([1, 2, 255]);
 	});
 
-	test("retries inside the viewport when the payload is too large", async () => {
-		const requests: Array<Record<string, unknown>> = [];
-
-		const bytes = await captureCdpScreenshot(async (params) => {
-			requests.push(params);
-			if (requests.length === 1) throw new BrowserUseCdpPayloadTooLargeError();
-			return { data: btoa("ok") };
-		});
-
-		expect(requests).toHaveLength(2);
-		expect(requests[1]).toEqual({
-			format: "jpeg",
-			quality: 80,
-			captureBeyondViewport: false,
-			fromSurface: true,
-		});
-		expect([...bytes]).toEqual([111, 107]);
-	});
-
-	test("hides the payload error when the viewport retry also fails", async () => {
+	test("wraps a payload-too-large failure without retrying, since the connection is already closed", async () => {
 		let attempts = 0;
 
 		const failure = await captureCdpScreenshot(async () => {
@@ -1106,7 +1087,7 @@ describe("BrowserUseCdpDriver screenshot capture", () => {
 			throw new BrowserUseCdpPayloadTooLargeError();
 		}).catch((error: unknown) => error);
 
-		expect(attempts).toBe(2);
+		expect(attempts).toBe(1);
 		expect(failure).toBeInstanceOf(Error);
 		expect(failure).not.toBeInstanceOf(BrowserUseCdpPayloadTooLargeError);
 		expect((failure as Error).message).toBe("Browser screenshot failed");

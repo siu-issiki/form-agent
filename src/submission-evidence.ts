@@ -12,6 +12,7 @@ export interface EvidenceObjectStore {
 		contentType: string,
 		sha256Hex: string,
 	): Promise<void>;
+	delete(key: string): Promise<void>;
 }
 
 /**
@@ -27,6 +28,7 @@ export interface EvidenceBucket {
 			sha256: string;
 		},
 	): Promise<unknown>;
+	delete(key: string): Promise<unknown>;
 }
 
 export class R2EvidenceObjectStore implements EvidenceObjectStore {
@@ -43,6 +45,10 @@ export class R2EvidenceObjectStore implements EvidenceObjectStore {
 			sha256: sha256Hex,
 		});
 	}
+
+	async delete(key: string): Promise<void> {
+		await this.bucket.delete(key);
+	}
 }
 
 export class InMemoryEvidenceObjectStore implements EvidenceObjectStore {
@@ -57,6 +63,10 @@ export class InMemoryEvidenceObjectStore implements EvidenceObjectStore {
 		sha256Hex: string,
 	): Promise<void> {
 		this.objects.set(key, { body, contentType, sha256: sha256Hex });
+	}
+
+	async delete(key: string): Promise<void> {
+		this.objects.delete(key);
 	}
 }
 
@@ -116,6 +126,7 @@ export class SubmissionEvidenceRecorder {
 			recorded = false;
 		}
 		if (!recorded) {
+			await this.objectStore.delete(objectKey).catch(() => undefined);
 			return this.#failed(stage, "EVENT_NOT_RECORDED");
 		}
 

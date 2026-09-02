@@ -19,6 +19,7 @@ import {
 	type EvidenceStage,
 	evidenceObjectKey,
 	InMemoryEvidenceObjectStore,
+	SubmissionEvidenceRecorder,
 	sha256Hex,
 } from "../src/submission-evidence";
 
@@ -678,5 +679,45 @@ class FakeDriver implements RestrictedBrowserDriver {
 			throw this.submitError;
 		}
 		return this.submitResult;
+	}
+}
+
+describe("SubmissionEvidenceRecorder", () => {
+	test("deletes the uploaded object when the D1 event cannot be recorded", async () => {
+		const driver = new FakeDriver();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const store = new RecordEvidenceCapturedRejectingJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const recorder = new SubmissionEvidenceRecorder(
+			driver,
+			evidence,
+			store,
+			input.id,
+			"run-token-1",
+			() => "2026-08-28T00:00:02.000Z",
+		);
+
+		const result = await recorder.capture("before_submit");
+
+		expect(result).toEqual({
+			captured: false,
+			failureCode: "EVENT_NOT_RECORDED",
+		});
+		expect(evidence.objects.size).toBe(0);
+		expect(store.events).toEqual([
+			{
+				jobId: input.id,
+				attempt: 1,
+				type: "evidence.capture_failed",
+				data: { stage: "before_submit", failureCode: "EVENT_NOT_RECORDED" },
+			},
+		]);
+	});
+});
+
+class RecordEvidenceCapturedRejectingJobStore extends InMemoryJobStore {
+	async recordEvidenceCaptured(): Promise<boolean> {
+		return false;
 	}
 }

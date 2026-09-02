@@ -176,6 +176,7 @@ driver が submit control と識別した要素は通常の `click` で操作で
 - `contentType` は `image/jpeg` で保存する。
 - put 時に sha256 を渡し、R2 側で整合性検証する。D1 の `events` にも同じ sha256 を記録し、取得後に照合できるようにする。
 - 公開アクセスは設定しない。読み出しは `wrangler r2 object get` による手動取得だけであり、専用の閲覧 API / UI は未実装である。
+- 撮影は表示中の viewport のみとする。フルページ撮影は CDP メッセージ上限（4M 文字）を超えると接続が閉じて回復できないため採用しない。
 
 ## ジョブライフサイクル
 

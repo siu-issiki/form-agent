@@ -1,9 +1,6 @@
 import { assertAllowedBrowserRequest } from "./browser-network-policy";
 import { SUBMISSION_CONFIRMATION_PATTERN } from "./browser-submit-confirmation";
-import {
-	BrowserUseCdpConnection,
-	BrowserUseCdpPayloadTooLargeError,
-} from "./browser-use-cdp";
+import { BrowserUseCdpConnection } from "./browser-use-cdp";
 import {
 	type CdpDomNode,
 	type CdpFormDiscovery,
@@ -1210,14 +1207,15 @@ export interface CdpScreenshotResult {
 export const SCREENSHOT_PARAMS = {
 	format: "jpeg",
 	quality: 80,
-	captureBeyondViewport: true,
+	captureBeyondViewport: false,
 	fromSurface: true,
 } as const;
 
 /**
- * Captures the visible page as JPEG. A payload that exceeds the CDP message
- * limit is retried once within the viewport only. Every failure is reported as
- * the same opaque error so that no page content leaks through the message.
+ * Captures only the currently visible viewport as JPEG. A payload that
+ * exceeds the CDP message limit closes the underlying connection, so there is
+ * no connection left to retry against; every failure is reported as the same
+ * opaque error so that no page content leaks through the message.
  */
 export async function captureCdpScreenshot(
 	send: (params: Record<string, unknown>) => Promise<CdpScreenshotResult>,
@@ -1225,18 +1223,8 @@ export async function captureCdpScreenshot(
 	let result: CdpScreenshotResult;
 	try {
 		result = await send({ ...SCREENSHOT_PARAMS });
-	} catch (error) {
-		if (!(error instanceof BrowserUseCdpPayloadTooLargeError)) {
-			throw new Error("Browser screenshot failed");
-		}
-		try {
-			result = await send({
-				...SCREENSHOT_PARAMS,
-				captureBeyondViewport: false,
-			});
-		} catch {
-			throw new Error("Browser screenshot failed");
-		}
+	} catch {
+		throw new Error("Browser screenshot failed");
 	}
 
 	let bytes: Uint8Array;
