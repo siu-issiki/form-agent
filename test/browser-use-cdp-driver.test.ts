@@ -18,6 +18,7 @@ import {
 	BLOCK_BROWSER_ESCAPE_EXPRESSION,
 	CHECK_FORM_VALIDITY_FUNCTION,
 	centerOfQuad,
+	continueSubmissionRequest,
 	createExpectedSubmissionRequest,
 	createSubmitActivationFailureLog,
 	denyRelatedBrowserTargets,
@@ -811,6 +812,29 @@ describe("BrowserUseCdpDriver submission confirmation", () => {
 		resolveObservedRequest();
 		await permissionWindow;
 		expect(completed).toBe(true);
+	});
+
+	test("records a submission request only after CDP continues it", async () => {
+		let observed = false;
+		await expect(
+			continueSubmissionRequest(
+				async () => {
+					throw new Error("CDP continue failed");
+				},
+				() => {
+					observed = true;
+				},
+			),
+		).rejects.toThrow("CDP continue failed");
+		expect(observed).toBe(false);
+
+		await continueSubmissionRequest(
+			async () => undefined,
+			() => {
+				observed = true;
+			},
+		);
+		expect(observed).toBe(true);
 	});
 
 	test("classifies a confirmation read failure without persisting its message", async () => {

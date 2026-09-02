@@ -123,6 +123,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#targetDomain: string | undefined;
 	#allowedHosts: string[] = [];
 	#submissionRequestAllowed = false;
+	#submissionRequestInFlight = false;
 	#submissionRequestCount = 0;
 	#submissionRequestObserved: (() => void) | undefined;
 	#expectedSubmissionRequest: ExpectedSubmissionRequest | undefined;
@@ -531,6 +532,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			paused.request.method.toUpperCase(),
 		);
 		let blockStage: SubmissionRequestBlockStage = "network_policy";
+		let claimedSubmissionRequest = false;
 		try {
 			if (!this.#targetDomain) {
 				throw new Error("Browser domain scope is not configured");
@@ -547,18 +549,28 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				paused.request.url,
 				this.#targetDomain,
 				paused.request.method,
-				this.#submissionRequestAllowed && this.#submissionRequestCount === 0,
+				this.#submissionRequestAllowed &&
+					this.#submissionRequestCount === 0 &&
+					!this.#submissionRequestInFlight,
 				!this.#formDataEntered && paused.resourceType !== "Document",
 				this.dryRun && this.#interactionStarted,
 				this.#allowedHosts,
 			);
 			if (unsafeRequest) {
-				this.#submissionRequestCount += 1;
-				this.#submissionRequestObserved?.();
+				this.#submissionRequestInFlight = true;
+				claimedSubmissionRequest = true;
 			}
-			await this.#send("Fetch.continueRequest", {
-				requestId: paused.requestId,
-			});
+			await continueSubmissionRequest(
+				() =>
+					this.#send("Fetch.continueRequest", {
+						requestId: paused.requestId,
+					}),
+				() => {
+					if (!unsafeRequest) return;
+					this.#submissionRequestCount += 1;
+					this.#submissionRequestObserved?.();
+				},
+			);
 		} catch {
 			if (unsafeRequest && this.#submissionAttemptInProgress) {
 				this.#submissionRequestBlockStage ??= blockStage;
@@ -567,6 +579,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				requestId: paused.requestId,
 				errorReason: "BlockedByClient",
 			}).catch(() => undefined);
+		} finally {
+			if (claimedSubmissionRequest) this.#submissionRequestInFlight = false;
 		}
 	}
 
@@ -989,6 +1003,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			resolveSubmissionRequestObserved = resolve;
 		});
 		this.#submissionRequestCount = 0;
+		this.#submissionRequestInFlight = false;
 		this.#submissionRequestObserved = resolveSubmissionRequestObserved;
 		this.#submissionRequestAllowed = true;
 		try {
@@ -1147,6 +1162,14 @@ export async function runSubmissionActivationWithinPermissionWindow(
 		activation.then(() => submissionRequestObserved),
 		permissionDeadline,
 	]);
+}
+
+export async function continueSubmissionRequest(
+	continueRequest: () => Promise<unknown>,
+	recordObserved: () => void,
+): Promise<void> {
+	await continueRequest();
+	recordObserved();
 }
 
 export async function readSubmissionConfirmation(
