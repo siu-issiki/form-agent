@@ -891,6 +891,16 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				activationStrategy,
 			}),
 		);
+		if (activationStrategy === "dom") {
+			await this.#activatePreparedSubmit(async () => {
+				const activated = await this.#callFunctionOnElement<boolean>(
+					backendNodeId,
+					ACTIVATE_SUBMIT_FUNCTION,
+				);
+				if (!activated) throw new BrowserElementError();
+			}, "dom");
+			return;
+		}
 		if (activationStrategy === "mouse") {
 			let hitTestAttempts = 0;
 			const point = await this.#prepareMouseClick(
@@ -1241,9 +1251,10 @@ export function submitUncertainReasonCode(
 	if (blockStage === "network_policy") {
 		return "SUBMIT_NETWORK_POLICY_BLOCKED";
 	}
-	return activationStrategy === "mouse"
-		? "SUBMIT_MOUSE_REQUEST_NOT_OBSERVED"
-		: "SUBMIT_ENTER_REQUEST_NOT_OBSERVED";
+	if (activationStrategy === "dom") return "SUBMIT_DOM_REQUEST_NOT_OBSERVED";
+	if (activationStrategy === "mouse")
+		return "SUBMIT_MOUSE_REQUEST_NOT_OBSERVED";
+	return "SUBMIT_ENTER_REQUEST_NOT_OBSERVED";
 }
 
 export function assertExpectedSubmissionRequest(
@@ -1266,6 +1277,16 @@ const SET_SELECT_VALUE_FUNCTION = `function(value) {
   this.value = value;
   this.dispatchEvent(new Event("input", { bubbles: true }));
   this.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
+}`;
+
+export const ACTIVATE_SUBMIT_FUNCTION = `function() {
+  if (!this.isConnected || this.disabled || !this.form || typeof this.click !== "function") return false;
+  const tag = typeof this.tagName === "string" ? this.tagName.toLowerCase() : "";
+  const type = typeof this.type === "string" ? this.type.toLowerCase() : "";
+  const submitLike = (tag === "button" && (!type || type === "submit")) || (tag === "input" && ["submit", "image"].includes(type));
+  if (!submitLike) return false;
+  this.click();
   return true;
 }`;
 

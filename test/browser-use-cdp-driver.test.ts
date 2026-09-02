@@ -8,6 +8,7 @@ import {
 } from "../src/browser-use-cdp";
 import { discoverCdpForms } from "../src/browser-use-cdp-dom";
 import {
+	ACTIVATE_SUBMIT_FUNCTION,
 	assertDryRunNavigationAllowed,
 	assertExpectedSubmissionRequest,
 	BLOCK_BROWSER_ESCAPE_EXPRESSION,
@@ -128,6 +129,9 @@ describe("BrowserUseCdpDriver child target policy", () => {
 	});
 
 	test("classifies uncertain submissions without persisting request data", () => {
+		expect(submitUncertainReasonCode("dom", false)).toBe(
+			"SUBMIT_DOM_REQUEST_NOT_OBSERVED",
+		);
 		expect(submitUncertainReasonCode("mouse", false)).toBe(
 			"SUBMIT_MOUSE_REQUEST_NOT_OBSERVED",
 		);
@@ -146,6 +150,36 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		expect(submitUncertainReasonCode("mouse", true, "expected_request")).toBe(
 			"SUBMIT_CONFIRMATION_NOT_OBSERVED",
 		);
+	});
+
+	test("activates only a connected native submit control through the DOM", () => {
+		const activateSubmit = runInNewContext(
+			`(${ACTIVATE_SUBMIT_FUNCTION})`,
+		) as (this: {
+			isConnected: boolean;
+			disabled: boolean;
+			form: object | null;
+			tagName: string;
+			type: string;
+			click(): void;
+		}) => boolean;
+		let clickCount = 0;
+		const submit = {
+			isConnected: true,
+			disabled: false,
+			form: {},
+			tagName: "BUTTON",
+			type: "submit",
+			click() {
+				clickCount += 1;
+			},
+		};
+
+		expect(activateSubmit.call(submit)).toBe(true);
+		expect(clickCount).toBe(1);
+		expect(activateSubmit.call({ ...submit, disabled: true })).toBe(false);
+		expect(activateSubmit.call({ ...submit, type: "button" })).toBe(false);
+		expect(activateSubmit.call({ ...submit, form: null })).toBe(false);
 	});
 
 	test("requires the resolved submit element to be unobscured", () => {

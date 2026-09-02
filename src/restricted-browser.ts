@@ -15,7 +15,7 @@ export type BrowserSubmitResult =
 			reason: string;
 	  };
 
-export type SubmitActivationStrategy = "mouse" | "enter";
+export type SubmitActivationStrategy = "dom" | "mouse" | "enter";
 
 export interface RestrictedBrowserDriver {
 	close?(): Promise<void>;

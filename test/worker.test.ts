@@ -722,6 +722,9 @@ describe("ResponsesAgentExecutor", () => {
 		expect(submitTool?.parameters?.properties).toHaveProperty(
 			"activationStrategy",
 		);
+		expect(submitTool?.parameters?.properties).toMatchObject({
+			activationStrategy: { enum: ["dom", "mouse", "enter"] },
+		});
 		expect(requestBodies[0]?.instructions).toContain("This is a dry-run");
 		expect(requestBodies[0]?.instructions).toContain(
 			"Use select for select elements, checkboxes, and radio controls",
