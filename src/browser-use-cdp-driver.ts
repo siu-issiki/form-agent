@@ -98,6 +98,8 @@ interface ExpectedSubmissionRequest {
 	method: string;
 }
 
+type SubmissionRequestBlockStage = "expected_request" | "network_policy";
+
 export type SubmitActivationStage =
 	| "scroll"
 	| "render_before_check"
@@ -120,6 +122,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#submissionRequestCount = 0;
 	#submissionRequestObserved: (() => void) | undefined;
 	#expectedSubmissionRequest: ExpectedSubmissionRequest | undefined;
+	#submissionAttemptInProgress = false;
+	#submissionRequestBlockStage: SubmissionRequestBlockStage | undefined;
 	#targetPolicyError: Error | undefined;
 	#elementGeneration = 0;
 	#elements = new Map<string, ElementReference>();
@@ -434,6 +438,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			);
 		}
 		try {
+			this.#submissionAttemptInProgress = true;
+			this.#submissionRequestBlockStage = undefined;
 			try {
 				await this.#activateSubmitElement(
 					this.#element(elementId).backendNodeId,
@@ -454,10 +460,16 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			}
 		} finally {
 			this.#submissionRequestAllowed = false;
+			this.#submissionAttemptInProgress = false;
 		}
+		const reasonCode = submitUncertainReasonCode(
+			activationStrategy,
+			this.#submissionRequestCount > 0,
+			this.#submissionRequestBlockStage,
+		);
 		return {
 			outcome: "uncertain",
-			reasonCode: "SUBMIT_RESULT_UNKNOWN",
+			reasonCode,
 			reason: "The page did not provide a reliable submission confirmation.",
 		};
 	}
@@ -492,19 +504,22 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async #handlePausedRequest(paused: PausedRequest): Promise<void> {
+		const unsafeRequest = !["GET", "HEAD", "OPTIONS"].includes(
+			paused.request.method.toUpperCase(),
+		);
+		let blockStage: SubmissionRequestBlockStage = "network_policy";
 		try {
 			if (!this.#targetDomain) {
 				throw new Error("Browser domain scope is not configured");
 			}
-			const unsafeRequest = !["GET", "HEAD", "OPTIONS"].includes(
-				paused.request.method.toUpperCase(),
-			);
 			if (unsafeRequest && this.#submissionRequestAllowed) {
+				blockStage = "expected_request";
 				assertExpectedSubmissionRequest(
 					paused.request,
 					this.#expectedSubmissionRequest,
 				);
 			}
+			blockStage = "network_policy";
 			assertAllowedBrowserRequest(
 				paused.request.url,
 				this.#targetDomain,
@@ -522,6 +537,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				requestId: paused.requestId,
 			});
 		} catch {
+			if (unsafeRequest && this.#submissionAttemptInProgress) {
+				this.#submissionRequestBlockStage ??= blockStage;
+			}
 			await this.#send("Fetch.failRequest", {
 				requestId: paused.requestId,
 				errorReason: "BlockedByClient",
@@ -1207,6 +1225,25 @@ export function createExpectedSubmissionRequest(
 	}
 	url.hash = "";
 	return { url: url.toString(), method: formMethod.toUpperCase() };
+}
+
+export function submitUncertainReasonCode(
+	activationStrategy: SubmitActivationStrategy,
+	requestObserved: boolean,
+	blockStage?: SubmissionRequestBlockStage,
+): string {
+	if (requestObserved) {
+		return "SUBMIT_CONFIRMATION_NOT_OBSERVED";
+	}
+	if (blockStage === "expected_request") {
+		return "SUBMIT_EXPECTED_REQUEST_BLOCKED";
+	}
+	if (blockStage === "network_policy") {
+		return "SUBMIT_NETWORK_POLICY_BLOCKED";
+	}
+	return activationStrategy === "mouse"
+		? "SUBMIT_MOUSE_REQUEST_NOT_OBSERVED"
+		: "SUBMIT_ENTER_REQUEST_NOT_OBSERVED";
 }
 
 export function assertExpectedSubmissionRequest(

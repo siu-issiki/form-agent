@@ -26,6 +26,7 @@ import {
 	retrySubmitMousePreparation,
 	runSubmissionActivationWithinPermissionWindow,
 	SET_CHECKED_VALUE_FUNCTION,
+	submitUncertainReasonCode,
 } from "../src/browser-use-cdp-driver";
 import {
 	BrowserElementError,
@@ -124,6 +125,27 @@ describe("BrowserUseCdpDriver child target policy", () => {
 				expected,
 			),
 		).toThrow();
+	});
+
+	test("classifies uncertain submissions without persisting request data", () => {
+		expect(submitUncertainReasonCode("mouse", false)).toBe(
+			"SUBMIT_MOUSE_REQUEST_NOT_OBSERVED",
+		);
+		expect(submitUncertainReasonCode("enter", false)).toBe(
+			"SUBMIT_ENTER_REQUEST_NOT_OBSERVED",
+		);
+		expect(submitUncertainReasonCode("mouse", true)).toBe(
+			"SUBMIT_CONFIRMATION_NOT_OBSERVED",
+		);
+		expect(submitUncertainReasonCode("mouse", false, "expected_request")).toBe(
+			"SUBMIT_EXPECTED_REQUEST_BLOCKED",
+		);
+		expect(submitUncertainReasonCode("mouse", false, "network_policy")).toBe(
+			"SUBMIT_NETWORK_POLICY_BLOCKED",
+		);
+		expect(submitUncertainReasonCode("mouse", true, "expected_request")).toBe(
+			"SUBMIT_CONFIRMATION_NOT_OBSERVED",
+		);
 	});
 
 	test("requires the resolved submit element to be unobscured", () => {
