@@ -5,10 +5,16 @@ import {
 	BrowserToolCoordinator,
 	BrowserToolInputError,
 	type BrowserToolName,
+	BrowserToolSetupError,
 } from "./browser-tool-handler";
 import { BrowserUseCdpPayloadTooLargeError } from "./browser-use-cdp";
 import { BrowserUseCdpDriver } from "./browser-use-cdp-driver";
-import { D1JobStore } from "./d1-job-store";
+import {
+	type AgentToolDiagnosticCode,
+	type AgentToolDiagnosticStage,
+	type AgentToolDiagnosticToolName,
+	D1JobStore,
+} from "./d1-job-store";
 import type { Job } from "./job";
 import {
 	assertAllowedTargetUrl,
@@ -175,6 +181,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 				signal,
 				this.#db,
 				dryRun,
+				turn + 1,
 			);
 			if (execution.result) return execution.result;
 			history.push({
@@ -236,25 +243,48 @@ async function executeToolCall(
 	signal: AbortSignal,
 	db: D1Database,
 	dryRun: boolean,
+	turn: number,
 ): Promise<ToolExecution> {
 	throwIfAborted(signal);
+	const toolName = diagnosticToolName(call.name);
 	let params: JsonObject;
 	try {
 		const value: unknown = JSON.parse(call.arguments);
 		if (!isRecord(value)) throw new SyntaxError();
 		params = value;
 	} catch {
+		await recordToolDiagnostic(
+			db,
+			job,
+			runToken,
+			turn,
+			toolName,
+			"input_parse",
+			"INVALID_TOOL_INPUT",
+		);
 		return toolError("INVALID_TOOL_INPUT");
 	}
 
 	if (call.name === "finish") {
-		const result = parseFinishResult(
+		const parsed = parseFinishResult(
 			params,
 			job.targetDomain,
 			job.allowedHosts,
 		);
-		return result
-			? { output: JSON.stringify({ outcome: result.outcome }), result }
+		await recordToolDiagnostic(
+			db,
+			job,
+			runToken,
+			turn,
+			"finish",
+			"finish_validation",
+			parsed.diagnosticCode,
+		);
+		return parsed.result
+			? {
+					output: JSON.stringify({ outcome: parsed.result.outcome }),
+					result: parsed.result,
+				}
 			: toolError("INVALID_TOOL_INPUT");
 	}
 	if (
@@ -263,14 +293,43 @@ async function executeToolCall(
 		(!isElementId(params.elementId) ||
 			!isSubmitActivationStrategy(params.activationStrategy))
 	) {
+		await recordToolDiagnostic(
+			db,
+			job,
+			runToken,
+			turn,
+			"submit",
+			"input_parse",
+			"INVALID_TOOL_INPUT",
+		);
 		return toolError("INVALID_TOOL_INPUT");
 	}
 
 	const tool = browserToolName(call.name);
-	if (!tool) return toolError("UNKNOWN_TOOL");
+	if (!tool) {
+		await recordToolDiagnostic(
+			db,
+			job,
+			runToken,
+			turn,
+			"unknown",
+			"tool_dispatch",
+			"UNKNOWN_TOOL",
+		);
+		return toolError("UNKNOWN_TOOL");
+	}
 	try {
 		if (tool === "submit" && dryRun) {
 			await coordinator.validateSubmit(job.id, runToken, params);
+			await recordToolDiagnostic(
+				db,
+				job,
+				runToken,
+				turn,
+				tool,
+				"submit_validate",
+				"DRY_RUN_COMPLETE",
+			);
 			return {
 				output: JSON.stringify({ status: "dry_run", submitted: false }),
 				result: {
@@ -286,14 +345,45 @@ async function executeToolCall(
 		if (tool === "submit" && "job" in value) {
 			const result = terminalResultFromJob(value.job);
 			if (result) {
+				await recordToolDiagnostic(
+					db,
+					job,
+					runToken,
+					turn,
+					tool,
+					"submit",
+					"OK",
+				);
 				return { output: JSON.stringify({ status: value.job.status }), result };
 			}
+			await recordToolDiagnostic(
+				db,
+				job,
+				runToken,
+				turn,
+				tool,
+				"submit",
+				"SUBMIT_RESULT_NOT_PERSISTED",
+			);
 			return toolError("SUBMIT_RESULT_NOT_PERSISTED");
 		}
+		await recordToolDiagnostic(db, job, runToken, turn, tool, tool, "OK");
 		return { output: JSON.stringify(value) };
 	} catch (error) {
 		throwIfAborted(signal);
-		if (error instanceof BrowserUseCdpPayloadTooLargeError) {
+		const originalError =
+			error instanceof BrowserToolSetupError ? error.originalError : error;
+		const diagnosticCode = classifyToolDiagnostic(originalError);
+		await recordToolDiagnostic(
+			db,
+			job,
+			runToken,
+			turn,
+			tool,
+			error instanceof BrowserToolSetupError ? error.stage : tool,
+			diagnosticCode,
+		);
+		if (originalError instanceof BrowserUseCdpPayloadTooLargeError) {
 			throw new AgentExecutionError(
 				"BROWSER_PAYLOAD_TOO_LARGE",
 				"The browser document exceeded the safe processing limit.",
@@ -301,8 +391,8 @@ async function executeToolCall(
 			);
 		}
 		if (
-			error instanceof SubmissionResultUncertainError ||
-			error instanceof SubmissionNotAuthorizedError
+			originalError instanceof SubmissionResultUncertainError ||
+			originalError instanceof SubmissionNotAuthorizedError
 		) {
 			const persisted = await new D1JobStore(db).find(job.id);
 			const result =
@@ -312,10 +402,10 @@ async function executeToolCall(
 				: toolError("JOB_STATE_CONFLICT");
 		}
 		if (
-			error instanceof BrowserToolInputError ||
-			error instanceof BrowserElementError ||
-			error instanceof NavigationPolicyError ||
-			error instanceof SyntaxError
+			originalError instanceof BrowserToolInputError ||
+			originalError instanceof BrowserElementError ||
+			originalError instanceof NavigationPolicyError ||
+			originalError instanceof SyntaxError
 		) {
 			return toolError("INVALID_TOOL_INPUT");
 		}
@@ -326,6 +416,86 @@ async function executeToolCall(
 		);
 	}
 }
+
+async function recordToolDiagnostic(
+	db: D1Database,
+	job: Job,
+	runToken: string,
+	turn: number,
+	toolName: AgentToolDiagnosticToolName,
+	stage: AgentToolDiagnosticStage,
+	resultCode: AgentToolDiagnosticCode,
+): Promise<void> {
+	try {
+		await new D1JobStore(db).recordAgentToolDiagnostic(
+			job.id,
+			runToken,
+			turn,
+			toolName,
+			stage,
+			resultCode,
+			new Date().toISOString(),
+		);
+	} catch {
+		console.warn("agent_tool_diagnostic_write_failed");
+	}
+}
+
+function diagnosticToolName(value: string): AgentToolDiagnosticToolName {
+	if (value === "finish") return value;
+	return browserToolName(value) ?? "unknown";
+}
+
+function classifyToolDiagnostic(error: unknown): AgentToolDiagnosticCode {
+	if (error instanceof BrowserUseCdpPayloadTooLargeError) {
+		return "PAYLOAD_TOO_LARGE";
+	}
+	if (error instanceof BrowserToolInputError || error instanceof SyntaxError) {
+		return "TOOL_INPUT_INVALID";
+	}
+	if (error instanceof BrowserElementError) return "ELEMENT_UNAVAILABLE";
+	if (error instanceof NavigationPolicyError) return "NAVIGATION_POLICY";
+	if (error instanceof SubmissionNotAuthorizedError) {
+		return "SUBMISSION_NOT_AUTHORIZED";
+	}
+	if (error instanceof SubmissionResultUncertainError) {
+		return "SUBMISSION_RESULT_UNCERTAIN";
+	}
+	if (!(error instanceof Error)) return "UNKNOWN";
+
+	switch (error.message) {
+		case "Browser Use CDP connection failed":
+			return "CDP_CONNECTION_FAILED";
+		case "Browser Use CDP connection is closed":
+		case "Browser Use CDP connection closed":
+			return "CDP_CONNECTION_CLOSED";
+		case "Browser Use CDP command timed out":
+			return "CDP_COMMAND_TIMEOUT";
+		case "Browser Use CDP command could not be sent":
+			return "CDP_COMMAND_SEND_FAILED";
+		case "Browser Use CDP command failed":
+			return "CDP_COMMAND_FAILED";
+		case "Invalid Browser Use CDP endpoint":
+			return "CDP_ENDPOINT_INVALID";
+		case "Browser Use API key is required":
+			return "BROWSER_CREDENTIALS_MISSING";
+		case "Browser domain scope cannot be changed":
+		case "Browser host scope cannot be changed":
+		case "Browser domain scope is not configured":
+			return "SCOPE_CONFIGURATION_FAILED";
+		case "Browser navigation failed":
+			return "NAVIGATION_FAILED";
+		case "Browser page did not become ready":
+			return "PAGE_NOT_READY";
+		case "Browser DOM discovery failed":
+			return "DOM_DISCOVERY_FAILED";
+		case "Browser page evaluation failed":
+			return "PAGE_EVALUATION_FAILED";
+		default:
+			return "UNKNOWN";
+	}
+}
+
 function terminalResultFromJob(
 	job: Omit<Job, "runToken">,
 ): AgentRunResult | null {
@@ -346,11 +516,21 @@ function terminalResultFromJob(
 	return null;
 }
 
+type FinishParseResult =
+	| { result: AgentRunResult; diagnosticCode: "OK" }
+	| {
+			result: null;
+			diagnosticCode:
+				| "FINISH_FIELDS_INVALID"
+				| "FINISH_FORM_URL_NOT_ALLOWED"
+				| "FINISH_OUTCOME_INVALID";
+	  };
+
 function parseFinishResult(
 	params: JsonObject,
 	targetDomain: string,
 	allowedHosts: readonly string[],
-): AgentRunResult | null {
+): FinishParseResult {
 	const { outcome, formUrl, reasonCode, reason, retryable } = params;
 	if (
 		typeof reasonCode !== "string" ||
@@ -361,7 +541,7 @@ function parseFinishResult(
 		(formUrl !== null && typeof formUrl !== "string") ||
 		(retryable !== null && typeof retryable !== "boolean")
 	) {
-		return null;
+		return { result: null, diagnosticCode: "FINISH_FIELDS_INVALID" };
 	}
 
 	if (outcome === "prohibited" && retryable === null) {
@@ -370,21 +550,33 @@ function parseFinishResult(
 				assertAllowedTargetUrl(formUrl, targetDomain, allowedHosts);
 			}
 		} catch {
-			return null;
+			return {
+				result: null,
+				diagnosticCode: "FINISH_FORM_URL_NOT_ALLOWED",
+			};
 		}
-		return { outcome, formUrl, reasonCode, reason };
+		return {
+			result: { outcome, formUrl, reasonCode, reason },
+			diagnosticCode: "OK",
+		};
 	}
 	if (outcome === "uncertain" && formUrl === null && retryable === null) {
-		return { outcome, reasonCode, reason };
+		return {
+			result: { outcome, reasonCode, reason },
+			diagnosticCode: "OK",
+		};
 	}
 	if (
 		outcome === "failed" &&
 		formUrl === null &&
 		typeof retryable === "boolean"
 	) {
-		return { outcome, reasonCode, reason, retryable };
+		return {
+			result: { outcome, reasonCode, reason, retryable },
+			diagnosticCode: "OK",
+		};
 	}
-	return null;
+	return { result: null, diagnosticCode: "FINISH_OUTCOME_INVALID" };
 }
 
 function browserToolName(value: string): BrowserToolName | null {

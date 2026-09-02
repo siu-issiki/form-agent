@@ -619,6 +619,29 @@ describe("ResponsesAgentExecutor", () => {
 		expect(driver.submitCount).toBe(0);
 		expect(driver.closed).toBe(true);
 		expect((await store.find(input.id))?.status).toBe("running");
+		const diagnostics = await readAgentToolDiagnostics(input.id);
+		expect(diagnostics).toEqual([
+			{
+				turn: 1,
+				toolName: "observe",
+				stage: "observe",
+				resultCode: "OK",
+			},
+			{
+				turn: 2,
+				toolName: "fill",
+				stage: "fill",
+				resultCode: "OK",
+			},
+			{
+				turn: 3,
+				toolName: "submit",
+				stage: "submit_validate",
+				resultCode: "DRY_RUN_COMPLETE",
+			},
+		]);
+		expect(JSON.stringify(diagnostics)).not.toContain(input.targetUrl);
+		expect(JSON.stringify(diagnostics)).not.toContain("Hello");
 	});
 
 	test("rejects a guessed dry-run submit element before observation", async () => {
@@ -742,6 +765,14 @@ describe("ResponsesAgentExecutor", () => {
 		expect(error).toBeInstanceOf(AgentExecutionError);
 		expect(error.reasonCode).toBe("BROWSER_TOOL_UNAVAILABLE");
 		expect(error.retryable).toBe(true);
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{
+				turn: 1,
+				toolName: "observe",
+				stage: "driver_connect",
+				resultCode: "UNKNOWN",
+			},
+		]);
 	});
 
 	test("does not retry a browser document that exceeds the safe Worker cap", async () => {
@@ -777,6 +808,14 @@ describe("ResponsesAgentExecutor", () => {
 		expect(error).toBeInstanceOf(AgentExecutionError);
 		expect(error.reasonCode).toBe("BROWSER_PAYLOAD_TOO_LARGE");
 		expect(error.retryable).toBe(false);
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{
+				turn: 1,
+				toolName: "observe",
+				stage: "driver_connect",
+				resultCode: "PAYLOAD_TOO_LARGE",
+			},
+		]);
 	});
 
 	test("waits for an active browser operation to stop after abort", async () => {
@@ -1084,8 +1123,33 @@ describe("ResponsesAgentExecutor", () => {
 				}),
 			]),
 		});
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{
+				turn: 1,
+				toolName: "finish",
+				stage: "finish_validation",
+				resultCode: "FINISH_FORM_URL_NOT_ALLOWED",
+			},
+			{
+				turn: 2,
+				toolName: "finish",
+				stage: "finish_validation",
+				resultCode: "OK",
+			},
+		]);
 	});
 });
+
+async function readAgentToolDiagnostics(
+	jobId: string,
+): Promise<Array<Record<string, unknown>>> {
+	const { results } = await env.DB.prepare(
+		"SELECT data_json FROM events WHERE job_id = ? AND type = 'agent.tool_diagnostic' ORDER BY CAST(json_extract(data_json, '$.turn') AS INTEGER)",
+	)
+		.bind(jobId)
+		.all<{ data_json: string }>();
+	return results.map((row) => JSON.parse(row.data_json));
+}
 
 function functionResponse(
 	callId: string,

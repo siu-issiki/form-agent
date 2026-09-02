@@ -33,6 +33,61 @@ interface JobRow extends StoredJobRow {
 
 type QuerySource = Pick<D1Database, "prepare">;
 
+export type AgentToolDiagnosticToolName =
+	| "navigate"
+	| "observe"
+	| "click"
+	| "fill"
+	| "select"
+	| "submit"
+	| "finish"
+	| "unknown";
+
+export type AgentToolDiagnosticStage =
+	| "input_parse"
+	| "finish_validation"
+	| "tool_dispatch"
+	| "driver_connect"
+	| "scope_setup"
+	| "bootstrap_navigate"
+	| "navigate"
+	| "observe"
+	| "click"
+	| "fill"
+	| "select"
+	| "submit"
+	| "submit_validate";
+
+export type AgentToolDiagnosticCode =
+	| "OK"
+	| "INVALID_TOOL_INPUT"
+	| "UNKNOWN_TOOL"
+	| "DRY_RUN_COMPLETE"
+	| "FINISH_FIELDS_INVALID"
+	| "FINISH_FORM_URL_NOT_ALLOWED"
+	| "FINISH_OUTCOME_INVALID"
+	| "SUBMIT_RESULT_NOT_PERSISTED"
+	| "JOB_STATE_CONFLICT"
+	| "CDP_CONNECTION_FAILED"
+	| "CDP_CONNECTION_CLOSED"
+	| "CDP_COMMAND_TIMEOUT"
+	| "CDP_COMMAND_SEND_FAILED"
+	| "CDP_COMMAND_FAILED"
+	| "CDP_ENDPOINT_INVALID"
+	| "BROWSER_CREDENTIALS_MISSING"
+	| "SCOPE_CONFIGURATION_FAILED"
+	| "NAVIGATION_FAILED"
+	| "PAGE_NOT_READY"
+	| "DOM_DISCOVERY_FAILED"
+	| "PAGE_EVALUATION_FAILED"
+	| "PAYLOAD_TOO_LARGE"
+	| "ELEMENT_UNAVAILABLE"
+	| "NAVIGATION_POLICY"
+	| "TOOL_INPUT_INVALID"
+	| "SUBMISSION_NOT_AUTHORIZED"
+	| "SUBMISSION_RESULT_UNCERTAIN"
+	| "UNKNOWN";
+
 export class D1JobStore implements JobStore {
 	constructor(private readonly db: D1Database) {}
 
@@ -180,6 +235,44 @@ export class D1JobStore implements JobStore {
 				reasonCode,
 				source,
 				durationMs,
+				now,
+				id,
+				runToken,
+			)
+			.run();
+
+		return result.meta.changes === 1;
+	}
+
+	async recordAgentToolDiagnostic(
+		id: string,
+		runToken: string,
+		turn: number,
+		toolName: AgentToolDiagnosticToolName,
+		stage: AgentToolDiagnosticStage,
+		resultCode: AgentToolDiagnosticCode,
+		now: string,
+	): Promise<boolean> {
+		const result = await this.db
+			.prepare(
+				`INSERT INTO events (
+          id, job_id, attempt, type, data_json, created_at
+        )
+        SELECT ?, id, attempt_count, 'agent.tool_diagnostic', json_object(
+          'turn', ?,
+          'toolName', ?,
+          'stage', ?,
+          'resultCode', ?
+        ), ?
+        FROM jobs
+        WHERE id = ? AND status = 'running' AND run_token = ?`,
+			)
+			.bind(
+				crypto.randomUUID(),
+				turn,
+				toolName,
+				stage,
+				resultCode,
 				now,
 				id,
 				runToken,
