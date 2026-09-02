@@ -6,6 +6,7 @@ import {
 	NavigationPolicyError,
 	RestrictedBrowserTools,
 } from "../src/restricted-browser";
+import { InMemoryEvidenceObjectStore } from "../src/submission-evidence";
 
 const targetUrl = "https://www.selenium.dev/selenium/web/web-form.html";
 const job: Job = {
@@ -53,6 +54,7 @@ describe("BrowserUseCdpDriver real CDP smoke", () => {
 				store,
 				job.id,
 				job.runToken ?? "",
+				new InMemoryEvidenceObjectStore(),
 			);
 			await tools.navigate(targetUrl);
 

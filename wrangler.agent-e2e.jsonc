@@ -12,6 +12,12 @@
       "migrations_dir": "migrations"
     }
   ],
+  "r2_buckets": [
+    {
+      "binding": "EVIDENCE_BUCKET",
+      "bucket_name": "form-agent-evidence-e2e"
+    }
+  ],
   "queues": {
     "producers": [
       {

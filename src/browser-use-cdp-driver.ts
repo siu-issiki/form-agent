@@ -1,6 +1,9 @@
 import { assertAllowedBrowserRequest } from "./browser-network-policy";
 import { SUBMISSION_CONFIRMATION_PATTERN } from "./browser-submit-confirmation";
-import { BrowserUseCdpConnection } from "./browser-use-cdp";
+import {
+	BrowserUseCdpConnection,
+	BrowserUseCdpPayloadTooLargeError,
+} from "./browser-use-cdp";
 import {
 	type CdpDomNode,
 	type CdpFormDiscovery,
@@ -221,6 +224,12 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 
 	currentUrl(): Promise<string> {
 		return this.#evaluate<string>("location.href");
+	}
+
+	captureScreenshot(): Promise<Uint8Array> {
+		return captureCdpScreenshot((params) =>
+			this.#send<CdpScreenshotResult>("Page.captureScreenshot", params),
+		);
 	}
 
 	async navigate(url: string): Promise<void> {
@@ -1192,6 +1201,63 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 		return this.connection.send<TResult>(method, params, this.sessionId);
 	}
+}
+
+export interface CdpScreenshotResult {
+	data?: string;
+}
+
+export const SCREENSHOT_PARAMS = {
+	format: "jpeg",
+	quality: 80,
+	captureBeyondViewport: true,
+	fromSurface: true,
+} as const;
+
+/**
+ * Captures the visible page as JPEG. A payload that exceeds the CDP message
+ * limit is retried once within the viewport only. Every failure is reported as
+ * the same opaque error so that no page content leaks through the message.
+ */
+export async function captureCdpScreenshot(
+	send: (params: Record<string, unknown>) => Promise<CdpScreenshotResult>,
+): Promise<Uint8Array> {
+	let result: CdpScreenshotResult;
+	try {
+		result = await send({ ...SCREENSHOT_PARAMS });
+	} catch (error) {
+		if (!(error instanceof BrowserUseCdpPayloadTooLargeError)) {
+			throw new Error("Browser screenshot failed");
+		}
+		try {
+			result = await send({
+				...SCREENSHOT_PARAMS,
+				captureBeyondViewport: false,
+			});
+		} catch {
+			throw new Error("Browser screenshot failed");
+		}
+	}
+
+	let bytes: Uint8Array;
+	try {
+		bytes = decodeBase64(result.data ?? "");
+	} catch {
+		throw new Error("Browser screenshot failed");
+	}
+	if (bytes.byteLength === 0) {
+		throw new Error("Browser screenshot failed");
+	}
+	return bytes;
+}
+
+export function decodeBase64(value: string): Uint8Array {
+	const binary = atob(value);
+	const bytes = new Uint8Array(binary.length);
+	for (let index = 0; index < binary.length; index += 1) {
+		bytes[index] = binary.charCodeAt(index);
+	}
+	return bytes;
 }
 
 export function createSubmitActivationFailureLog(

@@ -10,10 +10,17 @@ import {
 	NavigationPolicyError,
 	type RestrictedBrowserDriver,
 	RestrictedBrowserTools,
+	SubmissionEvidenceError,
 	SubmissionNotAuthorizedError,
 	SubmissionResultUncertainError,
 	type SubmitActivationStrategy,
 } from "../src/restricted-browser";
+import {
+	type EvidenceStage,
+	evidenceObjectKey,
+	InMemoryEvidenceObjectStore,
+	sha256Hex,
+} from "../src/submission-evidence";
 
 const input: JobInput = {
 	id: "job-001",
@@ -116,6 +123,7 @@ describe("RestrictedBrowserTools", () => {
 			store,
 			externalInput.id,
 			"run-token-1",
+			new InMemoryEvidenceObjectStore(),
 		);
 
 		await tools.navigate("https://docs.google.com/forms/example");
@@ -170,6 +178,7 @@ describe("RestrictedBrowserTools", () => {
 			store,
 			input.id,
 			"run-token-1",
+			new InMemoryEvidenceObjectStore(),
 			() => "2026-08-28T00:00:02.000Z",
 		);
 		await tools.fill("fa-0-0", "Hello");
@@ -212,7 +221,13 @@ describe("RestrictedBrowserTools", () => {
 		const store = new InMemoryJobStore();
 		await store.create(input, "2026-08-28T00:00:00.000Z");
 		await expect(
-			RestrictedBrowserTools.create(driver, store, input.id, "run-token-1"),
+			RestrictedBrowserTools.create(
+				driver,
+				store,
+				input.id,
+				"run-token-1",
+				new InMemoryEvidenceObjectStore(),
+			),
 		).rejects.toBeInstanceOf(SubmissionNotAuthorizedError);
 		expect(driver.submitCount).toBe(0);
 	});
@@ -228,6 +243,7 @@ describe("RestrictedBrowserTools", () => {
 			store,
 			input.id,
 			"run-token-1",
+			new InMemoryEvidenceObjectStore(),
 		);
 		await tools.fill("fa-0-0", "Hello");
 
@@ -248,6 +264,7 @@ describe("RestrictedBrowserTools", () => {
 			store,
 			input.id,
 			"run-token-1",
+			new InMemoryEvidenceObjectStore(),
 			() => "2026-08-28T00:00:02.000Z",
 		);
 		await tools.fill("fa-0-0", "Hello");
@@ -281,6 +298,7 @@ describe("RestrictedBrowserTools", () => {
 			store,
 			input.id,
 			"run-token-1",
+			new InMemoryEvidenceObjectStore(),
 		);
 		await tools.fill("fa-0-0", "Hello");
 
@@ -324,7 +342,13 @@ describe("RestrictedBrowserTools", () => {
 		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
 
 		await expect(
-			RestrictedBrowserTools.create(driver, store, input.id, "run-token-1"),
+			RestrictedBrowserTools.create(
+				driver,
+				store,
+				input.id,
+				"run-token-1",
+				new InMemoryEvidenceObjectStore(),
+			),
 		).rejects.toBeInstanceOf(NavigationPolicyError);
 	});
 
@@ -342,6 +366,7 @@ describe("RestrictedBrowserTools", () => {
 			store,
 			input.id,
 			"run-token-1",
+			new InMemoryEvidenceObjectStore(),
 		);
 
 		driver.redirectTo = "https://acme.co.jp/contact";
@@ -360,7 +385,13 @@ describe("RestrictedBrowserTools", () => {
 		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
 
 		await expect(
-			RestrictedBrowserTools.create(driver, store, input.id, "run-token-1"),
+			RestrictedBrowserTools.create(
+				driver,
+				store,
+				input.id,
+				"run-token-1",
+				new InMemoryEvidenceObjectStore(),
+			),
 		).rejects.toBeInstanceOf(NavigationPolicyError);
 	});
 
@@ -381,7 +412,13 @@ describe("RestrictedBrowserTools", () => {
 			await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
 
 			await expect(
-				RestrictedBrowserTools.create(driver, store, input.id, "run-token-1"),
+				RestrictedBrowserTools.create(
+					driver,
+					store,
+					input.id,
+					"run-token-1",
+					new InMemoryEvidenceObjectStore(),
+				),
 			).rejects.toBeInstanceOf(NavigationPolicyError);
 		}
 	});
@@ -400,6 +437,7 @@ describe("RestrictedBrowserTools", () => {
 			store,
 			input.id,
 			"run-token-1",
+			new InMemoryEvidenceObjectStore(),
 		);
 		await tools.fill("fa-0-0", "Hello");
 
@@ -410,7 +448,152 @@ describe("RestrictedBrowserTools", () => {
 		expect(persisted?.status).toBe("uncertain");
 		expect(persisted?.result?.reasonCode).toBe("SUBMIT_TARGET_INVALID");
 	});
+
+	test("captures evidence before and after a successful submission", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const tools = await createToolsWithEvidence(driver, store, evidence);
+		await tools.fill("fa-0-0", "Hello");
+
+		const sent = await tools.submit("fa-0-1", "mouse");
+
+		expect(sent.status).toBe("sent");
+		expect(store.events.map((event) => [event.type, event.data.stage])).toEqual(
+			[
+				["evidence.captured", "before_submit"],
+				["evidence.captured", "after_submit"],
+			],
+		);
+		expect(evidence.objects.size).toBe(2);
+		for (const event of store.events) {
+			expect(event.attempt).toBe(1);
+			const objectKey = event.data.objectKey as string;
+			expect(objectKey).toBe(
+				evidenceObjectKey(
+					input.id,
+					event.data.stage as EvidenceStage,
+					event.data.eventId as string,
+				),
+			);
+			const object = evidence.objects.get(objectKey);
+			if (!object) throw new Error("Expected a stored evidence object");
+			expect(object.contentType).toBe("image/jpeg");
+			expect(event.data.byteLength).toBe(object.body.byteLength);
+			expect(event.data.sha256).toBe(await sha256Hex(object.body));
+		}
+	});
+
+	test("does not submit when the evidence before submission fails", async () => {
+		const driver = new FakeDriver();
+		driver.failScreenshotAt = 1;
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const tools = await createToolsWithEvidence(driver, store, evidence);
+		await tools.fill("fa-0-0", "Hello");
+
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			SubmissionEvidenceError,
+		);
+
+		expect((await store.find(input.id))?.status).toBe("running");
+		expect(driver.submitCount).toBe(0);
+		expect(evidence.objects.size).toBe(0);
+		expect(store.events).toEqual([
+			{
+				jobId: input.id,
+				attempt: 1,
+				type: "evidence.capture_failed",
+				data: { stage: "before_submit", failureCode: "SCREENSHOT_FAILED" },
+			},
+		]);
+	});
+
+	test("keeps the sent result when the evidence after submission fails", async () => {
+		const driver = new FakeDriver();
+		driver.failScreenshotAt = 2;
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const tools = await createToolsWithEvidence(driver, store, evidence);
+		await tools.fill("fa-0-0", "Hello");
+
+		const sent = await tools.submit("fa-0-1");
+
+		expect(sent.status).toBe("sent");
+		expect(driver.submitCount).toBe(1);
+		expect(evidence.objects.size).toBe(1);
+		expect(
+			store.events.map((event) => [
+				event.type,
+				event.data.stage,
+				event.data.failureCode,
+			]),
+		).toEqual([
+			["evidence.captured", "before_submit", undefined],
+			["evidence.capture_failed", "after_submit", "SCREENSHOT_FAILED"],
+		]);
+	});
+
+	test("captures evidence after a browser submit failure", async () => {
+		const driver = new FakeDriver();
+		driver.submitError = new Error("connection lost");
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const tools = await createToolsWithEvidence(driver, store, evidence);
+		await tools.fill("fa-0-0", "Hello");
+
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			SubmissionResultUncertainError,
+		);
+
+		expect((await store.find(input.id))?.status).toBe("uncertain");
+		expect(driver.screenshotCount).toBe(2);
+		expect(store.events.map((event) => event.data.stage)).toEqual([
+			"before_submit",
+			"after_submit",
+		]);
+		expect(evidence.objects.size).toBe(2);
+	});
+
+	test("captures evidence after an uncertain browser submit result", async () => {
+		const driver = new FakeDriver();
+		driver.submitResult = {
+			outcome: "uncertain",
+			reasonCode: "SUBMIT_CONFIRMATION_MISSING",
+			reason: "The page did not provide a reliable submission confirmation.",
+		};
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const tools = await createToolsWithEvidence(driver, store, evidence);
+		await tools.fill("fa-0-0", "Hello");
+
+		const uncertain = await tools.submit("fa-0-1");
+
+		expect(uncertain.status).toBe("uncertain");
+		expect(store.events.map((event) => event.data.stage)).toEqual([
+			"before_submit",
+			"after_submit",
+		]);
+		expect(evidence.objects.size).toBe(2);
+	});
 });
+
+async function createToolsWithEvidence(
+	driver: FakeDriver,
+	store: InMemoryJobStore,
+	evidence: InMemoryEvidenceObjectStore,
+): Promise<RestrictedBrowserTools> {
+	await store.create(input, "2026-08-28T00:00:00.000Z");
+	await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+	return RestrictedBrowserTools.create(
+		driver,
+		store,
+		input.id,
+		"run-token-1",
+		evidence,
+		() => "2026-08-28T00:00:02.000Z",
+	);
+}
 
 async function createTools(
 	driver: FakeDriver,
@@ -418,7 +601,13 @@ async function createTools(
 	const store = new InMemoryJobStore();
 	await store.create(input, "2026-08-28T00:00:00.000Z");
 	await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
-	return RestrictedBrowserTools.create(driver, store, input.id, "run-token-1");
+	return RestrictedBrowserTools.create(
+		driver,
+		store,
+		input.id,
+		"run-token-1",
+		new InMemoryEvidenceObjectStore(),
+	);
 }
 
 class FakeDriver implements RestrictedBrowserDriver {
@@ -429,6 +618,8 @@ class FakeDriver implements RestrictedBrowserDriver {
 	submitActivationStrategies: SubmitActivationStrategy[] = [];
 	submitError: Error | null = null;
 	submitValidationError: Error | null = null;
+	screenshotCount = 0;
+	failScreenshotAt: number | null = null;
 	navigationLinks: Array<{ url: string; text: string }> | undefined;
 	submitResult: BrowserSubmitResult = {
 		outcome: "sent",
@@ -462,6 +653,14 @@ class FakeDriver implements RestrictedBrowserDriver {
 	async fill(): Promise<void> {}
 
 	async select(): Promise<void> {}
+
+	async captureScreenshot(): Promise<Uint8Array> {
+		this.screenshotCount += 1;
+		if (this.failScreenshotAt === this.screenshotCount) {
+			throw new Error("Browser screenshot failed");
+		}
+		return new Uint8Array([this.screenshotCount, 2, 3]);
+	}
 
 	async validateSubmit(): Promise<void> {
 		if (this.submitValidationError) {

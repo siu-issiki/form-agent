@@ -59,6 +59,12 @@ deploymentが1つのversionへ100%配信されていること、そのactive ver
 
 ## 初回実送信切替
 
+証跡スクリーンショット機能のdeploy前提として、R2バケットを作成しておく。バケットが存在しない場合、deployは失敗する。
+
+```bash
+./node_modules/.bin/wrangler r2 bucket create form-agent-evidence
+```
+
 1. Queue配送をpauseする。
 2. D1の`pending` / `running` / `submitting`が0件であることを確認する。
 3. 通常設定をdeployする。
@@ -106,14 +112,40 @@ D1 migrationはWorker deployでは自動適用されない。新しい列を参�
 
 完全な`target_url`、`form_url`、自由文の`reason`は一括出力しない。query tokenやフォーム値を含む可能性があるため、必要な場合だけ対象IDを限定し、標準出力の保存先と閲覧者を確認して取得する。
 
+まず対象ジョブのD1 `evidence.captured`イベントを取得し、`after_submit`のスクリーンショットが記録されているかを確認する。取得手順は次節「証跡スクリーンショットの確認」を参照する。
+
 次の外部証跡を照合する。
 
-1. 送信先の受信ログ、管理画面または受信メール
-2. 対象URLと送信時刻
-3. `browser_submit_activation`の`requestObserved`と`hitTestAttempts`
-4. D1の`attempt_count`と結果
+1. 証跡スクリーンショット（`after_submit`）
+2. 送信先の受信ログ、管理画面または受信メール
+3. 対象URLと送信時刻
+4. `browser_submit_activation`の`requestObserved`と`hitTestAttempts`
+5. D1の`attempt_count`と結果
 
 送信済みの可能性を否定できない場合は再投入しない。未送信と判断して再実行する場合も、既存IDは変更せず、承認記録と新しいジョブIDを使用する。
+
+## 証跡スクリーンショットの確認
+
+対象ジョブの証跡イベントをD1から取得する。
+
+```bash
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT id, attempt, type, data_json, created_at FROM events WHERE job_id = '<JOB_ID>' AND type LIKE 'evidence.%' ORDER BY created_at;"
+```
+
+`evidence.captured`の`data_json`に含まれる`objectKey`を使い、R2から画像を取得する。
+
+```bash
+./node_modules/.bin/wrangler r2 object get form-agent-evidence/<objectKey> --file ./evidence.jpg --remote
+```
+
+取得したファイルのハッシュを計算し、`data_json`の`sha256`と一致することを確認する。
+
+```bash
+shasum -a 256 ./evidence.jpg
+```
+
+画像には入力済みの個人情報が写る。確認後は取得したファイルを削除し、共有しない。R2側にはライフサイクル削除ルールを設定していないため、証跡スクリーンショットはR2上に無期限に残り続ける。この方針は運用ポリシー確定時に見直す。
 
 ## DLQの確認
 

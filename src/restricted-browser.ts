@@ -1,5 +1,10 @@
 import { parse } from "tldts";
 import type { Job, JobStore } from "./job";
+import {
+	type EvidenceCaptureResult,
+	type EvidenceObjectStore,
+	SubmissionEvidenceRecorder,
+} from "./submission-evidence";
 
 export interface BrowserObservation {
 	url: string;
@@ -31,6 +36,7 @@ export interface RestrictedBrowserDriver {
 	fill(elementId: string, value: string): Promise<void>;
 	select(elementId: string, value: string): Promise<void>;
 	validateSubmit(elementId: string): Promise<void>;
+	captureScreenshot(): Promise<Uint8Array>;
 	submit(
 		elementId: string,
 		activationStrategy: SubmitActivationStrategy,
@@ -62,6 +68,13 @@ export class SubmissionNotAuthorizedError extends Error {
 	constructor() {
 		super("The job did not grant submission permission");
 		this.name = "SubmissionNotAuthorizedError";
+	}
+}
+
+export class SubmissionEvidenceError extends Error {
+	constructor() {
+		super("The submission evidence could not be captured before submission");
+		this.name = "SubmissionEvidenceError";
 	}
 }
 
@@ -120,6 +133,7 @@ export class RestrictedBrowserTools {
 		private readonly jobs: JobStore,
 		private readonly jobId: string,
 		private readonly runToken: string,
+		private readonly recorder: SubmissionEvidenceRecorder,
 		targetDomain: string,
 		allowedHosts: readonly string[],
 		private readonly now: () => string = () => new Date().toISOString(),
@@ -133,6 +147,7 @@ export class RestrictedBrowserTools {
 		jobs: JobStore,
 		jobId: string,
 		runToken: string,
+		evidenceStore: EvidenceObjectStore,
 		now: () => string = () => new Date().toISOString(),
 	): Promise<RestrictedBrowserTools> {
 		const job = await jobs.find(jobId);
@@ -149,10 +164,22 @@ export class RestrictedBrowserTools {
 			jobs,
 			jobId,
 			runToken,
+			new SubmissionEvidenceRecorder(
+				driver,
+				evidenceStore,
+				jobs,
+				jobId,
+				runToken,
+				now,
+			),
 			targetDomain,
 			allowedHosts,
 			now,
 		);
+	}
+
+	captureEvidence(stage: "prohibited"): Promise<EvidenceCaptureResult> {
+		return this.recorder.capture(stage);
 	}
 
 	async navigate(url: string): Promise<void> {
@@ -216,6 +243,12 @@ export class RestrictedBrowserTools {
 		await this.validateSubmit(elementId);
 		this.#submitAttempted = true;
 
+		// Nothing is submitted until the pre-submission evidence exists.
+		const before = await this.recorder.capture("before_submit");
+		if (!before.captured) {
+			throw new SubmissionEvidenceError();
+		}
+
 		const authorized = await this.jobs.claimSubmission(
 			this.jobId,
 			this.runToken,
@@ -232,14 +265,20 @@ export class RestrictedBrowserTools {
 			throw new SubmissionNotAuthorizedError();
 		}
 
-		let result: BrowserSubmitResult;
+		let result: BrowserSubmitResult | undefined;
+		let submitError: unknown;
 		try {
 			result = await this.driver.submit(elementId, activationStrategy);
 		} catch (error) {
+			submitError = error;
+		}
+		// The post-submission evidence is best effort and never changes the result.
+		await this.recorder.capture("after_submit");
+		if (submitError !== undefined || !result) {
 			const diagnostic =
-				error instanceof BrowserSubmitDiagnosticError
-					? error
-					: createBrowserSubmitDiagnosticError("SUBMIT_OPERATION", error);
+				submitError instanceof BrowserSubmitDiagnosticError
+					? submitError
+					: createBrowserSubmitDiagnosticError("SUBMIT_OPERATION", submitError);
 			await this.#recordUncertain(
 				"SUBMIT_RESULT_UNKNOWN",
 				submitFailureReason(diagnostic),

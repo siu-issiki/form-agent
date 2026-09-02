@@ -25,6 +25,7 @@ import {
 	type RestrictedBrowserDriver,
 	type SubmitActivationStrategy,
 } from "../src/restricted-browser";
+import { R2EvidenceObjectStore } from "../src/submission-evidence";
 import worker, {
 	consumeJobBatch,
 	handleHttpRequest,
@@ -157,6 +158,106 @@ describe("D1JobStore", () => {
 			.first<{ provider_request_count: number }>();
 		expect(counter?.provider_request_count).toBe(1);
 	});
+
+	test("records evidence events only for the current run token", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+
+		const captured = await store.recordEvidenceCaptured(
+			input.id,
+			"run-token-1",
+			"event-001",
+			"before_submit",
+			"jobs/job-001/before_submit/event-001.jpg",
+			"a".repeat(64),
+			2_048,
+			"2026-08-28T00:00:02.000Z",
+		);
+		const failed = await store.recordEvidenceCaptureFailed(
+			input.id,
+			"run-token-1",
+			"after_submit",
+			"OBJECT_STORE_FAILED",
+			"2026-08-28T00:00:03.000Z",
+		);
+		const otherRun = await store.recordEvidenceCaptured(
+			input.id,
+			"run-token-2",
+			"event-002",
+			"prohibited",
+			"jobs/job-001/prohibited/event-002.jpg",
+			"b".repeat(64),
+			1_024,
+			"2026-08-28T00:00:04.000Z",
+		);
+		const otherRunFailure = await store.recordEvidenceCaptureFailed(
+			input.id,
+			"run-token-2",
+			"prohibited",
+			"NO_BROWSER_SESSION",
+			"2026-08-28T00:00:05.000Z",
+		);
+
+		expect(captured).toBe(true);
+		expect(failed).toBe(true);
+		expect(otherRun).toBe(false);
+		expect(otherRunFailure).toBe(false);
+		expect(await readEvidenceEvents(input.id)).toEqual([
+			{
+				type: "evidence.captured",
+				attempt: 1,
+				data: {
+					stage: "before_submit",
+					objectKey: "jobs/job-001/before_submit/event-001.jpg",
+					sha256: "a".repeat(64),
+					byteLength: 2_048,
+					contentType: "image/jpeg",
+				},
+			},
+			{
+				type: "evidence.capture_failed",
+				attempt: 1,
+				data: { stage: "after_submit", failureCode: "OBJECT_STORE_FAILED" },
+			},
+		]);
+	});
+
+	test("stops recording evidence once the job reaches a terminal state", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		await store.recordProhibited(
+			input.id,
+			"run-token-1",
+			null,
+			"SALES_PROHIBITED",
+			"The page prohibits sales outreach.",
+			"2026-08-28T00:00:02.000Z",
+		);
+
+		const captured = await store.recordEvidenceCaptured(
+			input.id,
+			"run-token-1",
+			"event-003",
+			"prohibited",
+			"jobs/job-001/prohibited/event-003.jpg",
+			"c".repeat(64),
+			512,
+			"2026-08-28T00:00:03.000Z",
+		);
+		const failed = await store.recordEvidenceCaptureFailed(
+			input.id,
+			"run-token-1",
+			"prohibited",
+			"SCREENSHOT_FAILED",
+			"2026-08-28T00:00:04.000Z",
+		);
+
+		expect(captured).toBe(false);
+		expect(failed).toBe(false);
+		expect(await readEvidenceEvents(input.id)).toEqual([]);
+	});
 });
 
 describe("Job HTTP API", () => {
@@ -164,6 +265,7 @@ describe("Job HTTP API", () => {
 	const queued: JobMessage[] = [];
 	const apiEnv = {
 		DB: env.DB,
+		EVIDENCE_BUCKET: env.EVIDENCE_BUCKET,
 		JOB_API_TOKEN: apiToken,
 		JOB_QUEUE: {
 			async send(message: JobMessage) {
@@ -444,7 +546,11 @@ describe("Job HTTP API", () => {
 	test("fails closed when the API token is not configured", async () => {
 		const response = await handleHttpRequest(
 			jobRequest("GET", `/jobs/${input.id}`, undefined, apiToken),
-			{ DB: apiEnv.DB, JOB_QUEUE: apiEnv.JOB_QUEUE },
+			{
+				DB: apiEnv.DB,
+				EVIDENCE_BUCKET: apiEnv.EVIDENCE_BUCKET,
+				JOB_QUEUE: apiEnv.JOB_QUEUE,
+			},
 		);
 
 		expect(response.status).toBe(401);
@@ -493,10 +599,14 @@ describe("BrowserToolCoordinator", () => {
 		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
 		const driver = new WorkerFakeBrowserDriver();
 		let createCount = 0;
-		const coordinator = new BrowserToolCoordinator(env.DB, async () => {
-			createCount += 1;
-			return driver;
-		});
+		const coordinator = new BrowserToolCoordinator(
+			env.DB,
+			async () => {
+				createCount += 1;
+				return driver;
+			},
+			new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+		);
 
 		const observed = await coordinator.execute(
 			input.id,
@@ -537,7 +647,11 @@ describe("BrowserToolCoordinator", () => {
 		await store.create(input, "2026-08-28T00:00:00.000Z");
 		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
 		const driver = new WorkerFakeBrowserDriver();
-		const coordinator = new BrowserToolCoordinator(env.DB, async () => driver);
+		const coordinator = new BrowserToolCoordinator(
+			env.DB,
+			async () => driver,
+			new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+		);
 		await coordinator.execute(input.id, "run-token-1", "fill", {
 			elementId: "fa-0-0",
 			payloadKey: "message",
@@ -571,6 +685,7 @@ describe("BrowserToolCoordinator", () => {
 		const coordinator = new BrowserToolCoordinator(
 			env.DB,
 			async () => new WorkerFakeBrowserDriver(),
+			new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 		);
 
 		await expect(
@@ -593,6 +708,80 @@ describe("BrowserToolCoordinator", () => {
 		).rejects.toBeInstanceOf(BrowserToolInputError);
 		await coordinator.close();
 	});
+
+	test("captures prohibited evidence for the active browser session", async () => {
+		const jobInput = { ...input, id: "job-evidence-session" };
+		const store = new D1JobStore(env.DB);
+		await store.create(jobInput, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(
+			jobInput.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		const driver = new WorkerFakeBrowserDriver();
+		const coordinator = new BrowserToolCoordinator(
+			env.DB,
+			async () => driver,
+			new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+		);
+		await coordinator.execute(jobInput.id, "run-token-1", "observe", {});
+
+		await coordinator.captureEvidence(jobInput.id, "run-token-1", "prohibited");
+		await coordinator.close();
+
+		const events = await readEvidenceEvents(jobInput.id);
+		expect(events).toHaveLength(1);
+		const event = events[0];
+		expect(event?.type).toBe("evidence.captured");
+		expect(event?.data.stage).toBe("prohibited");
+		expect(event?.data.contentType).toBe("image/jpeg");
+		expect(event?.data.byteLength).toBe(3);
+		const objectKey = String(event?.data.objectKey);
+		expect(objectKey).toMatch(
+			new RegExp(`^jobs/${jobInput.id}/prohibited/[0-9a-f-]{36}\\.jpg$`),
+		);
+		const object = await env.EVIDENCE_BUCKET.get(objectKey);
+		expect(object?.size).toBe(3);
+		expect(object?.httpMetadata?.contentType).toBe("image/jpeg");
+		expect(driver.screenshotCount).toBe(1);
+		expect((await store.find(jobInput.id))?.status).toBe("running");
+	});
+
+	test("records a missing browser session without creating a driver", async () => {
+		const jobInput = { ...input, id: "job-evidence-no-session" };
+		const store = new D1JobStore(env.DB);
+		await store.create(jobInput, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(
+			jobInput.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		let createCount = 0;
+		const coordinator = new BrowserToolCoordinator(
+			env.DB,
+			async () => {
+				createCount += 1;
+				return new WorkerFakeBrowserDriver();
+			},
+			new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+		);
+
+		await coordinator.captureEvidence(jobInput.id, "run-token-1", "prohibited");
+		await coordinator.close();
+
+		expect(createCount).toBe(0);
+		expect(await readEvidenceEvents(jobInput.id)).toEqual([
+			{
+				type: "evidence.capture_failed",
+				attempt: 1,
+				data: { stage: "prohibited", failureCode: "NO_BROWSER_SESSION" },
+			},
+		]);
+		const stored = await env.EVIDENCE_BUCKET.list({
+			prefix: `jobs/${jobInput.id}/`,
+		});
+		expect(stored.objects).toEqual([]);
+	});
 });
 
 class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
@@ -603,6 +792,8 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	requireObservationForSubmit = false;
 	validateSubmitCount = 0;
 	submitCount = 0;
+	screenshotCount = 0;
+	screenshotError: Error | null = null;
 	submitActivationStrategies: SubmitActivationStrategy[] = [];
 	filledValues: string[] = [];
 
@@ -632,6 +823,11 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 		if (this.requireObservationForSubmit && !this.observed) {
 			throw new BrowserElementError();
 		}
+	}
+	async captureScreenshot(): Promise<Uint8Array> {
+		this.screenshotCount += 1;
+		if (this.screenshotError) throw this.screenshotError;
+		return new Uint8Array([this.screenshotCount, 2, 3]);
 	}
 	async submit(
 		_elementId: string,
@@ -680,6 +876,7 @@ describe("ResponsesAgentExecutor", () => {
 		driver.requireObservationForSubmit = true;
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
@@ -799,6 +996,7 @@ describe("ResponsesAgentExecutor", () => {
 		driver.requireObservationForSubmit = true;
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
@@ -837,6 +1035,7 @@ describe("ResponsesAgentExecutor", () => {
 			if (!job) throw new Error("Expected a claimed job");
 			const executor = new ResponsesAgentExecutor({
 				db: env.DB,
+				evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 				model: "gpt-5.6-luna",
 				openAiApiKey: "openai-secret",
 				browserUseApiKey: "browser-secret",
@@ -868,6 +1067,7 @@ describe("ResponsesAgentExecutor", () => {
 		if (!job) throw new Error("Expected a claimed job");
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
@@ -911,6 +1111,7 @@ describe("ResponsesAgentExecutor", () => {
 		if (!job) throw new Error("Expected a claimed job");
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
@@ -971,6 +1172,7 @@ describe("ResponsesAgentExecutor", () => {
 		};
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
@@ -1036,6 +1238,7 @@ describe("ResponsesAgentExecutor", () => {
 		const driver = new WorkerFakeBrowserDriver();
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
@@ -1098,6 +1301,7 @@ describe("ResponsesAgentExecutor", () => {
 		if (!job) throw new Error("Expected a claimed job");
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
@@ -1152,6 +1356,7 @@ describe("ResponsesAgentExecutor", () => {
 		];
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
@@ -1214,6 +1419,7 @@ describe("ResponsesAgentExecutor", () => {
 		};
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
@@ -1269,6 +1475,7 @@ describe("ResponsesAgentExecutor", () => {
 		];
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
@@ -1329,6 +1536,7 @@ describe("ResponsesAgentExecutor", () => {
 		];
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
@@ -1395,6 +1603,7 @@ describe("ResponsesAgentExecutor", () => {
 		const requests: unknown[] = [];
 		const executor = new ResponsesAgentExecutor({
 			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 			model: "gpt-5.6-luna",
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
@@ -1441,7 +1650,136 @@ describe("ResponsesAgentExecutor", () => {
 			},
 		]);
 	});
+
+	test("captures evidence when the agent finishes with a prohibited outcome", async () => {
+		const jobInput = { ...input, id: "job-evidence-prohibited" };
+		const store = new D1JobStore(env.DB);
+		await store.create(jobInput, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			jobInput.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-finish", "finish", {
+				outcome: "prohibited",
+				formUrl: null,
+				reasonCode: "SALES_PROHIBITED",
+				reason: "The page prohibits sales outreach.",
+				retryable: null,
+			}),
+		];
+		const driver = new WorkerFakeBrowserDriver();
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () => {
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toEqual({
+			outcome: "prohibited",
+			formUrl: null,
+			reasonCode: "SALES_PROHIBITED",
+			reason: "The page prohibits sales outreach.",
+		});
+		expect(driver.screenshotCount).toBe(1);
+		const events = await readEvidenceEvents(jobInput.id);
+		expect(events).toHaveLength(1);
+		expect(events[0]?.type).toBe("evidence.captured");
+		expect(events[0]?.data.stage).toBe("prohibited");
+		const stored = await env.EVIDENCE_BUCKET.list({
+			prefix: `jobs/${jobInput.id}/prohibited/`,
+		});
+		expect(stored.objects).toHaveLength(1);
+	});
+
+	test("does not capture evidence for a dry-run submit", async () => {
+		const jobInput = { ...input, id: "job-evidence-dry-run" };
+		const store = new D1JobStore(env.DB);
+		const dryRunInput = {
+			...jobInput,
+			payload: { ...input.payload, _formAgentDryRun: true },
+		};
+		await store.create(dryRunInput, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			jobInput.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-fill", "fill", {
+				elementId: "fa-0-0",
+				payloadKey: "message",
+			}),
+			functionResponse("call-submit", "submit", {
+				elementId: "fa-0-1",
+				activationStrategy: "mouse",
+			}),
+		];
+		const driver = new WorkerFakeBrowserDriver();
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () => {
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toMatchObject({ reasonCode: "DRY_RUN_COMPLETE" });
+		expect(driver.submitCount).toBe(0);
+		expect(driver.screenshotCount).toBe(0);
+		expect(await readEvidenceEvents(jobInput.id)).toEqual([]);
+		const stored = await env.EVIDENCE_BUCKET.list({
+			prefix: `jobs/${jobInput.id}/`,
+		});
+		expect(stored.objects).toEqual([]);
+	});
 });
+
+async function readEvidenceEvents(
+	jobId: string,
+): Promise<
+	Array<{ type: string; attempt: number; data: Record<string, unknown> }>
+> {
+	const { results } = await env.DB.prepare(
+		"SELECT type, attempt, data_json FROM events WHERE job_id = ? AND type LIKE 'evidence.%' ORDER BY created_at, rowid",
+	)
+		.bind(jobId)
+		.all<{ type: string; attempt: number; data_json: string }>();
+	return results.map((row) => ({
+		type: row.type,
+		attempt: row.attempt,
+		data: JSON.parse(row.data_json) as Record<string, unknown>,
+	}));
+}
 
 async function readAgentToolDiagnostics(
 	jobId: string,

@@ -16,7 +16,9 @@ import {
 	assertDryRunNavigationAllowed,
 	assertExpectedSubmissionRequest,
 	BLOCK_BROWSER_ESCAPE_EXPRESSION,
+	type CdpScreenshotResult,
 	CHECK_FORM_VALIDITY_FUNCTION,
+	captureCdpScreenshot,
 	centerOfQuad,
 	continueSubmissionRequest,
 	createExpectedSubmissionRequest,
@@ -1054,5 +1056,71 @@ describe("BrowserUseCdpDriver submission confirmation", () => {
 				"The form was not submitted. Please correct the errors.",
 			),
 		).toBe(false);
+	});
+});
+
+describe("BrowserUseCdpDriver screenshot capture", () => {
+	test("captures a JPEG beyond the viewport and decodes the payload", async () => {
+		const requests: Array<Record<string, unknown>> = [];
+
+		const bytes = await captureCdpScreenshot(async (params) => {
+			requests.push(params);
+			return { data: btoa(String.fromCharCode(1, 2, 255)) };
+		});
+
+		expect(requests).toEqual([
+			{
+				format: "jpeg",
+				quality: 80,
+				captureBeyondViewport: true,
+				fromSurface: true,
+			},
+		]);
+		expect([...bytes]).toEqual([1, 2, 255]);
+	});
+
+	test("retries inside the viewport when the payload is too large", async () => {
+		const requests: Array<Record<string, unknown>> = [];
+
+		const bytes = await captureCdpScreenshot(async (params) => {
+			requests.push(params);
+			if (requests.length === 1) throw new BrowserUseCdpPayloadTooLargeError();
+			return { data: btoa("ok") };
+		});
+
+		expect(requests).toHaveLength(2);
+		expect(requests[1]).toEqual({
+			format: "jpeg",
+			quality: 80,
+			captureBeyondViewport: false,
+			fromSurface: true,
+		});
+		expect([...bytes]).toEqual([111, 107]);
+	});
+
+	test("hides the payload error when the viewport retry also fails", async () => {
+		let attempts = 0;
+
+		const failure = await captureCdpScreenshot(async () => {
+			attempts += 1;
+			throw new BrowserUseCdpPayloadTooLargeError();
+		}).catch((error: unknown) => error);
+
+		expect(attempts).toBe(2);
+		expect(failure).toBeInstanceOf(Error);
+		expect(failure).not.toBeInstanceOf(BrowserUseCdpPayloadTooLargeError);
+		expect((failure as Error).message).toBe("Browser screenshot failed");
+	});
+
+	test("rejects an empty screenshot payload without retrying", async () => {
+		let attempts = 0;
+
+		await expect(
+			captureCdpScreenshot(async (): Promise<CdpScreenshotResult> => {
+				attempts += 1;
+				return {};
+			}),
+		).rejects.toThrow("Browser screenshot failed");
+		expect(attempts).toBe(1);
 	});
 });

@@ -1,5 +1,7 @@
 import {
 	DuplicateJobError,
+	type EvidenceFailureCode,
+	type EvidenceStage,
 	type Job,
 	type JobInput,
 	type JobResult,
@@ -87,6 +89,8 @@ export type AgentToolDiagnosticCode =
 	| "TOOL_INPUT_INVALID"
 	| "SUBMISSION_NOT_AUTHORIZED"
 	| "SUBMISSION_RESULT_UNCERTAIN"
+	| "SCREENSHOT_FAILED"
+	| "EVIDENCE_CAPTURE_FAILED"
 	| "UNKNOWN";
 
 export class D1JobStore implements JobStore {
@@ -280,6 +284,66 @@ export class D1JobStore implements JobStore {
 				id,
 				runToken,
 			)
+			.run();
+
+		return result.meta.changes === 1;
+	}
+
+	async recordEvidenceCaptured(
+		id: string,
+		runToken: string,
+		eventId: string,
+		stage: EvidenceStage,
+		objectKey: string,
+		sha256: string,
+		byteLength: number,
+		now: string,
+	): Promise<boolean> {
+		const result = await this.db
+			.prepare(
+				`INSERT INTO events (
+          id, job_id, attempt, type, data_json, created_at
+        )
+        SELECT ?, id, attempt_count, 'evidence.captured', json_object(
+          'stage', ?,
+          'objectKey', ?,
+          'sha256', ?,
+          'byteLength', ?,
+          'contentType', 'image/jpeg'
+        ), ?
+        FROM jobs
+        WHERE id = ?
+          AND status IN ('running', 'submitting')
+          AND run_token = ?`,
+			)
+			.bind(eventId, stage, objectKey, sha256, byteLength, now, id, runToken)
+			.run();
+
+		return result.meta.changes === 1;
+	}
+
+	async recordEvidenceCaptureFailed(
+		id: string,
+		runToken: string,
+		stage: EvidenceStage,
+		failureCode: EvidenceFailureCode,
+		now: string,
+	): Promise<boolean> {
+		const result = await this.db
+			.prepare(
+				`INSERT INTO events (
+          id, job_id, attempt, type, data_json, created_at
+        )
+        SELECT ?, id, attempt_count, 'evidence.capture_failed', json_object(
+          'stage', ?,
+          'failureCode', ?
+        ), ?
+        FROM jobs
+        WHERE id = ?
+          AND status IN ('running', 'submitting')
+          AND run_token = ?`,
+			)
+			.bind(crypto.randomUUID(), stage, failureCode, now, id, runToken)
 			.run();
 
 		return result.meta.changes === 1;
