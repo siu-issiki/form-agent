@@ -139,6 +139,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#submissionRequestBlockStage: SubmissionRequestBlockStage | undefined;
 	#validatedSubmitInputBackendNodeId: number | undefined;
 	#targetPolicyError: Error | undefined;
+	readonly #frameNavigationRevisions = new Map<string, number>();
 	#elementGeneration = 0;
 	#elements = new Map<string, ElementReference>();
 	#formDataEntered = false;
@@ -466,6 +467,10 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 					: {}),
 			};
 		}
+		const expectedDocumentGetFrameId =
+			this.#expectedSubmissionRequest?.method === "GET"
+				? this.#expectedSubmissionFrameId
+				: undefined;
 		let beforeConfirmationCount: number;
 		try {
 			beforeConfirmationCount = await this.#confirmationBodyCount();
@@ -475,6 +480,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				error,
 			);
 		}
+		const frameNavigationRevisionBeforeActivation = expectedDocumentGetFrameId
+			? (this.#frameNavigationRevisions.get(expectedDocumentGetFrameId) ?? 0)
+			: 0;
 		try {
 			this.#submissionAttemptInProgress = true;
 			this.#submissionRequestBlockStage = undefined;
@@ -497,6 +505,11 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 					this.#submissionRequestCount > 0,
 					() => this.#confirmationBodyCount(),
 					() => this.currentUrl(),
+					hasExpectedFrameNavigated(
+						expectedDocumentGetFrameId,
+						frameNavigationRevisionBeforeActivation,
+						this.#frameNavigationRevisions,
+					),
 				);
 				if (confirmation) return confirmation;
 			}
@@ -531,6 +544,15 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		});
 		this.connection.on("DOM.documentUpdated", (_params, sessionId) => {
 			if (sessionId === this.sessionId) this.#clearElements();
+		});
+		this.connection.on("Page.frameNavigated", (params, sessionId) => {
+			if (sessionId !== this.sessionId) return;
+			const frameId = (params as { frame?: { id?: unknown } }).frame?.id;
+			if (typeof frameId !== "string") return;
+			this.#frameNavigationRevisions.set(
+				frameId,
+				(this.#frameNavigationRevisions.get(frameId) ?? 0) + 1,
+			);
 		});
 		await this.#send("Page.enable");
 		this.#topFrameId = (
@@ -1236,6 +1258,7 @@ export async function readSubmissionConfirmation(
 	requestObserved: boolean,
 	readAfterCount: () => Promise<number>,
 	readCurrentUrl: () => Promise<string>,
+	documentUpdatedSinceSubmit = false,
 ): Promise<BrowserSubmitResult | null> {
 	let afterCount: number;
 	try {
@@ -1243,12 +1266,28 @@ export async function readSubmissionConfirmation(
 	} catch (error) {
 		throw createBrowserSubmitDiagnosticError("SUBMIT_READ_AFTER_TEXT", error);
 	}
-	if (!requestObserved || afterCount <= beforeCount) return null;
+	if (
+		!requestObserved ||
+		(afterCount <= beforeCount &&
+			!(documentUpdatedSinceSubmit && afterCount > 0))
+	)
+		return null;
 	try {
 		return { outcome: "sent", formUrl: await readCurrentUrl() };
 	} catch (error) {
 		throw createBrowserSubmitDiagnosticError("POST_SUBMIT_URL_CHECK", error);
 	}
+}
+
+export function hasExpectedFrameNavigated(
+	expectedFrameId: string | undefined,
+	revisionBeforeSubmit: number,
+	frameNavigationRevisions: ReadonlyMap<string, number>,
+): boolean {
+	return (
+		expectedFrameId !== undefined &&
+		(frameNavigationRevisions.get(expectedFrameId) ?? 0) > revisionBeforeSubmit
+	);
 }
 
 export function assertDryRunNavigationAllowed(
