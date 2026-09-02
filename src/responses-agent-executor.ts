@@ -7,7 +7,10 @@ import {
 	type BrowserToolName,
 	BrowserToolSetupError,
 } from "./browser-tool-handler";
-import { BrowserUseCdpPayloadTooLargeError } from "./browser-use-cdp";
+import {
+	BrowserUseCdpPayloadTooLargeError,
+	BrowserUseCdpUpgradeRejectedError,
+} from "./browser-use-cdp";
 import { BrowserUseCdpDriver } from "./browser-use-cdp-driver";
 import {
 	type AgentToolDiagnosticCode,
@@ -558,6 +561,16 @@ async function executeToolCall(
 		) {
 			return toolError("INVALID_TOOL_INPUT");
 		}
+		if (
+			originalError instanceof BrowserUseCdpUpgradeRejectedError &&
+			!originalError.retryable
+		) {
+			throw new AgentExecutionError(
+				"BROWSER_UPGRADE_REJECTED",
+				"The browser provider rejected the connection.",
+				false,
+			);
+		}
 		throw new AgentExecutionError(
 			"BROWSER_TOOL_UNAVAILABLE",
 			"The browser provider or tool became unavailable.",
@@ -654,6 +667,9 @@ export function classifyToolDiagnostic(
 	}
 	if (error instanceof BrowserUseCdpPayloadTooLargeError) {
 		return "PAYLOAD_TOO_LARGE";
+	}
+	if (error instanceof BrowserUseCdpUpgradeRejectedError) {
+		return "CDP_UPGRADE_REJECTED";
 	}
 	if (error instanceof BrowserToolInputError || error instanceof SyntaxError) {
 		return "TOOL_INPUT_INVALID";

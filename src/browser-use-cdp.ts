@@ -30,6 +30,7 @@ export class BrowserUseCdpConnection {
 	#closed = false;
 	#closeRequested = false;
 	#closeLogged = false;
+	#pendingAtFailure: number | undefined;
 
 	private constructor(private readonly webSocket: WebSocket) {
 		webSocket.addEventListener("message", (event) => this.#onMessage(event));
@@ -165,7 +166,7 @@ export class BrowserUseCdpConnection {
 					reasonLength: reason.length,
 					reasonHint: classifyCdpCloseReason(reason),
 					wasClean: event.wasClean,
-					pending: this.#pending.size,
+					pending: this.#pendingAtFailure ?? this.#pending.size,
 				}),
 			);
 		}
@@ -176,6 +177,7 @@ export class BrowserUseCdpConnection {
 
 	#onError(): void {
 		if (this.#closed) return;
+		this.#pendingAtFailure = this.#pending.size;
 		console.warn(JSON.stringify({ event: "browser_use_cdp_error" }));
 		this.#closed = true;
 		this.#rejectPending();
@@ -220,6 +222,10 @@ export class BrowserUseCdpUpgradeRejectedError extends Error {
 	constructor(readonly status: number) {
 		super("Browser Use CDP connection failed");
 		this.name = "BrowserUseCdpUpgradeRejectedError";
+	}
+
+	get retryable(): boolean {
+		return this.status === 408 || this.status === 429 || this.status >= 500;
 	}
 }
 

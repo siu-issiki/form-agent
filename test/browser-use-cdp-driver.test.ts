@@ -2091,7 +2091,10 @@ describe("BrowserUseCdpConnection close diagnostics", () => {
 			"wss://connect.browser-use.com/session",
 			stubUpgradeFetch(webSocket),
 		);
-		const pending = connection.send("Page.enable");
+		const pending = [
+			connection.send("Page.enable"),
+			connection.send("DOM.enable"),
+		];
 		const captured = captureWarnings();
 		try {
 			webSocket.emit("error", {});
@@ -2104,7 +2107,9 @@ describe("BrowserUseCdpConnection close diagnostics", () => {
 			captured.restore();
 		}
 
-		await expect(pending).rejects.toThrow("Browser Use CDP connection closed");
+		await expect(Promise.all(pending)).rejects.toThrow(
+			"Browser Use CDP connection closed",
+		);
 		const events = captured.warnings.map(
 			(warning) => (JSON.parse(warning) as { event: string }).event,
 		);
@@ -2115,7 +2120,7 @@ describe("BrowserUseCdpConnection close diagnostics", () => {
 			reasonLength: "abnormal closure".length,
 			reasonHint: "OTHER",
 			wasClean: false,
-			pending: 0,
+			pending: 2,
 		});
 	});
 

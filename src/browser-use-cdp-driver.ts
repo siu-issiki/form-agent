@@ -54,13 +54,9 @@ export interface BrowserUseConnectOptions {
 	) => Promise<BrowserUseCdpConnection>;
 }
 
-export function isRetryableUpgradeStatus(status: number): boolean {
-	return status === 408 || status === 429 || status >= 500;
-}
-
 function isRetryableConnectError(error: unknown): boolean {
 	if (error instanceof BrowserUseCdpUpgradeRejectedError) {
-		return isRetryableUpgradeStatus(error.status);
+		return error.retryable;
 	}
 	return (
 		error instanceof Error &&

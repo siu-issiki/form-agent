@@ -141,6 +141,7 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 - CDP WebSocket が自発的に閉じた場合、close code、reason の文字数、reason を固定分類した hint（`NONE` / `LIMIT` / `AUTH` / `TIMEOUT` / `OTHER`）、`wasClean`、未完了コマンド数を記録する。相手から渡された reason の自由文そのものはログに残さない。
 - 接続確立（CDP 接続から初期化完了まで）が一過性の障害で失敗した場合だけ、10 秒 → 20 秒 → 30 秒の待機を挟んで最大 3 回再接続する。再試行は送信前の接続段階に限定し、フォームへの副作用はない。
 - 再試行の可否は失敗の種別で決める。WebSocket upgrade が拒否された場合は HTTP status が 408、429、5xx のときだけ再試行し、401 / 403 / 404 等の恒久的な拒否は即座に失敗させる。upgrade 要求自体が失敗したネットワーク障害、接続断、コマンド timeout は再試行する。endpoint 不正や API key 未設定は接続を試みずに失敗させる。
+- 恒久的な upgrade 拒否（401 / 403 / 404 等）は `BROWSER_UPGRADE_REJECTED` として再試行不可の failed にし、Queue の再配信を行わない。診断イベントには `CDP_UPGRADE_REJECTED` を記録する。
 - popup、Worker、Service Worker、WebSocket 等の迂回経路を遮断する。
 - CDP の `DOM.getDocument` を `pierce: true` で取得し、通常 DOM と open / closed Shadow DOM を Worker 側で走査する。
 - 観測した同一ページ・許可hostのリンクを最大20件までモデルへ返し、サイト内別ページのフォーム探索に利用する。
