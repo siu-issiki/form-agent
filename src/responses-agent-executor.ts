@@ -19,13 +19,14 @@ import type { Job } from "./job";
 import {
 	assertAllowedTargetUrl,
 	BrowserElementError,
+	BrowserFormInvalidError,
 	NavigationPolicyError,
 	SubmissionNotAuthorizedError,
 	SubmissionResultUncertainError,
 } from "./restricted-browser";
 
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
-const MAX_TURNS = 12;
+const MAX_TURNS = 16;
 const MAX_PROVIDER_REQUESTS = 16;
 const MAX_PROVIDER_OUTPUT_TOKENS = 4_096;
 const MAX_PROVIDER_REQUEST_BYTES = 128 * 1_024;
@@ -458,13 +459,16 @@ function diagnosticToolName(value: string): AgentToolDiagnosticToolName {
 	return browserToolName(value) ?? "unknown";
 }
 
-function classifyToolDiagnostic(error: unknown): AgentToolDiagnosticCode {
+export function classifyToolDiagnostic(
+	error: unknown,
+): AgentToolDiagnosticCode {
 	if (error instanceof BrowserUseCdpPayloadTooLargeError) {
 		return "PAYLOAD_TOO_LARGE";
 	}
 	if (error instanceof BrowserToolInputError || error instanceof SyntaxError) {
 		return "TOOL_INPUT_INVALID";
 	}
+	if (error instanceof BrowserFormInvalidError) return "FORM_INVALID";
 	if (error instanceof BrowserElementError) return "ELEMENT_UNAVAILABLE";
 	if (error instanceof NavigationPolicyError) return "NAVIGATION_POLICY";
 	if (error instanceof SubmissionNotAuthorizedError) {

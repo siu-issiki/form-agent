@@ -14,11 +14,13 @@ import { BrowserUseCdpPayloadTooLargeError } from "../src/browser-use-cdp";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobInput } from "../src/job";
 import {
+	classifyToolDiagnostic,
 	isJobDryRun,
 	ResponsesAgentExecutor,
 } from "../src/responses-agent-executor";
 import {
 	BrowserElementError,
+	BrowserFormInvalidError,
 	type BrowserSubmitResult,
 	type RestrictedBrowserDriver,
 	type SubmitActivationStrategy,
@@ -57,6 +59,15 @@ test("uses the persisted job mode and keeps legacy jobs dry-run", () => {
 			false,
 		),
 	).toBe(true);
+});
+
+test("reports native form invalidity separately from an unavailable element", () => {
+	expect(classifyToolDiagnostic(new BrowserFormInvalidError())).toBe(
+		"FORM_INVALID",
+	);
+	expect(classifyToolDiagnostic(new BrowserElementError())).toBe(
+		"ELEMENT_UNAVAILABLE",
+	);
 });
 
 beforeEach(async () => {

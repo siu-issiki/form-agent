@@ -9,6 +9,7 @@ import {
 import type { Job } from "./job";
 import {
 	BrowserElementError,
+	BrowserFormInvalidError,
 	type BrowserObservation,
 	type BrowserSubmitResult,
 	createBrowserSubmitDiagnosticError,
@@ -398,7 +399,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			reference.backendNodeId,
 			CHECK_FORM_VALIDITY_FUNCTION,
 		);
-		if (!formValid) throw new BrowserElementError();
+		if (!formValid) throw new BrowserFormInvalidError();
 		this.#expectedSubmissionRequest = createExpectedSubmissionRequest(
 			state.formAction,
 			state.formMethod,
