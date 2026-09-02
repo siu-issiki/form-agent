@@ -137,6 +137,72 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 			{ url: "https://example.com/contact", text: "お問い合わせ" },
 		]);
 	});
+
+	test("skips oversized links without consuming the observation limit", () => {
+		const links = discoverCdpNavigationLinks(
+			{
+				backendNodeId: 1,
+				nodeName: "#document",
+				children: [
+					{
+						backendNodeId: 2,
+						nodeName: "A",
+						attributes: ["href", `/${"x".repeat(2_048)}`],
+					},
+					{
+						backendNodeId: 3,
+						nodeName: "A",
+						attributes: ["href", "/contact"],
+					},
+				],
+			},
+			"https://example.com/",
+			() => true,
+			1,
+		);
+
+		expect(links).toEqual([{ url: "https://example.com/contact", text: "" }]);
+	});
+
+	test("resolves links against each document base URL", () => {
+		const links = discoverCdpNavigationLinks(
+			{
+				backendNodeId: 1,
+				nodeName: "#document",
+				baseURL: "https://example.com/",
+				children: [
+					{
+						backendNodeId: 2,
+						nodeName: "A",
+						attributes: ["href", "contact"],
+					},
+					{
+						backendNodeId: 3,
+						nodeName: "IFRAME",
+						contentDocument: {
+							backendNodeId: 4,
+							nodeName: "#document",
+							baseURL: "https://forms.example.com/directory/",
+							children: [
+								{
+									backendNodeId: 5,
+									nodeName: "A",
+									attributes: ["href", "contact"],
+								},
+							],
+						},
+					},
+				],
+			},
+			"https://example.com/landing/index.html",
+			() => true,
+		);
+
+		expect(links).toEqual([
+			{ url: "https://example.com/contact", text: "" },
+			{ url: "https://forms.example.com/directory/contact", text: "" },
+		]);
+	});
 });
 
 describe("BrowserUseCdpDriver child target policy", () => {

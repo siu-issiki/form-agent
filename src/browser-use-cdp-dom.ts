@@ -5,6 +5,8 @@ export interface CdpDomNode {
 	backendNodeId: number;
 	nodeName: string;
 	nodeValue?: string;
+	baseURL?: string;
+	documentURL?: string;
 	attributes?: string[];
 	children?: CdpDomNode[];
 	shadowRoots?: CdpDomNode[];
@@ -112,17 +114,23 @@ export function discoverCdpNavigationLinks(
 	const links: CdpNavigationLink[] = [];
 	const seen = new Set<string>();
 	const current = new URL(currentUrl);
-	const visit = (node: CdpDomNode) => {
+	const visit = (node: CdpDomNode, inheritedBaseUrl: string) => {
 		if (links.length >= maxLinks) return;
+		const baseUrl = node.baseURL ?? node.documentURL ?? inheritedBaseUrl;
 		if (node.nodeName.toLowerCase() === "a") {
 			const href = parseAttributes(node.attributes).href;
 			try {
-				const url = new URL(href ?? "", current);
+				const url = new URL(href ?? "", baseUrl);
 				const samePage =
 					url.origin === current.origin &&
 					url.pathname === current.pathname &&
 					url.search === current.search;
-				if (!samePage && !seen.has(url.href) && isAllowed(url.href)) {
+				if (
+					url.href.length <= 2_048 &&
+					!samePage &&
+					!seen.has(url.href) &&
+					isAllowed(url.href)
+				) {
 					seen.add(url.href);
 					links.push({
 						url: url.href,
@@ -133,9 +141,9 @@ export function discoverCdpNavigationLinks(
 				// Ignore malformed or disallowed links.
 			}
 		}
-		for (const child of composedChildren(node)) visit(child);
+		for (const child of composedChildren(node)) visit(child, baseUrl);
 	};
-	visit(root);
+	visit(root, currentUrl);
 	return links;
 }
 
