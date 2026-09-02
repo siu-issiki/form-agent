@@ -21,9 +21,11 @@ import {
 	BrowserElementError,
 	BrowserFormInvalidError,
 	NavigationPolicyError,
+	SubmissionEvidenceError,
 	SubmissionNotAuthorizedError,
 	SubmissionResultUncertainError,
 } from "./restricted-browser";
+import type { EvidenceObjectStore } from "./submission-evidence";
 
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const MAX_TURNS = 16;
@@ -44,6 +46,7 @@ interface FunctionCall {
 
 interface ResponsesAgentExecutorOptions {
 	db: D1Database;
+	evidenceStore: EvidenceObjectStore;
 	model: string;
 	openAiApiKey: string;
 	browserUseApiKey: string;
@@ -65,6 +68,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 	readonly terminationGraceMs = 30_000;
 
 	readonly #db: D1Database;
+	readonly #evidenceStore: EvidenceObjectStore;
 	readonly #model: string;
 	readonly #openAiApiKey: string;
 	readonly #browserUseApiKey: string;
@@ -84,6 +88,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 			throw new Error("Agent provider credentials are required");
 		}
 		this.#db = options.db;
+		this.#evidenceStore = options.evidenceStore;
 		this.#model = options.model;
 		this.#openAiApiKey = options.openAiApiKey;
 		this.#browserUseApiKey = options.browserUseApiKey;
@@ -99,8 +104,10 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 		signal: AbortSignal,
 	): Promise<AgentRunResult> {
 		const dryRun = isJobDryRun(input.job.payload, this.#dryRun);
-		const coordinator = new BrowserToolCoordinator(this.#db, (job) =>
-			this.#createBrowserDriver(this.#browserUseApiKey, job, dryRun),
+		const coordinator = new BrowserToolCoordinator(
+			this.#db,
+			(job) => this.#createBrowserDriver(this.#browserUseApiKey, job, dryRun),
+			this.#evidenceStore,
 		);
 		const abort = () => {
 			void coordinator.close().catch(() => undefined);
@@ -293,12 +300,14 @@ async function executeToolCall(
 			"finish_validation",
 			parsed.diagnosticCode,
 		);
-		return parsed.result
-			? {
-					output: JSON.stringify({ outcome: parsed.result.outcome }),
-					result: parsed.result,
-				}
-			: toolError("INVALID_TOOL_INPUT");
+		if (!parsed.result) return toolError("INVALID_TOOL_INPUT");
+		if (parsed.result.outcome === "prohibited") {
+			await coordinator.captureEvidence(job.id, runToken, "prohibited");
+		}
+		return {
+			output: JSON.stringify({ outcome: parsed.result.outcome }),
+			result: parsed.result,
+		};
 	}
 	if (
 		call.name === "submit" &&
@@ -396,6 +405,13 @@ async function executeToolCall(
 			error instanceof BrowserToolSetupError ? error.stage : tool,
 			diagnosticCode,
 		);
+		if (originalError instanceof SubmissionEvidenceError) {
+			throw new AgentExecutionError(
+				"SUBMISSION_EVIDENCE_UNAVAILABLE",
+				"The submission evidence could not be captured before submission.",
+				true,
+			);
+		}
 		if (originalError instanceof BrowserUseCdpPayloadTooLargeError) {
 			throw new AgentExecutionError(
 				"BROWSER_PAYLOAD_TOO_LARGE",
@@ -477,6 +493,9 @@ export function classifyToolDiagnostic(
 	if (error instanceof SubmissionResultUncertainError) {
 		return "SUBMISSION_RESULT_UNCERTAIN";
 	}
+	if (error instanceof SubmissionEvidenceError) {
+		return "EVIDENCE_CAPTURE_FAILED";
+	}
 	if (!(error instanceof Error)) return "UNKNOWN";
 
 	switch (error.message) {
@@ -507,6 +526,8 @@ export function classifyToolDiagnostic(
 			return "DOM_DISCOVERY_FAILED";
 		case "Browser page evaluation failed":
 			return "PAGE_EVALUATION_FAILED";
+		case "Browser screenshot failed":
+			return "SCREENSHOT_FAILED";
 		default:
 			return "UNKNOWN";
 	}

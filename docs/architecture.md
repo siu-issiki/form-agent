@@ -22,7 +22,7 @@
 | E2E | 管理下範囲を実装済み | 常設テストシステムの13シナリオ、重複配送、送信後`uncertain`をproductionで検証済み。外部の実サイト送信は未実施 |
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値を検証。一覧・キャンセルは未実装 |
 | Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
-| 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ、値を含まないagent tool診断イベント |
+| 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ、値を含まないagent tool診断イベント。送信前・送信後・禁止判定時のスクリーンショット証跡を Cloudflare R2 へ保存し、D1 の `events` へ sha256 付きで記録する |
 | 並列検証 | 部分実施 | 安全確認中は `max_concurrency: 1`。Cloudflare 上の単一ジョブを検証済みで、5 並列以上は未検証 |
 
 本書では、実装済みの構成を現在形で記述し、未実装または未検証の内容は「現在の制約」「PoC 計画」「残タスク・未決事項」に明示する。
@@ -60,12 +60,16 @@ Worker-native Agent executor
        └─ 信頼済み handler
             └─ BrowserUse CDP ──► 対象企業
         │
+        ├─ 送信前 / 送信後 / 禁止判定時のスクリーンショット
+        │       ▼
+        │  Cloudflare R2（証跡スクリーンショット）
+        │
         │ 状態・結果・Provider 呼び出し回数
         ▼
 Cloudflare D1
   ├─ jobs
   ├─ results
-  └─ events（retry / DLQ / agent tool診断）
+  └─ events（retry / DLQ / agent tool診断 / 証跡）
 ```
 
 PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外部の OpenAI / BrowserUse を組み合わせる。本番は production 環境だけを対象とし、D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済みである。2026-09-02 に `https://anyreach.co.jp/contact` を対象とした production dry-run を実行し、`pending → running → prohibited`、`DRY_RUN_COMPLETE`、1 attempt、8 Provider requests、BrowserUse active session 0 件を確認した。`submitting` / `sent` には遷移しておらず、フォーム送信は行っていない。
@@ -165,6 +169,15 @@ driver が submit control と識別した要素は通常の `click` で操作で
 
 状態遷移と結果保存は D1 session / batch と条件付き `UPDATE` を使う。retry / DLQとagent tool診断はイベントへ保存するが、全状態遷移、token、全体処理時間、BrowserUse待ち時間、費用の記録は未実装である。
 
+### Cloudflare R2（証跡）
+
+- バケット名は `form-agent-evidence`、binding 名は `EVIDENCE_BUCKET` である。
+- オブジェクトキーは `jobs/<jobId>/<stage>/<eventId>.jpg` とし、`eventId` は D1 `events.id` と 1 対 1 で対応する。`runToken`、URL、フォーム値はキーへ含めない。
+- `contentType` は `image/jpeg` で保存する。
+- put 時に sha256 を渡し、R2 側で整合性検証する。D1 の `events` にも同じ sha256 を記録し、取得後に照合できるようにする。
+- 公開アクセスは設定しない。読み出しは `wrangler r2 object get` による手動取得だけであり、専用の閲覧 API / UI は未実装である。
+- 撮影は表示中の viewport のみとする。フルページ撮影は CDP メッセージ上限（4M 文字）を超えると接続が閉じて回復できないため採用しない。
+
 ## ジョブライフサイクル
 
 1. 対象企業、対象 URL、許可ドメイン、送信内容を含むジョブを D1 に `pending` として作成する。
@@ -194,6 +207,20 @@ pending / running / failed ── retry 上限超過 ──► dead_lettered
 ```
 
 `prohibited` と `uncertain` は自動 retry しない。retryable error は `failed` を保存せず、`running` と同じ `runToken` を維持したまま Queue の再配信を待つ。再配信では新しい Agent 実行と browser session を開始する。`submitting` または `sent` を受け取った Consumer は送信を再実行しない。
+
+### 送信証跡スクリーンショット
+
+送信前・送信後・禁止判定時の 3 段階でスクリーンショットを撮影し、上記の Cloudflare R2（証跡）へ保存する。dry-run の `submit` 経路（`_formAgentDryRun: true`）では撮影しない。
+
+| stage | 撮影位置 | ジョブ状態 | 失敗時の扱い |
+| --- | --- | --- | --- |
+| `before_submit` | `submit` tool内、送信前検証成功・送信試行フラグ設定の直後、送信権取得（`claimSubmission`）の前 | `running` | 必須。撮影に失敗した場合は送信権取得も driver への送信も行わず、何も送信しない。再試行可能なエラーとして扱う |
+| `after_submit` | driver への送信が成功または例外で終わった直後、結果確定（`sent` / `uncertain`）の前 | `submitting` | ベストエフォート。失敗しても送信結果（`sent` / `uncertain` / 例外経路）は変えない |
+| `prohibited` | `finish` tool で禁止判定の結果を返す直前 | `running` | ベストエフォート。ブラウザセッションが未作成の場合は撮影せず、未撮影であることだけを記録する |
+
+`before_submit` の撮影失敗は送信前の唯一のブロッキング条件であり、二重送信防止と同様に「不確実なら送信しない」方針に従う。`after_submit` と `prohibited` は既存の結果確定ロジックに影響しない。送信後 URL の検証に使う値は `after_submit` の撮影より前に取得しておき、撮影失敗で CDP 接続が閉じても送信結果（`sent` / `uncertain`）は変わらない。
+
+撮影・保存・記録は合計 15 秒で打ち切り、超過時は `CAPTURE_TIMEOUT` として記録する。`after_submit` の stall が全体期限による `uncertain` を招かないようにするため。同じ撮影の成功・失敗は共通の `eventId` で排他的に記録し、撮影開始時の attempt を固定する。タイムアウト後に R2 保存または D1 記録が遅れて完了しても成功イベントへ戻さず、保存済みオブジェクトは補償削除する。
 
 ## データモデル
 
@@ -238,7 +265,11 @@ Provider、model、input / output token、処理時間、BrowserUse 待ち時間
 | `data_json` | TEXT | 秘密情報を除いたイベント詳細 |
 | `created_at` | TEXT | 発生日時 |
 
-現在保存するイベントは `job.retry_scheduled`、`job.dead_lettered`、`agent.tool_diagnostic` である。retry イベントにはreason code、発生元、attempt、実行時間、retry時点のProvider呼び出し累計を保存する。tool diagnosticにはturn、固定のtool名、処理stage、固定のresult codeだけを保存する。どのイベントにも秘密情報、URL、フォーム値、自由記述のエラー本文を含めない。
+現在保存するイベントは `job.retry_scheduled`、`job.dead_lettered`、`agent.tool_diagnostic`、`evidence.captured`、`evidence.capture_failed` である。retry イベントにはreason code、発生元、attempt、実行時間、retry時点のProvider呼び出し累計を保存する。tool diagnosticにはturn、固定のtool名、処理stage、固定のresult codeだけを保存する。
+
+`evidence.captured` の `data_json` は `{ stage, objectKey, sha256, byteLength, contentType: "image/jpeg" }` を保存する。`stage` は `before_submit` / `after_submit` / `prohibited` の固定値であり、`objectKey` は `jobId` / `stage` / `eventId` から機械的に組み立てた R2 オブジェクトキーである。`evidence.capture_failed` の `data_json` は `{ stage, failureCode }` を保存する。`failureCode` は `SCREENSHOT_FAILED` / `OBJECT_STORE_FAILED` / `EVENT_NOT_RECORDED` / `NO_BROWSER_SESSION` / `CAPTURE_TIMEOUT` の固定値である。
+
+どのイベントにも秘密情報、URL、フォーム値、自由記述のエラー本文を含めない。証跡イベントの `objectKey` も `jobId` / `stage` / `eventId` の組み合わせだけで構成されており、この方針を維持している。
 
 ## 安全設計 / 冪等性
 
@@ -264,7 +295,7 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 
 ### Agent への安全指示
 
-system prompt では、営業禁止・用途制限の確認と送信前の再観察を指示する。入力値は信頼済みhandlerが`payload.formValues`由来であることを機械的に強制する。一方、禁止判定の証跡と送信前確認の実施はまだAgentへの指示だけであり、ページ上のprompt injectionやAgentの誤判断に対する完全なハードガードではない。
+system prompt では、営業禁止・用途制限の確認と送信前の再観察を指示する。入力値は信頼済みhandlerが`payload.formValues`由来であることを機械的に強制する。禁止判定時と送信前後には画面のスクリーンショット証跡をR2へ保存するが、これは事後確認のための記録であり、禁止判定の根拠や送信前確認が正しく行われたことを信頼済みhandlerが機械的に検証する仕組みではない。ページ上のprompt injectionやAgentの誤判断に対する完全なハードガードでもない。
 
 ## 現在の制約
 
@@ -289,7 +320,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 - `JOB_API_TOKEN` は単一の共有 secret であり、利用者別の認証・権限・失効管理は行わない。
 - ジョブ一覧、キャンセル API は未実装である。
 - `submitting` / `uncertain` の照合、DLQ確認、緊急停止、安全な再開はrunbookで運用する。専用 API / UIと自動再投入は未実装であり、再実行時は既存ジョブを変更せず新しいジョブIDを使う。
-- payload、理由、ログ、DOM snapshot の保存期間・マスキング方針は未決定である。
+- payload、理由、ログ、DOM snapshot の保存期間・マスキング方針は未決定である。証跡スクリーンショットは入力済みの個人情報を含む画面を撮影するため保存期間の影響が大きいが、2026-09-02時点では無期限保存（R2ライフサイクル削除ルールなし）と暫定決定しており、運用ポリシー確定時に見直す。閲覧手段は `wrangler` CLI による手動取得だけであり、専用の閲覧 UI は未実装である。
 
 ### Provider / observability
 
@@ -383,7 +414,7 @@ PoC はまず 1 並列の production で開始し、管理下テストサイト�
 
 - 利用者別の認証・権限管理と、ジョブ一覧・キャンセル API。
 - 実Workerを`submitting`中に停止した場合に、`submitting`のまま再配信がackされ、再送されないことの検証。
-- 禁止判定の証跡と送信前確認を信頼済みhandlerで検証する境界。
+- 禁止判定と送信前後の画面証跡はスクリーンショットとしてR2へ保存されるようになったが、証跡内容や送信前確認の実施が正しいことを信頼済みhandlerが機械的に検証する仕組みは未実装である。
 - 対象企業ドメイン／サブドメインまたはジョブ固有の許可hostにあるGET型副作用を、submit gate外から起動させない設計。
 - GET送信完了文言を全document bodyの合計ではなく、送信対象frameだけで確認する実装。
 - 状態遷移、tool、token、時間、費用の observability。
@@ -394,11 +425,12 @@ PoC はまず 1 並列の production で開始し、管理下テストサイト�
 - CSVから抽出した外部form hostをジョブ単位の完全一致allowlistへ安全に反映する運用検証。
 - Provider abstraction と fallback。
 - 外部 API E2E は GitHub Actions の通常 CI に含めず、手動実行に限定する。
+- R2 アップロード後・D1 記録前に Worker が停止した場合の孤児オブジェクトは検出できない。intent イベントの先行記録または R2 ライフサイクルルールで対処する。
 
 ### 運用・ポリシー
 
 - 営業禁止判定の基準、根拠保存、監査方法。
-- 個人情報、送信本文、ログ、DOM snapshot の保存期間とマスキング方針。
+- 個人情報、送信本文、ログ、DOM snapshot、証跡スクリーンショットの保存期間とマスキング方針。
 - 対象サイトの利用規約、適用法令、社内ルールの確認手順。
 - 実送信を許可する対象、承認者、件数上限、緊急停止条件。
 - BrowserUse の session 上限、rate limit、保持期間、課金単位。
@@ -416,3 +448,4 @@ PoC はまず 1 並列の production で開始し、管理下テストサイト�
 - 送信権取得後に結果を確定できない場合は `uncertain` とし、自動 retry しない。
 - 本番処理は Cloudflare 上へ置き、手元 PC は開発・検証にだけ使う。
 - 5、20、50 並列の順に検証し、安全性、成功率、時間、rate limit、原価を確認してから引き上げる。
+- 送信前 / 送信後 / 禁止判定時の 3 段階でスクリーンショットを撮影し、Cloudflare R2 へ sha256 付きで保存し、D1 の `events` から参照する。dry-run の `submit` 経路では撮影しない。保存期間は運用ポリシー確定まで無期限とする。

@@ -6,6 +6,10 @@ import {
 	RestrictedBrowserTools,
 	type SubmitActivationStrategy,
 } from "./restricted-browser";
+import {
+	type EvidenceObjectStore,
+	recordEvidenceCaptureFailure,
+} from "./submission-evidence";
 
 export type BrowserToolName =
 	| "navigate"
@@ -48,6 +52,7 @@ export class BrowserToolCoordinator {
 	constructor(
 		private readonly db: D1Database,
 		private readonly createDriver: BrowserDriverFactory,
+		private readonly evidenceStore: EvidenceObjectStore,
 	) {}
 
 	async execute(
@@ -82,6 +87,54 @@ export class BrowserToolCoordinator {
 			() => undefined,
 		);
 		return operation;
+	}
+
+	/**
+	 * Captures evidence for a prohibited outcome. It never throws and never
+	 * creates a browser session, so the agent result is unaffected.
+	 */
+	async captureEvidence(
+		jobId: string,
+		runToken: string,
+		stage: "prohibited",
+	): Promise<void> {
+		const operation = this.#operationTail.then(() =>
+			this.#captureEvidence(jobId, runToken, stage),
+		);
+		this.#operationTail = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		await operation.catch(() => undefined);
+	}
+
+	async #captureEvidence(
+		jobId: string,
+		runToken: string,
+		stage: "prohibited",
+	): Promise<void> {
+		const tools = this.#tools;
+		if (
+			this.#closed ||
+			!tools ||
+			this.#scopeKey !== scopeKey(jobId, runToken)
+		) {
+			const store = new D1JobStore(this.db);
+			const job = await store.find(jobId);
+			if (job?.status !== "running" || job.runToken !== runToken) return;
+			await recordEvidenceCaptureFailure(
+				store,
+				jobId,
+				runToken,
+				job.attemptCount,
+				crypto.randomUUID(),
+				stage,
+				"NO_BROWSER_SESSION",
+				new Date().toISOString(),
+			);
+			return;
+		}
+		await tools.captureEvidence(stage);
 	}
 
 	async #execute(
@@ -139,14 +192,14 @@ export class BrowserToolCoordinator {
 		jobId: string,
 		runToken: string,
 	): Promise<{ job: Job; tools: RestrictedBrowserTools }> {
-		const scopeKey = `${jobId}\u0000${runToken}`;
+		const key = scopeKey(jobId, runToken);
 		const store = new D1JobStore(this.db);
 		const job = await store.find(jobId);
 		if (job?.status !== "running" || job.runToken !== runToken) {
 			throw new BrowserToolInputError();
 		}
 		if (this.#tools) {
-			if (this.#scopeKey !== scopeKey) {
+			if (this.#scopeKey !== key) {
 				throw new BrowserToolInputError();
 			}
 			return { job, tools: this.#tools };
@@ -166,6 +219,7 @@ export class BrowserToolCoordinator {
 					store,
 					jobId,
 					runToken,
+					this.evidenceStore,
 				);
 			} catch (error) {
 				throw new BrowserToolSetupError("scope_setup", error);
@@ -180,13 +234,17 @@ export class BrowserToolCoordinator {
 			}
 			this.#driver = driver;
 			this.#tools = tools;
-			this.#scopeKey = scopeKey;
+			this.#scopeKey = key;
 			return { job, tools };
 		} catch (error) {
 			await driver.close?.().catch(() => undefined);
 			throw error;
 		}
 	}
+}
+
+function scopeKey(jobId: string, runToken: string): string {
+	return `${jobId}\u0000${runToken}`;
 }
 
 function readSubmitActivationStrategy(

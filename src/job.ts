@@ -35,6 +35,22 @@ export interface Job extends JobInput {
 	updatedAt: string;
 }
 
+export type EvidenceStage = "before_submit" | "after_submit" | "prohibited";
+
+export type EvidenceFailureCode =
+	| "SCREENSHOT_FAILED"
+	| "OBJECT_STORE_FAILED"
+	| "EVENT_NOT_RECORDED"
+	| "NO_BROWSER_SESSION"
+	| "CAPTURE_TIMEOUT";
+
+export interface JobEvent {
+	jobId: string;
+	attempt: number;
+	type: string;
+	data: Record<string, unknown>;
+}
+
 export interface JobStore {
 	create(input: JobInput, now: string): Promise<Job>;
 	find(id: string): Promise<Job | null>;
@@ -78,6 +94,26 @@ export interface JobStore {
 		reason: string,
 		now: string,
 	): Promise<Job | null>;
+	recordEvidenceCaptured(
+		id: string,
+		runToken: string,
+		attempt: number,
+		eventId: string,
+		stage: EvidenceStage,
+		objectKey: string,
+		sha256: string,
+		byteLength: number,
+		now: string,
+	): Promise<boolean>;
+	recordEvidenceCaptureFailed(
+		id: string,
+		runToken: string,
+		attempt: number,
+		eventId: string,
+		stage: EvidenceStage,
+		failureCode: EvidenceFailureCode,
+		now: string,
+	): Promise<boolean>;
 }
 
 export class DuplicateJobError extends Error {
@@ -89,6 +125,8 @@ export class DuplicateJobError extends Error {
 
 export class InMemoryJobStore implements JobStore {
 	readonly #jobs = new Map<string, Job>();
+	readonly #evidenceEventIndexes = new Map<string, number>();
+	readonly events: JobEvent[] = [];
 
 	async create(input: JobInput, now: string): Promise<Job> {
 		if (this.#jobs.has(input.id)) {
@@ -231,6 +269,105 @@ export class InMemoryJobStore implements JobStore {
 			reason,
 			completedAt: now,
 		});
+	}
+
+	async recordEvidenceCaptured(
+		id: string,
+		runToken: string,
+		attempt: number,
+		eventId: string,
+		stage: EvidenceStage,
+		objectKey: string,
+		sha256: string,
+		byteLength: number,
+		_now: string,
+	): Promise<boolean> {
+		return this.#recordEvidenceEvent(
+			id,
+			runToken,
+			attempt,
+			eventId,
+			"evidence.captured",
+			{
+				eventId,
+				stage,
+				objectKey,
+				sha256,
+				byteLength,
+				contentType: "image/jpeg",
+			},
+		);
+	}
+
+	async recordEvidenceCaptureFailed(
+		id: string,
+		runToken: string,
+		attempt: number,
+		eventId: string,
+		stage: EvidenceStage,
+		failureCode: EvidenceFailureCode,
+		_now: string,
+	): Promise<boolean> {
+		const existingIndex = this.#evidenceEventIndexes.get(eventId);
+		if (existingIndex !== undefined) {
+			const existing = this.events[existingIndex];
+			if (
+				!existing ||
+				existing.jobId !== id ||
+				existing.attempt !== attempt ||
+				existing.type !== "evidence.captured"
+			) {
+				return false;
+			}
+			this.events[existingIndex] = {
+				jobId: id,
+				attempt,
+				type: "evidence.capture_failed",
+				data: { stage, failureCode },
+			};
+			return true;
+		}
+
+		return this.#recordEvidenceEvent(
+			id,
+			runToken,
+			attempt,
+			eventId,
+			"evidence.capture_failed",
+			{
+				stage,
+				failureCode,
+			},
+		);
+	}
+
+	#recordEvidenceEvent(
+		id: string,
+		runToken: string,
+		attempt: number,
+		eventId: string,
+		type: string,
+		data: Record<string, unknown>,
+	): boolean {
+		const job = this.#jobs.get(id);
+		if (
+			!job ||
+			(job.status !== "running" && job.status !== "submitting") ||
+			job.runToken !== runToken ||
+			job.attemptCount !== attempt ||
+			this.#evidenceEventIndexes.has(eventId)
+		) {
+			return false;
+		}
+
+		this.#evidenceEventIndexes.set(eventId, this.events.length);
+		this.events.push({
+			jobId: id,
+			attempt: job.attemptCount,
+			type,
+			data,
+		});
+		return true;
 	}
 
 	#finish(

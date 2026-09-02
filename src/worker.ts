@@ -11,6 +11,7 @@ import {
 	assertAllowedTargetUrl,
 	normalizeAllowedHosts,
 } from "./restricted-browser";
+import { R2EvidenceObjectStore } from "./submission-evidence";
 
 export interface JobMessage {
 	jobId: string;
@@ -19,6 +20,7 @@ export interface JobMessage {
 export interface Env {
 	DB: D1Database;
 	JOB_QUEUE: Queue<JobMessage>;
+	EVIDENCE_BUCKET: R2Bucket;
 	AGENT_EXECUTOR_ENABLED?: string;
 	AGENT_MODEL?: string;
 	AGENT_DRY_RUN?: string;
@@ -731,10 +733,12 @@ function createAgentExecutor(env: Env): AgentExecutor {
 		env.AGENT_EXECUTOR_ENABLED === "true" &&
 		env.AGENT_MODEL &&
 		env.OPENAI_API_KEY &&
-		env.BROWSER_USE_API_KEY
+		env.BROWSER_USE_API_KEY &&
+		env.EVIDENCE_BUCKET
 	) {
 		return new ResponsesAgentExecutor({
 			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
 			model: env.AGENT_MODEL,
 			openAiApiKey: env.OPENAI_API_KEY,
 			browserUseApiKey: env.BROWSER_USE_API_KEY,
