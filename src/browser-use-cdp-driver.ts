@@ -1,5 +1,5 @@
 import { assertAllowedBrowserRequest } from "./browser-network-policy";
-import { hasNewSubmissionConfirmation } from "./browser-submit-confirmation";
+import { SUBMISSION_CONFIRMATION_PATTERN } from "./browser-submit-confirmation";
 import { BrowserUseCdpConnection } from "./browser-use-cdp";
 import {
 	type CdpDomNode,
@@ -26,7 +26,8 @@ const MAX_OBSERVED_FORMS = 10;
 const MAX_OBSERVED_FIELDS = 100;
 const MAX_DOM_DISCOVERY_ATTEMPTS = 5;
 const DOM_DISCOVERY_RETRY_DELAY_MS = 500;
-const CONFIRMATION_WAIT_MS = 5_000;
+const MAX_CONFIRMATION_SNAPSHOTS = 5;
+const CONFIRMATION_POLL_INTERVAL_MS = 1_000;
 const SUBMISSION_PERMISSION_WINDOW_MS = 2_000;
 const MAX_SUBMIT_MOUSE_PREPARATION_ATTEMPTS = 3;
 
@@ -446,9 +447,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			throw createBrowserSubmitDiagnosticError("SUBMIT_VALIDATE", error);
 		}
 		this.#interactionStarted = true;
-		let beforeText: string;
+		let beforeConfirmationCount: number;
 		try {
-			beforeText = await this.#documentText();
+			beforeConfirmationCount = await this.#confirmationBodyCount();
 		} catch (error) {
 			throw createBrowserSubmitDiagnosticError(
 				"SUBMIT_READ_BEFORE_TEXT",
@@ -466,15 +467,19 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			} catch (error) {
 				throw createBrowserSubmitDiagnosticError("SUBMIT_ACTIVATE", error);
 			}
-			const deadline = Date.now() + CONFIRMATION_WAIT_MS;
-			while (Date.now() < deadline) {
+			for (
+				let snapshot = 0;
+				snapshot < MAX_CONFIRMATION_SNAPSHOTS;
+				snapshot += 1
+			) {
+				await delay(CONFIRMATION_POLL_INTERVAL_MS);
 				const confirmation = await readSubmissionConfirmation(
-					beforeText,
-					() => this.#documentText(),
+					beforeConfirmationCount,
+					this.#submissionRequestCount > 0,
+					() => this.#confirmationBodyCount(),
 					() => this.currentUrl(),
 				);
 				if (confirmation) return confirmation;
-				await delay(250);
 			}
 		} finally {
 			this.#submissionRequestAllowed = false;
@@ -583,20 +588,21 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		);
 	}
 
-	async #documentText(): Promise<string> {
+	async #confirmationBodyCount(): Promise<number> {
 		const { root } = await this.#send<{ root: CdpDomNode }>("DOM.getDocument", {
 			depth: -1,
 			pierce: true,
 		});
-		const texts = await Promise.all(
+		const matches = await Promise.all(
 			discoverCdpBodyBackendNodeIds(root).map((backendNodeId) =>
-				this.#callFunctionOnElement<string>(
+				this.#callFunctionOnElement<boolean>(
 					backendNodeId,
-					READ_ELEMENT_TEXT_FUNCTION,
+					HAS_CONFIRMATION_TEXT_FUNCTION,
+					[SUBMISSION_CONFIRMATION_PATTERN],
 				),
 			),
 		);
-		return texts.join("\n").slice(0, MAX_PAGE_TEXT);
+		return matches.filter(Boolean).length;
 	}
 
 	#element(elementId: string): ElementReference {
@@ -1144,17 +1150,18 @@ export async function runSubmissionActivationWithinPermissionWindow(
 }
 
 export async function readSubmissionConfirmation(
-	beforeText: string,
-	readAfterText: () => Promise<string>,
+	beforeCount: number,
+	requestObserved: boolean,
+	readAfterCount: () => Promise<number>,
 	readCurrentUrl: () => Promise<string>,
 ): Promise<BrowserSubmitResult | null> {
-	let afterText: string;
+	let afterCount: number;
 	try {
-		afterText = await readAfterText();
+		afterCount = await readAfterCount();
 	} catch (error) {
 		throw createBrowserSubmitDiagnosticError("SUBMIT_READ_AFTER_TEXT", error);
 	}
-	if (!hasNewSubmissionConfirmation(beforeText, afterText)) return null;
+	if (!requestObserved || afterCount <= beforeCount) return null;
 	try {
 		return { outcome: "sent", formUrl: await readCurrentUrl() };
 	} catch (error) {
@@ -1270,8 +1277,8 @@ const INSPECT_ELEMENT_FUNCTION = String.raw`function() {
   };
 }`;
 
-const READ_ELEMENT_TEXT_FUNCTION = `function() {
-  return String(this.innerText || "").slice(0, 20000);
+const HAS_CONFIRMATION_TEXT_FUNCTION = `function(pattern) {
+  return new RegExp(pattern, "i").test(String(this.innerText || ""));
 }`;
 
 export function createExpectedSubmissionRequest(
