@@ -988,6 +988,21 @@ describe("BrowserUseCdpDriver submission confirmation", () => {
 		).resolves.toBeNull();
 	});
 
+	test("accepts an existing confirmation after an observed document GET submit", async () => {
+		await expect(
+			readSubmissionConfirmation(
+				1,
+				true,
+				async () => 1,
+				async () => "https://example.com/submit?name=test",
+				true,
+			),
+		).resolves.toEqual({
+			outcome: "sent",
+			formUrl: "https://example.com/submit?name=test",
+		});
+	});
+
 	test("accepts a confirmation that appears after submit", () => {
 		expect(
 			hasNewSubmissionConfirmation(

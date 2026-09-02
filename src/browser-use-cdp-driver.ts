@@ -497,6 +497,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 					this.#submissionRequestCount > 0,
 					() => this.#confirmationBodyCount(),
 					() => this.currentUrl(),
+					this.#expectedSubmissionRequest?.method === "GET",
 				);
 				if (confirmation) return confirmation;
 			}
@@ -1236,6 +1237,7 @@ export async function readSubmissionConfirmation(
 	requestObserved: boolean,
 	readAfterCount: () => Promise<number>,
 	readCurrentUrl: () => Promise<string>,
+	allowExistingConfirmation = false,
 ): Promise<BrowserSubmitResult | null> {
 	let afterCount: number;
 	try {
@@ -1243,7 +1245,12 @@ export async function readSubmissionConfirmation(
 	} catch (error) {
 		throw createBrowserSubmitDiagnosticError("SUBMIT_READ_AFTER_TEXT", error);
 	}
-	if (!requestObserved || afterCount <= beforeCount) return null;
+	if (
+		!requestObserved ||
+		(afterCount <= beforeCount &&
+			!(allowExistingConfirmation && afterCount > 0))
+	)
+		return null;
 	try {
 		return { outcome: "sent", formUrl: await readCurrentUrl() };
 	} catch (error) {
