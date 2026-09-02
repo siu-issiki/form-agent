@@ -666,7 +666,15 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				),
 			),
 		);
-		return matches.filter(Boolean).length;
+		const matchingBodyCount = matches.filter(Boolean).length;
+		console.log(
+			JSON.stringify({
+				event: "browser_confirmation_snapshot",
+				bodyCount: matches.length,
+				matchingBodyCount,
+			}),
+		);
+		return matchingBodyCount;
 	}
 
 	#element(elementId: string): ElementReference {
