@@ -126,7 +126,19 @@ export class SubmissionEvidenceRecorder {
 			recorded = false;
 		}
 		if (!recorded) {
-			await this.objectStore.delete(objectKey).catch(() => undefined);
+			try {
+				await this.objectStore.delete(objectKey);
+			} catch {
+				// The key holds only jobId, stage, and eventId, so it is safe to log
+				// for a later manual cleanup of the unreferenced object.
+				console.warn(
+					JSON.stringify({
+						event: "submission_evidence_orphan",
+						stage,
+						objectKey,
+					}),
+				);
+			}
 			return this.#failed(stage, "EVENT_NOT_RECORDED");
 		}
 

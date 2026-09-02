@@ -147,6 +147,12 @@ shasum -a 256 ./evidence.jpg
 
 画像には入力済みの個人情報が写る。確認後は取得したファイルを削除し、共有しない。R2側にはライフサイクル削除ルールを設定していないため、証跡スクリーンショットはR2上に無期限に残り続ける。この方針は運用ポリシー確定時に見直す。
 
+D1へのイベント記録に失敗した場合、Workerはアップロード済みのオブジェクトを補償削除する。補償削除にも失敗した場合は、D1から辿れないオブジェクトが残り、Workerログに`submission_evidence_orphan`イベントとして`objectKey`が出力される。ログから`objectKey`を取得し、手動で削除する。
+
+```bash
+./node_modules/.bin/wrangler r2 object delete form-agent-evidence/<objectKey> --remote
+```
+
 ## DLQの確認
 
 DLQへ移動したジョブを確認する。

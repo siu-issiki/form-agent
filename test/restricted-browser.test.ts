@@ -748,10 +748,60 @@ describe("SubmissionEvidenceRecorder", () => {
 			},
 		]);
 	});
+
+	test("logs the orphan object key when the compensating deletion fails", async () => {
+		const driver = new FakeDriver();
+		const evidence = new DeleteFailingEvidenceObjectStore();
+		const store = new RecordEvidenceCapturedRejectingJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const recorder = new SubmissionEvidenceRecorder(
+			driver,
+			evidence,
+			store,
+			input.id,
+			"run-token-1",
+			() => "2026-08-28T00:00:02.000Z",
+		);
+		const warnings: string[] = [];
+		const originalWarn = console.warn;
+		console.warn = (message: unknown) => {
+			warnings.push(String(message));
+		};
+
+		let result: Awaited<ReturnType<typeof recorder.capture>>;
+		try {
+			result = await recorder.capture("before_submit");
+		} finally {
+			console.warn = originalWarn;
+		}
+
+		expect(result).toEqual({
+			captured: false,
+			failureCode: "EVENT_NOT_RECORDED",
+		});
+		expect(evidence.objects.size).toBe(1);
+		const [objectKey] = [...evidence.objects.keys()];
+		expect(warnings).toHaveLength(1);
+		expect(JSON.parse(warnings[0] ?? "{}")).toEqual({
+			event: "submission_evidence_orphan",
+			stage: "before_submit",
+			objectKey,
+		});
+		expect(store.events.map((event) => event.type)).toEqual([
+			"evidence.capture_failed",
+		]);
+	});
 });
 
 class RecordEvidenceCapturedRejectingJobStore extends InMemoryJobStore {
 	async recordEvidenceCaptured(): Promise<boolean> {
 		return false;
+	}
+}
+
+class DeleteFailingEvidenceObjectStore extends InMemoryEvidenceObjectStore {
+	override async delete(): Promise<void> {
+		throw new Error("delete failed");
 	}
 }
