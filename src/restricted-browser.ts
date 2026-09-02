@@ -5,6 +5,7 @@ export interface BrowserObservation {
 	url: string;
 	forms: unknown[];
 	pageText?: string;
+	navigationLinks?: Array<{ url: string; text: string }>;
 }
 
 export type BrowserSubmitResult =
@@ -165,7 +166,18 @@ export class RestrictedBrowserTools {
 		await this.#assertCurrentUrlAllowed();
 		const observation = await this.driver.observe();
 		this.#assertAllowedUrl(observation.url);
-		return observation;
+		if (!observation.navigationLinks) return observation;
+		return {
+			...observation,
+			navigationLinks: observation.navigationLinks.filter((link) => {
+				try {
+					this.#assertAllowedUrl(link.url);
+					return true;
+				} catch {
+					return false;
+				}
+			}),
+		};
 	}
 
 	async click(elementId: string): Promise<void> {

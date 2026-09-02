@@ -19,6 +19,7 @@ import {
 } from "./restricted-browser";
 
 const MAX_PAGE_TEXT = 20_000;
+const MAX_OBSERVED_LINKS = 20;
 const MAX_OBSERVED_FORMS = 10;
 const MAX_OBSERVED_FIELDS = 100;
 const MAX_DOM_DISCOVERY_ATTEMPTS = 5;
@@ -280,7 +281,10 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 
 		this.#elements = elements;
-		const pageText = await this.#bodyText();
+		const [pageText, navigationLinks] = await Promise.all([
+			this.#bodyText(),
+			this.#navigationLinks(),
+		]);
 		console.log(
 			JSON.stringify({
 				event: "browser_dom_observation",
@@ -295,7 +299,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				durationMs: Date.now() - startedAt,
 			}),
 		);
-		return { url, forms, pageText };
+		return { url, forms, pageText, navigationLinks };
 	}
 
 	async clickNonSubmit(elementId: string): Promise<void> {
@@ -565,6 +569,12 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#bodyText(): Promise<string> {
 		return this.#evaluate<string>(
 			`(document.body?.innerText ?? "").slice(0, ${MAX_PAGE_TEXT})`,
+		);
+	}
+
+	#navigationLinks(): Promise<Array<{ url: string; text: string }>> {
+		return this.#evaluate<Array<{ url: string; text: string }>>(
+			`Array.from(document.querySelectorAll("a[href]"), (link) => ({ url: String(link.href).slice(0, 2048), text: String(link.innerText || link.textContent || "").trim().slice(0, 500) })).slice(0, ${MAX_OBSERVED_LINKS})`,
 		);
 	}
 

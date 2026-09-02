@@ -745,6 +745,7 @@ function systemPrompt(dryRun: boolean): string {
 		"You operate one company's inquiry form using only the provided tools.",
 		"Stay on the persisted target domain. Never use another company or arbitrary URL.",
 		"Observe the page before acting and check for sales, solicitation, or purpose restrictions.",
+		"When the inquiry form is on another page, navigate only to an exact URL returned in observe.navigationLinks.",
 		"If outreach is prohibited or the form purpose is incompatible, do not submit; call finish with prohibited.",
 		"For prohibited, use reasonCode NO_FORM_PRESENT when no inquiry form exists, SALES_PROHIBITED when sales or outreach is prohibited, or FORM_PURPOSE_INCOMPATIBLE when the form purpose is incompatible.",
 		"For fill and select, choose only a payloadKey from payload.formValues. The trusted handler resolves its value; never invent personal or company data.",
@@ -772,7 +773,7 @@ const AGENT_TOOLS = [
 	),
 	functionTool(
 		"observe",
-		"Inspect the current page URL, forms, fields, choices, and prohibition text.",
+		"Inspect the current page URL, allowed navigation links, forms, fields, choices, and prohibition text.",
 		{},
 	),
 	functionTool("click", "Click a non-submit button with type=button.", {
