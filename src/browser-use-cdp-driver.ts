@@ -334,7 +334,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 					method: candidateForm.method,
 					fields,
 					prohibitionText:
-						`${parentProhibitionText} ${formProhibitionText}`.slice(
+						`${formProhibitionText} ${parentProhibitionText}`.slice(
 							0,
 							MAX_PAGE_TEXT,
 						),
@@ -1734,12 +1734,15 @@ export const READ_FORM_PROHIBITION_CONTEXT_FUNCTION = `function(maxLength) {
   let current = this;
   for (let depth = 0; depth < 3 && current; depth += 1) {
     let sibling = current.previousElementSibling;
-    for (let count = 0; count < 3 && sibling; count += 1) {
+    const siblingLimit = depth === 0 ? 3 : 1;
+    for (let count = 0; count < siblingLimit && sibling; count += 1) {
       if (sibling.matches?.("form") || sibling.querySelector?.("form")) break;
-      texts.unshift(sibling.innerText ?? "");
+      if (!["HEADER", "NAV", "FOOTER"].includes(sibling.tagName)) {
+        texts.push(String(sibling.innerText ?? "").slice(0, maxLength));
+      }
       sibling = sibling.previousElementSibling;
     }
-    current = current.parentElement;
+    current = current.parentElement ?? current.getRootNode?.()?.host ?? null;
     if (!current || current.tagName === "BODY") break;
   }
   return texts.join(" ").slice(0, maxLength);

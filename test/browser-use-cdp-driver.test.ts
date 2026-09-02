@@ -52,19 +52,7 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 	test("reads preceding warnings and form text without including a footer", () => {
 		const readContext = runInNewContext(
 			`(${READ_FORM_PROHIBITION_CONTEXT_FUNCTION})`,
-		) as (
-			this: {
-				previousElementSibling: {
-					innerText: string;
-					previousElementSibling: null;
-					matches(): boolean;
-					querySelector(): null;
-				};
-				innerText: string;
-				parentElement: { tagName: string };
-			},
-			maxLength: number,
-		) => string;
+		) as (this: object, maxLength: number) => string;
 
 		expect(
 			readContext.call(
@@ -80,7 +68,68 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 				},
 				100,
 			),
-		).toBe("営業利用は禁止です 一般お問い合わせフォーム");
+		).toBe("一般お問い合わせフォーム 営業利用は禁止です");
+	});
+
+	test("crosses a shadow host but excludes unrelated header context", () => {
+		const readContext = runInNewContext(
+			`(${READ_FORM_PROHIBITION_CONTEXT_FUNCTION})`,
+		) as (this: object, maxLength: number) => string;
+		const body = { tagName: "BODY" };
+		const header = {
+			tagName: "HEADER",
+			innerText: "採用お問い合わせ専用サイト",
+			previousElementSibling: null,
+			matches: () => false,
+			querySelector: () => null,
+		};
+		const warning = {
+			tagName: "ASIDE",
+			innerText: "営業利用は禁止です",
+			previousElementSibling: header,
+			matches: () => false,
+			querySelector: () => null,
+		};
+		const host = {
+			tagName: "CONTACT-FORM",
+			innerText: "",
+			previousElementSibling: warning,
+			parentElement: body,
+			matches: () => false,
+			querySelector: () => null,
+		};
+		const form = {
+			tagName: "FORM",
+			innerText: "一般お問い合わせフォーム",
+			previousElementSibling: null,
+			parentElement: null,
+			getRootNode: () => ({ host }),
+		};
+
+		const result = readContext.call(form, 200);
+		expect(result).toContain("営業利用は禁止です");
+		expect(result).not.toContain("採用お問い合わせ専用サイト");
+	});
+
+	test("keeps form text ahead of oversized preceding context", () => {
+		const readContext = runInNewContext(
+			`(${READ_FORM_PROHIBITION_CONTEXT_FUNCTION})`,
+		) as (this: object, maxLength: number) => string;
+		const previous = {
+			tagName: "DIV",
+			innerText: "x".repeat(500),
+			previousElementSibling: null,
+			matches: () => false,
+			querySelector: () => null,
+		};
+		const form = {
+			tagName: "FORM",
+			innerText: "営業目的の利用は禁止です",
+			previousElementSibling: previous,
+			parentElement: { tagName: "BODY" },
+		};
+
+		expect(readContext.call(form, 80)).toContain("営業目的の利用は禁止です");
 	});
 
 	test("finds the iframe element that owns a discovered form frame", () => {
