@@ -278,6 +278,22 @@ describe("RestrictedBrowserTools", () => {
 		);
 	});
 
+	test("detects a prohibition split across adjacent context segments", async () => {
+		const driver = new FakeDriver();
+		driver.observationForms = [
+			{
+				fields: [{ elementId: "fa-0-0" }, { elementId: "fa-0-1" }],
+				prohibitionTexts: ["営業目的での利用は", "禁止しています"],
+			},
+		];
+		const tools = await createTools(driver);
+		await tools.observe();
+
+		await expect(
+			tools.validateProhibited("SALES_PROHIBITED", input.targetUrl),
+		).resolves.toBeUndefined();
+	});
+
 	test("requires a fresh observation before accepting a prohibited outcome", async () => {
 		const driver = new FakeDriver();
 		driver.observationForms = [];

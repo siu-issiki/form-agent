@@ -518,7 +518,15 @@ function trustObservedForms(forms: unknown[]): unknown[] {
 				: null;
 		if (!texts) return visibleForm;
 		const codes: ProhibitedReasonCode[] = [];
-		for (const text of texts) {
+		const detectionTexts = [...texts];
+		for (let index = 1; index < texts.length; index += 1) {
+			const previous = texts[index - 1];
+			const current = texts[index];
+			if (previous !== undefined && current !== undefined) {
+				detectionTexts.push(`${previous.slice(-128)} ${current.slice(0, 128)}`);
+			}
+		}
+		for (const text of detectionTexts) {
 			for (const code of detectProhibitedTextReasonCodes(text)) {
 				if (!codes.includes(code)) codes.push(code);
 			}

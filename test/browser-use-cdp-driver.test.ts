@@ -132,6 +132,22 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 		expect(readContext.call(form, 80)).toContain("営業目的の利用は禁止です");
 	});
 
+	test("keeps prohibition text from the middle of an oversized source", () => {
+		const readContext = runInNewContext(
+			`(${READ_FORM_PROHIBITION_CONTEXT_FUNCTION})`,
+		) as (this: object, maxLength: number) => string[];
+		const form = {
+			tagName: "FORM",
+			innerText: `${"x".repeat(5_000)}営業目的の利用は禁止です${"y".repeat(5_000)}`,
+			previousElementSibling: null,
+			parentElement: { tagName: "BODY" },
+		};
+
+		expect(readContext.call(form, 4_000).join(" ")).toContain(
+			"営業目的の利用は禁止です",
+		);
+	});
+
 	test("finds the iframe element that owns a discovered form frame", () => {
 		expect(
 			findCdpFrameOwnerBackendNodeId(

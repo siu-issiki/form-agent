@@ -1733,8 +1733,12 @@ export const READ_FORM_PROHIBITION_CONTEXT_FUNCTION = `function(maxLength) {
   const texts = [];
   const appendText = (value) => {
     const text = String(value ?? "");
-    texts.push(text.slice(0, maxLength));
-    if (text.length > maxLength) texts.push(text.slice(-maxLength));
+    const chunkLength = Math.max(1, Number(maxLength) || 1);
+    const overlap = Math.min(64, Math.floor(chunkLength / 4));
+    const step = Math.max(1, chunkLength - overlap);
+    for (let offset = 0; offset < text.length; offset += step) {
+      texts.push(text.slice(offset, offset + chunkLength));
+    }
   };
   appendText(this.innerText);
 	const appendPrevious = (element, limit) => {
