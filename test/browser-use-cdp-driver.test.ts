@@ -25,6 +25,7 @@ import {
 	readSubmissionConfirmation,
 	retrySubmitMousePreparation,
 	runSubmissionActivationWithinPermissionWindow,
+	SET_CHECKED_VALUE_FUNCTION,
 } from "../src/browser-use-cdp-driver";
 import {
 	BrowserElementError,
@@ -202,6 +203,51 @@ describe("BrowserUseCdpDriver child target policy", () => {
 			checkFormValidity.call({ form: { checkValidity: () => false } }),
 		).toBe(false);
 		expect(checkFormValidity.call({})).toBe(false);
+	});
+
+	test("activates checkbox and radio inputs through their DOM click semantics", () => {
+		const events: string[] = [];
+		const setChecked = runInNewContext(`(${SET_CHECKED_VALUE_FUNCTION})`) as (
+			this: {
+				tagName: string;
+				type: string;
+				checked: boolean;
+				click(): void;
+			},
+			checked: boolean,
+		) => boolean;
+		const checkbox = {
+			tagName: "INPUT",
+			type: "checkbox",
+			checked: false,
+			click() {
+				this.checked = !this.checked;
+				events.push("click", "input", "change");
+			},
+		};
+
+		expect(setChecked.call(checkbox, true)).toBe(true);
+		expect(checkbox.checked).toBe(true);
+		expect(events).toEqual(["click", "input", "change"]);
+		expect(setChecked.call(checkbox, true)).toBe(true);
+		expect(events).toEqual(["click", "input", "change"]);
+		expect(setChecked.call(checkbox, false)).toBe(true);
+		expect(checkbox.checked).toBe(false);
+
+		const radio = { ...checkbox, type: "radio", checked: false };
+		expect(setChecked.call(radio, true)).toBe(true);
+		expect(setChecked.call(radio, false)).toBe(false);
+
+		const controlledCheckbox = {
+			...checkbox,
+			checked: false,
+			click() {
+				this.checked = true;
+				this.checked = false;
+			},
+		};
+		expect(setChecked.call(controlledCheckbox, true)).toBe(false);
+		expect(setChecked.call({ ...checkbox, type: "text" }, true)).toBe(false);
 	});
 
 	test("requires a successful input owned by the submit control's form", () => {
