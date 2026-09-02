@@ -23,6 +23,7 @@ import {
 	createSubmitActivationFailureLog,
 	denyRelatedBrowserTargets,
 	ENTER_KEY_DOWN_EVENT,
+	getSubmissionRequestDisposition,
 	HAS_SAME_FORM_OWNER_FUNCTION,
 	IS_COMPOSED_DESCENDANT_FUNCTION,
 	IS_ELEMENT_FOCUSED_FUNCTION,
@@ -262,6 +263,38 @@ describe("BrowserUseCdpDriver child target policy", () => {
 				createExpectedSubmissionRequest("https://example.com/search", "get"),
 			),
 		).toThrow();
+	});
+
+	test("claims only the first expected GET document navigation", () => {
+		const expected = createExpectedSubmissionRequest(
+			"https://example.com/search",
+			"get",
+		);
+		const request = {
+			url: "https://example.com/search?company=AnyReach",
+			method: "GET",
+		};
+		const disposition = (
+			resourceType: string,
+			count: number,
+			inFlight: boolean,
+		) =>
+			getSubmissionRequestDisposition(
+				request,
+				resourceType,
+				expected,
+				true,
+				true,
+				count,
+				inFlight,
+			);
+
+		expect(disposition("Document", 0, false)).toBe("claim");
+		expect(disposition("Fetch", 0, false)).toBe("ignore");
+		expect(disposition("Image", 0, false)).toBe("ignore");
+		expect(disposition("Script", 0, false)).toBe("ignore");
+		expect(disposition("Document", 0, true)).toBe("block");
+		expect(disposition("Document", 1, false)).toBe("block");
 	});
 
 	test("classifies uncertain submissions without persisting request data", () => {

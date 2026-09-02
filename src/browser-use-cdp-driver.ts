@@ -103,6 +103,7 @@ interface ExpectedSubmissionRequest {
 }
 
 type SubmissionRequestBlockStage = "expected_request" | "network_policy";
+type GetSubmissionRequestDisposition = "claim" | "block" | "ignore";
 
 export type SubmitActivationStage =
 	| "scroll"
@@ -533,11 +534,29 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		);
 		let blockStage: SubmissionRequestBlockStage = "network_policy";
 		let claimedSubmissionRequest = false;
+		let submissionRelatedRequest = unsafeRequest;
 		try {
 			if (!this.#targetDomain) {
 				throw new Error("Browser domain scope is not configured");
 			}
 			let expectedSubmissionRequest = false;
+			const getSubmissionDisposition = getSubmissionRequestDisposition(
+				paused.request,
+				paused.resourceType,
+				this.#expectedSubmissionRequest,
+				this.#submissionAttemptInProgress,
+				this.#submissionRequestAllowed,
+				this.#submissionRequestCount,
+				this.#submissionRequestInFlight,
+			);
+			submissionRelatedRequest ||= getSubmissionDisposition !== "ignore";
+			if (getSubmissionDisposition === "block") {
+				blockStage = "expected_request";
+				throw new BrowserElementError();
+			}
+			if (getSubmissionDisposition === "claim") {
+				expectedSubmissionRequest = true;
+			}
 			if (this.#submissionRequestAllowed) {
 				if (unsafeRequest) {
 					blockStage = "expected_request";
@@ -546,11 +565,6 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 						this.#expectedSubmissionRequest,
 					);
 					expectedSubmissionRequest = true;
-				} else {
-					expectedSubmissionRequest = isExpectedSubmissionRequest(
-						paused.request,
-						this.#expectedSubmissionRequest,
-					);
 				}
 			}
 			const canClaimSubmissionRequest =
@@ -583,7 +597,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				},
 			);
 		} catch {
-			if (unsafeRequest && this.#submissionAttemptInProgress) {
+			if (submissionRelatedRequest && this.#submissionAttemptInProgress) {
 				this.#submissionRequestBlockStage ??= blockStage;
 			}
 			await this.#send("Fetch.failRequest", {
@@ -1369,6 +1383,30 @@ export function isExpectedSubmissionRequest(
 	return (
 		url.origin === expectedUrl.origin && url.pathname === expectedUrl.pathname
 	);
+}
+
+export function getSubmissionRequestDisposition(
+	request: { url: string; method: string },
+	resourceType: string | undefined,
+	expected: ExpectedSubmissionRequest | undefined,
+	submissionAttemptInProgress: boolean,
+	submissionRequestAllowed: boolean,
+	submissionRequestCount: number,
+	submissionRequestInFlight: boolean,
+): GetSubmissionRequestDisposition {
+	if (
+		!submissionAttemptInProgress ||
+		resourceType !== "Document" ||
+		expected?.method !== "GET" ||
+		!isExpectedSubmissionRequest(request, expected)
+	) {
+		return "ignore";
+	}
+	return submissionRequestAllowed &&
+		submissionRequestCount === 0 &&
+		!submissionRequestInFlight
+		? "claim"
+		: "block";
 }
 
 const SET_SELECT_VALUE_FUNCTION = `function(value) {
