@@ -121,6 +121,16 @@ describe("RestrictedBrowserTools", () => {
 		).rejects.toBeInstanceOf(NavigationPolicyError);
 	});
 
+	test("treats an exact duplicate current navigation as a no-op", async () => {
+		const driver = new FakeDriver();
+		const tools = await createTools(driver);
+
+		await tools.navigate(input.targetUrl);
+		await tools.navigate(input.targetUrl);
+
+		expect(driver.navigationCount).toBe(1);
+	});
+
 	test("does not treat another observed hash route as the same navigation", async () => {
 		const driver = new FakeDriver();
 		driver.navigationLinks = [
@@ -878,6 +888,7 @@ class FakeDriver implements RestrictedBrowserDriver {
 	failScreenshotAt: number | null = null;
 	closeConnectionOnScreenshotFailure = false;
 	connectionClosed = false;
+	navigationCount = 0;
 	navigationLinks: Array<{ url: string; text: string }> | undefined;
 	observationForms: unknown[] = defaultObservedForms();
 	pageText: string | undefined;
@@ -898,6 +909,7 @@ class FakeDriver implements RestrictedBrowserDriver {
 	}
 
 	async navigate(url: string): Promise<void> {
+		this.navigationCount += 1;
 		this.url = this.redirectTo ?? url;
 	}
 

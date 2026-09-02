@@ -28,8 +28,8 @@ const MAX_OBSERVED_FORMS = 10;
 const MAX_OBSERVED_FIELDS = 100;
 const MAX_DOM_DISCOVERY_ATTEMPTS = 5;
 const DOM_DISCOVERY_RETRY_DELAY_MS = 500;
-const MAX_CONFIRMATION_SNAPSHOTS = 5;
 const CONFIRMATION_POLL_INTERVAL_MS = 1_000;
+const SUBMISSION_CONFIRMATION_TIMEOUT_MS = 15_000;
 const SUBMISSION_PERMISSION_WINDOW_MS = 2_000;
 const MAX_SUBMIT_MOUSE_PREPARATION_ATTEMPTS = 3;
 
@@ -170,6 +170,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	readonly #frameNavigationRevisions = new Map<string, number>();
 	readonly #frameParentIds = new Map<string, string | undefined>();
 	readonly #isolatedWorldContexts = new Map<string, number>();
+	readonly #pageChangeWaiters = new Set<() => void>();
 	#elementGeneration = 0;
 	#elements = new Map<string, ElementReference>();
 	#formDataEntered = false;
@@ -227,6 +228,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async close(): Promise<void> {
+		this.#notifyPageChanged();
 		this.connection.close();
 	}
 
@@ -583,25 +585,22 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			} catch (error) {
 				throw createBrowserSubmitDiagnosticError("SUBMIT_ACTIVATE", error);
 			}
-			for (
-				let snapshot = 0;
-				snapshot < MAX_CONFIRMATION_SNAPSHOTS;
-				snapshot += 1
-			) {
-				await delay(CONFIRMATION_POLL_INTERVAL_MS);
-				const confirmation = await readSubmissionConfirmation(
-					beforeConfirmationCount,
-					this.#submissionRequestCount > 0,
-					() => this.#confirmationBodyCount(expectedDocumentGetFrameId),
-					() => this.currentUrl(),
-					hasExpectedFrameNavigated(
-						expectedDocumentGetFrameId,
-						frameNavigationRevisionBeforeActivation,
-						this.#frameNavigationRevisions,
+			const confirmation = await waitForSubmissionConfirmation(
+				() =>
+					readSubmissionConfirmation(
+						beforeConfirmationCount,
+						this.#submissionRequestCount > 0,
+						() => this.#confirmationBodyCount(expectedDocumentGetFrameId),
+						() => this.currentUrl(),
+						hasExpectedFrameNavigated(
+							expectedDocumentGetFrameId,
+							frameNavigationRevisionBeforeActivation,
+							this.#frameNavigationRevisions,
+						),
 					),
-				);
-				if (confirmation) return confirmation;
-			}
+				(milliseconds) => this.#waitForPageChange(milliseconds),
+			);
+			if (confirmation) return confirmation;
 		} finally {
 			this.#submissionRequestAllowed = false;
 			this.#submissionAttemptInProgress = false;
@@ -635,6 +634,10 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			if (sessionId !== this.sessionId) return;
 			this.#clearElements();
 			this.#isolatedWorldContexts.clear();
+			this.#notifyPageChanged();
+		});
+		this.connection.on("Page.loadEventFired", (_params, sessionId) => {
+			if (sessionId === this.sessionId) this.#notifyPageChanged();
 		});
 		this.connection.on("Page.frameAttached", (params, sessionId) => {
 			if (sessionId !== this.sessionId) return;
@@ -661,6 +664,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				frameId,
 				(this.#frameNavigationRevisions.get(frameId) ?? 0) + 1,
 			);
+			this.#notifyPageChanged();
 		});
 		await this.#send("Page.enable");
 		const frameTree = (
@@ -842,6 +846,24 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			}),
 		);
 		return matchingBodyCount;
+	}
+
+	#notifyPageChanged(): void {
+		for (const resolve of this.#pageChangeWaiters) resolve();
+		this.#pageChangeWaiters.clear();
+	}
+
+	async #waitForPageChange(milliseconds: number): Promise<void> {
+		let resolvePageChange: (() => void) | undefined;
+		const pageChanged = new Promise<void>((resolve) => {
+			resolvePageChange = resolve;
+			this.#pageChangeWaiters.add(resolve);
+		});
+		try {
+			await Promise.race([pageChanged, delay(milliseconds)]);
+		} finally {
+			if (resolvePageChange) this.#pageChangeWaiters.delete(resolvePageChange);
+		}
 	}
 
 	#element(elementId: string): ElementReference {
@@ -1534,6 +1556,23 @@ export async function readSubmissionConfirmation(
 	} catch (error) {
 		throw createBrowserSubmitDiagnosticError("POST_SUBMIT_URL_CHECK", error);
 	}
+}
+
+export async function waitForSubmissionConfirmation(
+	readConfirmation: () => Promise<BrowserSubmitResult | null>,
+	waitForChange: (milliseconds: number) => Promise<void>,
+	timeoutMs = SUBMISSION_CONFIRMATION_TIMEOUT_MS,
+	now: () => number = Date.now,
+): Promise<BrowserSubmitResult | null> {
+	const deadline = now() + timeoutMs;
+	while (now() < deadline) {
+		await waitForChange(
+			Math.min(CONFIRMATION_POLL_INTERVAL_MS, deadline - now()),
+		);
+		const confirmation = await readConfirmation();
+		if (confirmation) return confirmation;
+	}
+	return readConfirmation();
 }
 
 export function hasExpectedFrameNavigated(
