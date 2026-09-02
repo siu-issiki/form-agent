@@ -139,6 +139,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#submissionRequestBlockStage: SubmissionRequestBlockStage | undefined;
 	#validatedSubmitInputBackendNodeId: number | undefined;
 	#targetPolicyError: Error | undefined;
+	#documentRevision = 0;
 	#elementGeneration = 0;
 	#elements = new Map<string, ElementReference>();
 	#formDataEntered = false;
@@ -466,6 +467,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 					: {}),
 			};
 		}
+		const expectsDocumentGet =
+			this.#expectedSubmissionRequest?.method === "GET";
 		let beforeConfirmationCount: number;
 		try {
 			beforeConfirmationCount = await this.#confirmationBodyCount();
@@ -475,6 +478,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				error,
 			);
 		}
+		const documentRevisionBeforeActivation = this.#documentRevision;
 		try {
 			this.#submissionAttemptInProgress = true;
 			this.#submissionRequestBlockStage = undefined;
@@ -497,7 +501,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 					this.#submissionRequestCount > 0,
 					() => this.#confirmationBodyCount(),
 					() => this.currentUrl(),
-					this.#expectedSubmissionRequest?.method === "GET",
+					expectsDocumentGet &&
+						this.#documentRevision > documentRevisionBeforeActivation,
 				);
 				if (confirmation) return confirmation;
 			}
@@ -531,7 +536,10 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			}
 		});
 		this.connection.on("DOM.documentUpdated", (_params, sessionId) => {
-			if (sessionId === this.sessionId) this.#clearElements();
+			if (sessionId === this.sessionId) {
+				this.#documentRevision += 1;
+				this.#clearElements();
+			}
 		});
 		await this.#send("Page.enable");
 		this.#topFrameId = (
@@ -1237,7 +1245,7 @@ export async function readSubmissionConfirmation(
 	requestObserved: boolean,
 	readAfterCount: () => Promise<number>,
 	readCurrentUrl: () => Promise<string>,
-	allowExistingConfirmation = false,
+	documentUpdatedSinceSubmit = false,
 ): Promise<BrowserSubmitResult | null> {
 	let afterCount: number;
 	try {
@@ -1248,7 +1256,7 @@ export async function readSubmissionConfirmation(
 	if (
 		!requestObserved ||
 		(afterCount <= beforeCount &&
-			!(allowExistingConfirmation && afterCount > 0))
+			!(documentUpdatedSinceSubmit && afterCount > 0))
 	)
 		return null;
 	try {
