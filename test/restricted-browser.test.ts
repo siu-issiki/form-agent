@@ -143,6 +143,23 @@ describe("RestrictedBrowserTools", () => {
 		).rejects.toBeInstanceOf(NavigationPolicyError);
 	});
 
+	test("exposes only allowed navigation links", async () => {
+		const driver = new FakeDriver();
+		driver.navigationLinks = [
+			{ url: "https://acme.co.jp/contact/form", text: "Contact" },
+			{ url: "https://evil.test/form", text: "External" },
+		];
+		const tools = await createTools(driver);
+
+		expect(await tools.observe()).toEqual({
+			url: input.targetUrl,
+			forms: [],
+			navigationLinks: [
+				{ url: "https://acme.co.jp/contact/form", text: "Contact" },
+			],
+		});
+	});
+
 	test("submits once only after acquiring D1-compatible permission", async () => {
 		const driver = new FakeDriver();
 		const store = new InMemoryJobStore();
@@ -412,6 +429,7 @@ class FakeDriver implements RestrictedBrowserDriver {
 	submitActivationStrategies: SubmitActivationStrategy[] = [];
 	submitError: Error | null = null;
 	submitValidationError: Error | null = null;
+	navigationLinks: Array<{ url: string; text: string }> | undefined;
 	submitResult: BrowserSubmitResult = {
 		outcome: "sent",
 		formUrl: input.targetUrl,
@@ -430,7 +448,13 @@ class FakeDriver implements RestrictedBrowserDriver {
 	}
 
 	async observe() {
-		return { url: this.url, forms: [] };
+		return {
+			url: this.url,
+			forms: [],
+			...(this.navigationLinks
+				? { navigationLinks: this.navigationLinks }
+				: {}),
+		};
 	}
 
 	async clickNonSubmit(): Promise<void> {}

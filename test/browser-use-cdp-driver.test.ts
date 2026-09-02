@@ -6,7 +6,10 @@ import {
 	BrowserUseCdpPayloadTooLargeError,
 	MAX_CDP_MESSAGE_CHARACTERS,
 } from "../src/browser-use-cdp";
-import { discoverCdpForms } from "../src/browser-use-cdp-dom";
+import {
+	discoverCdpForms,
+	discoverCdpNavigationLinks,
+} from "../src/browser-use-cdp-dom";
 import {
 	ACTIVATE_SUBMIT_FUNCTION,
 	assertDryRunNavigationAllowed,
@@ -98,6 +101,107 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 		expect(() =>
 			assertCdpMessageWithinLimit("x".repeat(MAX_CDP_MESSAGE_CHARACTERS + 1)),
 		).toThrow(BrowserUseCdpPayloadTooLargeError);
+	});
+
+	test("filters links before applying the observation limit", () => {
+		const rejected = Array.from({ length: 25 }, (_, index) => ({
+			backendNodeId: index + 2,
+			nodeName: "A",
+			attributes: ["href", `https://external-${index}.test/form`],
+		}));
+		const links = discoverCdpNavigationLinks(
+			{
+				backendNodeId: 1,
+				nodeName: "#document",
+				children: [
+					...rejected,
+					{
+						backendNodeId: 100,
+						nodeName: "A",
+						attributes: ["href", "/contact"],
+						children: [
+							{
+								backendNodeId: 101,
+								nodeName: "#text",
+								nodeValue: "お問い合わせ",
+							},
+						],
+					},
+				],
+			},
+			"https://example.com/",
+			(url) => new URL(url).hostname === "example.com",
+		);
+
+		expect(links).toEqual([
+			{ url: "https://example.com/contact", text: "お問い合わせ" },
+		]);
+	});
+
+	test("skips oversized links without consuming the observation limit", () => {
+		const links = discoverCdpNavigationLinks(
+			{
+				backendNodeId: 1,
+				nodeName: "#document",
+				children: [
+					{
+						backendNodeId: 2,
+						nodeName: "A",
+						attributes: ["href", `/${"x".repeat(2_048)}`],
+					},
+					{
+						backendNodeId: 3,
+						nodeName: "A",
+						attributes: ["href", "/contact"],
+					},
+				],
+			},
+			"https://example.com/",
+			() => true,
+			1,
+		);
+
+		expect(links).toEqual([{ url: "https://example.com/contact", text: "" }]);
+	});
+
+	test("resolves links against each document base URL", () => {
+		const links = discoverCdpNavigationLinks(
+			{
+				backendNodeId: 1,
+				nodeName: "#document",
+				baseURL: "https://example.com/",
+				children: [
+					{
+						backendNodeId: 2,
+						nodeName: "A",
+						attributes: ["href", "contact"],
+					},
+					{
+						backendNodeId: 3,
+						nodeName: "IFRAME",
+						contentDocument: {
+							backendNodeId: 4,
+							nodeName: "#document",
+							baseURL: "https://forms.example.com/directory/",
+							children: [
+								{
+									backendNodeId: 5,
+									nodeName: "A",
+									attributes: ["href", "contact"],
+								},
+							],
+						},
+					},
+				],
+			},
+			"https://example.com/landing/index.html",
+			() => true,
+		);
+
+		expect(links).toEqual([
+			{ url: "https://example.com/contact", text: "" },
+			{ url: "https://forms.example.com/directory/contact", text: "" },
+		]);
 	});
 });
 

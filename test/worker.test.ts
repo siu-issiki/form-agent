@@ -727,6 +727,9 @@ describe("ResponsesAgentExecutor", () => {
 		});
 		expect(requestBodies[0]?.instructions).toContain("This is a dry-run");
 		expect(requestBodies[0]?.instructions).toContain(
+			"navigate only to an exact URL returned in observe.navigationLinks",
+		);
+		expect(requestBodies[0]?.instructions).toContain(
 			"Use select for select elements, checkboxes, and radio controls",
 		);
 		expect(

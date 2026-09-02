@@ -5,9 +5,11 @@ import {
 	type CdpDomNode,
 	type CdpFormDiscovery,
 	discoverCdpForms,
+	discoverCdpNavigationLinks,
 } from "./browser-use-cdp-dom";
 import type { Job } from "./job";
 import {
+	assertAllowedTargetUrl,
 	BrowserElementError,
 	BrowserFormInvalidError,
 	type BrowserObservation,
@@ -223,8 +225,11 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	async observe(): Promise<BrowserObservation> {
 		const startedAt = Date.now();
 		const url = await this.currentUrl();
-		const { discovery, attempts: discoveryAttempts } =
-			await this.#discoverForms(url);
+		const {
+			discovery,
+			root,
+			attempts: discoveryAttempts,
+		} = await this.#discoverForms(url);
 
 		const generation = ++this.#elementGeneration;
 		const elements = new Map<string, ElementReference>();
@@ -281,6 +286,15 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 
 		this.#elements = elements;
 		const pageText = await this.#bodyText();
+		const navigationLinks = discoverCdpNavigationLinks(root, url, (linkUrl) => {
+			if (!this.#targetDomain) return false;
+			try {
+				assertAllowedTargetUrl(linkUrl, this.#targetDomain, this.#allowedHosts);
+				return true;
+			} catch {
+				return false;
+			}
+		});
 		console.log(
 			JSON.stringify({
 				event: "browser_dom_observation",
@@ -295,7 +309,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				durationMs: Date.now() - startedAt,
 			}),
 		);
-		return { url, forms, pageText };
+		return { url, forms, pageText, navigationLinks };
 	}
 
 	async clickNonSubmit(elementId: string): Promise<void> {
@@ -581,24 +595,22 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		this.#validatedSubmitInputBackendNodeId = undefined;
 	}
 
-	async #discoverForms(
-		url: string,
-	): Promise<{ discovery: CdpFormDiscovery; attempts: number }> {
+	async #discoverForms(url: string): Promise<{
+		discovery: CdpFormDiscovery;
+		root: CdpDomNode;
+		attempts: number;
+	}> {
 		for (let attempt = 1; attempt <= MAX_DOM_DISCOVERY_ATTEMPTS; attempt += 1) {
-			const discovery = discoverCdpForms(
-				(
-					await this.#send<{ root: CdpDomNode }>("DOM.getDocument", {
-						depth: -1,
-						pierce: true,
-					})
-				).root,
-				url,
+			const { root } = await this.#send<{ root: CdpDomNode }>(
+				"DOM.getDocument",
+				{ depth: -1, pierce: true },
 			);
+			const discovery = discoverCdpForms(root, url);
 			if (
 				discovery.candidateFieldCount > 0 ||
 				attempt === MAX_DOM_DISCOVERY_ATTEMPTS
 			) {
-				return { discovery, attempts: attempt };
+				return { discovery, root, attempts: attempt };
 			}
 			await delay(DOM_DISCOVERY_RETRY_DELAY_MS);
 		}

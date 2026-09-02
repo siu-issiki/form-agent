@@ -4,12 +4,20 @@ const MAX_CANDIDATE_FORMS = 25;
 export interface CdpDomNode {
 	backendNodeId: number;
 	nodeName: string;
+	nodeValue?: string;
+	baseURL?: string;
+	documentURL?: string;
 	attributes?: string[];
 	children?: CdpDomNode[];
 	shadowRoots?: CdpDomNode[];
 	contentDocument?: CdpDomNode;
 	templateContent?: CdpDomNode;
 	shadowRootType?: "user-agent" | "open" | "closed";
+}
+
+export interface CdpNavigationLink {
+	url: string;
+	text: string;
 }
 
 export interface CdpFieldCandidate {
@@ -95,6 +103,57 @@ export function discoverCdpForms(
 		closedShadowRootCount,
 		candidateFieldCount: fields.length,
 	};
+}
+
+export function discoverCdpNavigationLinks(
+	root: CdpDomNode,
+	currentUrl: string,
+	isAllowed: (url: string) => boolean,
+	maxLinks = 20,
+): CdpNavigationLink[] {
+	const links: CdpNavigationLink[] = [];
+	const seen = new Set<string>();
+	const current = new URL(currentUrl);
+	const visit = (node: CdpDomNode, inheritedBaseUrl: string) => {
+		if (links.length >= maxLinks) return;
+		const baseUrl = node.baseURL ?? node.documentURL ?? inheritedBaseUrl;
+		if (node.nodeName.toLowerCase() === "a") {
+			const href = parseAttributes(node.attributes).href;
+			try {
+				const url = new URL(href ?? "", baseUrl);
+				const samePage =
+					url.origin === current.origin &&
+					url.pathname === current.pathname &&
+					url.search === current.search;
+				if (
+					url.href.length <= 2_048 &&
+					!samePage &&
+					!seen.has(url.href) &&
+					isAllowed(url.href)
+				) {
+					seen.add(url.href);
+					links.push({
+						url: url.href,
+						text: descendantText(node).slice(0, 500),
+					});
+				}
+			} catch {
+				// Ignore malformed or disallowed links.
+			}
+		}
+		for (const child of composedChildren(node)) visit(child, baseUrl);
+	};
+	visit(root, currentUrl);
+	return links;
+}
+
+function descendantText(node: CdpDomNode): string {
+	let text = node.nodeName === "#text" ? (node.nodeValue ?? "") : "";
+	for (const child of composedChildren(node)) {
+		if (text.length >= 500) break;
+		text += descendantText(child);
+	}
+	return text.trim();
 }
 
 function composedChildren(node: CdpDomNode): CdpDomNode[] {
