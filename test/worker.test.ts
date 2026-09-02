@@ -1084,6 +1084,107 @@ describe("ResponsesAgentExecutor", () => {
 		expect(driver.closed).toBe(true);
 	});
 
+	test("normalizes prohibited reason code aliases", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () =>
+				Response.json(
+					functionResponse("call-finish", "finish", {
+						outcome: "prohibited",
+						formUrl: input.targetUrl,
+						reasonCode: "NO_INQUIRY_FORM",
+						reason: "No inquiry form is present.",
+						retryable: null,
+					}),
+				)) as typeof fetch,
+			createBrowserDriver: async () => new WorkerFakeBrowserDriver(),
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toMatchObject({
+			outcome: "prohibited",
+			reasonCode: "NO_FORM_PRESENT",
+		});
+	});
+
+	test("rejects an unknown prohibited reason code", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-invalid", "finish", {
+				outcome: "prohibited",
+				formUrl: input.targetUrl,
+				reasonCode: "ARBITRARY_PROHIBITED_REASON",
+				reason: "The form must not be submitted.",
+				retryable: null,
+			}),
+			functionResponse("call-valid", "finish", {
+				outcome: "prohibited",
+				formUrl: input.targetUrl,
+				reasonCode: "SALES_PROHIBITED",
+				reason: "Sales inquiries are prohibited.",
+				retryable: null,
+			}),
+		];
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () => {
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => new WorkerFakeBrowserDriver(),
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toMatchObject({
+			outcome: "prohibited",
+			reasonCode: "SALES_PROHIBITED",
+		});
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{
+				turn: 1,
+				toolName: "finish",
+				stage: "finish_validation",
+				resultCode: "FINISH_FIELDS_INVALID",
+			},
+			{
+				turn: 2,
+				toolName: "finish",
+				stage: "finish_validation",
+				resultCode: "OK",
+			},
+		]);
+	});
+
 	test("lets the model recover when click is used for a submit control", async () => {
 		const store = new D1JobStore(env.DB);
 		await store.create(input, "2026-08-28T00:00:00.000Z");
