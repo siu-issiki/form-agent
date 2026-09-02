@@ -176,6 +176,12 @@ driver が submit control と識別した要素は通常の `click` で操作で
 - レビューが allow を返した直後、送信権を取得する前に、現在 URL と観察済み全フィールドの `value` / `checked` を読み直して観察時と一致することを確認する。1 件でも異なる、要素が消えている、要素が増えている場合は `FORM_STATE_CHANGED` として送信せず、再観察を強制する。レビュー中に非信頼ページの JS が値を書き換えても、レビューされていない内容が送信されないようにするためである。
 - あわせて、レビュー呼び出しの直前と allow 直後に、submit 要素が属する form 全体を DOM から再探索した snapshot を取得して比較する。snapshot には hidden と disabled を含む全コントロールの tag / type / name / value / checked / disabled を DOM 順で含め、password の値はマスクする。観察済み要素だけを再訪する照合では見えない、レビュー中の hidden input 追加、`name` の差し替え、disabled の変更もこれで検出する。
 - レビューは `running` 状態でのみ Provider 呼び出し回数を消費できるため、必ず `claimSubmission` より前に実行する。
+- 既知の残存リスク（2026-09-03 時点で受容し、未対応）:
+  - allow 後の最終照合から activation までの間（`claimSubmission` の待ち時間を含む数十 ms）は再照合しない。この窓で非信頼ページの JS がフォームを書き換えた場合、レビューされていない内容が送信され得る。送信先は対象ドメインと期待済み action / method に限定されるため、影響は対象サイト自身のフォームへの内容差異にとどまる。
+  - snapshot にはコントロールの基本属性だけを含め、禁止文言、label、select の option、form の action / method の変化は比較しない。レビュー中にこれらが変わった場合、変化後の action へ送信され得る（ドメインと method の制限は network policy が別途強制する）。
+  - 修正の証明は「`fill` / `select` の実施」と「観察指紋全体の変化」で判定するため、無関係な動的フィールドや label が変わると、同じ値の再入力でも修正済みと見なされる。
+  - form 全体の再探索は候補 200 field / 25 form で打ち切られるため、それを超えるページでは snapshot が form 全体を表さない。
+
 - レビューモデルは既定で `AGENT_MODEL` と同じであり、`AGENT_SUBMIT_REVIEW_MODEL` を設定した場合だけ上書きする。
 
 ### Cloudflare D1
@@ -336,6 +342,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 - submit controlの期待済みGETは送信権で制御する。非submitの`click`、`fill`、`select`がDOMイベントを発火する直前から、その後および`submit`中のbrowser requestを遮断し、観察済みnavigateのtop-frame Document、期待済みsubmit request、またはそのrequest IDに直接連なるsafe redirectだけを許可する。`navigate`は直前の`observe.navigationLinks`で得たfragmentを含む完全一致URLまたは現在URLだけを許可する。観察済みリンク自体がGET型副作用を持つサイトは機械的に識別できないため、対象サイト側がGETをsafe methodとして扱うことは引き続き前提になる。
 - 営業禁止判定はフォーム不在と、候補form本文、前方・祖先側の近接要素、iframe親ページ側の近接要素に対する固定の日本語・英語パターンを使う。肯定表現と「禁止していない」は除外し、複数formがある場合のページ全体禁止は全formに何らかの禁止根拠がある場合だけ受理する。送信前確認は選択formの禁止根拠、form owner、native validity、action / method、入力後の再観察、1回限りの送信権を信頼済みhandlerで検証する。固定パターンに加えて送信直前の独立レビューが禁止表現と入力内容を再確認するが、レビューはモデル判断であり完全ではない。未知の禁止表現は`prohibited`として確定できず、追加パターンまたは人手確認が必要になる。
 - dry-runではジョブURLへのbootstrap後の再navigateと、最初のclick / fill / select以降に発生するbrowser requestをすべて遮断し、座標click前にCDPのhit targetが検証済み要素またはそのcomposed descendantであることを確認する。
+- 送信前の独立レビューとレビュー後の再照合は、レビュー中のページ JS による値の書き換えを検出するが、最終照合から activation までの窓、禁止文言 / label / option / action の変化、200 field を超える form の再探索は対象外である。詳細は「送信前の独立レビュー」の残存リスクを参照する。
 
 ### API / 運用
 
@@ -448,6 +455,7 @@ PoC はまず 1 並列の production で開始し、管理下テストサイト�
 - Provider abstraction と fallback。
 - 外部 API E2E は GitHub Actions の通常 CI に含めず、手動実行に限定する。
 - R2 アップロード後・D1 記録前に Worker が停止した場合の孤児オブジェクトは検出できない。intent イベントの先行記録または R2 ライフサイクルルールで対処する。
+- 送信前レビューの残存リスク対応: `dom` activation で照合と `requestSubmit` を同一 JS 実行内で行い、`mouse` / `enter` は activation 直前に再照合する。snapshot に禁止文言・label・option・action / method を含める。修正の証明を変更したコントロールの value / checked 差分に限定する。form 再探索の切り詰めを検出して fail-closed にする。いずれも管理下テストシステムでの E2E と併せて実施する。
 
 ### 運用・ポリシー
 
