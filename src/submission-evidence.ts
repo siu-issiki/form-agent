@@ -111,7 +111,10 @@ export class SubmissionEvidenceRecorder {
 						objectKey,
 					}),
 				);
-				resolve(this.#failed(stage, "CAPTURE_TIMEOUT"));
+				// The failure event write is not awaited: a stalled D1 must not
+				// extend the timeout past its bound. #failed never rejects.
+				void this.#failed(stage, "CAPTURE_TIMEOUT");
+				resolve({ captured: false, failureCode: "CAPTURE_TIMEOUT" });
 			}, this.timeoutMs);
 		});
 
