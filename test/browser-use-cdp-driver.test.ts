@@ -37,6 +37,7 @@ import {
 	isExpectedNavigationDocumentRequest,
 	isPayloadIndependentClickTarget,
 	READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
+	readPageText,
 	readSubmissionConfirmation,
 	retrySubmitMousePreparation,
 	runSubmissionActivationWithinPermissionWindow,
@@ -1405,5 +1406,30 @@ describe("BrowserUseCdpDriver screenshot capture", () => {
 			}),
 		).rejects.toThrow("Browser screenshot failed");
 		expect(attempts).toBe(1);
+	});
+});
+
+describe("BrowserUseCdpDriver page text", () => {
+	test("keeps a short page text untruncated", () => {
+		expect(readPageText("Contact us")).toEqual({
+			text: "Contact us",
+			truncated: false,
+		});
+	});
+
+	test("reports truncation at the observation limit", () => {
+		const raw = "a".repeat(20_001);
+
+		const result = readPageText(raw);
+
+		expect(result.truncated).toBe(true);
+		expect(result.text).toHaveLength(20_000);
+	});
+
+	test("does not report truncation for text exactly at the limit", () => {
+		const result = readPageText("a".repeat(20_000));
+
+		expect(result.truncated).toBe(false);
+		expect(result.text).toHaveLength(20_000);
 	});
 });

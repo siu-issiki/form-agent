@@ -58,7 +58,8 @@ export type AgentToolDiagnosticStage =
 	| "fill"
 	| "select"
 	| "submit"
-	| "submit_validate";
+	| "submit_validate"
+	| "submit_review";
 
 export type AgentToolDiagnosticCode =
 	| "OK"
@@ -70,6 +71,9 @@ export type AgentToolDiagnosticCode =
 	| "FINISH_OUTCOME_INVALID"
 	| "FINISH_PROHIBITION_NOT_VERIFIED"
 	| "SUBMIT_RESULT_NOT_PERSISTED"
+	| "SUBMIT_REVIEW_ALLOWED"
+	| "SUBMIT_REVIEW_DENIED"
+	| "SUBMIT_REVIEW_UNAVAILABLE"
 	| "JOB_STATE_CONFLICT"
 	| "CDP_CONNECTION_FAILED"
 	| "CDP_CONNECTION_CLOSED"

@@ -1,17 +1,96 @@
 import { parse } from "tldts";
 import type { Job, JobStore } from "./job";
 import {
+	EVIDENCE_CONTENT_TYPE,
 	type EvidenceCaptureResult,
 	type EvidenceObjectStore,
 	SubmissionEvidenceRecorder,
 } from "./submission-evidence";
 
+/** A denial only allows one correction; the second denial ends the job. */
+const MAX_SUBMIT_REVIEW_DENIALS = 2;
+const MAX_SUBMIT_REVIEW_REASON_LENGTH = 500;
+// biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are flattened on purpose
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/g;
+
 export interface BrowserObservation {
 	url: string;
 	forms: unknown[];
 	pageText?: string;
+	pageTextTruncated?: boolean;
 	navigationLinks?: Array<{ url: string; text: string }>;
 	prohibitedReasonCodes?: ProhibitedReasonCode[];
+}
+
+export type SubmitReviewReasonCode =
+	| "INPUTS_MATCH"
+	| "INPUT_MISMATCH"
+	| "SALES_PROHIBITED"
+	| "FORM_PURPOSE_INCOMPATIBLE"
+	| "WRONG_FORM"
+	| "UNCLEAR";
+
+export interface SubmitReviewDecision {
+	decision: "allow" | "deny";
+	reasonCode: SubmitReviewReasonCode;
+	reason: string;
+}
+
+export interface SubmitReviewInput {
+	targetDomain: string;
+	targetUrl: string;
+	currentUrl: string;
+	formValues: Record<string, string>;
+	observation: BrowserObservation;
+	submitElementId: string;
+	screenshot: { contentType: "image/jpeg"; bytes: Uint8Array } | null;
+}
+
+export interface SubmitReviewer {
+	review(input: SubmitReviewInput): Promise<SubmitReviewDecision>;
+}
+
+/** The pre-submit review rejected this submission. */
+export class SubmitReviewDeniedError extends Error {
+	constructor(readonly reasonCode: SubmitReviewReasonCode) {
+		super("The pre-submit review denied the submission");
+		this.name = "SubmitReviewDeniedError";
+	}
+}
+
+/** The pre-submit review could not produce a decision. */
+export class SubmitReviewUnavailableError extends Error {
+	constructor() {
+		super("The pre-submit review could not be completed");
+		this.name = "SubmitReviewUnavailableError";
+	}
+}
+
+export const PAYLOAD_KEY_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+export const MAX_PAYLOAD_VALUE_LENGTH = 8_192;
+
+/**
+ * Narrows `job.payload.formValues` to the entries the trusted handler is
+ * willing to enter into a form. It lives here so that the browser tool handler
+ * and the pre-submit review share exactly one definition of a trusted value.
+ */
+export function readTrustedFormValues(
+	payload: Record<string, unknown>,
+): Record<string, string> {
+	const formValues = payload.formValues;
+	if (!isRecord(formValues) || Array.isArray(formValues)) return {};
+	const trusted: Record<string, string> = {};
+	for (const [key, value] of Object.entries(formValues)) {
+		if (
+			PAYLOAD_KEY_PATTERN.test(key) &&
+			typeof value === "string" &&
+			value.length > 0 &&
+			value.length <= MAX_PAYLOAD_VALUE_LENGTH
+		) {
+			trusted[key] = value;
+		}
+	}
+	return trusted;
 }
 
 export type ProhibitedReasonCode =
@@ -67,6 +146,14 @@ export class BrowserFormInvalidError extends BrowserElementError {
 	constructor() {
 		super();
 		this.name = "BrowserFormInvalidError";
+	}
+}
+
+/** The latest observation is older than the latest trusted input. */
+export class ObservationStaleError extends BrowserElementError {
+	constructor() {
+		super();
+		this.name = "ObservationStaleError";
 	}
 }
 
@@ -130,13 +217,16 @@ export function createBrowserSubmitDiagnosticError(
 
 export class RestrictedBrowserTools {
 	readonly #targetDomain: string;
+	readonly #targetUrl: string;
 	readonly #allowedHosts: string[];
+	readonly #formValues: Record<string, string>;
 	readonly #successfulInputElementIds = new Set<string>();
 	readonly #allowedNavigationUrls = new Set<string>();
 	#latestObservation: BrowserObservation | undefined;
 	#inputRevision = 0;
 	#observationRevision = -1;
 	#submitAttempted = false;
+	#reviewDenialCount = 0;
 
 	private constructor(
 		private readonly driver: RestrictedBrowserDriver,
@@ -144,13 +234,17 @@ export class RestrictedBrowserTools {
 		private readonly jobId: string,
 		private readonly runToken: string,
 		private readonly recorder: SubmissionEvidenceRecorder,
+		private readonly reviewer: SubmitReviewer,
 		targetDomain: string,
 		allowedHosts: readonly string[],
 		targetUrl: string,
+		formValues: Record<string, string>,
 		private readonly now: () => string = () => new Date().toISOString(),
 	) {
 		this.#targetDomain = normalizeTargetDomain(targetDomain);
 		this.#allowedHosts = normalizeAllowedHosts(allowedHosts);
+		this.#targetUrl = targetUrl;
+		this.#formValues = formValues;
 		this.#allowedNavigationUrls.add(canonicalNavigationUrl(targetUrl));
 	}
 
@@ -160,6 +254,7 @@ export class RestrictedBrowserTools {
 		jobId: string,
 		runToken: string,
 		evidenceStore: EvidenceObjectStore,
+		reviewer: SubmitReviewer,
 		now: () => string = () => new Date().toISOString(),
 	): Promise<RestrictedBrowserTools> {
 		const job = await jobs.find(jobId);
@@ -185,9 +280,11 @@ export class RestrictedBrowserTools {
 				job.attemptCount,
 				now,
 			),
+			reviewer,
 			targetDomain,
 			allowedHosts,
 			job.targetUrl,
+			readTrustedFormValues(job.payload),
 			now,
 		);
 	}
@@ -274,7 +371,7 @@ export class RestrictedBrowserTools {
 			throw new BrowserElementError();
 		}
 		if (this.#observationRevision !== this.#inputRevision) {
-			throw new BrowserElementError();
+			throw new ObservationStaleError();
 		}
 		if (
 			prohibitedReasonCodesForElement(this.#latestObservation, elementId)
@@ -305,6 +402,31 @@ export class RestrictedBrowserTools {
 		}
 	}
 
+	/**
+	 * Runs the independent pre-submit review over the latest trusted
+	 * observation. It must run before `claimSubmission`, because the reviewer
+	 * consumes a provider request that D1 only grants while the job is still
+	 * `running`.
+	 */
+	async reviewSubmit(
+		elementId: string,
+		screenshot: { contentType: "image/jpeg"; bytes: Uint8Array } | null,
+	): Promise<SubmitReviewDecision> {
+		const observation = this.#latestObservation;
+		if (!observation) {
+			throw new BrowserElementError();
+		}
+		return this.reviewer.review({
+			targetDomain: this.#targetDomain,
+			targetUrl: this.#targetUrl,
+			currentUrl: observation.url,
+			formValues: this.#formValues,
+			observation,
+			submitElementId: elementId,
+			screenshot,
+		});
+	}
+
 	async submit(
 		elementId: string,
 		activationStrategy: SubmitActivationStrategy = "mouse",
@@ -313,13 +435,32 @@ export class RestrictedBrowserTools {
 			throw new SubmissionNotAuthorizedError();
 		}
 		await this.validateSubmit(elementId);
-		this.#submitAttempted = true;
 
 		// Nothing is submitted until the pre-submission evidence exists.
 		const before = await this.recorder.capture("before_submit");
 		if (!before.captured) {
 			throw new SubmissionEvidenceError();
 		}
+
+		const decision = await this.reviewSubmit(elementId, {
+			contentType: EVIDENCE_CONTENT_TYPE,
+			bytes: before.body,
+		});
+		if (decision.decision === "deny") {
+			this.#reviewDenialCount += 1;
+			if (this.#reviewDenialCount < MAX_SUBMIT_REVIEW_DENIALS) {
+				// Force a fresh observation so the next attempt reviews the
+				// corrected page instead of the denied one.
+				this.#inputRevision += 1;
+				throw new SubmitReviewDeniedError(decision.reasonCode);
+			}
+			await this.#recordUncertain(
+				"PRE_SUBMIT_REVIEW_DENIED",
+				submitReviewDeniedReason(decision),
+			);
+			throw new SubmissionResultUncertainError();
+		}
+		this.#submitAttempted = true;
 
 		const authorized = await this.jobs.claimSubmission(
 			this.jobId,
@@ -607,6 +748,19 @@ function canonicalNavigationUrl(rawUrl: string): string {
 
 function canonicalNavigationPermissionUrl(rawUrl: string): string {
 	return new URL(rawUrl).toString();
+}
+
+/**
+ * The reviewer's free-form reason is the only untrusted text this module
+ * persists. It is reachable through `GET /jobs/:id`, so control characters and
+ * line breaks are flattened and the text is truncated before storage. The model
+ * never sees it; only the fixed reason code is returned to the agent.
+ */
+function submitReviewDeniedReason(decision: SubmitReviewDecision): string {
+	const reason = decision.reason
+		.replace(CONTROL_CHARACTER_PATTERN, " ")
+		.slice(0, MAX_SUBMIT_REVIEW_REASON_LENGTH);
+	return `Pre-submit review denied the submission twice. Last reasonCode: ${decision.reasonCode}. ${reason}`;
 }
 
 function submitFailureReason(error: BrowserSubmitDiagnosticError): string {

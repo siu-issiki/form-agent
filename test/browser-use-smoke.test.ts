@@ -55,6 +55,15 @@ describe("BrowserUseCdpDriver real CDP smoke", () => {
 				job.id,
 				job.runToken ?? "",
 				new InMemoryEvidenceObjectStore(),
+				{
+					async review() {
+						return {
+							decision: "allow",
+							reasonCode: "INPUTS_MATCH",
+							reason: "The smoke test never submits.",
+						};
+					},
+				},
 			);
 			await tools.navigate(targetUrl);
 

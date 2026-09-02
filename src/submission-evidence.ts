@@ -80,7 +80,7 @@ export class InMemoryEvidenceObjectStore implements EvidenceObjectStore {
 }
 
 export type EvidenceCaptureResult =
-	| { captured: true; objectKey: string }
+	| { captured: true; objectKey: string; body: Uint8Array }
 	| { captured: false; failureCode: EvidenceFailureCode };
 
 export class SubmissionEvidenceRecorder {
@@ -200,7 +200,7 @@ export class SubmissionEvidenceRecorder {
 		}
 
 		logSubmissionEvidence(stage, true);
-		return { captured: true, objectKey };
+		return { captured: true, objectKey, body: bytes };
 	}
 
 	async #discardObject(stage: EvidenceStage, objectKey: string): Promise<void> {

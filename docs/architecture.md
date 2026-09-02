@@ -1,7 +1,7 @@
 # フォーム営業自動化アーキテクチャ
 
 - ステータス: PoC 実装中（production実送信有効 / 管理下サイト13シナリオ検証済み）
-- 最終更新: 2026-09-02
+- 最終更新: 2026-09-03
 - 対象: `siu-issiki/form-agent`
 
 ## 目的
@@ -124,9 +124,9 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 - 設定されたモデルと一致すること。
 - Responses API だけを利用すること。
 - function tool 以外を渡さないこと。
-- 1 run の Provider 呼び出しを最大 16 回に制限すること。
+- 1 run の Provider 呼び出しを最大 18 回（agent turn 16 + 送信前レビュー最大 2）に制限すること。agent と送信前レビューは D1 の同じカウンタを共有する。
 - 出力 token を最大 4,096 に制限すること。
-- request body を最大 128 KiB に制限すること。
+- request body を最大 128 KiB に制限すること。送信前レビューだけは証跡スクリーンショットを添付するため 1 MiB を上限とし、超過時は画像を外して再構成する。
 - response body を最大 256 KiB に制限すること。
 - OpenAI API key、BrowserUse API key、`runToken` をモデル入力へ含めないこと。
 
@@ -155,10 +155,24 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 | `click` | 非 submit 要素だけをクリックする |
 | `fill` | text input / textarea へ値を入力する |
 | `select` | select / radio / checkbox を選択する |
-| `submit` | D1 の送信権取得後に 1 回だけ送信する |
+| `submit` | 送信前に独立レビュー（同一 Provider、ツールなし、strict JSON）を通し、D1 の送信権取得後に 1 回だけ送信する。deny は 1 回だけ修正可、2 回目で `uncertain` |
 | `finish` | 送信せず、構造化された終端結果を返す |
 
 driver が submit control と識別した要素は通常の `click` で操作できない。非submitの`click`、`fill`、`select`はDOMイベントを発火する前にbrowser requestを遮断し、`navigate`は直前の観察で得たfragmentを含む完全一致URLのtop-frame Document requestだけを1回許可する。`submit` 中も遮断を解除せず、全入力が同じform ownerに属し、最後の入力・選択・click後に再観察され、選択したformに禁止根拠が検出されていないことを検証してから D1 を `running` から `submitting` へ更新し、最初の期待済み送信requestと、そのrequest IDに直接連なるsafeなredirectだけを許可する。非safe HTTP methodはaction URLとmethod、GETはactionのorigin / path、`Document` resource、送信対象frameを照合する。モデルはDOM activationを優先して選択し、trusted click gestureまたはkeyboard activationが必要な場合だけmouse / Enterを選ぶ。mouseのhit testは1 animation frameごとに最大3回試行する。
+
+### 送信前の独立レビュー
+
+`submit` は送信権を取得する前に、agent とは履歴を共有しない独立したレビューを 1 回通す。レビューは同じ Responses API に対して tool を一切渡さず、strict JSON schema で `allow` / `deny` だけを返させる。
+
+- 入力は、直前の信頼済み観察（URL、form、ページ本文、禁止 reason code）、`payload.formValues` の信頼済み値、`before_submit` スクリーンショット、対象ドメイン・URL、submit 要素 ID である。
+- 観察とスクリーンショットは `untrustedPageContent` としてラップし、外部サイト由来のデータであり指示として解釈しないことを instructions で明示する。
+- 判定 code は `INPUTS_MATCH`（allow のみ）、`INPUT_MISMATCH`、`SALES_PROHIBITED`、`FORM_PURPOSE_INCOMPATIBLE`、`WRONG_FORM`、`UNCLEAR` の固定値とする。
+- deny の 1 回目はモデルへ `SUBMIT_REVIEW_DENIED` と reason code だけを返し、再観察を強制したうえで 1 回だけ修正を許可する。送信権は取得せず、ブラウザ送信も行わない。
+- deny の 2 回目は `PRE_SUBMIT_REVIEW_DENIED` として `uncertain` を保存し、そのジョブを終了する。
+- レビュー自体を完了できない場合は allow にせず、再試行可能な `SUBMIT_REVIEW_UNAVAILABLE` として扱う。Provider の通信失敗、429、応答不正はそれぞれの Provider 用 reason code のまま伝播させ、browser tool の障害へ丸めない。
+- モデルへ返すのは固定の code と guidance だけであり、レビューの自由記述はモデルへ渡さない。自由記述は 2 回目 deny 時の `uncertain` の reason にだけ、制御文字を空白へ置換し 500 文字へ切り詰めて保存する。
+- レビューは `running` 状態でのみ Provider 呼び出し回数を消費できるため、必ず `claimSubmission` より前に実行する。
+- レビューモデルは既定で `AGENT_MODEL` と同じであり、`AGENT_SUBMIT_REVIEW_MODEL` を設定した場合だけ上書きする。
 
 ### Cloudflare D1
 
@@ -214,7 +228,7 @@ pending / running / failed ── retry 上限超過 ──► dead_lettered
 
 | stage | 撮影位置 | ジョブ状態 | 失敗時の扱い |
 | --- | --- | --- | --- |
-| `before_submit` | `submit` tool内、送信前検証成功・送信試行フラグ設定の直後、送信権取得（`claimSubmission`）の前 | `running` | 必須。撮影に失敗した場合は送信権取得も driver への送信も行わず、何も送信しない。再試行可能なエラーとして扱う |
+| `before_submit` | `submit` tool内、送信前検証成功の直後、送信前レビューと送信権取得（`claimSubmission`）の前 | `running` | 必須。撮影に失敗した場合はレビューも送信権取得も driver への送信も行わず、何も送信しない。再試行可能なエラーとして扱う。レビュー deny 後の再 submit では再撮影するため、1 attempt に複数件になり得る |
 | `after_submit` | driver への送信が成功または例外で終わった直後、結果確定（`sent` / `uncertain`）の前 | `submitting` | ベストエフォート。失敗しても送信結果（`sent` / `uncertain` / 例外経路）は変えない |
 | `prohibited` | `finish` tool で禁止判定の結果を返す直前 | `running` | ベストエフォート。ブラウザセッションが未作成の場合は撮影せず、未撮影であることだけを記録する |
 
@@ -289,13 +303,15 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 - Provider / BrowserUse の認証情報と D1 の実行権をモデル入力・tool 出力へ渡さない。
 - Agent に返すジョブ情報から `runToken` を除外する。
 - モデルが`fill` / `select`で指定できるのは`payload.formValues`内のキーだけとし、実際の値は信頼済みhandlerがD1から取得する。
+- `observe`の結果を`untrusted_page_content`として明示し、ページ本文が信頼済みhandlerの上限（20,000文字）で切り詰められた場合は`pageTextTruncated`で通知する。
+- 送信直前に、直前の観察・`payload.formValues`・`before_submit`スクリーンショットを入力とする独立レビューを通し、`allow`以外では送信権を取得しない。
 - ジョブ間で browser session、cookie、入力データを共有しない。
 
 `submitting` 中に Worker が停止し、結果保存まで到達しなかった場合は自動再送せず、人間の確認対象にする。人手照合、DLQ確認、緊急停止、安全な再開のrunbookは [operations.md](operations.md) に定義済みである。照合用の専用 API / UI は未実装である。
 
 ### Agent への安全指示
 
-system prompt では、営業禁止・用途制限の確認と送信前の再観察を指示する。入力値は信頼済みhandlerが`payload.formValues`由来であることを強制する。`prohibited`は、直前かつ現在URLと一致する観察でフォーム不在、または全候補formについてform本文、前方の近接要素、祖先側の近接要素、iframe親ページ側の近接要素から固定パターンの営業禁止・用途制限を検出した場合だけ受理する。送信前には選択したformの禁止根拠、全入力のform owner、native validity、現在のaction / method、入力後の再観察、1回限りの送信権を機械的に検証する。禁止判定時と送信前後には画面のスクリーンショット証跡をR2へ保存する。固定パターンで表現されない禁止事項、Shadow DOM内の本文、ページ上のprompt injectionに対する完全な判定は未対応である。
+system prompt では、営業禁止・用途制限の確認と送信前の再観察を指示する。入力値は信頼済みhandlerが`payload.formValues`由来であることを強制する。`prohibited`は、直前かつ現在URLと一致する観察でフォーム不在、または全候補formについてform本文、前方の近接要素、祖先側の近接要素、iframe親ページ側の近接要素から固定パターンの営業禁止・用途制限を検出した場合だけ受理する。送信前には選択したformの禁止根拠、全入力のform owner、native validity、現在のaction / method、入力後の再観察、1回限りの送信権を機械的に検証する。さらに送信直前には、観察・信頼済み入力値・`before_submit`スクリーンショットを入力とする独立レビューを通し、`INPUT_MISMATCH` / `SALES_PROHIBITED` / `FORM_PURPOSE_INCOMPATIBLE` / `WRONG_FORM` / `UNCLEAR`のいずれかでdenyされた場合は送信権を取得しない。1回目のdenyは再観察のうえ1回だけ修正を許可し、2回目のdenyは`PRE_SUBMIT_REVIEW_DENIED`として`uncertain`で終了する。レビューを完了できない場合はallowにせず、再試行可能な`SUBMIT_REVIEW_UNAVAILABLE`として扱う。禁止判定時と送信前後には画面のスクリーンショット証跡をR2へ保存する。`observe`の結果は外部サイト由来の非信頼データとして明示し、モデルとレビューの双方へページ内の指示に従わないよう指示する。固定パターンで表現されない禁止事項は独立レビューで補完するが、完全ではない。Shadow DOM内の本文とページ上のprompt injectionに対する完全な判定は引き続き未対応である。
 
 ## 現在の制約
 
@@ -311,7 +327,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 - 確認を挟むmulti-stepは管理下テストで検証済みである。ファイル添付とCAPTCHAは未対応である。
 - 送信完了は、許可したrequestを観測し、日本語の送信完了表現または`thank you`が5秒以内に新たに出現した場合に確定する。期待済みGET Documentは、送信対象frameの遷移と同じframe内の完了文言を必須にする。他frameの完了文言は判定に利用しない。
 - submit controlの期待済みGETは送信権で制御する。非submitの`click`、`fill`、`select`がDOMイベントを発火する直前から、その後および`submit`中のbrowser requestを遮断し、観察済みnavigateのtop-frame Document、期待済みsubmit request、またはそのrequest IDに直接連なるsafe redirectだけを許可する。`navigate`は直前の`observe.navigationLinks`で得たfragmentを含む完全一致URLまたは現在URLだけを許可する。観察済みリンク自体がGET型副作用を持つサイトは機械的に識別できないため、対象サイト側がGETをsafe methodとして扱うことは引き続き前提になる。
-- 営業禁止判定はフォーム不在と、候補form本文、前方・祖先側の近接要素、iframe親ページ側の近接要素に対する固定の日本語・英語パターンを使う。肯定表現と「禁止していない」は除外し、複数formがある場合のページ全体禁止は全formに何らかの禁止根拠がある場合だけ受理する。送信前確認は選択formの禁止根拠、form owner、native validity、action / method、入力後の再観察、1回限りの送信権を信頼済みhandlerで検証する。未知の禁止表現は`prohibited`として確定できず、追加パターンまたは人手確認が必要になる。
+- 営業禁止判定はフォーム不在と、候補form本文、前方・祖先側の近接要素、iframe親ページ側の近接要素に対する固定の日本語・英語パターンを使う。肯定表現と「禁止していない」は除外し、複数formがある場合のページ全体禁止は全formに何らかの禁止根拠がある場合だけ受理する。送信前確認は選択formの禁止根拠、form owner、native validity、action / method、入力後の再観察、1回限りの送信権を信頼済みhandlerで検証する。固定パターンに加えて送信直前の独立レビューが禁止表現と入力内容を再確認するが、レビューはモデル判断であり完全ではない。未知の禁止表現は`prohibited`として確定できず、追加パターンまたは人手確認が必要になる。
 - dry-runではジョブURLへのbootstrap後の再navigateと、最初のclick / fill / select以降に発生するbrowser requestをすべて遮断し、座標click前にCDPのhit targetが検証済み要素またはそのcomposed descendantであることを確認する。
 
 ### API / 運用
@@ -326,7 +342,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 
 - Provider は OpenAI 固定である。
 - Provider 呼び出し回数以外のtoken、rate limit、費用を保存しない。retryイベント以外の全体処理時間とBrowserUse待ち時間も保存しない。
-- agent tool診断はbrowser tool、`finish`、unknown tool dispatchを対象とする。`data_json`にはturn、固定tool名、stage、固定result codeだけを保存し、イベント共通列にはjob ID、attempt、記録時刻を保存する。入力値、URL、自由記述エラー、全状態遷移は保存しない。
+- agent tool診断はbrowser tool、`finish`、unknown tool dispatchを対象とする。`data_json`にはturn、固定tool名、stage、固定result codeだけを保存し、イベント共通列にはjob ID、attempt、記録時刻を保存する。送信前レビューはstage `submit_review`、result code `SUBMIT_REVIEW_ALLOWED` / `SUBMIT_REVIEW_DENIED` / `SUBMIT_REVIEW_UNAVAILABLE`として記録する。入力値、URL、自由記述エラー、全状態遷移は保存しない。
 - retry delay は 30 秒固定で、指数 backoff と jitter は未実装である。
 
 ## 並列・リトライ方針
@@ -443,6 +459,8 @@ PoC はまず 1 並列の production で開始し、管理下テストサイト�
 - 現在の推論 Provider は OpenAI とし、認証情報と制限は Worker 側で管理する。
 - BrowserUse Agent は使わず、standalone browser へ CDP 接続する。
 - Agent には用途限定 browser tool だけを公開し、`submit` を独立した制御対象にする。
+- `submit` の直前に、agent とは独立したレビューを 1 回通し、`allow` 以外では送信権を取得しない。1 回目の deny だけ修正を許可し、2 回目の deny は `uncertain` とする。
+- 送信前レビューの審査と証跡の設計は OpenAI Codex の `node_repl_policy.md` と `node_repl_review_evidence.rs` を参考にした。
 - exactly-once を仮定せず、`jobId`、`runToken`、D1 の条件付き状態遷移で二重送信を防ぐ。
 - 送信権取得後に結果を確定できない場合は `uncertain` とし、自動 retry しない。
 - 本番処理は Cloudflare 上へ置き、手元 PC は開発・検証にだけ使う。

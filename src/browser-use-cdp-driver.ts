@@ -406,7 +406,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				durationMs: Date.now() - startedAt,
 			}),
 		);
-		return { url, forms, pageText, navigationLinks };
+		return {
+			url,
+			forms,
+			pageText: pageText.text,
+			...(pageText.truncated ? { pageTextTruncated: true } : {}),
+			navigationLinks,
+		};
 	}
 
 	async clickNonSubmit(elementId: string): Promise<void> {
@@ -812,9 +818,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		throw new Error("Browser page did not become ready");
 	}
 
-	#bodyText(): Promise<string> {
-		return this.#evaluate<string>(
-			`(document.body?.innerText ?? "").slice(0, ${MAX_PAGE_TEXT})`,
+	async #bodyText(): Promise<{ text: string; truncated: boolean }> {
+		// One extra character makes the truncation detectable in the Worker
+		// instead of trusting a value computed inside the page.
+		return readPageText(
+			await this.#evaluate<string>(
+				`(document.body?.innerText ?? "").slice(0, ${MAX_PAGE_TEXT + 1})`,
+			),
 		);
 	}
 
@@ -1669,6 +1679,20 @@ export function createExpectedSubmissionRequest(
 	}
 	url.hash = "";
 	return { url: url.toString(), method: formMethod.toUpperCase() };
+}
+
+/**
+ * Splits the raw body text into the value the model may see and a flag saying
+ * whether the page held more. Truncation is decided in the Worker so that an
+ * untrusted page cannot claim its text was complete.
+ */
+export function readPageText(raw: string): {
+	text: string;
+	truncated: boolean;
+} {
+	return raw.length > MAX_PAGE_TEXT
+		? { text: raw.slice(0, MAX_PAGE_TEXT), truncated: true }
+		: { text: raw, truncated: false };
 }
 
 export function submitUncertainReasonCode(

@@ -10,12 +10,19 @@ import {
 	detectProhibitedReasonCodes,
 	detectProhibitedTextReasonCodes,
 	NavigationPolicyError,
+	ObservationStaleError,
 	type RestrictedBrowserDriver,
 	RestrictedBrowserTools,
+	readTrustedFormValues,
 	SubmissionEvidenceError,
 	SubmissionNotAuthorizedError,
 	SubmissionResultUncertainError,
 	type SubmitActivationStrategy,
+	type SubmitReviewDecision,
+	SubmitReviewDeniedError,
+	type SubmitReviewer,
+	type SubmitReviewInput,
+	type SubmitReviewReasonCode,
 } from "../src/restricted-browser";
 import {
 	type EvidenceStage,
@@ -157,6 +164,7 @@ describe("RestrictedBrowserTools", () => {
 			externalInput.id,
 			"run-token-1",
 			new InMemoryEvidenceObjectStore(),
+			allowSubmitReviewer(),
 		);
 
 		await tools.observe();
@@ -214,6 +222,7 @@ describe("RestrictedBrowserTools", () => {
 			input.id,
 			"run-token-1",
 			new InMemoryEvidenceObjectStore(),
+			allowSubmitReviewer(),
 			() => "2026-08-28T00:00:02.000Z",
 		);
 		await tools.fill("fa-0-0", "Hello");
@@ -427,6 +436,7 @@ describe("RestrictedBrowserTools", () => {
 				input.id,
 				"run-token-1",
 				new InMemoryEvidenceObjectStore(),
+				allowSubmitReviewer(),
 			),
 		).rejects.toBeInstanceOf(SubmissionNotAuthorizedError);
 		expect(driver.submitCount).toBe(0);
@@ -444,6 +454,7 @@ describe("RestrictedBrowserTools", () => {
 			input.id,
 			"run-token-1",
 			new InMemoryEvidenceObjectStore(),
+			allowSubmitReviewer(),
 		);
 		await tools.fill("fa-0-0", "Hello");
 		await tools.observe();
@@ -466,6 +477,7 @@ describe("RestrictedBrowserTools", () => {
 			input.id,
 			"run-token-1",
 			new InMemoryEvidenceObjectStore(),
+			allowSubmitReviewer(),
 			() => "2026-08-28T00:00:02.000Z",
 		);
 		await tools.fill("fa-0-0", "Hello");
@@ -501,6 +513,7 @@ describe("RestrictedBrowserTools", () => {
 			input.id,
 			"run-token-1",
 			new InMemoryEvidenceObjectStore(),
+			allowSubmitReviewer(),
 		);
 		await tools.fill("fa-0-0", "Hello");
 		await tools.observe();
@@ -551,6 +564,7 @@ describe("RestrictedBrowserTools", () => {
 				input.id,
 				"run-token-1",
 				new InMemoryEvidenceObjectStore(),
+				allowSubmitReviewer(),
 			),
 		).rejects.toBeInstanceOf(NavigationPolicyError);
 	});
@@ -570,6 +584,7 @@ describe("RestrictedBrowserTools", () => {
 			input.id,
 			"run-token-1",
 			new InMemoryEvidenceObjectStore(),
+			allowSubmitReviewer(),
 		);
 
 		driver.redirectTo = "https://acme.co.jp/contact";
@@ -594,6 +609,7 @@ describe("RestrictedBrowserTools", () => {
 				input.id,
 				"run-token-1",
 				new InMemoryEvidenceObjectStore(),
+				allowSubmitReviewer(),
 			),
 		).rejects.toBeInstanceOf(NavigationPolicyError);
 	});
@@ -621,6 +637,7 @@ describe("RestrictedBrowserTools", () => {
 					input.id,
 					"run-token-1",
 					new InMemoryEvidenceObjectStore(),
+					allowSubmitReviewer(),
 				),
 			).rejects.toBeInstanceOf(NavigationPolicyError);
 		}
@@ -641,6 +658,7 @@ describe("RestrictedBrowserTools", () => {
 			input.id,
 			"run-token-1",
 			new InMemoryEvidenceObjectStore(),
+			allowSubmitReviewer(),
 		);
 		await tools.fill("fa-0-0", "Hello");
 		await tools.observe();
@@ -812,12 +830,178 @@ describe("RestrictedBrowserTools", () => {
 		]);
 		expect(evidence.objects.size).toBe(2);
 	});
+
+	test("submits only after the independent pre-submit review allows it", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const reviewer = new StubSubmitReviewer();
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			evidence,
+			reviewer,
+		);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+
+		const sent = await tools.submit("fa-0-1");
+
+		expect(sent.status).toBe("sent");
+		expect(reviewer.reviewCount).toBe(1);
+		expect(driver.submitCount).toBe(1);
+	});
+
+	test("passes the observation, trusted values, and screenshot to the reviewer", async () => {
+		const driver = new FakeDriver();
+		const reviewer = new StubSubmitReviewer();
+		const jobInput: JobInput = {
+			...input,
+			id: "job-review-input",
+			payload: {
+				formValues: { message: "Hello", empty: "", nested: { a: 1 } },
+				instruction: "Do not enter this control value",
+			},
+		};
+		const tools = await createToolsForInput(driver, jobInput, reviewer);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+
+		await tools.submit("fa-0-1");
+
+		const reviewInput = reviewer.inputs[0];
+		expect(reviewInput?.formValues).toEqual({ message: "Hello" });
+		expect(reviewInput?.submitElementId).toBe("fa-0-1");
+		expect(reviewInput?.targetDomain).toBe(input.targetDomain);
+		expect(reviewInput?.targetUrl).toBe(input.targetUrl);
+		expect(reviewInput?.currentUrl).toBe(input.targetUrl);
+		expect(reviewInput?.observation.forms).toEqual(defaultObservedForms());
+		expect(reviewInput?.screenshot?.contentType).toBe("image/jpeg");
+		expect(reviewInput?.screenshot?.bytes).toEqual(new Uint8Array([1, 2, 3]));
+	});
+
+	test("allows exactly one correction after the review denies the submission", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const reviewer = new StubSubmitReviewer(denyDecision());
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			evidence,
+			reviewer,
+		);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+
+		const denied = await tools.submit("fa-0-1").catch((error) => error);
+
+		expect(denied).toBeInstanceOf(SubmitReviewDeniedError);
+		expect(denied.reasonCode).toBe("INPUT_MISMATCH");
+		expect(driver.submitCount).toBe(0);
+		expect((await store.find(input.id))?.status).toBe("running");
+		expect(store.events.map((event) => event.data.stage)).toEqual([
+			"before_submit",
+		]);
+		await expect(tools.validateSubmit("fa-0-1")).rejects.toBeInstanceOf(
+			ObservationStaleError,
+		);
+
+		await tools.observe();
+		const sent = await tools.submit("fa-0-1");
+
+		expect(sent.status).toBe("sent");
+		expect(reviewer.reviewCount).toBe(2);
+		expect(driver.submitCount).toBe(1);
+	});
+
+	test("ends the job as uncertain when the review denies twice", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const reviewer = new StubSubmitReviewer(
+			denyDecision(),
+			denyDecision("SALES_PROHIBITED", "Sales\nis prohibited."),
+		);
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			evidence,
+			reviewer,
+		);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			SubmitReviewDeniedError,
+		);
+		await tools.observe();
+
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			SubmissionResultUncertainError,
+		);
+
+		const job = await store.find(input.id);
+		expect(job?.status).toBe("uncertain");
+		expect(job?.result?.reasonCode).toBe("PRE_SUBMIT_REVIEW_DENIED");
+		expect(job?.result?.reason).toBe(
+			"Pre-submit review denied the submission twice. Last reasonCode: SALES_PROHIBITED. Sales is prohibited.",
+		);
+		expect(driver.submitCount).toBe(0);
+	});
+
+	test("does not submit when the reviewer itself fails", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const reviewer = new StubSubmitReviewer();
+		reviewer.error = new Error("reviewer transport failure");
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			evidence,
+			reviewer,
+		);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+
+		const failure = await tools.submit("fa-0-1").catch((error) => error);
+
+		expect(failure).toBe(reviewer.error);
+		expect(driver.submitCount).toBe(0);
+		expect((await store.find(input.id))?.status).toBe("running");
+		expect(store.events.map((event) => event.data.stage)).toEqual([
+			"before_submit",
+		]);
+	});
+});
+
+describe("readTrustedFormValues", () => {
+	test("keeps only string payload values with a safe key", () => {
+		expect(
+			readTrustedFormValues({
+				formValues: {
+					message: "Hello",
+					"bad key": "value",
+					empty: "",
+					numeric: 1,
+					long: "x".repeat(8_193),
+				},
+				instruction: "ignored",
+			}),
+		).toEqual({ message: "Hello" });
+	});
+
+	test("returns nothing when formValues is absent or not an object", () => {
+		expect(readTrustedFormValues({})).toEqual({});
+		expect(readTrustedFormValues({ formValues: ["Hello"] })).toEqual({});
+	});
 });
 
 async function createToolsWithEvidence(
 	driver: FakeDriver,
 	store: InMemoryJobStore,
 	evidence: InMemoryEvidenceObjectStore,
+	reviewer: SubmitReviewer = allowSubmitReviewer(),
 ): Promise<RestrictedBrowserTools> {
 	await store.create(input, "2026-08-28T00:00:00.000Z");
 	await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
@@ -827,19 +1011,22 @@ async function createToolsWithEvidence(
 		input.id,
 		"run-token-1",
 		evidence,
+		reviewer,
 		() => "2026-08-28T00:00:02.000Z",
 	);
 }
 
 async function createTools(
 	driver: FakeDriver,
+	reviewer: SubmitReviewer = allowSubmitReviewer(),
 ): Promise<RestrictedBrowserTools> {
-	return createToolsForInput(driver, input);
+	return createToolsForInput(driver, input, reviewer);
 }
 
 async function createToolsForInput(
 	driver: FakeDriver,
 	jobInput: JobInput,
+	reviewer: SubmitReviewer = allowSubmitReviewer(),
 ): Promise<RestrictedBrowserTools> {
 	const store = new InMemoryJobStore();
 	await store.create(jobInput, "2026-08-28T00:00:00.000Z");
@@ -850,7 +1037,49 @@ async function createToolsForInput(
 		jobInput.id,
 		"run-token-1",
 		new InMemoryEvidenceObjectStore(),
+		reviewer,
 	);
+}
+
+/**
+ * Test double for the independent pre-submit review. It records what the
+ * trusted handler passes in and replays a queued decision, defaulting to allow.
+ */
+class StubSubmitReviewer implements SubmitReviewer {
+	readonly inputs: SubmitReviewInput[] = [];
+	error: Error | null = null;
+	readonly #decisions: SubmitReviewDecision[];
+
+	constructor(...decisions: SubmitReviewDecision[]) {
+		this.#decisions = decisions;
+	}
+
+	get reviewCount(): number {
+		return this.inputs.length;
+	}
+
+	async review(input: SubmitReviewInput): Promise<SubmitReviewDecision> {
+		this.inputs.push(input);
+		if (this.error) throw this.error;
+		return (
+			this.#decisions.shift() ?? {
+				decision: "allow",
+				reasonCode: "INPUTS_MATCH",
+				reason: "The inputs match the job payload.",
+			}
+		);
+	}
+}
+
+function allowSubmitReviewer(): SubmitReviewer {
+	return new StubSubmitReviewer();
+}
+
+function denyDecision(
+	reasonCode: SubmitReviewReasonCode = "INPUT_MISMATCH",
+	reason = "A filled value does not come from formValues.",
+): SubmitReviewDecision {
+	return { decision: "deny", reasonCode, reason };
 }
 
 function defaultObservedForms(prohibitionText?: string): unknown[] {
