@@ -198,9 +198,11 @@ export class RestrictedBrowserTools {
 
 	async navigate(url: string): Promise<void> {
 		this.#assertAllowedUrl(url);
-		if (
-			!this.#allowedNavigationUrls.has(canonicalNavigationPermissionUrl(url))
-		) {
+		const canonicalUrl = canonicalNavigationPermissionUrl(url);
+		if (!this.#allowedNavigationUrls.has(canonicalUrl)) {
+			const currentUrl = await this.driver.currentUrl();
+			this.#assertAllowedUrl(currentUrl);
+			if (canonicalNavigationPermissionUrl(currentUrl) === canonicalUrl) return;
 			throw new NavigationPolicyError();
 		}
 		await this.driver.navigate(url);

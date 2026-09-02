@@ -1004,15 +1004,28 @@ describe("ResponsesAgentExecutor", () => {
 			reason:
 				"Dry-run validated the current submit control and stopped before submission authorization or browser submission.",
 		});
-		expect(requestBodies[0]?.tools?.map((tool) => tool.name)).toContain(
-			"submit",
+		expect(requestBodies[0]?.tools?.map((tool) => tool.name)).toEqual([
+			"observe",
+		]);
+		expect(requestBodies[1]?.tools?.map((tool) => tool.name)).toEqual(
+			expect.arrayContaining([
+				"navigate",
+				"observe",
+				"submit",
+				"finish_prohibited",
+				"finish_uncertain",
+				"finish_failed",
+			]),
 		);
-		const fillTool = requestBodies[0]?.tools?.find(
+		expect(requestBodies[1]?.tools?.map((tool) => tool.name)).not.toContain(
+			"finish",
+		);
+		const fillTool = requestBodies[1]?.tools?.find(
 			(tool) => tool.name === "fill",
 		);
 		expect(fillTool?.parameters?.properties).toHaveProperty("payloadKey");
 		expect(fillTool?.parameters?.properties).not.toHaveProperty("value");
-		const submitTool = requestBodies[0]?.tools?.find(
+		const submitTool = requestBodies[1]?.tools?.find(
 			(tool) => tool.name === "submit",
 		);
 		expect(submitTool?.parameters?.properties).toHaveProperty(
@@ -1029,11 +1042,11 @@ describe("ResponsesAgentExecutor", () => {
 			"Use select for select elements, checkboxes, and radio controls",
 		);
 		expect(
-			requestBodies[0]?.tools?.find((tool) => tool.name === "select")
+			requestBodies[1]?.tools?.find((tool) => tool.name === "select")
 				?.description,
 		).toContain("checkbox");
 		expect(
-			requestBodies[0]?.tools?.find((tool) => tool.name === "click")
+			requestBodies[1]?.tools?.find((tool) => tool.name === "click")
 				?.description,
 		).toContain("type=button");
 		expect(driver.validateSubmitCount).toBe(1);
@@ -1089,9 +1102,8 @@ describe("ResponsesAgentExecutor", () => {
 				elementId: "fa-0-1",
 				activationStrategy: "mouse",
 			}),
-			functionResponse("call-finish", "finish", {
-				outcome: "failed",
-				formUrl: null,
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-finish", "finish_failed", {
 				reasonCode: "SUBMIT_ELEMENT_NOT_OBSERVED",
 				reason: "The submit element was not observed.",
 				retryable: false,
@@ -1125,6 +1137,26 @@ describe("ResponsesAgentExecutor", () => {
 		});
 		expect(driver.validateSubmitCount).toBe(0);
 		expect(driver.submitCount).toBe(0);
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{
+				turn: 1,
+				toolName: "unknown",
+				stage: "tool_dispatch",
+				resultCode: "UNKNOWN_TOOL",
+			},
+			{
+				turn: 2,
+				toolName: "observe",
+				stage: "observe",
+				resultCode: "OK",
+			},
+			{
+				turn: 3,
+				toolName: "finish",
+				stage: "finish_validation",
+				resultCode: "OK",
+			},
+		]);
 	});
 
 	test.each([408, 409])(
@@ -1317,12 +1349,10 @@ describe("ResponsesAgentExecutor", () => {
 			[];
 		const responses = [
 			functionResponse("call-observe", "observe", {}),
-			functionResponse("call-finish", "finish", {
-				outcome: "prohibited",
+			functionResponse("call-finish", "finish_prohibited", {
 				formUrl: input.targetUrl,
 				reasonCode: "NO_FORM_PRESENT",
 				reason: "No inquiry form is present.",
-				retryable: null,
 			}),
 		];
 		const fetcher = async function (
@@ -1407,12 +1437,10 @@ describe("ResponsesAgentExecutor", () => {
 		if (!job) throw new Error("Expected a claimed job");
 		const responses = [
 			functionResponse("call-observe", "observe", {}),
-			functionResponse("call-finish", "finish", {
-				outcome: "prohibited",
+			functionResponse("call-finish", "finish_prohibited", {
 				formUrl: input.targetUrl,
 				reasonCode: "NO_INQUIRY_FORM",
 				reason: "No inquiry form is present.",
-				retryable: null,
 			}),
 		];
 		const driver = new WorkerFakeBrowserDriver();
@@ -1453,16 +1481,12 @@ describe("ResponsesAgentExecutor", () => {
 		if (!job) throw new Error("Expected a claimed job");
 		const responses = [
 			functionResponse("call-observe", "observe", {}),
-			functionResponse("call-unverified", "finish", {
-				outcome: "prohibited",
+			functionResponse("call-unverified", "finish_prohibited", {
 				formUrl: input.targetUrl,
 				reasonCode: "NO_FORM_PRESENT",
 				reason: "No inquiry form is present.",
-				retryable: null,
 			}),
-			functionResponse("call-failed", "finish", {
-				outcome: "failed",
-				formUrl: null,
+			functionResponse("call-failed", "finish_failed", {
 				reasonCode: "PROHIBITION_NOT_VERIFIED",
 				reason: "The trusted handler could not verify the prohibition.",
 				retryable: false,
@@ -1523,20 +1547,16 @@ describe("ResponsesAgentExecutor", () => {
 		);
 		if (!job) throw new Error("Expected a claimed job");
 		const responses = [
-			functionResponse("call-invalid", "finish", {
-				outcome: "prohibited",
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-invalid", "finish_prohibited", {
 				formUrl: input.targetUrl,
 				reasonCode: "ARBITRARY_PROHIBITED_REASON",
 				reason: "The form must not be submitted.",
-				retryable: null,
 			}),
-			functionResponse("call-observe", "observe", {}),
-			functionResponse("call-valid", "finish", {
-				outcome: "prohibited",
+			functionResponse("call-valid", "finish_prohibited", {
 				formUrl: input.targetUrl,
 				reasonCode: "SALES_PROHIBITED",
 				reason: "Sales inquiries are prohibited.",
-				retryable: null,
 			}),
 		];
 		const driver = new WorkerFakeBrowserDriver();
@@ -1567,15 +1587,15 @@ describe("ResponsesAgentExecutor", () => {
 		expect(await readAgentToolDiagnostics(input.id)).toEqual([
 			{
 				turn: 1,
-				toolName: "finish",
-				stage: "finish_validation",
-				resultCode: "FINISH_FIELDS_INVALID",
-			},
-			{
-				turn: 2,
 				toolName: "observe",
 				stage: "observe",
 				resultCode: "OK",
+			},
+			{
+				turn: 2,
+				toolName: "finish",
+				stage: "finish_validation",
+				resultCode: "FINISH_FIELDS_INVALID",
 			},
 			{
 				turn: 3,
@@ -1596,10 +1616,9 @@ describe("ResponsesAgentExecutor", () => {
 		);
 		if (!job) throw new Error("Expected a claimed job");
 		const responses = [
+			functionResponse("call-observe", "observe", {}),
 			functionResponse("call-click", "click", { elementId: "fa-0-1" }),
-			functionResponse("call-finish", "finish", {
-				outcome: "failed",
-				formUrl: null,
+			functionResponse("call-finish", "finish_failed", {
 				reasonCode: "CORRECTED_TOOL_SELECTION",
 				reason: "The submit control requires the submit tool.",
 				retryable: false,
@@ -1634,8 +1653,8 @@ describe("ResponsesAgentExecutor", () => {
 			outcome: "failed",
 			reasonCode: "CORRECTED_TOOL_SELECTION",
 		});
-		expect(requests).toHaveLength(2);
-		expect(requests[1]).toMatchObject({
+		expect(requests).toHaveLength(3);
+		expect(requests[2]).toMatchObject({
 			input: expect.arrayContaining([
 				expect.objectContaining({
 					type: "function_call_output",
@@ -1657,6 +1676,7 @@ describe("ResponsesAgentExecutor", () => {
 		if (!job) throw new Error("Expected a claimed job");
 		const driver = new WorkerFakeBrowserDriver();
 		const responses = [
+			functionResponse("call-observe", "observe", {}),
 			functionResponse("call-fill", "fill", {
 				elementId: "fa-0-0",
 				payloadKey: "message",
@@ -1692,18 +1712,24 @@ describe("ResponsesAgentExecutor", () => {
 		expect(await readAgentToolDiagnostics(input.id)).toEqual([
 			{
 				turn: 1,
-				toolName: "fill",
-				stage: "fill",
-				resultCode: "OK",
-			},
-			{
-				turn: 2,
 				toolName: "observe",
 				stage: "observe",
 				resultCode: "OK",
 			},
 			{
+				turn: 2,
+				toolName: "fill",
+				stage: "fill",
+				resultCode: "OK",
+			},
+			{
 				turn: 3,
+				toolName: "observe",
+				stage: "observe",
+				resultCode: "OK",
+			},
+			{
+				turn: 4,
 				toolName: "submit",
 				stage: "submit",
 				resultCode: "OK",
@@ -1725,6 +1751,7 @@ describe("ResponsesAgentExecutor", () => {
 			throw new Error("arbitrary browser detail");
 		};
 		const responses = [
+			functionResponse("call-observe", "observe", {}),
 			functionResponse("call-fill", "fill", {
 				elementId: "fa-0-0",
 				payloadKey: "message",
@@ -1760,18 +1787,24 @@ describe("ResponsesAgentExecutor", () => {
 		expect(diagnostics).toEqual([
 			{
 				turn: 1,
-				toolName: "fill",
-				stage: "fill",
-				resultCode: "OK",
-			},
-			{
-				turn: 2,
 				toolName: "observe",
 				stage: "observe",
 				resultCode: "OK",
 			},
 			{
+				turn: 2,
+				toolName: "fill",
+				stage: "fill",
+				resultCode: "OK",
+			},
+			{
 				turn: 3,
+				toolName: "observe",
+				stage: "observe",
+				resultCode: "OK",
+			},
+			{
+				turn: 4,
 				toolName: "submit",
 				stage: "submit",
 				resultCode: "SUBMISSION_RESULT_UNCERTAIN",
@@ -1792,20 +1825,16 @@ describe("ResponsesAgentExecutor", () => {
 		);
 		if (!job) throw new Error("Expected a claimed job");
 		const responses = [
-			functionResponse("call-invalid", "finish", {
-				outcome: "prohibited",
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-invalid", "finish_prohibited", {
 				formUrl: "https://evil.test/contact",
 				reasonCode: "NO_FORM_PRESENT",
 				reason: "No inquiry form is present.",
-				retryable: null,
 			}),
-			functionResponse("call-observe", "observe", {}),
-			functionResponse("call-valid", "finish", {
-				outcome: "prohibited",
+			functionResponse("call-valid", "finish_prohibited", {
 				formUrl: input.targetUrl,
 				reasonCode: "NO_FORM_PRESENT",
 				reason: "No inquiry form is present.",
-				retryable: null,
 			}),
 		];
 		const requests: unknown[] = [];
@@ -1836,7 +1865,7 @@ describe("ResponsesAgentExecutor", () => {
 			formUrl: input.targetUrl,
 		});
 		expect(requests).toHaveLength(3);
-		expect(requests[1]).toMatchObject({
+		expect(requests[2]).toMatchObject({
 			input: expect.arrayContaining([
 				expect.objectContaining({
 					type: "function_call_output",
@@ -1848,15 +1877,15 @@ describe("ResponsesAgentExecutor", () => {
 		expect(await readAgentToolDiagnostics(input.id)).toEqual([
 			{
 				turn: 1,
-				toolName: "finish",
-				stage: "finish_validation",
-				resultCode: "FINISH_FORM_URL_NOT_ALLOWED",
-			},
-			{
-				turn: 2,
 				toolName: "observe",
 				stage: "observe",
 				resultCode: "OK",
+			},
+			{
+				turn: 2,
+				toolName: "finish",
+				stage: "finish_validation",
+				resultCode: "FINISH_FORM_URL_NOT_ALLOWED",
 			},
 			{
 				turn: 3,
@@ -1879,12 +1908,10 @@ describe("ResponsesAgentExecutor", () => {
 		if (!job) throw new Error("Expected a claimed job");
 		const responses = [
 			functionResponse("call-observe", "observe", {}),
-			functionResponse("call-finish", "finish", {
-				outcome: "prohibited",
+			functionResponse("call-finish", "finish_prohibited", {
 				formUrl: null,
 				reasonCode: "SALES_PROHIBITED",
 				reason: "The page prohibits sales outreach.",
-				retryable: null,
 			}),
 		];
 		const driver = new WorkerFakeBrowserDriver();
