@@ -98,6 +98,17 @@ DLQへ移動したジョブを確認する。
 
 `dead_lettered`は自動再投入しない。原因を解消し、外部送信が発生していないことを照合し、人間が承認した場合だけ新しいジョブIDで登録する。
 
+## エージェントツールの診断
+
+対象ジョブのツール処理段階と固定結果コードを確認する。
+
+```bash
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT attempt,data_json,created_at FROM events WHERE job_id='<JOB_ID>' AND type='agent.tool_diagnostic' ORDER BY attempt,CAST(json_extract(data_json,'$.turn') AS INTEGER),created_at;"
+```
+
+`data_json`にはturn、固定のtool名、stage、result codeだけが入り、URL、会社名、フォーム値、モデルの自由文は保存されない。
+
 ## 重複Queue配送の検証
 
 使い捨てサイトだけを対象とし、他のproducerがジョブを登録しない排他的な保守時間に実行する。最初に配送をpauseし、Cloudflare Queuesのbacklogが0件であることをDashboardで確認する。次にD1を確認し、`pending`、`running`、`submitting`がすべて0件でなければ検証を中止する。

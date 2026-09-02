@@ -228,7 +228,7 @@ Provider、model、input / output token、処理時間、BrowserUse 待ち時間
 | `data_json` | TEXT | 秘密情報を除いたイベント詳細 |
 | `created_at` | TEXT | 発生日時 |
 
-現在保存するイベントは `job.retry_scheduled` と `job.dead_lettered` である。retry イベントには秘密情報や自由記述のエラー本文を含めず、reason code、発生元、attempt、実行時間、retry時点のProvider呼び出し累計を保存する。
+現在保存するイベントは `job.retry_scheduled`、`job.dead_lettered`、`agent.tool_diagnostic` である。retry イベントにはreason code、発生元、attempt、実行時間、retry時点のProvider呼び出し累計を保存する。tool diagnosticにはturn、固定のtool名、処理stage、固定のresult codeだけを保存する。どのイベントにも秘密情報、URL、フォーム値、自由記述のエラー本文を含めない。
 
 ## 安全設計 / 冪等性
 

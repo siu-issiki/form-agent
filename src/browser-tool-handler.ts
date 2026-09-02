@@ -23,6 +23,21 @@ export type BrowserDriverFactory = (
 
 export class BrowserToolInputError extends Error {}
 
+export type BrowserToolSetupStage =
+	| "driver_connect"
+	| "scope_setup"
+	| "bootstrap_navigate";
+
+export class BrowserToolSetupError extends Error {
+	constructor(
+		readonly stage: BrowserToolSetupStage,
+		readonly originalError: unknown,
+	) {
+		super("The browser tool setup failed");
+		this.name = "BrowserToolSetupError";
+	}
+}
+
 export class BrowserToolCoordinator {
 	#driver: RestrictedBrowserDriver | undefined;
 	#tools: RestrictedBrowserTools | undefined;
@@ -137,15 +152,29 @@ export class BrowserToolCoordinator {
 			return { job, tools: this.#tools };
 		}
 
-		const driver = await this.createDriver(job);
+		let driver: RestrictedBrowserDriver;
 		try {
-			const tools = await RestrictedBrowserTools.create(
-				driver,
-				store,
-				jobId,
-				runToken,
-			);
-			await tools.navigate(job.targetUrl);
+			driver = await this.createDriver(job);
+		} catch (error) {
+			throw new BrowserToolSetupError("driver_connect", error);
+		}
+		try {
+			let tools: RestrictedBrowserTools;
+			try {
+				tools = await RestrictedBrowserTools.create(
+					driver,
+					store,
+					jobId,
+					runToken,
+				);
+			} catch (error) {
+				throw new BrowserToolSetupError("scope_setup", error);
+			}
+			try {
+				await tools.navigate(job.targetUrl);
+			} catch (error) {
+				throw new BrowserToolSetupError("bootstrap_navigate", error);
+			}
 			if (this.#closed) {
 				throw new BrowserToolInputError();
 			}

@@ -619,6 +619,29 @@ describe("ResponsesAgentExecutor", () => {
 		expect(driver.submitCount).toBe(0);
 		expect(driver.closed).toBe(true);
 		expect((await store.find(input.id))?.status).toBe("running");
+		const diagnostics = await readAgentToolDiagnostics(input.id);
+		expect(diagnostics).toEqual([
+			{
+				turn: 1,
+				toolName: "observe",
+				stage: "observe",
+				resultCode: "OK",
+			},
+			{
+				turn: 2,
+				toolName: "fill",
+				stage: "fill",
+				resultCode: "OK",
+			},
+			{
+				turn: 3,
+				toolName: "submit",
+				stage: "submit_validate",
+				resultCode: "DRY_RUN_COMPLETE",
+			},
+		]);
+		expect(JSON.stringify(diagnostics)).not.toContain(input.targetUrl);
+		expect(JSON.stringify(diagnostics)).not.toContain("Hello");
 	});
 
 	test("rejects a guessed dry-run submit element before observation", async () => {
@@ -742,6 +765,14 @@ describe("ResponsesAgentExecutor", () => {
 		expect(error).toBeInstanceOf(AgentExecutionError);
 		expect(error.reasonCode).toBe("BROWSER_TOOL_UNAVAILABLE");
 		expect(error.retryable).toBe(true);
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{
+				turn: 1,
+				toolName: "observe",
+				stage: "driver_connect",
+				resultCode: "UNKNOWN",
+			},
+		]);
 	});
 
 	test("does not retry a browser document that exceeds the safe Worker cap", async () => {
@@ -777,6 +808,14 @@ describe("ResponsesAgentExecutor", () => {
 		expect(error).toBeInstanceOf(AgentExecutionError);
 		expect(error.reasonCode).toBe("BROWSER_PAYLOAD_TOO_LARGE");
 		expect(error.retryable).toBe(false);
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{
+				turn: 1,
+				toolName: "observe",
+				stage: "driver_connect",
+				resultCode: "PAYLOAD_TOO_LARGE",
+			},
+		]);
 	});
 
 	test("waits for an active browser operation to stop after abort", async () => {
@@ -1023,6 +1062,83 @@ describe("ResponsesAgentExecutor", () => {
 		expect(result).toEqual({ outcome: "sent", formUrl: input.targetUrl });
 		expect((await store.find(input.id))?.status).toBe("sent");
 		expect(driver.closed).toBe(true);
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{
+				turn: 1,
+				toolName: "fill",
+				stage: "fill",
+				resultCode: "OK",
+			},
+			{
+				turn: 2,
+				toolName: "submit",
+				stage: "submit",
+				resultCode: "OK",
+			},
+		]);
+	});
+
+	test("records a fixed diagnostic when a real submit result is uncertain", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const driver = new WorkerFakeBrowserDriver();
+		driver.submit = async () => {
+			throw new Error("arbitrary browser detail");
+		};
+		const responses = [
+			functionResponse("call-fill", "fill", {
+				elementId: "fa-0-0",
+				payloadKey: "message",
+			}),
+			functionResponse("call-submit", "submit", {
+				elementId: "fa-0-1",
+				activationStrategy: "mouse",
+			}),
+		];
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () => {
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toMatchObject({ outcome: "uncertain" });
+		expect((await store.find(input.id))?.status).toBe("uncertain");
+		const diagnostics = await readAgentToolDiagnostics(input.id);
+		expect(diagnostics).toEqual([
+			{
+				turn: 1,
+				toolName: "fill",
+				stage: "fill",
+				resultCode: "OK",
+			},
+			{
+				turn: 2,
+				toolName: "submit",
+				stage: "submit",
+				resultCode: "SUBMISSION_RESULT_UNCERTAIN",
+			},
+		]);
+		expect(JSON.stringify(diagnostics)).not.toContain(
+			"arbitrary browser detail",
+		);
 	});
 
 	test("rejects a finish result containing a form URL outside the target domain", async () => {
@@ -1084,8 +1200,33 @@ describe("ResponsesAgentExecutor", () => {
 				}),
 			]),
 		});
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{
+				turn: 1,
+				toolName: "finish",
+				stage: "finish_validation",
+				resultCode: "FINISH_FORM_URL_NOT_ALLOWED",
+			},
+			{
+				turn: 2,
+				toolName: "finish",
+				stage: "finish_validation",
+				resultCode: "OK",
+			},
+		]);
 	});
 });
+
+async function readAgentToolDiagnostics(
+	jobId: string,
+): Promise<Array<Record<string, unknown>>> {
+	const { results } = await env.DB.prepare(
+		"SELECT data_json FROM events WHERE job_id = ? AND type = 'agent.tool_diagnostic' ORDER BY CAST(json_extract(data_json, '$.turn') AS INTEGER)",
+	)
+		.bind(jobId)
+		.all<{ data_json: string }>();
+	return results.map((row) => JSON.parse(row.data_json));
+}
 
 function functionResponse(
 	callId: string,
