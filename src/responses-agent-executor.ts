@@ -731,6 +731,7 @@ function systemPrompt(dryRun: boolean): string {
 		"Observe the page before acting and check for sales, solicitation, or purpose restrictions.",
 		"If outreach is prohibited or the form purpose is incompatible, do not submit; call finish with prohibited.",
 		"For fill and select, choose only a payloadKey from payload.formValues. The trusted handler resolves its value; never invent personal or company data.",
+		"Use select for select elements, checkboxes, and radio controls. Click is only for a non-submit button with type=button.",
 		"Before submit, re-observe and verify the target, all values, required fields, and that submit has not been attempted.",
 		"Choose submit activationStrategy from the observed DOM: prefer mouse for visible button or input submit controls; use enter only when keyboard activation is more appropriate.",
 		"Use submit exactly once. Only submit can report sent.",
@@ -757,7 +758,7 @@ const AGENT_TOOLS = [
 		"Inspect the current page URL, forms, fields, choices, and prohibition text.",
 		{},
 	),
-	functionTool("click", "Click a non-submit element on the current page.", {
+	functionTool("click", "Click a non-submit button with type=button.", {
 		elementId: { type: "string", pattern: "^fa-[a-z0-9-]+$", maxLength: 64 },
 	}),
 	functionTool(
@@ -772,14 +773,18 @@ const AGENT_TOOLS = [
 			},
 		},
 	),
-	functionTool("select", "Select using a trusted payload.formValues entry.", {
-		elementId: { type: "string", pattern: "^fa-[a-z0-9-]+$", maxLength: 64 },
-		payloadKey: {
-			type: "string",
-			pattern: "^[A-Za-z][A-Za-z0-9_]{0,63}$",
-			maxLength: 64,
+	functionTool(
+		"select",
+		"Set a select element, checkbox, or radio control using a trusted payload.formValues entry.",
+		{
+			elementId: { type: "string", pattern: "^fa-[a-z0-9-]+$", maxLength: 64 },
+			payloadKey: {
+				type: "string",
+				pattern: "^[A-Za-z][A-Za-z0-9_]{0,63}$",
+				maxLength: 64,
+			},
 		},
-	}),
+	),
 	functionTool(
 		"submit",
 		"Submit once with a model-selected constrained CDP activation after confirming the target, required fields, values, and absence of sales prohibitions. Mouse coordinates are derived from the live DOM by the trusted handler.",
