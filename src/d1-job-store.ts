@@ -265,7 +265,9 @@ export class D1JobStore implements JobStore {
           'resultCode', ?
         ), ?
         FROM jobs
-        WHERE id = ? AND status = 'running' AND run_token = ?`,
+        WHERE id = ?
+          AND status IN ('running', 'submitting', 'sent', 'uncertain')
+          AND run_token = ?`,
 			)
 			.bind(
 				crypto.randomUUID(),

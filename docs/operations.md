@@ -104,7 +104,7 @@ DLQへ移動したジョブを確認する。
 
 ```bash
 ./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
-  "SELECT attempt,data_json,created_at FROM events WHERE job_id='<JOB_ID>' AND type='agent.tool_diagnostic' ORDER BY CAST(json_extract(data_json,'$.turn') AS INTEGER);"
+  "SELECT attempt,data_json,created_at FROM events WHERE job_id='<JOB_ID>' AND type='agent.tool_diagnostic' ORDER BY attempt,CAST(json_extract(data_json,'$.turn') AS INTEGER),created_at;"
 ```
 
 `data_json`にはturn、固定のtool名、stage、result codeだけが入り、URL、会社名、フォーム値、モデルの自由文は保存されない。
