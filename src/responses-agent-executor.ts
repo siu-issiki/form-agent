@@ -17,6 +17,7 @@ import {
 } from "./d1-job-store";
 import type { Job } from "./job";
 import {
+	CORRECTION_TURNS,
 	invalidProviderResponse,
 	isRecord,
 	type JsonObject,
@@ -31,6 +32,8 @@ import {
 	BrowserElementError,
 	BrowserFormInvalidError,
 	type BrowserObservation,
+	CorrectionRequiredError,
+	FormStateChangedError,
 	NavigationPolicyError,
 	ObservationStaleError,
 	type ProhibitedReasonCode,
@@ -74,6 +77,8 @@ interface ResponsesAgentExecutorOptions {
 interface ToolExecution {
 	output: string;
 	result?: AgentRunResult;
+	/** Set when the pre-submit review denied a correctable submission. */
+	reviewDenied?: true;
 }
 
 export class ResponsesAgentExecutor implements AgentExecutor {
@@ -160,7 +165,9 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 			},
 		];
 
-		for (let turn = 0; turn < MAX_TURNS; turn += 1) {
+		let maxTurns = MAX_TURNS;
+		let correctionTurnsGranted = false;
+		for (let turn = 0; turn < maxTurns; turn += 1) {
 			throwIfAborted(signal);
 			const body = JSON.stringify({
 				model: this.#model,
@@ -213,6 +220,12 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 				turn + 1,
 			);
 			if (execution.result) return execution.result;
+			if (execution.reviewDenied && !correctionTurnsGranted) {
+				// The single correction the review allows must not be cut short
+				// by a denial that lands near the turn limit.
+				correctionTurnsGranted = true;
+				maxTurns += CORRECTION_TURNS;
+			}
 			history.push({
 				type: "function_call_output",
 				call_id: call.call_id,
@@ -460,9 +473,12 @@ async function executeToolCall(
 			throw originalError;
 		}
 		if (originalError instanceof SubmitReviewDeniedError) {
-			return toolError("SUBMIT_REVIEW_DENIED", {
-				reasonCode: originalError.reasonCode,
-			});
+			return {
+				...toolError("SUBMIT_REVIEW_DENIED", {
+					reasonCode: originalError.reasonCode,
+				}),
+				reviewDenied: true,
+			};
 		}
 		if (originalError instanceof SubmitReviewUnavailableError) {
 			throw new AgentExecutionError(
@@ -498,6 +514,12 @@ async function executeToolCall(
 		}
 		if (originalError instanceof NavigationPolicyError) {
 			return toolError("NAVIGATION_NOT_ALLOWED");
+		}
+		if (originalError instanceof CorrectionRequiredError) {
+			return toolError("CORRECTION_REQUIRED");
+		}
+		if (originalError instanceof FormStateChangedError) {
+			return toolError("FORM_STATE_CHANGED");
 		}
 		if (originalError instanceof ObservationStaleError) {
 			return toolError("OBSERVATION_STALE");
@@ -805,6 +827,10 @@ export const TOOL_ERROR_GUIDANCE = {
 		"Navigate only to the current URL or an exact URL from the latest observe.navigationLinks.",
 	OBSERVATION_STALE:
 		"Call observe again after the last click, fill, or select, then retry.",
+	CORRECTION_REQUIRED:
+		"The review denied the inputs. Change at least one field with fill or select using a payloadKey, observe again, then submit once more.",
+	FORM_STATE_CHANGED:
+		"The page changed after it was reviewed. Observe again, verify every value, and submit once more.",
 	FORM_INVALID:
 		"Native validation failed. Re-observe, fill every required field from payload.formValues, and fix invalid values.",
 	ELEMENT_UNAVAILABLE:
@@ -863,7 +889,7 @@ function systemPrompt(dryRun: boolean): string {
 		"Before submit, re-observe and verify the target, all values, required fields, and that submit has not been attempted.",
 		"Choose submit activationStrategy from the observed DOM: prefer dom for button or input submit controls; use mouse only when a trusted click gesture is required, or enter when keyboard activation is required.",
 		"Use submit exactly once. Only submit can report sent.",
-		"submit runs an independent pre-submit review. If it returns SUBMIT_REVIEW_DENIED, re-observe, correct the inputs using payloadKeys only, and submit once more. A second denial ends the job as uncertain.",
+		"submit runs an independent pre-submit review. If it returns SUBMIT_REVIEW_DENIED, change at least one field with fill or select using payloadKeys only, re-observe, and submit once more. Only INPUT_MISMATCH is correctable; any other denial ends the job as uncertain, and so does a second denial.",
 		"If meaning or submission outcome is unclear, call finish with uncertain. For technical failures, call finish with failed.",
 	];
 	if (dryRun) {

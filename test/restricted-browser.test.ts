@@ -6,11 +6,14 @@ import {
 	BrowserElementError,
 	BrowserSubmitDiagnosticError,
 	type BrowserSubmitResult,
+	CorrectionRequiredError,
 	createBrowserSubmitDiagnosticError,
 	detectProhibitedReasonCodes,
 	detectProhibitedTextReasonCodes,
+	FormStateChangedError,
 	NavigationPolicyError,
 	ObservationStaleError,
+	type ObservedFieldState,
 	type RestrictedBrowserDriver,
 	RestrictedBrowserTools,
 	readTrustedFormValues,
@@ -903,10 +906,19 @@ describe("RestrictedBrowserTools", () => {
 		expect(store.events.map((event) => event.data.stage)).toEqual([
 			"before_submit",
 		]);
+		// Re-observing alone does not clear the denial; a value must change.
+		await expect(tools.validateSubmit("fa-0-1")).rejects.toBeInstanceOf(
+			CorrectionRequiredError,
+		);
+		await tools.observe();
+		await expect(tools.validateSubmit("fa-0-1")).rejects.toBeInstanceOf(
+			CorrectionRequiredError,
+		);
+
+		await tools.fill("fa-0-2", "Corrected");
 		await expect(tools.validateSubmit("fa-0-1")).rejects.toBeInstanceOf(
 			ObservationStaleError,
 		);
-
 		await tools.observe();
 		const sent = await tools.submit("fa-0-1");
 
@@ -915,13 +927,155 @@ describe("RestrictedBrowserTools", () => {
 		expect(driver.submitCount).toBe(1);
 	});
 
+	test("does not offer a correction for a denial the agent cannot fix", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const reviewer = new StubSubmitReviewer(
+			denyDecision("SALES_PROHIBITED", "Sales outreach is prohibited."),
+		);
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			evidence,
+			reviewer,
+		);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			SubmissionResultUncertainError,
+		);
+
+		const job = await store.find(input.id);
+		expect(job?.status).toBe("uncertain");
+		expect(job?.result?.reasonCode).toBe("PRE_SUBMIT_REVIEW_DENIED");
+		expect(job?.result?.reason).toBe(
+			"Pre-submit review denied the submission (reasonCode: SALES_PROHIBITED, denials: 1). Sales outreach is prohibited.",
+		);
+		// A denial with no correction on offer spends the whole budget.
+		expect(job?.submitReviewDenialCount).toBe(2);
+		expect(driver.submitCount).toBe(0);
+	});
+
+	test("does not submit content that changed after the review", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const reviewer = new StubSubmitReviewer();
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			evidence,
+			reviewer,
+		);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+		// The untrusted page rewrites a reviewed value while the review runs.
+		driver.fieldStates = [
+			{ elementId: "fa-0-0", value: "attacker", checked: false },
+			{ elementId: "fa-0-2", value: "", checked: false },
+		];
+
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			FormStateChangedError,
+		);
+
+		expect(driver.submitCount).toBe(0);
+		expect((await store.find(input.id))?.status).toBe("running");
+		await expect(tools.validateSubmit("fa-0-1")).rejects.toBeInstanceOf(
+			ObservationStaleError,
+		);
+	});
+
+	test("does not submit when a reviewed field disappeared", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			evidence,
+			new StubSubmitReviewer(),
+		);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+		driver.fieldStates = [{ elementId: "fa-0-0", value: "", checked: false }];
+
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			FormStateChangedError,
+		);
+
+		expect(driver.submitCount).toBe(0);
+	});
+
+	test("does not submit when the page navigated after the review", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			evidence,
+			new StubSubmitReviewer(),
+		);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+		driver.url = "https://acme.co.jp/other";
+
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			FormStateChangedError,
+		);
+
+		expect(driver.submitCount).toBe(0);
+	});
+
+	test("does not submit after the persisted denial budget is spent", async () => {
+		const driver = new FakeDriver();
+		const store = new UncertainOnceFailingJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			evidence,
+			new StubSubmitReviewer(
+				denyDecision("WRONG_FORM", "The submit control belongs elsewhere."),
+			),
+		);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			SubmissionResultUncertainError,
+		);
+		// The uncertain write failed, so the job is still running.
+		expect((await store.find(input.id))?.status).toBe("running");
+
+		// A later review that allows must not revive the spent job.
+		const revived = await createToolsWithEvidence(
+			driver,
+			store,
+			evidence,
+			new StubSubmitReviewer(),
+			true,
+		);
+		await revived.fill("fa-0-0", "Hello");
+		await revived.observe();
+
+		await expect(revived.submit("fa-0-1")).rejects.toBeInstanceOf(
+			SubmissionResultUncertainError,
+		);
+
+		expect(driver.submitCount).toBe(0);
+		expect((await store.find(input.id))?.status).toBe("uncertain");
+	});
+
 	test("ends the job as uncertain when the review denies twice", async () => {
 		const driver = new FakeDriver();
 		const store = new InMemoryJobStore();
 		const evidence = new InMemoryEvidenceObjectStore();
 		const reviewer = new StubSubmitReviewer(
 			denyDecision(),
-			denyDecision("SALES_PROHIBITED", "Sales\nis prohibited."),
+			denyDecision("INPUT_MISMATCH", "Still\nwrong."),
 		);
 		const tools = await createToolsWithEvidence(
 			driver,
@@ -934,6 +1088,7 @@ describe("RestrictedBrowserTools", () => {
 		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
 			SubmitReviewDeniedError,
 		);
+		await tools.fill("fa-0-2", "Corrected");
 		await tools.observe();
 
 		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
@@ -944,7 +1099,7 @@ describe("RestrictedBrowserTools", () => {
 		expect(job?.status).toBe("uncertain");
 		expect(job?.result?.reasonCode).toBe("PRE_SUBMIT_REVIEW_DENIED");
 		expect(job?.result?.reason).toBe(
-			"Pre-submit review denied the submission twice. Last reasonCode: SALES_PROHIBITED. Sales is prohibited.",
+			"Pre-submit review denied the submission (reasonCode: INPUT_MISMATCH, denials: 2). Still wrong.",
 		);
 		expect(driver.submitCount).toBe(0);
 	});
@@ -1042,9 +1197,12 @@ async function createToolsWithEvidence(
 	store: InMemoryJobStore,
 	evidence: InMemoryEvidenceObjectStore,
 	reviewer: SubmitReviewer = allowSubmitReviewer(),
+	reuseExistingJob = false,
 ): Promise<RestrictedBrowserTools> {
-	await store.create(input, "2026-08-28T00:00:00.000Z");
-	await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+	if (!reuseExistingJob) {
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+	}
 	return RestrictedBrowserTools.create(
 		driver,
 		store,
@@ -1126,12 +1284,20 @@ function defaultObservedForms(prohibitionText?: string): unknown[] {
 	return [
 		{
 			fields: [
-				{ elementId: "fa-0-0" },
-				{ elementId: "fa-0-1" },
-				{ elementId: "fa-0-2" },
+				{ elementId: "fa-0-0", tag: "input", type: "text", value: "" },
+				{ elementId: "fa-0-1", tag: "input", type: "submit", value: "Send" },
+				{ elementId: "fa-0-2", tag: "input", type: "text", value: "" },
 			],
 			...(prohibitionText === undefined ? {} : { prohibitionText }),
 		},
+	];
+}
+
+/** Matches `defaultObservedForms`, minus the submit control. */
+function defaultFieldStates(): ObservedFieldState[] {
+	return [
+		{ elementId: "fa-0-0", value: "", checked: false },
+		{ elementId: "fa-0-2", value: "", checked: false },
 	];
 }
 
@@ -1149,6 +1315,8 @@ class FakeDriver implements RestrictedBrowserDriver {
 	connectionClosed = false;
 	navigationLinks: Array<{ url: string; text: string }> | undefined;
 	observationForms: unknown[] = defaultObservedForms();
+	fieldStates: ObservedFieldState[] = defaultFieldStates();
+	fieldStatesError: Error | null = null;
 	pageText: string | undefined;
 	submitResult: BrowserSubmitResult = {
 		outcome: "sent",
@@ -1202,6 +1370,11 @@ class FakeDriver implements RestrictedBrowserDriver {
 		if (this.submitValidationError) {
 			throw this.submitValidationError;
 		}
+	}
+
+	async readObservedFieldStates(): Promise<ObservedFieldState[]> {
+		if (this.fieldStatesError) throw this.fieldStatesError;
+		return this.fieldStates;
 	}
 
 	async submit(
@@ -1392,6 +1565,25 @@ describe("SubmissionEvidenceRecorder", () => {
 		]);
 	});
 });
+
+/** Drops the first uncertain write, as a stalled D1 would. */
+class UncertainOnceFailingJobStore extends InMemoryJobStore {
+	#failuresLeft = 1;
+
+	override async recordUncertain(
+		...args: Parameters<InMemoryJobStore["recordUncertain"]>
+	): Promise<
+		ReturnType<InMemoryJobStore["recordUncertain"]> extends Promise<infer T>
+			? T
+			: never
+	> {
+		if (this.#failuresLeft > 0) {
+			this.#failuresLeft -= 1;
+			throw new Error("D1 is unavailable");
+		}
+		return super.recordUncertain(...args);
+	}
+}
 
 class RecordEvidenceCapturedRejectingJobStore extends InMemoryJobStore {
 	async recordEvidenceCaptured(): Promise<boolean> {

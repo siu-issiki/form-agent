@@ -134,7 +134,7 @@ describe("ResponsesSubmitReviewer", () => {
 
 		expect(await providerRequestCount()).toBe(1);
 		await env.DB.prepare(
-			"UPDATE jobs SET provider_request_count = 18 WHERE id = ?",
+			"UPDATE jobs SET provider_request_count = 21 WHERE id = ?",
 		)
 			.bind(input.id)
 			.run();

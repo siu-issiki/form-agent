@@ -44,10 +44,12 @@ import {
 	SET_CHECKED_VALUE_FUNCTION,
 	shouldBlockNonSubmitRequest,
 	submitUncertainReasonCode,
+	toObservedFieldState,
 } from "../src/browser-use-cdp-driver";
 import {
 	BrowserElementError,
 	BrowserSubmitDiagnosticError,
+	isReviewComparableField,
 } from "../src/restricted-browser";
 
 describe("BrowserUse CDP payload and DOM discovery", () => {
@@ -1433,3 +1435,63 @@ describe("BrowserUseCdpDriver page text", () => {
 		expect(result.text).toHaveLength(20_000);
 	});
 });
+
+describe("BrowserUseCdpDriver reviewed field comparison", () => {
+	test("excludes the controls that submit the form", () => {
+		expect(isReviewComparableField("input", "text")).toBe(true);
+		expect(isReviewComparableField("input", "checkbox")).toBe(true);
+		expect(isReviewComparableField("textarea", null)).toBe(true);
+		expect(isReviewComparableField("select", null)).toBe(true);
+		expect(isReviewComparableField("input", "submit")).toBe(false);
+		expect(isReviewComparableField("input", "image")).toBe(false);
+		expect(isReviewComparableField("button", null)).toBe(false);
+		expect(isReviewComparableField("button", "button")).toBe(false);
+	});
+
+	test("reads the live value and checked state of a comparable element", () => {
+		expect(
+			toObservedFieldState("fa-0-0", elementState({ value: "Hello" })),
+		).toEqual({ elementId: "fa-0-0", value: "Hello", checked: false });
+		expect(
+			toObservedFieldState(
+				"fa-0-2",
+				elementState({ type: "checkbox", checked: true }),
+			),
+		).toEqual({ elementId: "fa-0-2", value: "", checked: true });
+	});
+
+	test("never exposes a password value to the comparison", () => {
+		expect(
+			toObservedFieldState(
+				"fa-0-3",
+				elementState({ type: "password", value: "secret" }),
+			),
+		).toEqual({ elementId: "fa-0-3", value: "", checked: false });
+	});
+
+	test("drops a submit control and an unusable element", () => {
+		expect(
+			toObservedFieldState(
+				"fa-0-1",
+				elementState({ type: "submit", submitLike: true }),
+			),
+		).toBeNull();
+		expect(
+			toObservedFieldState("fa-0-4", elementState({ ok: false })),
+		).toBeNull();
+	});
+});
+
+function elementState(
+	overrides: Partial<Parameters<typeof toObservedFieldState>[1]> = {},
+) {
+	return {
+		ok: true,
+		tag: "input",
+		type: "text",
+		value: "",
+		checked: false,
+		submitLike: false,
+		...overrides,
+	};
+}

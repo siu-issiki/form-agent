@@ -10,6 +10,8 @@ import {
 /** A denial only allows one correction; the second denial ends the job. */
 const MAX_SUBMIT_REVIEW_DENIALS = 2;
 const MAX_SUBMIT_REVIEW_REASON_LENGTH = 500;
+const SUBMIT_REVIEW_BUDGET_EXHAUSTED_REASON =
+	"Pre-submit review denied the submission and its correction budget is exhausted.";
 // biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are flattened on purpose
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/g;
 
@@ -50,6 +52,23 @@ export interface SubmitReviewer {
 	review(input: SubmitReviewInput): Promise<SubmitReviewDecision>;
 }
 
+export interface ObservedFieldState {
+	elementId: string;
+	value: string;
+	checked: boolean;
+}
+
+/**
+ * Mirrors the driver's own exclusion rule so that the observation and the live
+ * read-back always describe the same set of elements. Submit controls and
+ * buttons are excluded because activating them is what `submit` does.
+ */
+export function isReviewComparableField(tag: unknown, type: unknown): boolean {
+	if (tag === "button") return false;
+	if (tag === "input" && (type === "submit" || type === "image")) return false;
+	return true;
+}
+
 /** The pre-submit review rejected this submission. */
 export class SubmitReviewDeniedError extends Error {
 	constructor(readonly reasonCode: SubmitReviewReasonCode) {
@@ -78,8 +97,10 @@ export function readTrustedFormValues(
 	payload: Record<string, unknown>,
 ): Record<string, string> {
 	const formValues = payload.formValues;
-	if (!isRecord(formValues) || Array.isArray(formValues)) return {};
-	const trusted: Record<string, string> = {};
+	// A null prototype keeps inherited members such as `constructor` out of the
+	// result, so a payloadKey can only ever resolve to a job-supplied value.
+	const trusted: Record<string, string> = Object.create(null);
+	if (!isRecord(formValues) || Array.isArray(formValues)) return trusted;
 	for (const [key, value] of Object.entries(formValues)) {
 		if (
 			PAYLOAD_KEY_PATTERN.test(key) &&
@@ -121,6 +142,12 @@ export interface RestrictedBrowserDriver {
 	fill(elementId: string, value: string): Promise<void>;
 	select(elementId: string, value: string): Promise<void>;
 	validateSubmit(elementId: string): Promise<void>;
+	/**
+	 * Re-reads the live state of every element named by the latest observation,
+	 * excluding submit controls and buttons. It is used to detect a page that
+	 * changed itself between the review and the submission.
+	 */
+	readObservedFieldStates(): Promise<ObservedFieldState[]>;
 	captureScreenshot(): Promise<Uint8Array>;
 	submit(
 		elementId: string,
@@ -154,6 +181,22 @@ export class ObservationStaleError extends BrowserElementError {
 	constructor() {
 		super();
 		this.name = "ObservationStaleError";
+	}
+}
+
+/** The review denied the inputs and no field has been changed since. */
+export class CorrectionRequiredError extends BrowserElementError {
+	constructor() {
+		super();
+		this.name = "CorrectionRequiredError";
+	}
+}
+
+/** The page changed between the review and the submission. */
+export class FormStateChangedError extends BrowserElementError {
+	constructor() {
+		super();
+		this.name = "FormStateChangedError";
 	}
 }
 
@@ -226,6 +269,7 @@ export class RestrictedBrowserTools {
 	#inputRevision = 0;
 	#observationRevision = -1;
 	#submitAttempted = false;
+	#correctionRequired = false;
 
 	private constructor(
 		private readonly driver: RestrictedBrowserDriver,
@@ -356,6 +400,8 @@ export class RestrictedBrowserTools {
 		await this.#assertCurrentUrlAllowed();
 		this.#successfulInputElementIds.add(elementId);
 		this.#inputRevision += 1;
+		// A denied review is only cleared by an actual input change.
+		this.#correctionRequired = false;
 	}
 
 	async select(elementId: string, value: string): Promise<void> {
@@ -363,11 +409,15 @@ export class RestrictedBrowserTools {
 		await this.#assertCurrentUrlAllowed();
 		this.#successfulInputElementIds.add(elementId);
 		this.#inputRevision += 1;
+		this.#correctionRequired = false;
 	}
 
 	async validateSubmit(elementId: string): Promise<void> {
 		if (this.#successfulInputElementIds.size < 1) {
 			throw new BrowserElementError();
+		}
+		if (this.#correctionRequired) {
+			throw new CorrectionRequiredError();
 		}
 		if (this.#observationRevision !== this.#inputRevision) {
 			throw new ObservationStaleError();
@@ -435,6 +485,24 @@ export class RestrictedBrowserTools {
 		}
 		await this.validateSubmit(elementId);
 
+		// The denial budget is read from D1 before anything else happens, so a
+		// failed uncertain write cannot leave a spent job open to another
+		// review that happens to allow.
+		const persisted = await this.jobs.find(this.jobId);
+		if (
+			persisted?.status !== "running" ||
+			persisted.runToken !== this.runToken
+		) {
+			throw new SubmissionNotAuthorizedError();
+		}
+		if (persisted.submitReviewDenialCount >= MAX_SUBMIT_REVIEW_DENIALS) {
+			await this.#recordUncertain(
+				"PRE_SUBMIT_REVIEW_DENIED",
+				SUBMIT_REVIEW_BUDGET_EXHAUSTED_REASON,
+			);
+			throw new SubmissionResultUncertainError();
+		}
+
 		// Nothing is submitted until the pre-submission evidence exists.
 		const before = await this.recorder.capture("before_submit");
 		if (!before.captured) {
@@ -446,28 +514,28 @@ export class RestrictedBrowserTools {
 			bytes: before.body,
 		});
 		if (decision.decision === "deny") {
-			// The denial budget lives in D1, so a Queue redelivery resumes with
-			// the same budget instead of granting another correction.
-			const denialCount = await this.jobs.recordSubmitReviewDenial(
-				this.jobId,
-				this.runToken,
-				this.now(),
-			);
-			if (denialCount === null) {
-				throw new SubmissionNotAuthorizedError();
-			}
-			if (denialCount < MAX_SUBMIT_REVIEW_DENIALS) {
-				// Force a fresh observation so the next attempt reviews the
-				// corrected page instead of the denied one.
+			// Only a mismatch between the entered values and the payload is
+			// correctable by the agent. Every other denial is a judgement about
+			// the page or the form itself, which a retry cannot change.
+			const correctable = decision.reasonCode === "INPUT_MISMATCH";
+			const denialCount = await this.#spendSubmitReviewDenial(correctable);
+			if (correctable && denialCount < MAX_SUBMIT_REVIEW_DENIALS) {
+				// Force both a real input change and a fresh observation so the
+				// next review sees corrected values instead of the denied ones.
+				this.#correctionRequired = true;
 				this.#inputRevision += 1;
 				throw new SubmitReviewDeniedError(decision.reasonCode);
 			}
 			await this.#recordUncertain(
 				"PRE_SUBMIT_REVIEW_DENIED",
-				submitReviewDeniedReason(decision),
+				submitReviewDeniedReason(decision, denialCount),
 			);
 			throw new SubmissionResultUncertainError();
 		}
+
+		// The reviewed page is not the page that gets submitted unless nothing
+		// moved in between. Untrusted page scripts run during the review.
+		await this.#assertReviewedStateUnchanged();
 		this.#submitAttempted = true;
 
 		const authorized = await this.jobs.claimSubmission(
@@ -578,8 +646,70 @@ export class RestrictedBrowserTools {
 		}
 	}
 
+	/**
+	 * Records this denial in D1 and returns its ordinal. A denial that offers
+	 * no correction consumes the whole remaining budget, so a failed uncertain
+	 * write cannot leave the job open to a later review that allows.
+	 */
+	async #spendSubmitReviewDenial(correctable: boolean): Promise<number> {
+		const denialCount = await this.jobs.recordSubmitReviewDenial(
+			this.jobId,
+			this.runToken,
+			this.now(),
+		);
+		if (denialCount === null) {
+			throw new SubmissionNotAuthorizedError();
+		}
+		if (correctable && denialCount < MAX_SUBMIT_REVIEW_DENIALS) {
+			return denialCount;
+		}
+		for (
+			let spent = denialCount;
+			spent < MAX_SUBMIT_REVIEW_DENIALS;
+			spent += 1
+		) {
+			if (
+				(await this.jobs.recordSubmitReviewDenial(
+					this.jobId,
+					this.runToken,
+					this.now(),
+				)) === null
+			) {
+				throw new SubmissionNotAuthorizedError();
+			}
+		}
+		return denialCount;
+	}
+
 	async #assertCurrentUrlAllowed(): Promise<void> {
 		this.#assertAllowedUrl(await this.driver.currentUrl());
+	}
+
+	/**
+	 * Confirms that the page still matches the observation the reviewer saw.
+	 * A mismatch forces a fresh observation instead of submitting content that
+	 * was never reviewed.
+	 */
+	async #assertReviewedStateUnchanged(): Promise<void> {
+		const observation = this.#latestObservation;
+		if (!observation) throw new FormStateChangedError();
+		let unchanged: boolean;
+		try {
+			const currentUrl = await this.driver.currentUrl();
+			this.#assertAllowedUrl(currentUrl);
+			const states = await this.driver.readObservedFieldStates();
+			unchanged =
+				canonicalNavigationPermissionUrl(currentUrl) ===
+					canonicalNavigationPermissionUrl(observation.url) &&
+				hasSameObservedFieldStates(observation, states);
+		} catch (error) {
+			if (error instanceof NavigationPolicyError) throw error;
+			unchanged = false;
+		}
+		if (!unchanged) {
+			this.#inputRevision += 1;
+			throw new FormStateChangedError();
+		}
 	}
 
 	#assertAllowedUrl(rawUrl: string): void {
@@ -764,11 +894,46 @@ function canonicalNavigationPermissionUrl(rawUrl: string): string {
  * line breaks are flattened and the text is truncated before storage. The model
  * never sees it; only the fixed reason code is returned to the agent.
  */
-function submitReviewDeniedReason(decision: SubmitReviewDecision): string {
+function submitReviewDeniedReason(
+	decision: SubmitReviewDecision,
+	denialCount: number,
+): string {
 	const reason = decision.reason
 		.replace(CONTROL_CHARACTER_PATTERN, " ")
 		.slice(0, MAX_SUBMIT_REVIEW_REASON_LENGTH);
-	return `Pre-submit review denied the submission twice. Last reasonCode: ${decision.reasonCode}. ${reason}`;
+	return `Pre-submit review denied the submission (reasonCode: ${decision.reasonCode}, denials: ${denialCount}). ${reason}`;
+}
+
+/**
+ * Compares the observation the reviewer saw with the live element states.
+ * Element sets must match exactly; values always, and checked state only where
+ * the observation reported one.
+ */
+function hasSameObservedFieldStates(
+	observation: BrowserObservation,
+	states: readonly ObservedFieldState[],
+): boolean {
+	const observed = new Map<string, Record<string, unknown>>();
+	for (const form of observation.forms) {
+		if (!isRecord(form) || !Array.isArray(form.fields)) continue;
+		for (const field of form.fields) {
+			if (!isRecord(field) || typeof field.elementId !== "string") continue;
+			if (!isReviewComparableField(field.tag, field.type)) continue;
+			observed.set(field.elementId, field);
+		}
+	}
+	if (states.length !== observed.size) return false;
+	for (const state of states) {
+		const field = observed.get(state.elementId);
+		if (!field) return false;
+		if (typeof field.value === "string" && field.value !== state.value) {
+			return false;
+		}
+		if (typeof field.checked === "boolean" && field.checked !== state.checked) {
+			return false;
+		}
+	}
+	return true;
 }
 
 function submitFailureReason(error: BrowserSubmitDiagnosticError): string {

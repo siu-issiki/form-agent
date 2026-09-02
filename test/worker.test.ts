@@ -14,6 +14,11 @@ import { BrowserUseCdpPayloadTooLargeError } from "../src/browser-use-cdp";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobInput } from "../src/job";
 import {
+	CORRECTION_TURNS,
+	MAX_PROVIDER_REQUESTS,
+	MAX_TURNS,
+} from "../src/openai-responses-client";
+import {
 	classifyToolDiagnostic,
 	isJobDryRun,
 	ResponsesAgentExecutor,
@@ -23,6 +28,7 @@ import {
 	BrowserElementError,
 	BrowserFormInvalidError,
 	type BrowserSubmitResult,
+	type ObservedFieldState,
 	type RestrictedBrowserDriver,
 	type SubmitActivationStrategy,
 	type SubmitReviewer,
@@ -808,6 +814,19 @@ describe("BrowserToolCoordinator", () => {
 				payloadKey: "missing",
 			}),
 		).rejects.toBeInstanceOf(BrowserToolInputError);
+		// An inherited member is not a job-supplied value.
+		await expect(
+			coordinator.execute(input.id, "run-token-1", "fill", {
+				elementId: "fa-0-0",
+				payloadKey: "constructor",
+			}),
+		).rejects.toBeInstanceOf(BrowserToolInputError);
+		await expect(
+			coordinator.execute(input.id, "run-token-1", "fill", {
+				elementId: "fa-0-0",
+				payloadKey: "toString",
+			}),
+		).rejects.toBeInstanceOf(BrowserToolInputError);
 		await coordinator.close();
 	});
 
@@ -901,6 +920,7 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	submitActivationStrategies: SubmitActivationStrategy[] = [];
 	filledValues: string[] = [];
 	observationForms: unknown[] = workerObservedForms();
+	fieldStates: ObservedFieldState[] = workerFieldStates();
 	pageText: string | undefined;
 	pageTextTruncated = false;
 	validateSubmitError: Error | null = null;
@@ -938,6 +958,9 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 			throw new BrowserElementError();
 		}
 	}
+	async readObservedFieldStates(): Promise<ObservedFieldState[]> {
+		return this.fieldStates;
+	}
 	async captureScreenshot(): Promise<Uint8Array> {
 		this.screenshotCount += 1;
 		if (this.screenshotError) throw this.screenshotError;
@@ -956,9 +979,17 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 function workerObservedForms(): unknown[] {
 	return [
 		{
-			fields: [{ elementId: "fa-0-0" }, { elementId: "fa-0-1" }],
+			fields: [
+				{ elementId: "fa-0-0", tag: "input", type: "text", value: "" },
+				{ elementId: "fa-0-1", tag: "input", type: "submit", value: "Send" },
+			],
 		},
 	];
+}
+
+/** Matches `workerObservedForms`, minus the submit control. */
+function workerFieldStates(): ObservedFieldState[] {
+	return [{ elementId: "fa-0-0", value: "", checked: false }];
 }
 
 describe("ResponsesAgentExecutor", () => {
@@ -2046,6 +2077,10 @@ describe("ResponsesAgentExecutor", () => {
 				"INPUT_MISMATCH",
 				"A value is in the wrong field.",
 			),
+			functionResponse("call-correct", "fill", {
+				elementId: "fa-0-0",
+				payloadKey: "message",
+			}),
 			functionResponse("call-reobserve", "observe", {}),
 			functionResponse("call-resubmit", "submit", {
 				elementId: "fa-0-1",
@@ -2104,8 +2139,91 @@ describe("ResponsesAgentExecutor", () => {
 				provider_request_count: number;
 				submit_review_denial_count: number;
 			}>();
-		expect(counters?.provider_request_count).toBe(7);
+		expect(counters?.provider_request_count).toBe(8);
 		expect(counters?.submit_review_denial_count).toBe(1);
+	});
+
+	test("requires a real input change before the corrected submit", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const driver = new WorkerFakeBrowserDriver();
+		const responses = [
+			functionResponse("call-fill", "fill", {
+				elementId: "fa-0-0",
+				payloadKey: "message",
+			}),
+			functionResponse("call-confirm", "observe", {}),
+			functionResponse("call-submit", "submit", {
+				elementId: "fa-0-1",
+				activationStrategy: "mouse",
+			}),
+			reviewResponse(
+				"deny",
+				"INPUT_MISMATCH",
+				"A value is in the wrong field.",
+			),
+			// The agent re-observes without changing anything.
+			functionResponse("call-reobserve", "observe", {}),
+			functionResponse("call-retry", "submit", {
+				elementId: "fa-0-1",
+				activationStrategy: "mouse",
+			}),
+			functionResponse("call-finish", "finish", {
+				outcome: "uncertain",
+				formUrl: null,
+				reasonCode: "CORRECTION_NOT_APPLIED",
+				reason: "The inputs were not corrected.",
+				retryable: null,
+			}),
+		];
+		const requests: unknown[] = [];
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async (_resource, init) => {
+				requests.push(JSON.parse(String(init?.body)));
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toMatchObject({ reasonCode: "CORRECTION_NOT_APPLIED" });
+		expect(driver.submitCount).toBe(0);
+		const lastRequest = requests[requests.length - 1] as {
+			input: Array<{ type?: string; call_id?: string; output?: string }>;
+		};
+		expect(
+			lastRequest.input.find(
+				(item) =>
+					item.type === "function_call_output" && item.call_id === "call-retry",
+			)?.output,
+		).toBe(
+			JSON.stringify({
+				error: "CORRECTION_REQUIRED",
+				guidance: TOOL_ERROR_GUIDANCE.CORRECTION_REQUIRED,
+			}),
+		);
+	});
+
+	test("grants extra turns for the correction the review allows", () => {
+		expect(MAX_PROVIDER_REQUESTS).toBe(MAX_TURNS + CORRECTION_TURNS + 2);
+		expect(MAX_PROVIDER_REQUESTS).toBe(21);
 	});
 
 	test("keeps a reviewer provider failure classified instead of a browser failure", async () => {
@@ -2261,6 +2379,14 @@ describe("ResponsesAgentExecutor", () => {
 			}),
 			true,
 		],
+		[
+			"FORM_STATE_CHANGED" as const,
+			functionResponse("call-tool", "submit", {
+				elementId: "fa-0-1",
+				activationStrategy: "mouse",
+			}),
+			true,
+		],
 	])("returns fixed guidance with %s", async (code, call, observeFirst) => {
 		const store = new D1JobStore(env.DB);
 		await store.create(input, "2026-08-28T00:00:00.000Z");
@@ -2273,6 +2399,12 @@ describe("ResponsesAgentExecutor", () => {
 		const driver = new WorkerFakeBrowserDriver();
 		if (code === "FORM_INVALID") {
 			driver.validateSubmitError = new BrowserFormInvalidError();
+		}
+		if (code === "FORM_STATE_CHANGED") {
+			// The untrusted page rewrites a reviewed value during the review.
+			driver.fieldStates = [
+				{ elementId: "fa-0-0", value: "rewritten", checked: false },
+			];
 		}
 		const responses = [
 			functionResponse("call-fill", "fill", {
@@ -2299,7 +2431,13 @@ describe("ResponsesAgentExecutor", () => {
 			openAiApiKey: "openai-secret",
 			browserUseApiKey: "browser-secret",
 			fetcher: (async (_resource, init) => {
-				requests.push(JSON.parse(String(init?.body)));
+				const body = JSON.parse(String(init?.body)) as {
+					text?: { format?: unknown };
+				};
+				if (body.text?.format) {
+					return Response.json(reviewResponse("allow"));
+				}
+				requests.push(body);
 				const response = responses.shift();
 				if (!response) throw new Error("Unexpected provider request");
 				return Response.json(response);

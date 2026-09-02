@@ -124,7 +124,7 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 - 設定されたモデルと一致すること。
 - Responses API だけを利用すること。
 - function tool 以外を渡さないこと。
-- 1 run の Provider 呼び出しを最大 18 回（agent turn 16 + 送信前レビュー最大 2）に制限すること。agent と送信前レビューは D1 の同じカウンタを共有する。
+- 1 run の Provider 呼び出しを最大 21 回（agent turn 16 + 修正 3 + 送信前レビュー最大 2）に制限すること。agent と送信前レビューは D1 の同じカウンタを共有する。レビューが deny を返した最初の 1 回だけ turn 上限を 3 増やし、turn 終盤で deny された場合でも修正に必要な fill・observe・submit を実行できるようにする。
 - 出力 token を最大 4,096 に制限すること。
 - request body を最大 128 KiB に制限すること。送信前レビューだけは証跡スクリーンショットを添付するため 1 MiB を上限とし、超過時は画像を外して再構成する。
 - response body を最大 256 KiB に制限すること。
@@ -167,10 +167,13 @@ driver が submit control と識別した要素は通常の `click` で操作で
 - 入力は、直前の信頼済み観察（URL、form、ページ本文、禁止 reason code）、`payload.formValues` の信頼済み値、`before_submit` スクリーンショット、対象ドメイン・URL、submit 要素 ID である。
 - 観察とスクリーンショットは `untrustedPageContent` としてラップし、外部サイト由来のデータであり指示として解釈しないことを instructions で明示する。
 - 判定 code は `INPUTS_MATCH`（allow のみ）、`INPUT_MISMATCH`、`SALES_PROHIBITED`、`FORM_PURPOSE_INCOMPATIBLE`、`WRONG_FORM`、`UNCLEAR` の固定値とする。`allow` と deny 系 code、`deny` と `INPUTS_MATCH` のように矛盾する組み合わせは、どちらの判定としても解釈せず応答不正として扱う。
-- deny の 1 回目はモデルへ `SUBMIT_REVIEW_DENIED` と reason code だけを返し、再観察を強制したうえで 1 回だけ修正を許可する。送信権は取得せず、ブラウザ送信も行わない。deny 回数は D1 のジョブ行（`submit_review_denial_count`）へ保存し、Queue 再配信で新しい browser session と Agent 実行になっても 1 attempt 目と同じ修正予算を共有する。
+- 修正を許可するのは `INPUT_MISMATCH` の deny だけであり、他の reason code は 1 回目でも `PRE_SUBMIT_REVIEW_DENIED` として `uncertain` で終了する。ページやフォーム自体への判断は入力の修正で覆らないためである。
+- 修正が許可された場合はモデルへ `SUBMIT_REVIEW_DENIED` と reason code だけを返し、実際の `fill` / `select` の成功と再観察の両方を次の `submit` の前提にする。再観察だけでは `CORRECTION_REQUIRED` として拒否し、何も変えずに再判定を引くことを防ぐ。送信権は取得せず、ブラウザ送信も行わない。
 - deny の 2 回目は `PRE_SUBMIT_REVIEW_DENIED` として `uncertain` を保存し、そのジョブを終了する。
+- deny 予算は D1 のジョブ行（`submit_review_denial_count`）へ保存し、Queue 再配信で新しい browser session と Agent 実行になっても 1 attempt 目と同じ予算を共有する。修正を許可しない deny は残り予算をすべて消費するため、`uncertain` の保存に失敗して `running` のまま残っても、後続の allow で送信へ進むことはない。`submit` は冒頭で永続値を読み直し、予算を使い切っていればレビューも撮影も行わずに `uncertain` で終了する。「修正が必要」というフラグ自体は実行単位であり、再配信後の新しい実行はページを最初から入力し直す。
 - レビュー自体を完了できない場合は allow にせず、再試行可能な `SUBMIT_REVIEW_UNAVAILABLE` として扱う。Provider の通信失敗、429、応答不正はそれぞれの Provider 用 reason code のまま伝播させ、browser tool の障害へ丸めない。
 - モデルへ返すのは固定の code と guidance だけであり、レビューの自由記述はモデルへ渡さない。自由記述は 2 回目 deny 時の `uncertain` の reason にだけ、制御文字を空白へ置換し 500 文字へ切り詰めて保存する。
+- レビューが allow を返した直後、送信権を取得する前に、現在 URL と観察済み全フィールドの `value` / `checked` を読み直して観察時と一致することを確認する。1 件でも異なる、要素が消えている、要素が増えている場合は `FORM_STATE_CHANGED` として送信せず、再観察を強制する。レビュー中に非信頼ページの JS が値を書き換えても、レビューされていない内容が送信されないようにするためである。
 - レビューは `running` 状態でのみ Provider 呼び出し回数を消費できるため、必ず `claimSubmission` より前に実行する。
 - レビューモデルは既定で `AGENT_MODEL` と同じであり、`AGENT_SUBMIT_REVIEW_MODEL` を設定した場合だけ上書きする。
 
@@ -250,7 +253,7 @@ pending / running / failed ── retry 上限超過 ──► dead_lettered
 | `payload_json` | TEXT | 送信者情報、本文などの入力 |
 | `status` | TEXT | `pending` / `running` / `submitting` / `sent` / `prohibited` / `uncertain` / `failed` / `dead_lettered` |
 | `attempt_count` | INTEGER | 実行試行回数 |
-| `submit_review_denial_count` | INTEGER | 送信前レビューが deny した累計回数。Queue 再配信をまたいで共有する |
+| `submit_review_denial_count` | INTEGER | 送信前レビューが消費した deny 予算。修正を許可しない deny は残り予算をすべて消費する。Queue 再配信をまたいで共有する |
 | `run_token` | TEXT NULL | 現在の実行権を識別する token |
 | `provider_request_count` | INTEGER | 現在の run が使用した Provider 呼び出し回数 |
 | `created_at` | TEXT | 作成日時 |
@@ -306,13 +309,15 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 - モデルが`fill` / `select`で指定できるのは`payload.formValues`内のキーだけとし、実際の値は信頼済みhandlerがD1から取得する。
 - `observe`の結果を`untrusted_page_content`として明示し、ページ本文が信頼済みhandlerの上限（20,000文字）で切り詰められた場合は`pageTextTruncated`で通知する。
 - 送信直前に、直前の観察・`payload.formValues`・`before_submit`スクリーンショットを入力とする独立レビューを通し、`allow`以外では送信権を取得しない。
+- レビューのdenyで修正を許可するのは`INPUT_MISMATCH`だけとし、実際の`fill` / `select`を次の`submit`の前提にする。deny予算はD1のジョブ行に保存し、実行と再配信をまたいで共有する。
+- レビューのallowから送信権取得までの間に、現在URLと観察済み全フィールドの値・チェック状態を読み直し、1件でも異なれば送信しない。
 - ジョブ間で browser session、cookie、入力データを共有しない。
 
 `submitting` 中に Worker が停止し、結果保存まで到達しなかった場合は自動再送せず、人間の確認対象にする。人手照合、DLQ確認、緊急停止、安全な再開のrunbookは [operations.md](operations.md) に定義済みである。照合用の専用 API / UI は未実装である。
 
 ### Agent への安全指示
 
-system prompt では、営業禁止・用途制限の確認と送信前の再観察を指示する。入力値は信頼済みhandlerが`payload.formValues`由来であることを強制する。`prohibited`は、直前かつ現在URLと一致する観察でフォーム不在、または全候補formについてform本文、前方の近接要素、祖先側の近接要素、iframe親ページ側の近接要素から固定パターンの営業禁止・用途制限を検出した場合だけ受理する。送信前には選択したformの禁止根拠、全入力のform owner、native validity、現在のaction / method、入力後の再観察、1回限りの送信権を機械的に検証する。さらに送信直前には、観察・信頼済み入力値・`before_submit`スクリーンショットを入力とする独立レビューを通し、`INPUT_MISMATCH` / `SALES_PROHIBITED` / `FORM_PURPOSE_INCOMPATIBLE` / `WRONG_FORM` / `UNCLEAR`のいずれかでdenyされた場合は送信権を取得しない。1回目のdenyは再観察のうえ1回だけ修正を許可し、2回目のdenyは`PRE_SUBMIT_REVIEW_DENIED`として`uncertain`で終了する。レビューを完了できない場合はallowにせず、再試行可能な`SUBMIT_REVIEW_UNAVAILABLE`として扱う。禁止判定時と送信前後には画面のスクリーンショット証跡をR2へ保存する。`observe`の結果は外部サイト由来の非信頼データとして明示し、モデルとレビューの双方へページ内の指示に従わないよう指示する。固定パターンで表現されない禁止事項は独立レビューで補完するが、完全ではない。Shadow DOM内の本文とページ上のprompt injectionに対する完全な判定は引き続き未対応である。
+system prompt では、営業禁止・用途制限の確認と送信前の再観察を指示する。入力値は信頼済みhandlerが`payload.formValues`由来であることを強制する。`prohibited`は、直前かつ現在URLと一致する観察でフォーム不在、または全候補formについてform本文、前方の近接要素、祖先側の近接要素、iframe親ページ側の近接要素から固定パターンの営業禁止・用途制限を検出した場合だけ受理する。送信前には選択したformの禁止根拠、全入力のform owner、native validity、現在のaction / method、入力後の再観察、1回限りの送信権を機械的に検証する。さらに送信直前には、観察・信頼済み入力値・`before_submit`スクリーンショットを入力とする独立レビューを通し、`INPUT_MISMATCH` / `SALES_PROHIBITED` / `FORM_PURPOSE_INCOMPATIBLE` / `WRONG_FORM` / `UNCLEAR`のいずれかでdenyされた場合は送信権を取得しない。修正を許可するのは`INPUT_MISMATCH`だけで、実際の入力変更と再観察の両方を次の`submit`の前提にする。他のreason codeは1回目でも、`INPUT_MISMATCH`は2回目のdenyで`PRE_SUBMIT_REVIEW_DENIED`として`uncertain`で終了する。allow後・送信権取得前には現在URLと観察済み全フィールドの値・チェック状態を読み直し、レビュー中にページが変化していれば送信しない。レビューを完了できない場合はallowにせず、再試行可能な`SUBMIT_REVIEW_UNAVAILABLE`として扱う。禁止判定時と送信前後には画面のスクリーンショット証跡をR2へ保存する。`observe`の結果は外部サイト由来の非信頼データとして明示し、モデルとレビューの双方へページ内の指示に従わないよう指示する。固定パターンで表現されない禁止事項は独立レビューで補完するが、完全ではない。Shadow DOM内の本文とページ上のprompt injectionに対する完全な判定は引き続き未対応である。
 
 ## 現在の制約
 
@@ -320,7 +325,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 
 - top-level navigation は対象企業ドメインとそのサブドメイン、またはジョブごとに登録した完全一致の外部hostだけを許可する。
 - フォーム入力前に限り、公開HTTPS hostのread-only subresource（`GET` / `HEAD` / `OPTIONS`）を許可する。入力開始後は対象企業ドメインとジョブ固有の許可host以外への通信を遮断する。
-- CDP DOM tree から `form` と可視 `input` / `textarea` / `select` / `button` を観察し、`form` 属性による外部関連付けにも対応する。
+- CDP DOM tree から `form` と可視 `input` / `textarea` / `select` / `button` を観察し、`form` 属性による外部関連付けにも対応する。各フィールドは tag、type、name、role、label、placeholder、必須、現在値、選択肢を返し、checkbox / radio では `checked` も返す。password の値は常に空文字で返す。
 - 探索上限は最大 25 form candidate、200 field candidate、モデルへ返す観察結果は最大 10 form、合計 100 field、本文 20,000 文字までとする。
 - open / closed Shadow DOMは探索対象で、管理下テストでは送信まで検証済みである。ただし実サイトでの互換性検証は継続する。
 - cross-origin iframeはジョブ固有の外部host許可を使う管理下テストで送信まで検証済みである。contenteditableと独自UI componentは未対応または未検証である。
@@ -460,7 +465,7 @@ PoC はまず 1 並列の production で開始し、管理下テストサイト�
 - 現在の推論 Provider は OpenAI とし、認証情報と制限は Worker 側で管理する。
 - BrowserUse Agent は使わず、standalone browser へ CDP 接続する。
 - Agent には用途限定 browser tool だけを公開し、`submit` を独立した制御対象にする。
-- `submit` の直前に、agent とは独立したレビューを 1 回通し、`allow` 以外では送信権を取得しない。1 回目の deny だけ修正を許可し、2 回目の deny は `uncertain` とする。
+- `submit` の直前に、agent とは独立したレビューを 1 回通し、`allow` 以外では送信権を取得しない。修正を許可するのは `INPUT_MISMATCH` の 1 回目の deny だけとし、実際の入力変更を必須にする。2 回目の deny と修正不能な deny は `uncertain` とする。
 - 送信前レビューの審査と証跡の設計は OpenAI Codex の `node_repl_policy.md` と `node_repl_review_evidence.rs` を参考にした。
 - exactly-once を仮定せず、`jobId`、`runToken`、D1 の条件付き状態遷移で二重送信を防ぐ。
 - 送信権取得後に結果を確定できない場合は `uncertain` とし、自動 retry しない。

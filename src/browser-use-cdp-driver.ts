@@ -17,7 +17,9 @@ import {
 	type BrowserObservation,
 	type BrowserSubmitResult,
 	createBrowserSubmitDiagnosticError,
+	isReviewComparableField,
 	normalizeAllowedHosts,
+	type ObservedFieldState,
 	PROHIBITION_TEXT_PATTERN_SOURCES,
 	type RestrictedBrowserDriver,
 	type SubmitActivationStrategy,
@@ -333,6 +335,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 					placeholder: state.placeholder,
 					required: state.required,
 					value: state.type === "password" ? "" : state.value,
+					...(state.type === "checkbox" || state.type === "radio"
+						? { checked: state.checked }
+						: {}),
 					options: state.options,
 				});
 			}
@@ -413,6 +418,23 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			...(pageText.truncated ? { pageTextTruncated: true } : {}),
 			navigationLinks,
 		};
+	}
+
+	/**
+	 * Re-reads every element the latest observation named, so the caller can
+	 * confirm the page still holds the reviewed content. Elements that no
+	 * longer resolve are omitted, which the caller sees as a set mismatch.
+	 */
+	async readObservedFieldStates(): Promise<ObservedFieldState[]> {
+		const states: ObservedFieldState[] = [];
+		for (const [elementId, reference] of this.#elements) {
+			const state = await this.#inspectElement(reference.backendNodeId).catch(
+				() => null,
+			);
+			const comparable = state && toObservedFieldState(elementId, state);
+			if (comparable) states.push(comparable);
+		}
+		return states;
 	}
 
 	async clickNonSubmit(elementId: string): Promise<void> {
@@ -1686,6 +1708,31 @@ export function createExpectedSubmissionRequest(
  * whether the page held more. Truncation is decided in the Worker so that an
  * untrusted page cannot claim its text was complete.
  */
+/**
+ * Narrows one inspected element to the state the pre-submit comparison uses,
+ * or null when the element is not comparable (unusable, or a submit control
+ * whose activation is what `submit` does).
+ */
+export function toObservedFieldState(
+	elementId: string,
+	state: {
+		ok: boolean;
+		tag: string;
+		type: string;
+		value: string;
+		checked: boolean;
+		submitLike: boolean;
+	},
+): ObservedFieldState | null {
+	if (!state.ok || state.submitLike) return null;
+	if (!isReviewComparableField(state.tag, state.type || null)) return null;
+	return {
+		elementId,
+		value: state.type === "password" ? "" : state.value,
+		checked: state.checked,
+	};
+}
+
 export function readPageText(raw: string): {
 	text: string;
 	truncated: boolean;

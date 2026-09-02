@@ -296,8 +296,12 @@ function readPayloadValue(
 	if (!PAYLOAD_KEY_PATTERN.test(payloadKey)) {
 		throw new BrowserToolInputError();
 	}
-	const value = readTrustedFormValues(job.payload)[payloadKey];
-	if (value === undefined || value.length > maxLength) {
+	const trusted = readTrustedFormValues(job.payload);
+	if (!Object.hasOwn(trusted, payloadKey)) {
+		throw new BrowserToolInputError();
+	}
+	const value = trusted[payloadKey];
+	if (typeof value !== "string" || value.length > maxLength) {
 		throw new BrowserToolInputError();
 	}
 	return value;
