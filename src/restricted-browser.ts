@@ -11,7 +11,13 @@ export interface BrowserObservation {
 	forms: unknown[];
 	pageText?: string;
 	navigationLinks?: Array<{ url: string; text: string }>;
+	prohibitedReasonCodes?: ProhibitedReasonCode[];
 }
+
+export type ProhibitedReasonCode =
+	| "NO_FORM_PRESENT"
+	| "SALES_PROHIBITED"
+	| "FORM_PURPOSE_INCOMPATIBLE";
 
 export type BrowserSubmitResult =
 	| { outcome: "sent"; formUrl: string }
@@ -126,6 +132,10 @@ export class RestrictedBrowserTools {
 	readonly #targetDomain: string;
 	readonly #allowedHosts: string[];
 	readonly #successfulInputElementIds = new Set<string>();
+	readonly #allowedNavigationUrls = new Set<string>();
+	#latestObservation: BrowserObservation | undefined;
+	#inputRevision = 0;
+	#observationRevision = -1;
 	#submitAttempted = false;
 
 	private constructor(
@@ -136,10 +146,12 @@ export class RestrictedBrowserTools {
 		private readonly recorder: SubmissionEvidenceRecorder,
 		targetDomain: string,
 		allowedHosts: readonly string[],
+		targetUrl: string,
 		private readonly now: () => string = () => new Date().toISOString(),
 	) {
 		this.#targetDomain = normalizeTargetDomain(targetDomain);
 		this.#allowedHosts = normalizeAllowedHosts(allowedHosts);
+		this.#allowedNavigationUrls.add(canonicalNavigationUrl(targetUrl));
 	}
 
 	static async create(
@@ -175,6 +187,7 @@ export class RestrictedBrowserTools {
 			),
 			targetDomain,
 			allowedHosts,
+			job.targetUrl,
 			now,
 		);
 	}
@@ -185,53 +198,91 @@ export class RestrictedBrowserTools {
 
 	async navigate(url: string): Promise<void> {
 		this.#assertAllowedUrl(url);
+		if (!this.#allowedNavigationUrls.has(canonicalNavigationUrl(url))) {
+			throw new NavigationPolicyError();
+		}
 		await this.driver.navigate(url);
 		await this.#assertCurrentUrlAllowed();
 		this.#successfulInputElementIds.clear();
+		this.#latestObservation = undefined;
+		this.#allowedNavigationUrls.clear();
+		this.#inputRevision += 1;
 	}
 
 	async observe(): Promise<BrowserObservation> {
 		await this.#assertCurrentUrlAllowed();
 		const observation = await this.driver.observe();
 		this.#assertAllowedUrl(observation.url);
-		if (!observation.navigationLinks) return observation;
-		return {
+		const navigationLinks = observation.navigationLinks?.filter((link) => {
+			try {
+				this.#assertAllowedUrl(link.url);
+				return true;
+			} catch {
+				return false;
+			}
+		});
+		const trustedObservation: BrowserObservation = {
 			...observation,
-			navigationLinks: observation.navigationLinks.filter((link) => {
-				try {
-					this.#assertAllowedUrl(link.url);
-					return true;
-				} catch {
-					return false;
-				}
-			}),
+			...(navigationLinks ? { navigationLinks } : {}),
+			prohibitedReasonCodes: detectProhibitedReasonCodes(observation),
 		};
+		this.#latestObservation = trustedObservation;
+		this.#observationRevision = this.#inputRevision;
+		this.#allowedNavigationUrls.clear();
+		this.#allowedNavigationUrls.add(
+			canonicalNavigationUrl(trustedObservation.url),
+		);
+		for (const link of trustedObservation.navigationLinks ?? []) {
+			this.#allowedNavigationUrls.add(canonicalNavigationUrl(link.url));
+		}
+		return trustedObservation;
 	}
 
 	async click(elementId: string): Promise<void> {
 		await this.driver.clickNonSubmit(elementId);
 		await this.#assertCurrentUrlAllowed();
+		this.#inputRevision += 1;
 	}
 
 	async fill(elementId: string, value: string): Promise<void> {
 		await this.driver.fill(elementId, value);
 		await this.#assertCurrentUrlAllowed();
 		this.#successfulInputElementIds.add(elementId);
+		this.#inputRevision += 1;
 	}
 
 	async select(elementId: string, value: string): Promise<void> {
 		await this.driver.select(elementId, value);
 		await this.#assertCurrentUrlAllowed();
 		this.#successfulInputElementIds.add(elementId);
+		this.#inputRevision += 1;
 	}
 
 	async validateSubmit(elementId: string): Promise<void> {
 		if (this.#successfulInputElementIds.size < 1) {
 			throw new BrowserElementError();
 		}
+		if (this.#observationRevision !== this.#inputRevision) {
+			throw new BrowserElementError();
+		}
+		if ((this.#latestObservation?.prohibitedReasonCodes?.length ?? 0) > 0) {
+			throw new BrowserElementError();
+		}
 		await this.#assertCurrentUrlAllowed();
 		await this.driver.validateSubmit(elementId);
 		await this.#assertCurrentUrlAllowed();
+	}
+
+	validateProhibited(reasonCode: ProhibitedReasonCode, formUrl: string | null) {
+		const observation = this.#latestObservation;
+		if (
+			!observation?.prohibitedReasonCodes?.includes(reasonCode) ||
+			(formUrl !== null &&
+				canonicalNavigationUrl(formUrl) !==
+					canonicalNavigationUrl(observation.url))
+		) {
+			throw new BrowserElementError();
+		}
 	}
 
 	async submit(
@@ -379,6 +430,34 @@ export class RestrictedBrowserTools {
 			// The caller still receives an uncertain result and must never retry submit.
 		}
 	}
+}
+
+export function detectProhibitedReasonCodes(
+	observation: Pick<BrowserObservation, "forms" | "pageText">,
+): ProhibitedReasonCode[] {
+	const codes: ProhibitedReasonCode[] = [];
+	if (observation.forms.length === 0) codes.push("NO_FORM_PRESENT");
+	const text = (observation.pageText ?? "").replace(/\s+/g, " ").toLowerCase();
+	if (
+		/(営業|勧誘|セールス).{0,40}(禁止|お断り|受け付け|ご遠慮)/.test(text) ||
+		/(禁止|お断り|受け付け|ご遠慮).{0,40}(営業|勧誘|セールス)/.test(text) ||
+		/(sales|solicitation).{0,40}(prohibited|not accepted|do not use)/.test(text)
+	) {
+		codes.push("SALES_PROHIBITED");
+	}
+	if (
+		/(採用|サポート|報道|サンプル|資料請求).{0,30}(専用|のみ)/.test(text) ||
+		/(専用|のみ).{0,30}(採用|サポート|報道|サンプル|資料請求)/.test(text)
+	) {
+		codes.push("FORM_PURPOSE_INCOMPATIBLE");
+	}
+	return codes;
+}
+
+function canonicalNavigationUrl(rawUrl: string): string {
+	const url = new URL(rawUrl);
+	url.hash = "";
+	return url.toString();
 }
 
 function submitFailureReason(error: BrowserSubmitDiagnosticError): string {

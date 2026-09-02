@@ -21,6 +21,7 @@ import {
 	BrowserElementError,
 	BrowserFormInvalidError,
 	NavigationPolicyError,
+	type ProhibitedReasonCode,
 	SubmissionEvidenceError,
 	SubmissionNotAuthorizedError,
 	SubmissionResultUncertainError,
@@ -291,6 +292,40 @@ async function executeToolCall(
 			job.targetDomain,
 			job.allowedHosts,
 		);
+		if (!parsed.result) {
+			await recordToolDiagnostic(
+				db,
+				job,
+				runToken,
+				turn,
+				"finish",
+				"finish_validation",
+				parsed.diagnosticCode,
+			);
+			return toolError("INVALID_TOOL_INPUT");
+		}
+		if (parsed.result.outcome === "prohibited") {
+			try {
+				await coordinator.validateProhibited(
+					job.id,
+					runToken,
+					parsed.result.reasonCode,
+					parsed.result.formUrl,
+				);
+			} catch {
+				await recordToolDiagnostic(
+					db,
+					job,
+					runToken,
+					turn,
+					"finish",
+					"finish_validation",
+					"FINISH_PROHIBITION_NOT_VERIFIED",
+				);
+				return toolError("PROHIBITION_NOT_VERIFIED");
+			}
+			await coordinator.captureEvidence(job.id, runToken, "prohibited");
+		}
 		await recordToolDiagnostic(
 			db,
 			job,
@@ -300,10 +335,6 @@ async function executeToolCall(
 			"finish_validation",
 			parsed.diagnosticCode,
 		);
-		if (!parsed.result) return toolError("INVALID_TOOL_INPUT");
-		if (parsed.result.outcome === "prohibited") {
-			await coordinator.captureEvidence(job.id, runToken, "prohibited");
-		}
 		return {
 			output: JSON.stringify({ outcome: parsed.result.outcome }),
 			result: parsed.result,
@@ -554,7 +585,17 @@ function terminalResultFromJob(
 }
 
 type FinishParseResult =
-	| { result: AgentRunResult; diagnosticCode: "OK" }
+	| {
+			result:
+				| Exclude<AgentRunResult, { outcome: "prohibited" }>
+				| {
+						outcome: "prohibited";
+						formUrl: string | null;
+						reasonCode: ProhibitedReasonCode;
+						reason: string;
+				  };
+			diagnosticCode: "OK";
+	  }
 	| {
 			result: null;
 			diagnosticCode:

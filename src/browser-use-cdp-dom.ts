@@ -175,16 +175,36 @@ export function discoverCdpNavigationLinks(
 export function discoverCdpBodyBackendNodeIds(
 	root: CdpDomNode,
 	maxBodies = 20,
+	targetFrameId?: string,
 ): number[] {
 	const backendNodeIds: number[] = [];
-	const visit = (node: CdpDomNode) => {
+	const visit = (node: CdpDomNode, inheritedFrameId?: string) => {
 		if (backendNodeIds.length >= maxBodies) return;
-		if (node.nodeName.toLowerCase() === "body") {
+		const frameId =
+			node.nodeName.toLowerCase() === "#document"
+				? (node.frameId ?? inheritedFrameId)
+				: inheritedFrameId;
+		if (
+			node.nodeName.toLowerCase() === "body" &&
+			(targetFrameId === undefined || frameId === targetFrameId)
+		) {
 			backendNodeIds.push(node.backendNodeId);
 		}
-		for (const child of composedChildren(node)) visit(child);
+		for (const child of [
+			...(node.children ?? []),
+			...(node.shadowRoots ?? []),
+		]) {
+			visit(child, frameId);
+		}
+		if (node.contentDocument) {
+			visit(
+				node.contentDocument,
+				node.frameId ?? node.contentDocument.frameId ?? frameId,
+			);
+		}
+		if (node.templateContent) visit(node.templateContent, frameId);
 	};
-	visit(root);
+	visit(root, root.frameId);
 	return backendNodeIds;
 }
 

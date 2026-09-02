@@ -127,6 +127,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#targetDomain: string | undefined;
 	#allowedHosts: string[] = [];
 	#submissionRequestAllowed = false;
+	#blockNonSubmitRequests = false;
 	#submissionRequestInFlight = false;
 	#submissionRequestCount = 0;
 	#submissionRequestObserved: (() => void) | undefined;
@@ -231,6 +232,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 
 	async navigate(url: string): Promise<void> {
 		assertDryRunNavigationAllowed(this.dryRun, this.#navigationCount);
+		this.#blockNonSubmitRequests = false;
 		this.#navigationCount += 1;
 		this.#clearElements();
 		const result = await this.#send<{ errorText?: string }>("Page.navigate", {
@@ -344,6 +346,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			throw new BrowserElementError();
 		}
 		this.#interactionStarted = true;
+		this.#blockNonSubmitRequests = true;
 		await this.#clickElement(reference.backendNodeId);
 	}
 
@@ -430,17 +433,15 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 		let hasInputInSubmitForm = false;
 		for (const inputBackendNodeId of this.#successfulInputBackendNodeIds) {
-			if (
+			const hasSameFormOwner =
 				await this.#callFunctionOnElementWithElementArgument<boolean>(
 					reference.backendNodeId,
 					inputBackendNodeId,
 					HAS_SAME_FORM_OWNER_FUNCTION,
-				)
-			) {
-				hasInputInSubmitForm = true;
-				this.#validatedSubmitInputBackendNodeId = inputBackendNodeId;
-				break;
-			}
+				);
+			if (!hasSameFormOwner) throw new BrowserElementError();
+			hasInputInSubmitForm = true;
+			this.#validatedSubmitInputBackendNodeId ??= inputBackendNodeId;
 		}
 		if (!hasInputInSubmitForm) throw new BrowserElementError();
 		const formValid = await this.#callFunctionOnElement<boolean>(
@@ -464,6 +465,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		} catch (error) {
 			throw createBrowserSubmitDiagnosticError("SUBMIT_VALIDATE", error);
 		}
+		this.#blockNonSubmitRequests = false;
 		this.#interactionStarted = true;
 		if (this.#expectedSubmissionRequest?.method === "GET") {
 			this.#getSubmissionGuard ??= {
@@ -479,7 +481,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				: undefined;
 		let beforeConfirmationCount: number;
 		try {
-			beforeConfirmationCount = await this.#confirmationBodyCount();
+			beforeConfirmationCount = await this.#confirmationBodyCount(
+				expectedDocumentGetFrameId,
+			);
 		} catch (error) {
 			throw createBrowserSubmitDiagnosticError(
 				"SUBMIT_READ_BEFORE_TEXT",
@@ -509,7 +513,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				const confirmation = await readSubmissionConfirmation(
 					beforeConfirmationCount,
 					this.#submissionRequestCount > 0,
-					() => this.#confirmationBodyCount(),
+					() => this.#confirmationBodyCount(expectedDocumentGetFrameId),
 					() => this.currentUrl(),
 					hasExpectedFrameNavigated(
 						expectedDocumentGetFrameId,
@@ -631,7 +635,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				paused.request.method,
 				canClaimSubmissionRequest,
 				!this.#formDataEntered && paused.resourceType !== "Document",
-				this.dryRun && this.#interactionStarted,
+				(this.dryRun && this.#interactionStarted) ||
+					this.#blockNonSubmitRequests,
 				this.#allowedHosts,
 			);
 			if (canClaimSubmissionRequest) {
@@ -680,13 +685,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		);
 	}
 
-	async #confirmationBodyCount(): Promise<number> {
+	async #confirmationBodyCount(frameId?: string): Promise<number> {
 		const { root } = await this.#send<{ root: CdpDomNode }>("DOM.getDocument", {
 			depth: -1,
 			pierce: true,
 		});
 		const matches = await Promise.all(
-			discoverCdpBodyBackendNodeIds(root).map((backendNodeId) =>
+			discoverCdpBodyBackendNodeIds(root, 20, frameId).map((backendNodeId) =>
 				this.#callFunctionOnElement<boolean>(
 					backendNodeId,
 					HAS_CONFIRMATION_TEXT_FUNCTION,
@@ -700,6 +705,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				event: "browser_confirmation_snapshot",
 				bodyCount: matches.length,
 				matchingBodyCount,
+				frameScoped: frameId !== undefined,
 			}),
 		);
 		return matchingBodyCount;

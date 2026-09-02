@@ -265,6 +265,31 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 			}),
 		).toEqual([2, 4]);
 	});
+
+	test("limits confirmation body nodes to the submitted frame", () => {
+		const root = {
+			backendNodeId: 1,
+			nodeName: "#document",
+			frameId: "top-frame",
+			children: [
+				{ backendNodeId: 2, nodeName: "BODY" },
+				{
+					backendNodeId: 3,
+					nodeName: "IFRAME",
+					frameId: "form-frame",
+					contentDocument: {
+						backendNodeId: 4,
+						nodeName: "#document",
+						frameId: "form-frame",
+						children: [{ backendNodeId: 5, nodeName: "BODY" }],
+					},
+				},
+			],
+		};
+
+		expect(discoverCdpBodyBackendNodeIds(root, 20, "top-frame")).toEqual([2]);
+		expect(discoverCdpBodyBackendNodeIds(root, 20, "form-frame")).toEqual([5]);
+	});
 });
 
 describe("BrowserUseCdpDriver child target policy", () => {

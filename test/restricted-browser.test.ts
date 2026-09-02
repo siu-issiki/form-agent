@@ -7,6 +7,7 @@ import {
 	BrowserSubmitDiagnosticError,
 	type BrowserSubmitResult,
 	createBrowserSubmitDiagnosticError,
+	detectProhibitedReasonCodes,
 	NavigationPolicyError,
 	type RestrictedBrowserDriver,
 	RestrictedBrowserTools,
@@ -97,16 +98,33 @@ describe("RestrictedBrowserTools", () => {
 	});
 	test("allows only the target domain and its subdomains", async () => {
 		const driver = new FakeDriver();
+		driver.navigationLinks = [
+			{ url: "https://contact.acme.co.jp/form", text: "Contact" },
+		];
 		const tools = await createTools(driver);
 
+		await tools.observe();
 		await tools.navigate("https://contact.acme.co.jp/form");
 		await expect(
 			tools.navigate("https://acme.co.jp.evil.test/form"),
 		).rejects.toBeInstanceOf(NavigationPolicyError);
 	});
 
+	test("rejects an unobserved same-domain navigation target", async () => {
+		const driver = new FakeDriver();
+		const tools = await createTools(driver);
+		await tools.observe();
+
+		await expect(
+			tools.navigate("https://acme.co.jp/unobserved-side-effect"),
+		).rejects.toBeInstanceOf(NavigationPolicyError);
+	});
+
 	test("allows only exact job-specific external hosts", async () => {
 		const driver = new FakeDriver();
+		driver.navigationLinks = [
+			{ url: "https://docs.google.com/forms/example", text: "Form" },
+		];
 		const externalInput = {
 			...input,
 			targetUrl: "https://forms.gle/example",
@@ -127,6 +145,7 @@ describe("RestrictedBrowserTools", () => {
 			new InMemoryEvidenceObjectStore(),
 		);
 
+		await tools.observe();
 		await tools.navigate("https://docs.google.com/forms/example");
 		await expect(
 			tools.navigate("https://drive.google.com/example"),
@@ -162,10 +181,11 @@ describe("RestrictedBrowserTools", () => {
 
 		expect(await tools.observe()).toEqual({
 			url: input.targetUrl,
-			forms: [],
+			forms: [{}],
 			navigationLinks: [
 				{ url: "https://acme.co.jp/contact/form", text: "Contact" },
 			],
+			prohibitedReasonCodes: [],
 		});
 	});
 
@@ -183,6 +203,7 @@ describe("RestrictedBrowserTools", () => {
 			() => "2026-08-28T00:00:02.000Z",
 		);
 		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
 
 		const sent = await tools.submit("fa-0-1", "mouse");
 
@@ -195,10 +216,74 @@ describe("RestrictedBrowserTools", () => {
 		expect(driver.submitCount).toBe(1);
 	});
 
+	test("requires a fresh observation after trusted inputs change", async () => {
+		const driver = new FakeDriver();
+		const tools = await createTools(driver);
+		await tools.observe();
+		await tools.fill("fa-0-0", "Hello");
+
+		await expect(tools.validateSubmit("fa-0-1")).rejects.toBeInstanceOf(
+			BrowserElementError,
+		);
+		await tools.observe();
+		await expect(tools.validateSubmit("fa-0-1")).resolves.toBeUndefined();
+	});
+
+	test("requires a fresh observation after a non-submit click", async () => {
+		const driver = new FakeDriver();
+		const tools = await createTools(driver);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+		await tools.click("fa-0-2");
+
+		await expect(tools.validateSubmit("fa-0-1")).rejects.toBeInstanceOf(
+			BrowserElementError,
+		);
+		await tools.observe();
+		await expect(tools.validateSubmit("fa-0-1")).resolves.toBeUndefined();
+	});
+
+	test("corroborates prohibited outcomes from the latest observation", async () => {
+		const driver = new FakeDriver();
+		driver.observationForms = [{}];
+		driver.pageText =
+			"このフォームは製品サンプル専用です。営業、提案、勧誘目的での利用は禁止しています。";
+		const tools = await createTools(driver);
+		await tools.observe();
+
+		expect(() =>
+			tools.validateProhibited("SALES_PROHIBITED", input.targetUrl),
+		).not.toThrow();
+		expect(() =>
+			tools.validateProhibited("NO_FORM_PRESENT", input.targetUrl),
+		).toThrow(BrowserElementError);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+		await expect(tools.validateSubmit("fa-0-1")).rejects.toBeInstanceOf(
+			BrowserElementError,
+		);
+	});
+
+	test("detects only mechanically supported prohibition reasons", () => {
+		expect(
+			detectProhibitedReasonCodes({
+				forms: [],
+				pageText: "お問い合わせフォームはありません。",
+			}),
+		).toEqual(["NO_FORM_PRESENT"]);
+		expect(
+			detectProhibitedReasonCodes({
+				forms: [{}],
+				pageText: "採用お問い合わせ専用です。営業目的の利用は禁止です。",
+			}),
+		).toEqual(["SALES_PROHIBITED", "FORM_PURPOSE_INCOMPATIBLE"]);
+	});
+
 	test("forgets successful inputs after navigation", async () => {
 		const driver = new FakeDriver();
 		const tools = await createTools(driver);
 		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
 		await tools.navigate(input.targetUrl);
 
 		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
@@ -247,6 +332,7 @@ describe("RestrictedBrowserTools", () => {
 			new InMemoryEvidenceObjectStore(),
 		);
 		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
 
 		await expect(tools.submit("fa-0-1")).rejects.toThrow();
 
@@ -269,6 +355,7 @@ describe("RestrictedBrowserTools", () => {
 			() => "2026-08-28T00:00:02.000Z",
 		);
 		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
 
 		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
 			SubmissionResultUncertainError,
@@ -302,6 +389,7 @@ describe("RestrictedBrowserTools", () => {
 			new InMemoryEvidenceObjectStore(),
 		);
 		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
 
 		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
 			SubmissionResultUncertainError,
@@ -441,6 +529,7 @@ describe("RestrictedBrowserTools", () => {
 			new InMemoryEvidenceObjectStore(),
 		);
 		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
 
 		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
 			SubmissionResultUncertainError,
@@ -456,6 +545,7 @@ describe("RestrictedBrowserTools", () => {
 		const evidence = new InMemoryEvidenceObjectStore();
 		const tools = await createToolsWithEvidence(driver, store, evidence);
 		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
 
 		const sent = await tools.submit("fa-0-1", "mouse");
 
@@ -492,6 +582,7 @@ describe("RestrictedBrowserTools", () => {
 		const evidence = new InMemoryEvidenceObjectStore();
 		const tools = await createToolsWithEvidence(driver, store, evidence);
 		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
 
 		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
 			SubmissionEvidenceError,
@@ -517,6 +608,7 @@ describe("RestrictedBrowserTools", () => {
 		const evidence = new InMemoryEvidenceObjectStore();
 		const tools = await createToolsWithEvidence(driver, store, evidence);
 		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
 
 		const sent = await tools.submit("fa-0-1");
 
@@ -543,6 +635,7 @@ describe("RestrictedBrowserTools", () => {
 		const evidence = new InMemoryEvidenceObjectStore();
 		const tools = await createToolsWithEvidence(driver, store, evidence);
 		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
 
 		const sent = await tools.submit("fa-0-1");
 
@@ -568,6 +661,7 @@ describe("RestrictedBrowserTools", () => {
 		const evidence = new InMemoryEvidenceObjectStore();
 		const tools = await createToolsWithEvidence(driver, store, evidence);
 		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
 
 		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
 			SubmissionResultUncertainError,
@@ -593,6 +687,7 @@ describe("RestrictedBrowserTools", () => {
 		const evidence = new InMemoryEvidenceObjectStore();
 		const tools = await createToolsWithEvidence(driver, store, evidence);
 		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
 
 		const uncertain = await tools.submit("fa-0-1");
 
@@ -650,6 +745,8 @@ class FakeDriver implements RestrictedBrowserDriver {
 	closeConnectionOnScreenshotFailure = false;
 	connectionClosed = false;
 	navigationLinks: Array<{ url: string; text: string }> | undefined;
+	observationForms: unknown[] = [{}];
+	pageText: string | undefined;
 	submitResult: BrowserSubmitResult = {
 		outcome: "sent",
 		formUrl: input.targetUrl,
@@ -673,7 +770,8 @@ class FakeDriver implements RestrictedBrowserDriver {
 	async observe() {
 		return {
 			url: this.url,
-			forms: [],
+			forms: this.observationForms,
+			...(this.pageText ? { pageText: this.pageText } : {}),
 			...(this.navigationLinks
 				? { navigationLinks: this.navigationLinks }
 				: {}),
