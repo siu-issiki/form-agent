@@ -65,7 +65,7 @@ Worker-native Agent executor
 Cloudflare D1
   ├─ jobs
   ├─ results
-  └─ events（retry / DLQ イベント）
+  └─ events（retry / DLQ / browser tool診断）
 ```
 
 PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外部の OpenAI / BrowserUse を組み合わせる。本番は production 環境だけを対象とし、D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済みである。2026-09-02 に `https://anyreach.co.jp/contact` を対象とした production dry-run を実行し、`pending → running → prohibited`、`DRY_RUN_COMPLETE`、1 attempt、8 Provider requests、BrowserUse active session 0 件を確認した。`submitting` / `sent` には遷移しておらず、フォーム送信は行っていない。
@@ -278,8 +278,8 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 - cross-origin iframeはジョブ固有の外部host許可を使う管理下テストで送信まで検証済みである。contenteditableと独自UI componentは未対応または未検証である。
 - popup、別 tab、Service Worker を利用するフォームは未対応である。
 - 確認を挟むmulti-stepは管理下テストで検証済みである。ファイル添付とCAPTCHAは未対応である。
-- 送信完了は、許可したrequestを観測し、日本語の送信完了表現または`thank you`が5秒以内に新たに出現した場合に確定する。期待済みGET Documentだけは、送信対象と同じframeの遷移後にも完了文言が存在すれば確定する。
-- submit controlの期待済みGETは送信権で制御する。一方、`GET` / `HEAD` / `OPTIONS`は通常通信として許可するため、同一ドメインのGET型副作用endpointを非submitの`click`や`navigate`で起動する経路は防止できない。
+- 送信完了は、許可したrequestを観測し、日本語の送信完了表現または`thank you`が5秒以内に新たに出現した場合に確定する。期待済みGET Documentだけは送信対象frameの遷移も必須にするが、完了文言件数は全document bodyの合計で判定しており、送信対象frameだけには限定していない。
+- submit controlの期待済みGETは送信権で制御する。一方、`GET` / `HEAD` / `OPTIONS`は通常通信として許可するため、対象企業ドメイン／サブドメインまたはジョブ固有の許可hostにあるGET型副作用endpointを、非submitの`click`や`navigate`で起動する経路は防止できない。
 - 営業禁止判定と送信前確認はAgentへの指示であり、信頼済みhandlerでは未検証である。
 - dry-runではジョブURLへのbootstrap後の再navigateと、最初のclick / fill / select以降に発生するbrowser requestをすべて遮断し、座標click前にCDPのhit targetが検証済み要素またはそのcomposed descendantであることを確認する。
 
@@ -295,7 +295,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 
 - Provider は OpenAI 固定である。
 - Provider 呼び出し回数以外のtoken、rate limit、費用を保存しない。retryイベント以外の全体処理時間とBrowserUse待ち時間も保存しない。
-- browser toolはturn、固定tool名、stage、固定result codeだけを保存する。入力値、URL、自由記述エラー、全状態遷移は保存しない。
+- browser tool診断の`data_json`にはturn、固定tool名、stage、固定result codeだけを保存し、イベント共通列にはjob ID、attempt、記録時刻を保存する。入力値、URL、自由記述エラー、全状態遷移は保存しない。
 - retry delay は 30 秒固定で、指数 backoff と jitter は未実装である。
 
 ## 並列・リトライ方針
@@ -384,7 +384,8 @@ PoC はまず 1 並列の production で開始し、管理下テストサイト�
 - 利用者別の認証・権限管理と、ジョブ一覧・キャンセル API。
 - 実Workerを`submitting`中に停止した場合に、`submitting`のまま再配信がackされ、再送されないことの検証。
 - 禁止判定の証跡と送信前確認を信頼済みhandlerで検証する境界。
-- 同一ドメインの GET 型副作用を submit gate 外から起動させない設計。
+- 対象企業ドメイン／サブドメインまたはジョブ固有の許可hostにあるGET型副作用を、submit gate外から起動させない設計。
+- GET送信完了文言を全document bodyの合計ではなく、送信対象frameだけで確認する実装。
 - 状態遷移、tool、token、時間、費用の observability。
 - `submitting` / `uncertain` の照合を支援する専用 API / UI。
 - 実 form のcross-origin iframe、確認画面、複数ページ、Shadow DOM互換性検証と、添付・CAPTCHAの対応方針。
