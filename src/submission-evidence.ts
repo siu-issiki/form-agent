@@ -90,6 +90,7 @@ export class SubmissionEvidenceRecorder {
 		private readonly jobs: JobStore,
 		private readonly jobId: string,
 		private readonly runToken: string,
+		private readonly attempt: number,
 		private readonly now: () => string = () => new Date().toISOString(),
 		private readonly timeoutMs: number = EVIDENCE_CAPTURE_TIMEOUT_MS,
 	) {}
@@ -97,13 +98,14 @@ export class SubmissionEvidenceRecorder {
 	async capture(stage: EvidenceStage): Promise<EvidenceCaptureResult> {
 		const eventId = crypto.randomUUID();
 		const objectKey = evidenceObjectKey(this.jobId, stage, eventId);
+		let expired = false;
 
 		let timer!: ReturnType<typeof setTimeout>;
 		const timedOut = new Promise<EvidenceCaptureResult>((resolve) => {
 			timer = setTimeout(() => {
-				// The R2 put and/or D1 record may still land after this fires,
-				// leaving an orphaned object -- keep the key in the log so it can
-				// be matched against D1 and cleaned up manually.
+				expired = true;
+				// Keep the key in the log in case the Worker stops before a late R2
+				// write can be compensated.
 				console.warn(
 					JSON.stringify({
 						event: "submission_evidence_timeout",
@@ -113,14 +115,14 @@ export class SubmissionEvidenceRecorder {
 				);
 				// The failure event write is not awaited: a stalled D1 must not
 				// extend the timeout past its bound. #failed never rejects.
-				void this.#failed(stage, "CAPTURE_TIMEOUT");
+				void this.#failed(eventId, stage, "CAPTURE_TIMEOUT");
 				resolve({ captured: false, failureCode: "CAPTURE_TIMEOUT" });
 			}, this.timeoutMs);
 		});
 
 		try {
 			return await Promise.race([
-				this.#captureUnbounded(stage, eventId, objectKey),
+				this.#captureUnbounded(stage, eventId, objectKey, () => expired),
 				timedOut,
 			]);
 		} finally {
@@ -132,20 +134,25 @@ export class SubmissionEvidenceRecorder {
 		stage: EvidenceStage,
 		eventId: string,
 		objectKey: string,
+		expired: () => boolean,
 	): Promise<EvidenceCaptureResult> {
 		let bytes: Uint8Array;
 		try {
 			bytes = await this.driver.captureScreenshot();
 		} catch {
-			return this.#failed(stage, "SCREENSHOT_FAILED");
+			return expired()
+				? timeoutResult()
+				: this.#failed(eventId, stage, "SCREENSHOT_FAILED");
 		}
+		if (expired()) return timeoutResult();
 		if (bytes.byteLength === 0) {
-			return this.#failed(stage, "SCREENSHOT_FAILED");
+			return this.#failed(eventId, stage, "SCREENSHOT_FAILED");
 		}
 
 		let sha256: string;
 		try {
 			sha256 = await sha256Hex(bytes);
+			if (expired()) return timeoutResult();
 			await this.objectStore.put(
 				objectKey,
 				bytes,
@@ -153,7 +160,17 @@ export class SubmissionEvidenceRecorder {
 				sha256,
 			);
 		} catch {
-			return this.#failed(stage, "OBJECT_STORE_FAILED");
+			if (!expired()) {
+				return this.#failed(eventId, stage, "OBJECT_STORE_FAILED");
+			}
+			await this.#discardObject(stage, objectKey);
+			await this.#failed(eventId, stage, "CAPTURE_TIMEOUT", false);
+			return timeoutResult();
+		}
+		if (expired()) {
+			await this.#discardObject(stage, objectKey);
+			await this.#failed(eventId, stage, "CAPTURE_TIMEOUT", false);
+			return timeoutResult();
 		}
 
 		let recorded: boolean;
@@ -161,6 +178,7 @@ export class SubmissionEvidenceRecorder {
 			recorded = await this.jobs.recordEvidenceCaptured(
 				this.jobId,
 				this.runToken,
+				this.attempt,
 				eventId,
 				stage,
 				objectKey,
@@ -171,38 +189,52 @@ export class SubmissionEvidenceRecorder {
 		} catch {
 			recorded = false;
 		}
+		if (expired()) {
+			await this.#failed(eventId, stage, "CAPTURE_TIMEOUT", false);
+			await this.#discardObject(stage, objectKey);
+			return timeoutResult();
+		}
 		if (!recorded) {
-			try {
-				await this.objectStore.delete(objectKey);
-			} catch {
-				// The key holds only jobId, stage, and eventId, so it is safe to log
-				// for a later manual cleanup of the unreferenced object.
-				console.warn(
-					JSON.stringify({
-						event: "submission_evidence_orphan",
-						stage,
-						objectKey,
-					}),
-				);
-			}
-			return this.#failed(stage, "EVENT_NOT_RECORDED");
+			await this.#discardObject(stage, objectKey);
+			return this.#failed(eventId, stage, "EVENT_NOT_RECORDED");
 		}
 
 		logSubmissionEvidence(stage, true);
 		return { captured: true, objectKey };
 	}
 
+	async #discardObject(stage: EvidenceStage, objectKey: string): Promise<void> {
+		try {
+			await this.objectStore.delete(objectKey);
+		} catch {
+			// The key holds only jobId, stage, and eventId, so it is safe to log
+			// for a later manual cleanup of the unreferenced object.
+			console.warn(
+				JSON.stringify({
+					event: "submission_evidence_orphan",
+					stage,
+					objectKey,
+				}),
+			);
+		}
+	}
+
 	async #failed(
+		eventId: string,
 		stage: EvidenceStage,
 		failureCode: EvidenceFailureCode,
+		shouldLog = true,
 	): Promise<EvidenceCaptureResult> {
 		await recordEvidenceCaptureFailure(
 			this.jobs,
 			this.jobId,
 			this.runToken,
+			this.attempt,
+			eventId,
 			stage,
 			failureCode,
 			this.now(),
+			shouldLog,
 		);
 		return { captured: false, failureCode };
 	}
@@ -212,14 +244,19 @@ export async function recordEvidenceCaptureFailure(
 	jobs: Pick<JobStore, "recordEvidenceCaptureFailed">,
 	jobId: string,
 	runToken: string,
+	attempt: number,
+	eventId: string,
 	stage: EvidenceStage,
 	failureCode: EvidenceFailureCode,
 	now: string,
+	shouldLog = true,
 ): Promise<void> {
 	try {
 		await jobs.recordEvidenceCaptureFailed(
 			jobId,
 			runToken,
+			attempt,
+			eventId,
 			stage,
 			failureCode,
 			now,
@@ -227,7 +264,11 @@ export async function recordEvidenceCaptureFailure(
 	} catch {
 		// The evidence outcome must never change the submission outcome.
 	}
-	logSubmissionEvidence(stage, false, failureCode);
+	if (shouldLog) logSubmissionEvidence(stage, false, failureCode);
+}
+
+function timeoutResult(): EvidenceCaptureResult {
+	return { captured: false, failureCode: "CAPTURE_TIMEOUT" };
 }
 
 export function logSubmissionEvidence(

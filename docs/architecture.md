@@ -220,7 +220,7 @@ pending / running / failed ── retry 上限超過 ──► dead_lettered
 
 `before_submit` の撮影失敗は送信前の唯一のブロッキング条件であり、二重送信防止と同様に「不確実なら送信しない」方針に従う。`after_submit` と `prohibited` は既存の結果確定ロジックに影響しない。送信後 URL の検証に使う値は `after_submit` の撮影より前に取得しておき、撮影失敗で CDP 接続が閉じても送信結果（`sent` / `uncertain`）は変わらない。
 
-撮影・保存・記録は合計 15 秒で打ち切り、超過時は `CAPTURE_TIMEOUT` として記録する。`after_submit` の stall が全体期限による `uncertain` を招かないようにするため。
+撮影・保存・記録は合計 15 秒で打ち切り、超過時は `CAPTURE_TIMEOUT` として記録する。`after_submit` の stall が全体期限による `uncertain` を招かないようにするため。同じ撮影の成功・失敗は共通の `eventId` で排他的に記録し、撮影開始時の attempt を固定する。タイムアウト後に R2 保存または D1 記録が遅れて完了しても成功イベントへ戻さず、保存済みオブジェクトは補償削除する。
 
 ## データモデル
 

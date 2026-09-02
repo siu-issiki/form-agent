@@ -729,6 +729,7 @@ describe("SubmissionEvidenceRecorder", () => {
 			store,
 			input.id,
 			"run-token-1",
+			1,
 			() => "2026-08-28T00:00:02.000Z",
 		);
 
@@ -761,6 +762,7 @@ describe("SubmissionEvidenceRecorder", () => {
 			store,
 			input.id,
 			"run-token-1",
+			1,
 			() => "2026-08-28T00:00:02.000Z",
 		);
 		const warnings: string[] = [];
@@ -807,6 +809,7 @@ describe("SubmissionEvidenceRecorder", () => {
 			store,
 			input.id,
 			"run-token-1",
+			1,
 			() => "2026-08-28T00:00:02.000Z",
 			20,
 		);
@@ -842,6 +845,51 @@ describe("SubmissionEvidenceRecorder", () => {
 			}),
 		).toBe(true);
 	});
+
+	test("discards a D1 capture result that completes after timeout", async () => {
+		const driver = new FakeDriver();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const store = new DelayedRecordEvidenceJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const recorder = new SubmissionEvidenceRecorder(
+			driver,
+			evidence,
+			store,
+			input.id,
+			"run-token-1",
+			1,
+			() => "2026-08-28T00:00:02.000Z",
+			20,
+		);
+
+		const capture = recorder.capture("before_submit");
+		await store.recordStarted;
+		const result = await capture;
+		await store.recordRunAttempt(
+			input.id,
+			"run-token-1",
+			2,
+			"2026-08-28T00:00:03.000Z",
+		);
+		store.releaseRecord();
+		await store.recordFinished;
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(result).toEqual({
+			captured: false,
+			failureCode: "CAPTURE_TIMEOUT",
+		});
+		expect(evidence.objects.size).toBe(0);
+		expect(store.events).toEqual([
+			{
+				jobId: input.id,
+				attempt: 1,
+				type: "evidence.capture_failed",
+				data: { stage: "before_submit", failureCode: "CAPTURE_TIMEOUT" },
+			},
+		]);
+	});
 });
 
 class RecordEvidenceCapturedRejectingJobStore extends InMemoryJobStore {
@@ -854,4 +902,45 @@ class DeleteFailingEvidenceObjectStore extends InMemoryEvidenceObjectStore {
 	override async delete(): Promise<void> {
 		throw new Error("delete failed");
 	}
+}
+
+class DelayedRecordEvidenceJobStore extends InMemoryJobStore {
+	readonly #recordStarted = deferred<void>();
+	readonly #releaseRecord = deferred<void>();
+	readonly #recordFinished = deferred<void>();
+
+	get recordStarted(): Promise<void> {
+		return this.#recordStarted.promise;
+	}
+
+	get recordFinished(): Promise<void> {
+		return this.#recordFinished.promise;
+	}
+
+	releaseRecord(): void {
+		this.#releaseRecord.resolve(undefined);
+	}
+
+	override async recordEvidenceCaptured(
+		...args: Parameters<InMemoryJobStore["recordEvidenceCaptured"]>
+	): Promise<boolean> {
+		this.#recordStarted.resolve(undefined);
+		await this.#releaseRecord.promise;
+		try {
+			return await super.recordEvidenceCaptured(...args);
+		} finally {
+			this.#recordFinished.resolve(undefined);
+		}
+	}
+}
+
+function deferred<T>(): {
+	promise: Promise<T>;
+	resolve: (value: T | PromiseLike<T>) => void;
+} {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	const promise = new Promise<T>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
 }

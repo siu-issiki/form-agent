@@ -292,6 +292,7 @@ export class D1JobStore implements JobStore {
 	async recordEvidenceCaptured(
 		id: string,
 		runToken: string,
+		attempt: number,
 		eventId: string,
 		stage: EvidenceStage,
 		objectKey: string,
@@ -304,19 +305,32 @@ export class D1JobStore implements JobStore {
 				`INSERT INTO events (
           id, job_id, attempt, type, data_json, created_at
         )
-        SELECT ?, id, attempt_count, 'evidence.captured', json_object(
+		        SELECT ?, id, ?, 'evidence.captured', json_object(
           'stage', ?,
           'objectKey', ?,
           'sha256', ?,
           'byteLength', ?,
           'contentType', 'image/jpeg'
         ), ?
-        FROM jobs
-        WHERE id = ?
-          AND status IN ('running', 'submitting')
-          AND run_token = ?`,
+		FROM jobs
+		WHERE id = ?
+		  AND status IN ('running', 'submitting')
+		  AND run_token = ?
+		  AND attempt_count = ?
+		ON CONFLICT(id) DO NOTHING`,
 			)
-			.bind(eventId, stage, objectKey, sha256, byteLength, now, id, runToken)
+			.bind(
+				eventId,
+				attempt,
+				stage,
+				objectKey,
+				sha256,
+				byteLength,
+				now,
+				id,
+				runToken,
+				attempt,
+			)
 			.run();
 
 		return result.meta.changes === 1;
@@ -325,28 +339,56 @@ export class D1JobStore implements JobStore {
 	async recordEvidenceCaptureFailed(
 		id: string,
 		runToken: string,
+		attempt: number,
+		eventId: string,
 		stage: EvidenceStage,
 		failureCode: EvidenceFailureCode,
 		now: string,
 	): Promise<boolean> {
-		const result = await this.db
-			.prepare(
-				`INSERT INTO events (
-          id, job_id, attempt, type, data_json, created_at
-        )
-        SELECT ?, id, attempt_count, 'evidence.capture_failed', json_object(
-          'stage', ?,
-          'failureCode', ?
-        ), ?
-        FROM jobs
-        WHERE id = ?
-          AND status IN ('running', 'submitting')
-          AND run_token = ?`,
-			)
-			.bind(crypto.randomUUID(), stage, failureCode, now, id, runToken)
-			.run();
+		const session = this.db.withSession("first-primary");
+		const [updated, inserted] = await session.batch([
+			session
+				.prepare(
+					`UPDATE events
+					 SET type = 'evidence.capture_failed',
+					     data_json = json_object('stage', ?, 'failureCode', ?),
+					     created_at = ?
+					 WHERE id = ?
+					   AND job_id = ?
+					   AND attempt = ?
+					   AND type = 'evidence.captured'`,
+				)
+				.bind(stage, failureCode, now, eventId, id, attempt),
+			session
+				.prepare(
+					`INSERT INTO events (
+		  id, job_id, attempt, type, data_json, created_at
+		)
+		SELECT ?, id, ?, 'evidence.capture_failed', json_object(
+		  'stage', ?,
+		  'failureCode', ?
+		), ?
+		FROM jobs
+		WHERE id = ?
+		  AND status IN ('running', 'submitting')
+		  AND run_token = ?
+		  AND attempt_count = ?
+		  AND NOT EXISTS (SELECT 1 FROM events WHERE events.id = ?)`,
+				)
+				.bind(
+					eventId,
+					attempt,
+					stage,
+					failureCode,
+					now,
+					id,
+					runToken,
+					attempt,
+					eventId,
+				),
+		]);
 
-		return result.meta.changes === 1;
+		return (updated?.meta.changes ?? 0) + (inserted?.meta.changes ?? 0) === 1;
 	}
 
 	recordSent(

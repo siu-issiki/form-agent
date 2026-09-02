@@ -119,10 +119,15 @@ export class BrowserToolCoordinator {
 			!tools ||
 			this.#scopeKey !== scopeKey(jobId, runToken)
 		) {
+			const store = new D1JobStore(this.db);
+			const job = await store.find(jobId);
+			if (job?.status !== "running" || job.runToken !== runToken) return;
 			await recordEvidenceCaptureFailure(
-				new D1JobStore(this.db),
+				store,
 				jobId,
 				runToken,
+				job.attemptCount,
+				crypto.randomUUID(),
 				stage,
 				"NO_BROWSER_SESSION",
 				new Date().toISOString(),

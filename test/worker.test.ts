@@ -159,7 +159,7 @@ describe("D1JobStore", () => {
 		expect(counter?.provider_request_count).toBe(1);
 	});
 
-	test("records evidence events only for the current run token", async () => {
+	test("records evidence events only for the current run token and attempt", async () => {
 		const store = new D1JobStore(env.DB);
 		await store.create(input, "2026-08-28T00:00:00.000Z");
 		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
@@ -167,6 +167,7 @@ describe("D1JobStore", () => {
 		const captured = await store.recordEvidenceCaptured(
 			input.id,
 			"run-token-1",
+			1,
 			"event-001",
 			"before_submit",
 			"jobs/job-001/before_submit/event-001.jpg",
@@ -177,16 +178,36 @@ describe("D1JobStore", () => {
 		const failed = await store.recordEvidenceCaptureFailed(
 			input.id,
 			"run-token-1",
+			1,
+			"event-002",
 			"after_submit",
 			"OBJECT_STORE_FAILED",
 			"2026-08-28T00:00:03.000Z",
 		);
+		await store.recordRunAttempt(
+			input.id,
+			"run-token-1",
+			2,
+			"2026-08-28T00:00:03.500Z",
+		);
+		const staleAttempt = await store.recordEvidenceCaptured(
+			input.id,
+			"run-token-1",
+			1,
+			"event-stale",
+			"prohibited",
+			"jobs/job-001/prohibited/event-stale.jpg",
+			"b".repeat(64),
+			1_024,
+			"2026-08-28T00:00:03.750Z",
+		);
 		const otherRun = await store.recordEvidenceCaptured(
 			input.id,
 			"run-token-2",
-			"event-002",
+			1,
+			"event-003",
 			"prohibited",
-			"jobs/job-001/prohibited/event-002.jpg",
+			"jobs/job-001/prohibited/event-003.jpg",
 			"b".repeat(64),
 			1_024,
 			"2026-08-28T00:00:04.000Z",
@@ -194,6 +215,8 @@ describe("D1JobStore", () => {
 		const otherRunFailure = await store.recordEvidenceCaptureFailed(
 			input.id,
 			"run-token-2",
+			1,
+			"event-004",
 			"prohibited",
 			"NO_BROWSER_SESSION",
 			"2026-08-28T00:00:05.000Z",
@@ -201,6 +224,7 @@ describe("D1JobStore", () => {
 
 		expect(captured).toBe(true);
 		expect(failed).toBe(true);
+		expect(staleAttempt).toBe(false);
 		expect(otherRun).toBe(false);
 		expect(otherRunFailure).toBe(false);
 		expect(await readEvidenceEvents(input.id)).toEqual([
@@ -223,6 +247,58 @@ describe("D1JobStore", () => {
 		]);
 	});
 
+	test("keeps timeout failure terminal for the same evidence event", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+
+		expect(
+			await store.recordEvidenceCaptured(
+				input.id,
+				"run-token-1",
+				1,
+				"event-timeout",
+				"before_submit",
+				"jobs/job-001/before_submit/event-timeout.jpg",
+				"a".repeat(64),
+				2_048,
+				"2026-08-28T00:00:02.000Z",
+			),
+		).toBe(true);
+		expect(
+			await store.recordEvidenceCaptureFailed(
+				input.id,
+				"run-token-1",
+				1,
+				"event-timeout",
+				"before_submit",
+				"CAPTURE_TIMEOUT",
+				"2026-08-28T00:00:03.000Z",
+			),
+		).toBe(true);
+		expect(
+			await store.recordEvidenceCaptured(
+				input.id,
+				"run-token-1",
+				1,
+				"event-timeout",
+				"before_submit",
+				"jobs/job-001/before_submit/event-timeout.jpg",
+				"a".repeat(64),
+				2_048,
+				"2026-08-28T00:00:04.000Z",
+			),
+		).toBe(false);
+
+		expect(await readEvidenceEvents(input.id)).toEqual([
+			{
+				type: "evidence.capture_failed",
+				attempt: 1,
+				data: { stage: "before_submit", failureCode: "CAPTURE_TIMEOUT" },
+			},
+		]);
+	});
+
 	test("stops recording evidence once the job reaches a terminal state", async () => {
 		const store = new D1JobStore(env.DB);
 		await store.create(input, "2026-08-28T00:00:00.000Z");
@@ -239,6 +315,7 @@ describe("D1JobStore", () => {
 		const captured = await store.recordEvidenceCaptured(
 			input.id,
 			"run-token-1",
+			1,
 			"event-003",
 			"prohibited",
 			"jobs/job-001/prohibited/event-003.jpg",
@@ -249,6 +326,8 @@ describe("D1JobStore", () => {
 		const failed = await store.recordEvidenceCaptureFailed(
 			input.id,
 			"run-token-1",
+			1,
+			"event-004",
 			"prohibited",
 			"SCREENSHOT_FAILED",
 			"2026-08-28T00:00:04.000Z",

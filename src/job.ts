@@ -97,6 +97,7 @@ export interface JobStore {
 	recordEvidenceCaptured(
 		id: string,
 		runToken: string,
+		attempt: number,
 		eventId: string,
 		stage: EvidenceStage,
 		objectKey: string,
@@ -107,6 +108,8 @@ export interface JobStore {
 	recordEvidenceCaptureFailed(
 		id: string,
 		runToken: string,
+		attempt: number,
+		eventId: string,
 		stage: EvidenceStage,
 		failureCode: EvidenceFailureCode,
 		now: string,
@@ -122,6 +125,7 @@ export class DuplicateJobError extends Error {
 
 export class InMemoryJobStore implements JobStore {
 	readonly #jobs = new Map<string, Job>();
+	readonly #evidenceEventIndexes = new Map<string, number>();
 	readonly events: JobEvent[] = [];
 
 	async create(input: JobInput, now: string): Promise<Job> {
@@ -270,6 +274,7 @@ export class InMemoryJobStore implements JobStore {
 	async recordEvidenceCaptured(
 		id: string,
 		runToken: string,
+		attempt: number,
 		eventId: string,
 		stage: EvidenceStage,
 		objectKey: string,
@@ -277,32 +282,70 @@ export class InMemoryJobStore implements JobStore {
 		byteLength: number,
 		_now: string,
 	): Promise<boolean> {
-		return this.#recordEvidenceEvent(id, runToken, "evidence.captured", {
+		return this.#recordEvidenceEvent(
+			id,
+			runToken,
+			attempt,
 			eventId,
-			stage,
-			objectKey,
-			sha256,
-			byteLength,
-			contentType: "image/jpeg",
-		});
+			"evidence.captured",
+			{
+				eventId,
+				stage,
+				objectKey,
+				sha256,
+				byteLength,
+				contentType: "image/jpeg",
+			},
+		);
 	}
 
 	async recordEvidenceCaptureFailed(
 		id: string,
 		runToken: string,
+		attempt: number,
+		eventId: string,
 		stage: EvidenceStage,
 		failureCode: EvidenceFailureCode,
 		_now: string,
 	): Promise<boolean> {
-		return this.#recordEvidenceEvent(id, runToken, "evidence.capture_failed", {
-			stage,
-			failureCode,
-		});
+		const existingIndex = this.#evidenceEventIndexes.get(eventId);
+		if (existingIndex !== undefined) {
+			const existing = this.events[existingIndex];
+			if (
+				!existing ||
+				existing.jobId !== id ||
+				existing.attempt !== attempt ||
+				existing.type !== "evidence.captured"
+			) {
+				return false;
+			}
+			this.events[existingIndex] = {
+				jobId: id,
+				attempt,
+				type: "evidence.capture_failed",
+				data: { stage, failureCode },
+			};
+			return true;
+		}
+
+		return this.#recordEvidenceEvent(
+			id,
+			runToken,
+			attempt,
+			eventId,
+			"evidence.capture_failed",
+			{
+				stage,
+				failureCode,
+			},
+		);
 	}
 
 	#recordEvidenceEvent(
 		id: string,
 		runToken: string,
+		attempt: number,
+		eventId: string,
 		type: string,
 		data: Record<string, unknown>,
 	): boolean {
@@ -310,11 +353,14 @@ export class InMemoryJobStore implements JobStore {
 		if (
 			!job ||
 			(job.status !== "running" && job.status !== "submitting") ||
-			job.runToken !== runToken
+			job.runToken !== runToken ||
+			job.attemptCount !== attempt ||
+			this.#evidenceEventIndexes.has(eventId)
 		) {
 			return false;
 		}
 
+		this.#evidenceEventIndexes.set(eventId, this.events.length);
 		this.events.push({
 			jobId: id,
 			attempt: job.attemptCount,

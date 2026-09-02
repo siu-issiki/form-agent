@@ -170,6 +170,7 @@ export class RestrictedBrowserTools {
 				jobs,
 				jobId,
 				runToken,
+				job.attemptCount,
 				now,
 			),
 			targetDomain,
