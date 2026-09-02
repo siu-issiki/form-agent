@@ -50,6 +50,13 @@ export class BrowserElementError extends Error {
 	}
 }
 
+export class BrowserFormInvalidError extends BrowserElementError {
+	constructor() {
+		super();
+		this.name = "BrowserFormInvalidError";
+	}
+}
+
 export class SubmissionNotAuthorizedError extends Error {
 	constructor() {
 		super("The job did not grant submission permission");
