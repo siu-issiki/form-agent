@@ -172,6 +172,26 @@ export function discoverCdpNavigationLinks(
 	return links;
 }
 
+export function findCdpFrameOwnerBackendNodeId(
+	root: CdpDomNode,
+	frameId: string,
+): number | undefined {
+	let ownerBackendNodeId: number | undefined;
+	const visit = (node: CdpDomNode) => {
+		if (ownerBackendNodeId !== undefined) return;
+		if (
+			node.nodeName.toLowerCase() === "iframe" &&
+			(node.frameId === frameId || node.contentDocument?.frameId === frameId)
+		) {
+			ownerBackendNodeId = node.backendNodeId;
+			return;
+		}
+		for (const child of composedChildren(node)) visit(child);
+	};
+	visit(root);
+	return ownerBackendNodeId;
+}
+
 export function discoverCdpBodyBackendNodeIds(
 	root: CdpDomNode,
 	maxBodies = 20,

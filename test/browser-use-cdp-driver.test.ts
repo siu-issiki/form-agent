@@ -10,6 +10,7 @@ import {
 	discoverCdpBodyBackendNodeIds,
 	discoverCdpForms,
 	discoverCdpNavigationLinks,
+	findCdpFrameOwnerBackendNodeId,
 } from "../src/browser-use-cdp-dom";
 import {
 	ACTIVATE_SUBMIT_FUNCTION,
@@ -48,14 +49,19 @@ import {
 } from "../src/restricted-browser";
 
 describe("BrowserUse CDP payload and DOM discovery", () => {
-	test("reads the adjacent warning and form text without including a footer", () => {
+	test("reads preceding warnings and form text without including a footer", () => {
 		const readContext = runInNewContext(
 			`(${READ_FORM_PROHIBITION_CONTEXT_FUNCTION})`,
 		) as (
 			this: {
-				previousElementSibling: { innerText: string };
+				previousElementSibling: {
+					innerText: string;
+					previousElementSibling: null;
+					matches(): boolean;
+					querySelector(): null;
+				};
 				innerText: string;
-				nextElementSibling: { innerText: string };
+				parentElement: { tagName: string };
 			},
 			maxLength: number,
 		) => string;
@@ -63,13 +69,41 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 		expect(
 			readContext.call(
 				{
-					previousElementSibling: { innerText: "営業利用は禁止です" },
+					previousElementSibling: {
+						innerText: "営業利用は禁止です",
+						previousElementSibling: null,
+						matches: () => false,
+						querySelector: () => null,
+					},
 					innerText: "一般お問い合わせフォーム",
-					nextElementSibling: { innerText: "採用お問い合わせ専用" },
+					parentElement: { tagName: "BODY" },
 				},
 				100,
 			),
 		).toBe("営業利用は禁止です 一般お問い合わせフォーム");
+	});
+
+	test("finds the iframe element that owns a discovered form frame", () => {
+		expect(
+			findCdpFrameOwnerBackendNodeId(
+				{
+					backendNodeId: 1,
+					nodeName: "#document",
+					children: [
+						{
+							backendNodeId: 2,
+							nodeName: "IFRAME",
+							contentDocument: {
+								backendNodeId: 3,
+								nodeName: "#document",
+								frameId: "child-frame",
+							},
+						},
+					],
+				},
+				"child-frame",
+			),
+		).toBe(2);
 	});
 
 	test("discovers controls inside a closed shadow root", () => {

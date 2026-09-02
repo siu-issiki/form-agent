@@ -458,16 +458,12 @@ export function detectProhibitedReasonCodes(
 	const codes: ProhibitedReasonCode[] = [];
 	if (observation.forms.length === 0) return ["NO_FORM_PRESENT"];
 	if (observation.forms.every(hasTrustedFormProhibitionMetadata)) {
-		for (const code of [
-			"SALES_PROHIBITED",
-			"FORM_PURPOSE_INCOMPATIBLE",
-		] as const) {
-			if (
-				observation.forms.every((form) =>
-					readProhibitedReasonCodes(form).includes(code),
-				)
-			) {
-				codes.push(code);
+		const formCodes = observation.forms.map(readProhibitedReasonCodes);
+		if (formCodes.every((formCode) => formCode.length > 0)) {
+			for (const formCode of formCodes) {
+				for (const code of formCode) {
+					if (!codes.includes(code)) codes.push(code);
+				}
 			}
 		}
 		return codes;

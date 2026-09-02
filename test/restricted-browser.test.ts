@@ -366,6 +366,17 @@ describe("RestrictedBrowserTools", () => {
 		).toEqual([]);
 	});
 
+	test("accepts either trusted reason when every observed form is blocked", () => {
+		expect(
+			detectProhibitedReasonCodes({
+				forms: [
+					{ prohibitedReasonCodes: ["SALES_PROHIBITED"] },
+					{ prohibitedReasonCodes: ["FORM_PURPOSE_INCOMPATIBLE"] },
+				],
+			}),
+		).toEqual(["SALES_PROHIBITED", "FORM_PURPOSE_INCOMPATIBLE"]);
+	});
+
 	test("forgets successful inputs after navigation", async () => {
 		const driver = new FakeDriver();
 		const tools = await createTools(driver);

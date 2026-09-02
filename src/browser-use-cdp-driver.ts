@@ -7,6 +7,7 @@ import {
 	discoverCdpBodyBackendNodeIds,
 	discoverCdpForms,
 	discoverCdpNavigationLinks,
+	findCdpFrameOwnerBackendNodeId,
 } from "./browser-use-cdp-dom";
 import type { Job } from "./job";
 import {
@@ -313,16 +314,30 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				});
 			}
 			if (fields.length > 0) {
-				const prohibitionText = await this.#callFunctionOnElement<string>(
+				const formProhibitionText = await this.#callFunctionOnElement<string>(
 					candidateForm.backendNodeId,
 					READ_FORM_PROHIBITION_CONTEXT_FUNCTION,
 					[MAX_PAGE_TEXT],
 				);
+				const frameOwnerBackendNodeId = candidateForm.frameId
+					? findCdpFrameOwnerBackendNodeId(root, candidateForm.frameId)
+					: undefined;
+				const parentProhibitionText = frameOwnerBackendNodeId
+					? await this.#callFunctionOnElement<string>(
+							frameOwnerBackendNodeId,
+							READ_FORM_PROHIBITION_CONTEXT_FUNCTION,
+							[MAX_PAGE_TEXT],
+						)
+					: "";
 				forms.push({
 					action: candidateForm.action,
 					method: candidateForm.method,
 					fields,
-					prohibitionText,
+					prohibitionText:
+						`${parentProhibitionText} ${formProhibitionText}`.slice(
+							0,
+							MAX_PAGE_TEXT,
+						),
 				});
 			}
 		}
@@ -386,6 +401,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 		this.#interactionStarted = true;
 		this.#formDataEntered = true;
+		this.#blockNonSubmitRequests = true;
 		await this.#send("DOM.scrollIntoViewIfNeeded", {
 			backendNodeId: reference.backendNodeId,
 		});
@@ -404,6 +420,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 		this.#interactionStarted = true;
 		this.#formDataEntered = true;
+		this.#blockNonSubmitRequests = true;
 		if (state.tag === "select") {
 			const changed = await this.#callFunctionOnElement<boolean>(
 				reference.backendNodeId,
@@ -1713,9 +1730,19 @@ export const CHECK_FORM_VALIDITY_FUNCTION = `function() {
 }`;
 
 export const READ_FORM_PROHIBITION_CONTEXT_FUNCTION = `function(maxLength) {
-  const previousText = this.previousElementSibling?.innerText ?? "";
-  const formText = this.innerText ?? "";
-  return String(previousText + " " + formText).slice(0, maxLength);
+  const texts = [this.innerText ?? ""];
+  let current = this;
+  for (let depth = 0; depth < 3 && current; depth += 1) {
+    let sibling = current.previousElementSibling;
+    for (let count = 0; count < 3 && sibling; count += 1) {
+      if (sibling.matches?.("form") || sibling.querySelector?.("form")) break;
+      texts.unshift(sibling.innerText ?? "");
+      sibling = sibling.previousElementSibling;
+    }
+    current = current.parentElement;
+    if (!current || current.tagName === "BODY") break;
+  }
+  return texts.join(" ").slice(0, maxLength);
 }`;
 
 export const HAS_SAME_FORM_OWNER_FUNCTION = `function(input) {
