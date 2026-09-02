@@ -471,34 +471,44 @@ export function detectProhibitedReasonCodes(
 	return detectProhibitedTextReasonCodes(observation.pageText ?? "");
 }
 
+export const PROHIBITION_TEXT_PATTERN_SOURCES = {
+	explicitAllowances: [
+		"(営業|勧誘|セールス).{0,40}(も|を)?受け付け(?:て)?(?:います|ております)",
+		"(営業|勧誘|セールス).{0,40}禁止して(?:い|おり)?ません",
+		"(sales|solicitation).{0,40}(?:is|are) not prohibited",
+	],
+	salesProhibited: [
+		"(営業|勧誘|セールス).{0,40}(禁止|お断り|受け付け(?:て)?(?:おりません|いません|ません|ない)|ご遠慮)",
+		"(禁止|お断り|受け付け(?:て)?(?:おりません|いません|ません|ない)|ご遠慮).{0,40}(営業|勧誘|セールス)",
+		"(sales|solicitation).{0,40}(prohibited|not accepted|do not use)",
+	],
+	formPurposeIncompatible: [
+		"(採用|サポート|報道|サンプル|資料請求).{0,30}(専用|のみ)",
+		"(専用|のみ).{0,30}(採用|サポート|報道|サンプル|資料請求)",
+	],
+} as const;
+
 export function detectProhibitedTextReasonCodes(
 	rawText: string,
 ): ProhibitedReasonCode[] {
 	const codes: ProhibitedReasonCode[] = [];
 	const text = rawText.replace(/\s+/g, " ").toLowerCase();
-	const withoutExplicitAllowances = text
-		.replace(
-			/(営業|勧誘|セールス).{0,40}(も|を)?受け付け(?:て)?(?:います|ております)/g,
-			" ",
-		)
-		.replace(/(営業|勧誘|セールス).{0,40}禁止して(?:い|おり)?ません/g, " ")
-		.replace(/(sales|solicitation).{0,40}(?:is|are) not prohibited/g, " ");
+	const withoutExplicitAllowances =
+		PROHIBITION_TEXT_PATTERN_SOURCES.explicitAllowances.reduce(
+			(value, source) => value.replace(new RegExp(source, "g"), " "),
+			text,
+		);
 	if (
-		/(営業|勧誘|セールス).{0,40}(禁止|お断り|受け付け(?:て)?(?:おりません|いません|ません|ない)|ご遠慮)/.test(
-			withoutExplicitAllowances,
-		) ||
-		/(禁止|お断り|受け付け(?:て)?(?:おりません|いません|ません|ない)|ご遠慮).{0,40}(営業|勧誘|セールス)/.test(
-			withoutExplicitAllowances,
-		) ||
-		/(sales|solicitation).{0,40}(prohibited|not accepted|do not use)/.test(
-			withoutExplicitAllowances,
+		PROHIBITION_TEXT_PATTERN_SOURCES.salesProhibited.some((source) =>
+			new RegExp(source).test(withoutExplicitAllowances),
 		)
 	) {
 		codes.push("SALES_PROHIBITED");
 	}
 	if (
-		/(採用|サポート|報道|サンプル|資料請求).{0,30}(専用|のみ)/.test(text) ||
-		/(専用|のみ).{0,30}(採用|サポート|報道|サンプル|資料請求)/.test(text)
+		PROHIBITION_TEXT_PATTERN_SOURCES.formPurposeIncompatible.some((source) =>
+			new RegExp(source).test(text),
+		)
 	) {
 		codes.push("FORM_PURPOSE_INCOMPATIBLE");
 	}
@@ -508,7 +518,12 @@ export function detectProhibitedTextReasonCodes(
 function trustObservedForms(forms: unknown[]): unknown[] {
 	return forms.map((form) => {
 		if (!isRecord(form)) return form;
-		const { prohibitionText, prohibitionTexts, ...visibleForm } = form;
+		const {
+			prohibitionText,
+			prohibitionTexts,
+			prohibitedReasonCodes,
+			...visibleForm
+		} = form;
 		const texts = Array.isArray(prohibitionTexts)
 			? prohibitionTexts.filter(
 					(value): value is string => typeof value === "string",
@@ -516,7 +531,18 @@ function trustObservedForms(forms: unknown[]): unknown[] {
 			: typeof prohibitionText === "string"
 				? [prohibitionText]
 				: null;
-		if (!texts) return visibleForm;
+		if (!texts) {
+			return {
+				...visibleForm,
+				...(Array.isArray(prohibitedReasonCodes)
+					? {
+							prohibitedReasonCodes: prohibitedReasonCodes.filter(
+								isProhibitedReasonCode,
+							),
+						}
+					: {}),
+			};
+		}
 		const codes: ProhibitedReasonCode[] = [];
 		const detectionTexts = [...texts];
 		for (let index = 1; index < texts.length; index += 1) {

@@ -35,7 +35,7 @@ import {
 	isAuthorizedSubmissionRedirect,
 	isExpectedNavigationDocumentRequest,
 	isPayloadIndependentClickTarget,
-	READ_FORM_PROHIBITION_CONTEXT_FUNCTION,
+	READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
 	readSubmissionConfirmation,
 	retrySubmitMousePreparation,
 	runSubmissionActivationWithinPermissionWindow,
@@ -51,30 +51,53 @@ import {
 describe("BrowserUse CDP payload and DOM discovery", () => {
 	test("reads preceding warnings and form text without including a footer", () => {
 		const readContext = runInNewContext(
-			`(${READ_FORM_PROHIBITION_CONTEXT_FUNCTION})`,
-		) as (this: object, maxLength: number) => string[];
+			`(${READ_FORM_PROHIBITION_REASON_CODES_FUNCTION})`,
+		) as (this: object) => string[];
 
 		expect(
-			readContext.call(
-				{
-					previousElementSibling: {
-						innerText: "営業利用は禁止です",
-						previousElementSibling: null,
-						matches: () => false,
-						querySelector: () => null,
-					},
-					innerText: "一般お問い合わせフォーム",
-					parentElement: { tagName: "BODY" },
+			readContext.call({
+				previousElementSibling: {
+					innerText: "営業利用は禁止です",
+					previousElementSibling: null,
+					matches: () => false,
+					querySelector: () => null,
 				},
-				100,
-			),
-		).toEqual(["一般お問い合わせフォーム", "営業利用は禁止です"]);
+				innerText: "一般お問い合わせフォーム",
+				parentElement: { tagName: "BODY" },
+			}),
+		).toEqual(["SALES_PROHIBITED"]);
+	});
+
+	test("detects a warning split across preceding siblings", () => {
+		const readContext = runInNewContext(
+			`(${READ_FORM_PROHIBITION_REASON_CODES_FUNCTION})`,
+		) as (this: object) => string[];
+		const warningStart = {
+			innerText: "営業目的での利用は",
+			previousElementSibling: null,
+			matches: () => false,
+			querySelector: () => null,
+		};
+		const warningEnd = {
+			innerText: "禁止しています",
+			previousElementSibling: warningStart,
+			matches: () => false,
+			querySelector: () => null,
+		};
+
+		expect(
+			readContext.call({
+				innerText: "一般お問い合わせフォーム",
+				previousElementSibling: warningEnd,
+				parentElement: { tagName: "BODY" },
+			}),
+		).toEqual(["SALES_PROHIBITED"]);
 	});
 
 	test("crosses a shadow host but excludes unrelated header context", () => {
 		const readContext = runInNewContext(
-			`(${READ_FORM_PROHIBITION_CONTEXT_FUNCTION})`,
-		) as (this: object, maxLength: number) => string[];
+			`(${READ_FORM_PROHIBITION_REASON_CODES_FUNCTION})`,
+		) as (this: object) => string[];
 		const body = { tagName: "BODY" };
 		const header = {
 			tagName: "HEADER",
@@ -106,15 +129,13 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 			getRootNode: () => ({ host }),
 		};
 
-		const result = readContext.call(form, 200).join(" ");
-		expect(result).toContain("営業利用は禁止です");
-		expect(result).not.toContain("採用お問い合わせ専用サイト");
+		expect(readContext.call(form)).toEqual(["SALES_PROHIBITED"]);
 	});
 
 	test("keeps an outside warning separate from oversized form text", () => {
 		const readContext = runInNewContext(
-			`(${READ_FORM_PROHIBITION_CONTEXT_FUNCTION})`,
-		) as (this: object, maxLength: number) => string[];
+			`(${READ_FORM_PROHIBITION_REASON_CODES_FUNCTION})`,
+		) as (this: object) => string[];
 		const previous = {
 			tagName: "ASIDE",
 			innerText: "営業目的の利用は禁止です",
@@ -129,23 +150,23 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 			parentElement: { tagName: "BODY" },
 		};
 
-		expect(readContext.call(form, 80)).toContain("営業目的の利用は禁止です");
+		expect(readContext.call(form)).toEqual(["SALES_PROHIBITED"]);
 	});
 
-	test("keeps prohibition text from the middle of an oversized source", () => {
+	test("returns bounded reason codes for an oversized source", () => {
 		const readContext = runInNewContext(
-			`(${READ_FORM_PROHIBITION_CONTEXT_FUNCTION})`,
-		) as (this: object, maxLength: number) => string[];
+			`(${READ_FORM_PROHIBITION_REASON_CODES_FUNCTION})`,
+		) as (this: object) => string[];
 		const form = {
 			tagName: "FORM",
-			innerText: `${"x".repeat(5_000)}営業目的の利用は禁止です${"y".repeat(5_000)}`,
+			innerText: `${"x".repeat(5_000_000)}営業目的の利用は禁止です${"y".repeat(5_000_000)}`,
 			previousElementSibling: null,
 			parentElement: { tagName: "BODY" },
 		};
 
-		expect(readContext.call(form, 4_000).join(" ")).toContain(
-			"営業目的の利用は禁止です",
-		);
+		const result = readContext.call(form);
+		expect(result).toEqual(["SALES_PROHIBITED"]);
+		expect(JSON.stringify(result).length).toBeLessThan(100);
 	});
 
 	test("finds the iframe element that owns a discovered form frame", () => {

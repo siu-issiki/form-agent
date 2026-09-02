@@ -18,12 +18,12 @@ import {
 	type BrowserSubmitResult,
 	createBrowserSubmitDiagnosticError,
 	normalizeAllowedHosts,
+	PROHIBITION_TEXT_PATTERN_SOURCES,
 	type RestrictedBrowserDriver,
 	type SubmitActivationStrategy,
 } from "./restricted-browser";
 
 const MAX_PAGE_TEXT = 20_000;
-const MAX_PROHIBITION_SEGMENT_TEXT = 4_000;
 const MAX_OBSERVED_FORMS = 10;
 const MAX_OBSERVED_FIELDS = 100;
 const MAX_DOM_DISCOVERY_ATTEMPTS = 5;
@@ -274,7 +274,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			action: string;
 			method: string;
 			fields: unknown[];
-			prohibitionTexts: string[];
+			prohibitedReasonCodes: string[];
 		}> = [];
 		let fieldIndex = 0;
 
@@ -315,28 +315,30 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				});
 			}
 			if (fields.length > 0) {
-				const formProhibitionTexts = await this.#callFunctionOnElement<
+				const formProhibitedReasonCodes = await this.#callFunctionOnElement<
 					string[]
-				>(candidateForm.backendNodeId, READ_FORM_PROHIBITION_CONTEXT_FUNCTION, [
-					MAX_PROHIBITION_SEGMENT_TEXT,
-				]);
+				>(
+					candidateForm.backendNodeId,
+					READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
+				);
 				const frameOwnerBackendNodeId = candidateForm.frameId
 					? findCdpFrameOwnerBackendNodeId(root, candidateForm.frameId)
 					: undefined;
-				const parentProhibitionTexts = frameOwnerBackendNodeId
+				const parentProhibitedReasonCodes = frameOwnerBackendNodeId
 					? await this.#callFunctionOnElement<string[]>(
 							frameOwnerBackendNodeId,
-							READ_FORM_PROHIBITION_CONTEXT_FUNCTION,
-							[MAX_PROHIBITION_SEGMENT_TEXT],
+							READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
 						)
 					: [];
 				forms.push({
 					action: candidateForm.action,
 					method: candidateForm.method,
 					fields,
-					prohibitionTexts: [
-						...formProhibitionTexts,
-						...parentProhibitionTexts,
+					prohibitedReasonCodes: [
+						...new Set([
+							...formProhibitedReasonCodes,
+							...parentProhibitedReasonCodes,
+						]),
 					],
 				});
 			}
@@ -1729,16 +1731,11 @@ export const CHECK_FORM_VALIDITY_FUNCTION = `function() {
   return Boolean(this.form && typeof this.form.checkValidity === "function" && this.form.checkValidity());
 }`;
 
-export const READ_FORM_PROHIBITION_CONTEXT_FUNCTION = `function(maxLength) {
+export const READ_FORM_PROHIBITION_REASON_CODES_FUNCTION = `function() {
+  const patternSources = ${JSON.stringify(PROHIBITION_TEXT_PATTERN_SOURCES)};
   const texts = [];
   const appendText = (value) => {
-    const text = String(value ?? "");
-    const chunkLength = Math.max(1, Number(maxLength) || 1);
-    const overlap = Math.min(64, Math.floor(chunkLength / 4));
-    const step = Math.max(1, chunkLength - overlap);
-    for (let offset = 0; offset < text.length; offset += step) {
-      texts.push(text.slice(offset, offset + chunkLength));
-    }
+    texts.push(String(value ?? ""));
   };
   appendText(this.innerText);
 	const appendPrevious = (element, limit) => {
@@ -1766,7 +1763,31 @@ export const READ_FORM_PROHIBITION_CONTEXT_FUNCTION = `function(maxLength) {
 			current = current.parentElement;
 		}
 	}
-  return texts;
+  const detectionTexts = [...texts];
+  for (let index = 1; index < texts.length; index += 1) {
+    detectionTexts.push(texts[index - 1].slice(-128) + " " + texts[index].slice(0, 128));
+  }
+  const codes = [];
+  for (const rawText of detectionTexts) {
+    const text = rawText.replace(/\\s+/g, " ").toLowerCase();
+    const withoutExplicitAllowances = patternSources.explicitAllowances.reduce(
+      (value, source) => value.replace(new RegExp(source, "g"), " "),
+      text,
+    );
+    if (
+      !codes.includes("SALES_PROHIBITED") &&
+      patternSources.salesProhibited.some((source) => new RegExp(source).test(withoutExplicitAllowances))
+    ) {
+      codes.push("SALES_PROHIBITED");
+    }
+    if (
+      !codes.includes("FORM_PURPOSE_INCOMPATIBLE") &&
+      patternSources.formPurposeIncompatible.some((source) => new RegExp(source).test(text))
+    ) {
+      codes.push("FORM_PURPOSE_INCOMPATIBLE");
+    }
+  }
+  return codes;
 }`;
 
 export const HAS_SAME_FORM_OWNER_FUNCTION = `function(input) {
