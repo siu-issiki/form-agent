@@ -25,6 +25,7 @@ import {
 	ENTER_KEY_DOWN_EVENT,
 	getSubmissionRequestDisposition,
 	HAS_SAME_FORM_OWNER_FUNCTION,
+	hasExpectedFrameNavigated,
 	IS_COMPOSED_DESCENDANT_FUNCTION,
 	IS_ELEMENT_FOCUSED_FUNCTION,
 	IS_SUBMIT_UNOBSCURED_FUNCTION,
@@ -775,6 +776,19 @@ describe("BrowserUseCdpDriver child target policy", () => {
 });
 
 describe("BrowserUseCdpDriver submission confirmation", () => {
+	test("accepts only a navigation of the submitted form frame", () => {
+		const revisions = new Map([
+			["form-frame", 2],
+			["other-frame", 5],
+		]);
+		expect(hasExpectedFrameNavigated("form-frame", 1, revisions)).toBe(true);
+		expect(hasExpectedFrameNavigated("form-frame", 2, revisions)).toBe(false);
+		expect(
+			hasExpectedFrameNavigated("form-frame", 1, new Map([["other-frame", 5]])),
+		).toBe(false);
+		expect(hasExpectedFrameNavigated(undefined, 0, revisions)).toBe(false);
+	});
+
 	test("retries submit mouse preparation for transient element mismatches", async () => {
 		let attempts = 0;
 		let waits = 0;
