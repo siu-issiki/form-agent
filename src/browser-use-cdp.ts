@@ -1,5 +1,6 @@
 const CDP_COMMAND_TIMEOUT_MS = 15_000;
 export const MAX_CDP_MESSAGE_CHARACTERS = 4 * 1024 * 1024;
+const MAX_CLOSE_REASON_CHARACTERS = 200;
 
 interface CdpMessage {
 	id?: number;
@@ -31,17 +32,20 @@ export class BrowserUseCdpConnection {
 
 	private constructor(private readonly webSocket: WebSocket) {
 		webSocket.addEventListener("message", (event) => this.#onMessage(event));
-		webSocket.addEventListener("close", () => this.#onClose());
-		webSocket.addEventListener("error", () => this.#onClose());
+		webSocket.addEventListener("close", (event) => this.#onClose(event));
+		webSocket.addEventListener("error", () => this.#onError());
 	}
 
-	static async connect(webSocketUrl: string): Promise<BrowserUseCdpConnection> {
+	static async connect(
+		webSocketUrl: string,
+		fetchImpl: typeof fetch = fetch,
+	): Promise<BrowserUseCdpConnection> {
 		const url = new URL(webSocketUrl);
 		if (url.protocol !== "wss:") {
 			throw new Error("A secure CDP WebSocket endpoint is required");
 		}
 		url.protocol = "https:";
-		const response = await fetch(url, {
+		const response = await fetchImpl(url, {
 			headers: { Upgrade: "websocket" },
 		});
 		if (response.status !== 101 || !response.webSocket) {
@@ -142,8 +146,24 @@ export class BrowserUseCdpConnection {
 		}
 	}
 
-	#onClose(): void {
+	#onClose(event: CloseEvent): void {
 		if (this.#closed) return;
+		console.warn(
+			JSON.stringify({
+				event: "browser_use_cdp_closed",
+				code: event.code,
+				reason: (event.reason ?? "").slice(0, MAX_CLOSE_REASON_CHARACTERS),
+				wasClean: event.wasClean,
+				pending: this.#pending.size,
+			}),
+		);
+		this.#closed = true;
+		this.#rejectPending();
+	}
+
+	#onError(): void {
+		if (this.#closed) return;
+		console.warn(JSON.stringify({ event: "browser_use_cdp_error" }));
 		this.#closed = true;
 		this.#rejectPending();
 	}

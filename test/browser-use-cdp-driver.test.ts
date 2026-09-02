@@ -3,6 +3,7 @@ import { runInNewContext } from "node:vm";
 import { hasNewSubmissionConfirmation } from "../src/browser-submit-confirmation";
 import {
 	assertCdpMessageWithinLimit,
+	BrowserUseCdpConnection,
 	BrowserUseCdpPayloadTooLargeError,
 	MAX_CDP_MESSAGE_CHARACTERS,
 } from "../src/browser-use-cdp";
@@ -17,6 +18,7 @@ import {
 	assertDryRunNavigationAllowed,
 	assertExpectedSubmissionRequest,
 	BLOCK_BROWSER_ESCAPE_EXPRESSION,
+	BrowserUseCdpDriver,
 	type CdpScreenshotResult,
 	CHECK_FORM_VALIDITY_FUNCTION,
 	captureCdpScreenshot,
@@ -48,6 +50,7 @@ import {
 	toObservedFieldState,
 	waitForSubmissionConfirmation,
 } from "../src/browser-use-cdp-driver";
+import type { Job } from "../src/job";
 import {
 	BrowserElementError,
 	BrowserSubmitDiagnosticError,
@@ -1614,3 +1617,320 @@ function snapshotElement(
 		...overrides,
 	};
 }
+
+const connectJob: Job = {
+	id: "connect-retry",
+	companyId: "connect-retry",
+	companyName: "Connect retry fixture",
+	targetUrl: "https://example.com/contact",
+	targetDomain: "example.com",
+	allowedHosts: [],
+	payload: {},
+	status: "running",
+	attemptCount: 1,
+	submitReviewDenialCount: 0,
+	runToken: "connect-retry",
+	result: null,
+	createdAt: "2026-09-03T00:00:00.000Z",
+	updatedAt: "2026-09-03T00:00:00.000Z",
+};
+
+class FakeCdpConnection {
+	closeCount = 0;
+	readonly sent: string[] = [];
+
+	constructor(private readonly failure?: Error) {}
+
+	send<TResult>(method: string): Promise<TResult> {
+		this.sent.push(method);
+		if (this.failure) return Promise.reject(this.failure);
+		return Promise.resolve(fakeCdpResponse(method) as TResult);
+	}
+
+	on(): () => void {
+		return () => {};
+	}
+
+	close(): void {
+		this.closeCount += 1;
+	}
+}
+
+function fakeCdpResponse(method: string): unknown {
+	switch (method) {
+		case "Target.getTargets":
+			return { targetInfos: [{ targetId: "target-1", type: "page" }] };
+		case "Target.attachToTarget":
+			return { sessionId: "session-1" };
+		case "Page.getFrameTree":
+			return { frameTree: { frame: { id: "frame-1" } } };
+		case "Runtime.evaluate":
+			return { result: {} };
+		default:
+			return {};
+	}
+}
+
+function asConnection(connection: FakeCdpConnection): BrowserUseCdpConnection {
+	return connection as unknown as BrowserUseCdpConnection;
+}
+
+function captureWarnings(): { warnings: string[]; restore: () => void } {
+	const warnings: string[] = [];
+	const originalWarn = console.warn;
+	console.warn = (message: unknown) => {
+		warnings.push(String(message));
+	};
+	return {
+		warnings,
+		restore: () => {
+			console.warn = originalWarn;
+		},
+	};
+}
+
+function stubUpgradeFetch(webSocket: FakeWebSocket): typeof fetch {
+	return (async () =>
+		({
+			status: 101,
+			webSocket,
+		}) as unknown as Response) as unknown as typeof fetch;
+}
+
+describe("BrowserUseCdpDriver.connect retries", () => {
+	test("retries a closed connection once and then succeeds", async () => {
+		const connections: FakeCdpConnection[] = [];
+		const delays: number[] = [];
+		const captured = captureWarnings();
+
+		let driver: BrowserUseCdpDriver;
+		try {
+			driver = await BrowserUseCdpDriver.connect(
+				"api-key",
+				connectJob,
+				true,
+				"wss://connect.browser-use.com",
+				{
+					retryDelaysMs: [10, 20, 30],
+					sleep: async (ms) => {
+						delays.push(ms);
+					},
+					connectConnection: async () => {
+						const connection = new FakeCdpConnection(
+							connections.length === 0
+								? new Error("Browser Use CDP connection closed")
+								: undefined,
+						);
+						connections.push(connection);
+						return asConnection(connection);
+					},
+				},
+			);
+		} finally {
+			captured.restore();
+		}
+
+		expect(driver).toBeInstanceOf(BrowserUseCdpDriver);
+		expect(connections).toHaveLength(2);
+		expect(connections[0]?.closeCount).toBe(1);
+		expect(connections[1]?.closeCount).toBe(0);
+		expect(delays).toEqual([10]);
+		expect(captured.warnings).toHaveLength(1);
+		expect(JSON.parse(captured.warnings[0] ?? "{}")).toEqual({
+			event: "browser_use_connect_retry",
+			attempt: 1,
+			delayMs: 10,
+			reason: "CDP_CONNECTION_CLOSED",
+		});
+	});
+
+	test("throws the last error after four failed attempts", async () => {
+		const connections: FakeCdpConnection[] = [];
+		const delays: number[] = [];
+		const captured = captureWarnings();
+		const failure = new Error("Browser Use CDP command timed out");
+
+		let caught: unknown;
+		try {
+			await BrowserUseCdpDriver.connect(
+				"api-key",
+				connectJob,
+				true,
+				"wss://connect.browser-use.com",
+				{
+					retryDelaysMs: [10, 20, 30],
+					sleep: async (ms) => {
+						delays.push(ms);
+					},
+					connectConnection: async () => {
+						const connection = new FakeCdpConnection(failure);
+						connections.push(connection);
+						return asConnection(connection);
+					},
+				},
+			);
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect(caught).toBe(failure);
+		expect(connections).toHaveLength(4);
+		expect(connections.map((connection) => connection.closeCount)).toEqual([
+			1, 1, 1, 1,
+		]);
+		expect(delays).toEqual([10, 20, 30]);
+		expect(
+			captured.warnings.map(
+				(warning) => (JSON.parse(warning) as { attempt: number }).attempt,
+			),
+		).toEqual([1, 2, 3]);
+		expect(
+			(JSON.parse(captured.warnings[0] ?? "{}") as { reason?: string }).reason,
+		).toBe("CDP_COMMAND_TIMEOUT");
+	});
+
+	test("does not retry a rejected endpoint", async () => {
+		let connectAttempts = 0;
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await BrowserUseCdpDriver.connect(
+				"api-key",
+				connectJob,
+				true,
+				"wss://connect.example.com",
+				{
+					retryDelaysMs: [10, 20, 30],
+					sleep: async () => {},
+					connectConnection: async () => {
+						connectAttempts += 1;
+						return asConnection(new FakeCdpConnection());
+					},
+				},
+			);
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect((caught as Error).message).toBe("Invalid Browser Use CDP endpoint");
+		expect(connectAttempts).toBe(0);
+		expect(captured.warnings).toEqual([]);
+	});
+
+	test("does not retry a payload that is too large", async () => {
+		const connections: FakeCdpConnection[] = [];
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await BrowserUseCdpDriver.connect(
+				"api-key",
+				connectJob,
+				true,
+				"wss://connect.browser-use.com",
+				{
+					retryDelaysMs: [10, 20, 30],
+					sleep: async () => {},
+					connectConnection: async () => {
+						const connection = new FakeCdpConnection(
+							new BrowserUseCdpPayloadTooLargeError(),
+						);
+						connections.push(connection);
+						return asConnection(connection);
+					},
+				},
+			);
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect(caught).toBeInstanceOf(BrowserUseCdpPayloadTooLargeError);
+		expect(connections).toHaveLength(1);
+		expect(captured.warnings).toEqual([]);
+	});
+});
+
+class FakeWebSocket {
+	readonly sent: string[] = [];
+	readonly closeCalls: Array<{ code: number; reason: string }> = [];
+	readonly #listeners = new Map<string, Set<(event: unknown) => void>>();
+
+	accept(): void {}
+
+	addEventListener(type: string, listener: (event: unknown) => void): void {
+		const listeners =
+			this.#listeners.get(type) ?? new Set<(event: unknown) => void>();
+		listeners.add(listener);
+		this.#listeners.set(type, listeners);
+	}
+
+	send(data: string): void {
+		this.sent.push(data);
+	}
+
+	close(code: number, reason: string): void {
+		this.closeCalls.push({ code, reason });
+	}
+
+	emit(type: string, event: unknown): void {
+		for (const listener of this.#listeners.get(type) ?? []) listener(event);
+	}
+}
+
+describe("BrowserUseCdpConnection close logging", () => {
+	test("records the close code, reason and pending command count", async () => {
+		const webSocket = new FakeWebSocket();
+		const connection = await BrowserUseCdpConnection.connect(
+			"wss://connect.browser-use.com/session",
+			stubUpgradeFetch(webSocket),
+		);
+		const pending = connection.send("Page.enable");
+		const captured = captureWarnings();
+		try {
+			webSocket.emit("close", {
+				code: 1006,
+				reason: "abnormal closure",
+				wasClean: false,
+			});
+		} finally {
+			captured.restore();
+		}
+
+		await expect(pending).rejects.toThrow("Browser Use CDP connection closed");
+		expect(captured.warnings).toHaveLength(1);
+		expect(JSON.parse(captured.warnings[0] ?? "{}")).toEqual({
+			event: "browser_use_cdp_closed",
+			code: 1006,
+			reason: "abnormal closure",
+			wasClean: false,
+			pending: 1,
+		});
+	});
+
+	test("does not record a close that follows an intentional close", async () => {
+		const webSocket = new FakeWebSocket();
+		const connection = await BrowserUseCdpConnection.connect(
+			"wss://connect.browser-use.com/session",
+			stubUpgradeFetch(webSocket),
+		);
+		connection.close();
+		const captured = captureWarnings();
+		try {
+			webSocket.emit("close", { code: 1000, reason: "", wasClean: true });
+		} finally {
+			captured.restore();
+		}
+
+		expect(captured.warnings).toEqual([]);
+		expect(webSocket.closeCalls).toEqual([
+			{ code: 1000, reason: "Form Agent run complete" },
+		]);
+	});
+});

@@ -34,6 +34,48 @@ const CONFIRMATION_POLL_INTERVAL_MS = 1_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MS = 15_000;
 const SUBMISSION_PERMISSION_WINDOW_MS = 2_000;
 const MAX_SUBMIT_MOUSE_PREPARATION_ATTEMPTS = 3;
+const CONNECT_RETRY_DELAYS_MS = [10_000, 20_000, 30_000];
+
+const RETRYABLE_CONNECT_ERROR_MESSAGES = new Set([
+	"Browser Use CDP connection failed",
+	"Browser Use CDP connection closed",
+	"Browser Use CDP connection is closed",
+	"Browser Use CDP command timed out",
+]);
+
+export interface BrowserUseConnectOptions {
+	retryDelaysMs?: readonly number[];
+	sleep?: (ms: number) => Promise<void>;
+	connectConnection?: (
+		webSocketUrl: string,
+	) => Promise<BrowserUseCdpConnection>;
+}
+
+function isRetryableConnectError(error: unknown): boolean {
+	return (
+		error instanceof Error &&
+		RETRYABLE_CONNECT_ERROR_MESSAGES.has(error.message)
+	);
+}
+
+export function connectFailureReason(error: unknown): string {
+	if (!(error instanceof Error)) return "UNKNOWN";
+	switch (error.message) {
+		case "Browser Use CDP connection failed":
+			return "CDP_CONNECTION_FAILED";
+		case "Browser Use CDP connection is closed":
+		case "Browser Use CDP connection closed":
+			return "CDP_CONNECTION_CLOSED";
+		case "Browser Use CDP command timed out":
+			return "CDP_COMMAND_TIMEOUT";
+		default:
+			return "UNKNOWN";
+	}
+}
+
+function sleepMs(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export const ENTER_KEY_DOWN_EVENT = {
 	type: "keyDown",
@@ -191,6 +233,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		_job: Job,
 		dryRun = false,
 		endpoint = "wss://connect.browser-use.com",
+		options: BrowserUseConnectOptions = {},
 	): Promise<BrowserUseCdpDriver> {
 		if (!apiKey) throw new Error("Browser Use API key is required");
 		const url = new URL(endpoint);
@@ -200,8 +243,48 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		url.searchParams.set("apiKey", apiKey);
 		url.searchParams.set("proxyCountryCode", "jp");
 		url.searchParams.set("timeout", "15");
+		const webSocketUrl = url.toString();
 
-		const connection = await BrowserUseCdpConnection.connect(url.toString());
+		const retryDelaysMs = options.retryDelaysMs ?? CONNECT_RETRY_DELAYS_MS;
+		const sleep = options.sleep ?? sleepMs;
+		const openConnection =
+			options.connectConnection ??
+			((target: string) => BrowserUseCdpConnection.connect(target));
+
+		let lastError: unknown;
+		for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+			if (attempt > 0) {
+				const delayMs = retryDelaysMs[attempt - 1] ?? 0;
+				console.warn(
+					JSON.stringify({
+						event: "browser_use_connect_retry",
+						attempt,
+						delayMs,
+						reason: connectFailureReason(lastError),
+					}),
+				);
+				await sleep(delayMs);
+			}
+			try {
+				return await BrowserUseCdpDriver.#establish(
+					webSocketUrl,
+					dryRun,
+					openConnection,
+				);
+			} catch (error) {
+				if (!isRetryableConnectError(error)) throw error;
+				lastError = error;
+			}
+		}
+		throw lastError;
+	}
+
+	static async #establish(
+		webSocketUrl: string,
+		dryRun: boolean,
+		openConnection: (webSocketUrl: string) => Promise<BrowserUseCdpConnection>,
+	): Promise<BrowserUseCdpDriver> {
+		const connection = await openConnection(webSocketUrl);
 		try {
 			const { targetInfos } = await connection.send<{
 				targetInfos: TargetInfo[];

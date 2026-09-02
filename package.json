@@ -4,7 +4,7 @@
 	"type": "module",
 	"scripts": {
 		"typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.workers.json",
-		"lint": "biome check src test vitest.config.ts vitest.browser-use.config.ts",
+		"lint": "biome check src test tools vitest.config.ts vitest.browser-use.config.ts",
 		"test": "bun run test:unit && bun run test:workers",
 		"test:unit": "bun test test/job.test.ts test/browser-use-client.test.ts test/browser-use-cdp-driver.test.ts test/restricted-browser.test.ts test/agent-executor.test.ts test/campaign-import.test.ts",
 		"test:workers": "vitest run",
