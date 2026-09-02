@@ -713,7 +713,7 @@ describe("BrowserToolCoordinator", () => {
 		expect(observed).toEqual({
 			result: {
 				url: input.targetUrl,
-				forms: [{}],
+				forms: workerObservedForms(),
 				prohibitedReasonCodes: [],
 			},
 		});
@@ -880,7 +880,7 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	screenshotError: Error | null = null;
 	submitActivationStrategies: SubmitActivationStrategy[] = [];
 	filledValues: string[] = [];
-	observationForms: unknown[] = [{}];
+	observationForms: unknown[] = workerObservedForms();
 	pageText: string | undefined;
 
 	async close(): Promise<void> {
@@ -927,6 +927,14 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 		this.submitActivationStrategies.push(activationStrategy);
 		return { outcome: "sent", formUrl: this.url };
 	}
+}
+
+function workerObservedForms(): unknown[] {
+	return [
+		{
+			fields: [{ elementId: "fa-0-0" }, { elementId: "fa-0-1" }],
+		},
+	];
 }
 
 describe("ResponsesAgentExecutor", () => {

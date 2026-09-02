@@ -99,7 +99,7 @@ export class BrowserToolCoordinator {
 		const operation = this.#operationTail.then(async () => {
 			if (this.#closed) throw new BrowserToolInputError();
 			const { tools } = await this.#getToolsAndJob(jobId, runToken);
-			tools.validateProhibited(reasonCode, formUrl);
+			await tools.validateProhibited(reasonCode, formUrl);
 		});
 		this.#operationTail = operation.then(
 			() => undefined,

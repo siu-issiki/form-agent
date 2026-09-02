@@ -8,6 +8,7 @@ import {
 	type BrowserSubmitResult,
 	createBrowserSubmitDiagnosticError,
 	detectProhibitedReasonCodes,
+	detectProhibitedTextReasonCodes,
 	NavigationPolicyError,
 	type RestrictedBrowserDriver,
 	RestrictedBrowserTools,
@@ -120,6 +121,19 @@ describe("RestrictedBrowserTools", () => {
 		).rejects.toBeInstanceOf(NavigationPolicyError);
 	});
 
+	test("does not treat another observed hash route as the same navigation", async () => {
+		const driver = new FakeDriver();
+		driver.navigationLinks = [
+			{ url: "https://acme.co.jp/app#/contact", text: "Contact" },
+		];
+		const tools = await createTools(driver);
+		await tools.observe();
+
+		await expect(
+			tools.navigate("https://acme.co.jp/app#/delete"),
+		).rejects.toBeInstanceOf(NavigationPolicyError);
+	});
+
 	test("allows only exact job-specific external hosts", async () => {
 		const driver = new FakeDriver();
 		driver.navigationLinks = [
@@ -181,7 +195,7 @@ describe("RestrictedBrowserTools", () => {
 
 		expect(await tools.observe()).toEqual({
 			url: input.targetUrl,
-			forms: [{}],
+			forms: defaultObservedForms(),
 			navigationLinks: [
 				{ url: "https://acme.co.jp/contact/form", text: "Contact" },
 			],
@@ -245,20 +259,70 @@ describe("RestrictedBrowserTools", () => {
 
 	test("corroborates prohibited outcomes from the latest observation", async () => {
 		const driver = new FakeDriver();
-		driver.observationForms = [{}];
-		driver.pageText =
-			"このフォームは製品サンプル専用です。営業、提案、勧誘目的での利用は禁止しています。";
+		driver.observationForms = defaultObservedForms(
+			"このフォームは製品サンプル専用です。営業、提案、勧誘目的での利用は禁止しています。",
+		);
 		const tools = await createTools(driver);
 		await tools.observe();
 
-		expect(() =>
+		await expect(
 			tools.validateProhibited("SALES_PROHIBITED", input.targetUrl),
-		).not.toThrow();
-		expect(() =>
+		).resolves.toBeUndefined();
+		await expect(
 			tools.validateProhibited("NO_FORM_PRESENT", input.targetUrl),
-		).toThrow(BrowserElementError);
+		).rejects.toBeInstanceOf(BrowserElementError);
 		await tools.fill("fa-0-0", "Hello");
 		await tools.observe();
+		await expect(tools.validateSubmit("fa-0-1")).rejects.toBeInstanceOf(
+			BrowserElementError,
+		);
+	});
+
+	test("requires a fresh observation before accepting a prohibited outcome", async () => {
+		const driver = new FakeDriver();
+		driver.observationForms = [];
+		const tools = await createTools(driver);
+		await tools.observe();
+		await tools.click("fa-0-2");
+
+		await expect(
+			tools.validateProhibited("NO_FORM_PRESENT", input.targetUrl),
+		).rejects.toBeInstanceOf(BrowserElementError);
+	});
+
+	test("rejects a prohibited outcome after the observed hash route changes", async () => {
+		const driver = new FakeDriver();
+		driver.observationForms = [];
+		driver.url = "https://acme.co.jp/app#/contact";
+		const tools = await createToolsForInput(driver, {
+			...input,
+			targetUrl: driver.url,
+		});
+		await tools.observe();
+		driver.url = "https://acme.co.jp/app#/other";
+
+		await expect(
+			tools.validateProhibited("NO_FORM_PRESENT", null),
+		).rejects.toBeInstanceOf(BrowserElementError);
+	});
+
+	test("applies prohibition only to the selected submit form", async () => {
+		const driver = new FakeDriver();
+		driver.observationForms = [
+			{
+				fields: [{ elementId: "fa-0-0" }, { elementId: "fa-0-1" }],
+				prohibitionText: "営業目的の利用は禁止です。",
+			},
+			{
+				fields: [{ elementId: "fa-0-3" }, { elementId: "fa-0-4" }],
+				prohibitionText: "一般お問い合わせフォーム",
+			},
+		];
+		const tools = await createTools(driver);
+		await tools.fill("fa-0-3", "Hello");
+		await tools.observe();
+
+		await expect(tools.validateSubmit("fa-0-4")).resolves.toBeUndefined();
 		await expect(tools.validateSubmit("fa-0-1")).rejects.toBeInstanceOf(
 			BrowserElementError,
 		);
@@ -277,6 +341,29 @@ describe("RestrictedBrowserTools", () => {
 				pageText: "採用お問い合わせ専用です。営業目的の利用は禁止です。",
 			}),
 		).toEqual(["SALES_PROHIBITED", "FORM_PURPOSE_INCOMPATIBLE"]);
+	});
+
+	test("does not classify explicit sales acceptance or negated prohibition", () => {
+		expect(
+			detectProhibitedTextReasonCodes("営業のお問い合わせも受け付けています。"),
+		).toEqual([]);
+		expect(
+			detectProhibitedTextReasonCodes("営業目的の利用を禁止していません。"),
+		).toEqual([]);
+		expect(
+			detectProhibitedTextReasonCodes("Sales inquiries are not prohibited."),
+		).toEqual([]);
+	});
+
+	test("does not prohibit the page when another observed form remains usable", () => {
+		expect(
+			detectProhibitedReasonCodes({
+				forms: [
+					{ prohibitedReasonCodes: ["SALES_PROHIBITED"] },
+					{ prohibitedReasonCodes: [] },
+				],
+			}),
+		).toEqual([]);
 	});
 
 	test("forgets successful inputs after navigation", async () => {
@@ -720,16 +807,36 @@ async function createToolsWithEvidence(
 async function createTools(
 	driver: FakeDriver,
 ): Promise<RestrictedBrowserTools> {
+	return createToolsForInput(driver, input);
+}
+
+async function createToolsForInput(
+	driver: FakeDriver,
+	jobInput: JobInput,
+): Promise<RestrictedBrowserTools> {
 	const store = new InMemoryJobStore();
-	await store.create(input, "2026-08-28T00:00:00.000Z");
-	await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+	await store.create(jobInput, "2026-08-28T00:00:00.000Z");
+	await store.claimRun(jobInput.id, "run-token-1", "2026-08-28T00:00:01.000Z");
 	return RestrictedBrowserTools.create(
 		driver,
 		store,
-		input.id,
+		jobInput.id,
 		"run-token-1",
 		new InMemoryEvidenceObjectStore(),
 	);
+}
+
+function defaultObservedForms(prohibitionText?: string): unknown[] {
+	return [
+		{
+			fields: [
+				{ elementId: "fa-0-0" },
+				{ elementId: "fa-0-1" },
+				{ elementId: "fa-0-2" },
+			],
+			...(prohibitionText === undefined ? {} : { prohibitionText }),
+		},
+	];
 }
 
 class FakeDriver implements RestrictedBrowserDriver {
@@ -745,7 +852,7 @@ class FakeDriver implements RestrictedBrowserDriver {
 	closeConnectionOnScreenshotFailure = false;
 	connectionClosed = false;
 	navigationLinks: Array<{ url: string; text: string }> | undefined;
-	observationForms: unknown[] = [{}];
+	observationForms: unknown[] = defaultObservedForms();
 	pageText: string | undefined;
 	submitResult: BrowserSubmitResult = {
 		outcome: "sent",

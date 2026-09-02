@@ -31,11 +31,15 @@ import {
 	IS_COMPOSED_DESCENDANT_FUNCTION,
 	IS_ELEMENT_FOCUSED_FUNCTION,
 	IS_SUBMIT_UNOBSCURED_FUNCTION,
+	isAuthorizedSubmissionRedirect,
+	isExpectedNavigationDocumentRequest,
 	isPayloadIndependentClickTarget,
+	READ_FORM_PROHIBITION_CONTEXT_FUNCTION,
 	readSubmissionConfirmation,
 	retrySubmitMousePreparation,
 	runSubmissionActivationWithinPermissionWindow,
 	SET_CHECKED_VALUE_FUNCTION,
+	shouldBlockNonSubmitRequest,
 	submitUncertainReasonCode,
 } from "../src/browser-use-cdp-driver";
 import {
@@ -44,6 +48,30 @@ import {
 } from "../src/restricted-browser";
 
 describe("BrowserUse CDP payload and DOM discovery", () => {
+	test("reads the adjacent warning and form text without including a footer", () => {
+		const readContext = runInNewContext(
+			`(${READ_FORM_PROHIBITION_CONTEXT_FUNCTION})`,
+		) as (
+			this: {
+				previousElementSibling: { innerText: string };
+				innerText: string;
+				nextElementSibling: { innerText: string };
+			},
+			maxLength: number,
+		) => string;
+
+		expect(
+			readContext.call(
+				{
+					previousElementSibling: { innerText: "営業利用は禁止です" },
+					innerText: "一般お問い合わせフォーム",
+					nextElementSibling: { innerText: "採用お問い合わせ専用" },
+				},
+				100,
+			),
+		).toBe("営業利用は禁止です 一般お問い合わせフォーム");
+	});
+
 	test("discovers controls inside a closed shadow root", () => {
 		const discovery = discoverCdpForms(
 			{
@@ -293,6 +321,97 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 });
 
 describe("BrowserUseCdpDriver child target policy", () => {
+	test("keeps delayed GETs blocked while allowing only the claimed operation", () => {
+		expect(shouldBlockNonSubmitRequest(true, false, false)).toBe(true);
+		expect(shouldBlockNonSubmitRequest(true, true, false)).toBe(false);
+		expect(shouldBlockNonSubmitRequest(true, false, true)).toBe(false);
+		expect(shouldBlockNonSubmitRequest(true, false, false, true)).toBe(false);
+		expect(shouldBlockNonSubmitRequest(false, false, false)).toBe(false);
+	});
+
+	test("allows only a direct safe redirect from the claimed submit request", () => {
+		const paused = {
+			requestId: "redirect-1",
+			redirectedRequestId: "submit-1",
+			resourceType: "Document",
+			frameId: "form-frame",
+			request: { url: "https://example.com/complete", method: "GET" },
+		};
+		expect(
+			isAuthorizedSubmissionRedirect(paused, "submit-1", "form-frame"),
+		).toBe(true);
+		expect(isAuthorizedSubmissionRedirect(paused, "other", "form-frame")).toBe(
+			false,
+		);
+		expect(
+			isAuthorizedSubmissionRedirect(
+				{ ...paused, frameId: "other-frame" },
+				"submit-1",
+				"form-frame",
+			),
+		).toBe(false);
+		expect(
+			isAuthorizedSubmissionRedirect(
+				{ ...paused, request: { ...paused.request, method: "POST" } },
+				"submit-1",
+				"form-frame",
+			),
+		).toBe(false);
+	});
+
+	test("allows only the exact trusted top-frame document navigation", () => {
+		const expected = {
+			url: "https://example.com/contact?step=2",
+			frameId: "top-frame",
+		};
+		expect(
+			isExpectedNavigationDocumentRequest(
+				{
+					url: "https://example.com/contact?step=2",
+					method: "GET",
+				},
+				"Document",
+				"top-frame",
+				expected,
+			),
+		).toBe(true);
+		for (const request of [
+			{ url: "https://example.com/side-effect", method: "GET" },
+			{ url: "https://example.com/contact?step=2", method: "POST" },
+		]) {
+			expect(
+				isExpectedNavigationDocumentRequest(
+					request,
+					"Document",
+					"top-frame",
+					expected,
+				),
+			).toBe(false);
+		}
+		expect(
+			isExpectedNavigationDocumentRequest(
+				{
+					url: "https://example.com/contact?step=2",
+					method: "GET",
+				},
+				"Fetch",
+				"top-frame",
+				expected,
+			),
+		).toBe(false);
+		expect(
+			isExpectedNavigationDocumentRequest(
+				{
+					url: "https://example.com/contact?step=2",
+					method: "GET",
+				},
+				"Document",
+				"other-frame",
+				expected,
+			),
+		).toBe(false);
+	});
+
 	test("allows only the validated form action and method during submission", () => {
 		const expected = createExpectedSubmissionRequest(
 			"https://example.com/submit?test=1#confirmation",

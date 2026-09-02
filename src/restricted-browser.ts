@@ -198,7 +198,9 @@ export class RestrictedBrowserTools {
 
 	async navigate(url: string): Promise<void> {
 		this.#assertAllowedUrl(url);
-		if (!this.#allowedNavigationUrls.has(canonicalNavigationUrl(url))) {
+		if (
+			!this.#allowedNavigationUrls.has(canonicalNavigationPermissionUrl(url))
+		) {
 			throw new NavigationPolicyError();
 		}
 		await this.driver.navigate(url);
@@ -221,19 +223,28 @@ export class RestrictedBrowserTools {
 				return false;
 			}
 		});
+		const trustedForms = trustObservedForms(observation.forms);
 		const trustedObservation: BrowserObservation = {
 			...observation,
+			forms: trustedForms,
 			...(navigationLinks ? { navigationLinks } : {}),
-			prohibitedReasonCodes: detectProhibitedReasonCodes(observation),
+			prohibitedReasonCodes: detectProhibitedReasonCodes({
+				forms: trustedForms,
+				...(observation.pageText === undefined
+					? {}
+					: { pageText: observation.pageText }),
+			}),
 		};
 		this.#latestObservation = trustedObservation;
 		this.#observationRevision = this.#inputRevision;
 		this.#allowedNavigationUrls.clear();
 		this.#allowedNavigationUrls.add(
-			canonicalNavigationUrl(trustedObservation.url),
+			canonicalNavigationPermissionUrl(trustedObservation.url),
 		);
 		for (const link of trustedObservation.navigationLinks ?? []) {
-			this.#allowedNavigationUrls.add(canonicalNavigationUrl(link.url));
+			this.#allowedNavigationUrls.add(
+				canonicalNavigationPermissionUrl(link.url),
+			);
 		}
 		return trustedObservation;
 	}
@@ -265,7 +276,10 @@ export class RestrictedBrowserTools {
 		if (this.#observationRevision !== this.#inputRevision) {
 			throw new BrowserElementError();
 		}
-		if ((this.#latestObservation?.prohibitedReasonCodes?.length ?? 0) > 0) {
+		if (
+			prohibitedReasonCodesForElement(this.#latestObservation, elementId)
+				.length > 0
+		) {
 			throw new BrowserElementError();
 		}
 		await this.#assertCurrentUrlAllowed();
@@ -273,13 +287,19 @@ export class RestrictedBrowserTools {
 		await this.#assertCurrentUrlAllowed();
 	}
 
-	validateProhibited(reasonCode: ProhibitedReasonCode, formUrl: string | null) {
+	async validateProhibited(
+		reasonCode: ProhibitedReasonCode,
+		formUrl: string | null,
+	): Promise<void> {
 		const observation = this.#latestObservation;
 		if (
+			this.#observationRevision !== this.#inputRevision ||
 			!observation?.prohibitedReasonCodes?.includes(reasonCode) ||
 			(formUrl !== null &&
 				canonicalNavigationUrl(formUrl) !==
-					canonicalNavigationUrl(observation.url))
+					canonicalNavigationUrl(observation.url)) ||
+			canonicalNavigationPermissionUrl(await this.driver.currentUrl()) !==
+				canonicalNavigationPermissionUrl(observation.url)
 		) {
 			throw new BrowserElementError();
 		}
@@ -436,12 +456,47 @@ export function detectProhibitedReasonCodes(
 	observation: Pick<BrowserObservation, "forms" | "pageText">,
 ): ProhibitedReasonCode[] {
 	const codes: ProhibitedReasonCode[] = [];
-	if (observation.forms.length === 0) codes.push("NO_FORM_PRESENT");
-	const text = (observation.pageText ?? "").replace(/\s+/g, " ").toLowerCase();
+	if (observation.forms.length === 0) return ["NO_FORM_PRESENT"];
+	if (observation.forms.every(hasTrustedFormProhibitionMetadata)) {
+		for (const code of [
+			"SALES_PROHIBITED",
+			"FORM_PURPOSE_INCOMPATIBLE",
+		] as const) {
+			if (
+				observation.forms.every((form) =>
+					readProhibitedReasonCodes(form).includes(code),
+				)
+			) {
+				codes.push(code);
+			}
+		}
+		return codes;
+	}
+	return detectProhibitedTextReasonCodes(observation.pageText ?? "");
+}
+
+export function detectProhibitedTextReasonCodes(
+	rawText: string,
+): ProhibitedReasonCode[] {
+	const codes: ProhibitedReasonCode[] = [];
+	const text = rawText.replace(/\s+/g, " ").toLowerCase();
+	const withoutExplicitAllowances = text
+		.replace(
+			/(営業|勧誘|セールス).{0,40}(も|を)?受け付け(?:て)?(?:います|ております)/g,
+			" ",
+		)
+		.replace(/(営業|勧誘|セールス).{0,40}禁止して(?:い|おり)?ません/g, " ")
+		.replace(/(sales|solicitation).{0,40}(?:is|are) not prohibited/g, " ");
 	if (
-		/(営業|勧誘|セールス).{0,40}(禁止|お断り|受け付け|ご遠慮)/.test(text) ||
-		/(禁止|お断り|受け付け|ご遠慮).{0,40}(営業|勧誘|セールス)/.test(text) ||
-		/(sales|solicitation).{0,40}(prohibited|not accepted|do not use)/.test(text)
+		/(営業|勧誘|セールス).{0,40}(禁止|お断り|受け付け(?:て)?(?:おりません|いません|ません|ない)|ご遠慮)/.test(
+			withoutExplicitAllowances,
+		) ||
+		/(禁止|お断り|受け付け(?:て)?(?:おりません|いません|ません|ない)|ご遠慮).{0,40}(営業|勧誘|セールス)/.test(
+			withoutExplicitAllowances,
+		) ||
+		/(sales|solicitation).{0,40}(prohibited|not accepted|do not use)/.test(
+			withoutExplicitAllowances,
+		)
 	) {
 		codes.push("SALES_PROHIBITED");
 	}
@@ -454,10 +509,61 @@ export function detectProhibitedReasonCodes(
 	return codes;
 }
 
+function trustObservedForms(forms: unknown[]): unknown[] {
+	return forms.map((form) => {
+		if (!isRecord(form)) return form;
+		const { prohibitionText, ...visibleForm } = form;
+		if (typeof prohibitionText !== "string") return visibleForm;
+		return {
+			...visibleForm,
+			prohibitedReasonCodes: detectProhibitedTextReasonCodes(prohibitionText),
+		};
+	});
+}
+
+function prohibitedReasonCodesForElement(
+	observation: BrowserObservation | undefined,
+	elementId: string,
+): ProhibitedReasonCode[] {
+	for (const form of observation?.forms ?? []) {
+		if (!isRecord(form) || !Array.isArray(form.fields)) continue;
+		const ownsElement = form.fields.some(
+			(field) => isRecord(field) && field.elementId === elementId,
+		);
+		if (ownsElement) return readProhibitedReasonCodes(form);
+	}
+	throw new BrowserElementError();
+}
+
+function hasTrustedFormProhibitionMetadata(form: unknown): boolean {
+	return isRecord(form) && Array.isArray(form.prohibitedReasonCodes);
+}
+
+function readProhibitedReasonCodes(form: unknown): ProhibitedReasonCode[] {
+	if (!isRecord(form) || !Array.isArray(form.prohibitedReasonCodes)) return [];
+	return form.prohibitedReasonCodes.filter(isProhibitedReasonCode);
+}
+
+function isProhibitedReasonCode(value: unknown): value is ProhibitedReasonCode {
+	return (
+		value === "NO_FORM_PRESENT" ||
+		value === "SALES_PROHIBITED" ||
+		value === "FORM_PURPOSE_INCOMPATIBLE"
+	);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
 function canonicalNavigationUrl(rawUrl: string): string {
 	const url = new URL(rawUrl);
 	url.hash = "";
 	return url.toString();
+}
+
+function canonicalNavigationPermissionUrl(rawUrl: string): string {
+	return new URL(rawUrl).toString();
 }
 
 function submitFailureReason(error: BrowserSubmitDiagnosticError): string {

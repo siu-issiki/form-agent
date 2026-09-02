@@ -158,7 +158,7 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 | `submit` | D1 の送信権取得後に 1 回だけ送信する |
 | `finish` | 送信せず、構造化された終端結果を返す |
 
-driver が submit control と識別した要素は通常の `click` で操作できない。非submitの`click`後はbrowser requestを遮断し、`navigate`は直前の観察で得た完全一致URLだけを許可する。`submit` は全入力が同じform ownerに属し、最後の入力・選択・click後に再観察され、禁止根拠が検出されていないことを検証してから D1 を `running` から `submitting` へ更新し、最初の期待済み送信requestだけを許可する。非safe HTTP methodはaction URLとmethod、GETはactionのorigin / path、`Document` resource、送信対象frameを照合する。モデルはDOM activationを優先して選択し、trusted click gestureまたはkeyboard activationが必要な場合だけmouse / Enterを選ぶ。mouseのhit testは1 animation frameごとに最大3回試行する。
+driver が submit control と識別した要素は通常の `click` で操作できない。非submitの`click`後はbrowser requestを遮断し、`navigate`は直前の観察で得たfragmentを含む完全一致URLのtop-frame Document requestだけを1回許可する。`submit` 中も遮断を解除せず、全入力が同じform ownerに属し、最後の入力・選択・click後に再観察され、選択したformに禁止根拠が検出されていないことを検証してから D1 を `running` から `submitting` へ更新し、最初の期待済み送信requestと、そのrequest IDに直接連なるsafeなredirectだけを許可する。非safe HTTP methodはaction URLとmethod、GETはactionのorigin / path、`Document` resource、送信対象frameを照合する。モデルはDOM activationを優先して選択し、trusted click gestureまたはkeyboard activationが必要な場合だけmouse / Enterを選ぶ。mouseのhit testは1 animation frameごとに最大3回試行する。
 
 ### Cloudflare D1
 
@@ -295,7 +295,7 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 
 ### Agent への安全指示
 
-system prompt では、営業禁止・用途制限の確認と送信前の再観察を指示する。入力値は信頼済みhandlerが`payload.formValues`由来であることを強制する。`prohibited`は、直前の観察でフォーム不在または固定パターンの営業禁止・用途制限を検出した場合だけ受理する。送信前には全入力のform owner、native validity、現在のaction / method、入力後の再観察、禁止根拠なし、1回限りの送信権を機械的に検証する。禁止判定時と送信前後には画面のスクリーンショット証跡をR2へ保存する。固定パターンで表現されない禁止事項、Shadow DOM内の本文、ページ上のprompt injectionに対する完全な判定は未対応である。
+system prompt では、営業禁止・用途制限の確認と送信前の再観察を指示する。入力値は信頼済みhandlerが`payload.formValues`由来であることを強制する。`prohibited`は、直前かつ現在URLと一致する観察でフォーム不在、または全候補formの直前要素とform本文から固定パターンの営業禁止・用途制限を検出した場合だけ受理する。送信前には選択したformの禁止根拠、全入力のform owner、native validity、現在のaction / method、入力後の再観察、1回限りの送信権を機械的に検証する。禁止判定時と送信前後には画面のスクリーンショット証跡をR2へ保存する。固定パターンで表現されない禁止事項、Shadow DOM内の本文、ページ上のprompt injectionに対する完全な判定は未対応である。
 
 ## 現在の制約
 
@@ -310,8 +310,8 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 - popup、別 tab、Service Worker を利用するフォームは未対応である。
 - 確認を挟むmulti-stepは管理下テストで検証済みである。ファイル添付とCAPTCHAは未対応である。
 - 送信完了は、許可したrequestを観測し、日本語の送信完了表現または`thank you`が5秒以内に新たに出現した場合に確定する。期待済みGET Documentは、送信対象frameの遷移と同じframe内の完了文言を必須にする。他frameの完了文言は判定に利用しない。
-- submit controlの期待済みGETは送信権で制御する。非submitの`click`中とその後のbrowser requestは遮断し、`navigate`は直前の`observe.navigationLinks`で得た完全一致URLまたは現在URLだけを許可する。観察済みリンク自体がGET型副作用を持つサイトは機械的に識別できないため、対象サイト側がGETをsafe methodとして扱うことは引き続き前提になる。
-- 営業禁止判定はフォーム不在と固定の日本語・英語パターン、送信前確認はform owner、native validity、action / method、入力後の再観察、禁止根拠なし、1回限りの送信権を信頼済みhandlerで検証する。未知の禁止表現は`prohibited`として確定できず、追加パターンまたは人手確認が必要になる。
+- submit controlの期待済みGETは送信権で制御する。非submitの`click`中とその後、および`submit`中のbrowser requestは遮断し、観察済みnavigateのtop-frame Document、期待済みsubmit request、またはそのrequest IDに直接連なるsafe redirectだけを許可する。`navigate`は直前の`observe.navigationLinks`で得たfragmentを含む完全一致URLまたは現在URLだけを許可する。観察済みリンク自体がGET型副作用を持つサイトは機械的に識別できないため、対象サイト側がGETをsafe methodとして扱うことは引き続き前提になる。
+- 営業禁止判定はフォーム不在と、候補formの直前要素＋form本文に対する固定の日本語・英語パターンを使う。肯定表現と「禁止していない」は除外し、複数formがある場合のページ全体禁止は全formで根拠が一致した場合だけ受理する。送信前確認は選択formの禁止根拠、form owner、native validity、action / method、入力後の再観察、1回限りの送信権を信頼済みhandlerで検証する。未知の禁止表現は`prohibited`として確定できず、追加パターンまたは人手確認が必要になる。
 - dry-runではジョブURLへのbootstrap後の再navigateと、最初のclick / fill / select以降に発生するbrowser requestをすべて遮断し、座標click前にCDPのhit targetが検証済み要素またはそのcomposed descendantであることを確認する。
 
 ### API / 運用
