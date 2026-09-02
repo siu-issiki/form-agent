@@ -153,6 +153,15 @@ D1へのイベント記録に失敗した場合、Workerはアップロード済
 ./node_modules/.bin/wrangler r2 object delete form-agent-evidence/<objectKey> --remote
 ```
 
+`wrangler`にはR2オブジェクトを一覧するコマンドが無い（`get` / `put` / `delete`のみ）ため、孤児オブジェクトの網羅的な突き合わせにはCloudflare REST APIを使う。R2読み取り権限を持つAPIトークンとアカウントIDが必要。
+
+```bash
+curl -s "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/form-agent-evidence/objects?prefix=jobs/<JOB_ID>/" \
+  -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" | jq -r '.result[].key'
+```
+
+出力された各キーを、対象ジョブのD1 `evidence.captured`イベントの`objectKey`一覧（前掲の`SELECT ... WHERE type LIKE 'evidence.%'`で取得できる）と突き合わせる。D1側に対応するキーが無いオブジェクトは、補償削除にも失敗した孤児（`submission_evidence_orphan`ログが出ていない場合は、R2 put後・D1記録前にWorkerが停止したケースも含む）とみなし、`wrangler r2 object delete`で手動削除する。
+
 ## DLQの確認
 
 DLQへ移動したジョブを確認する。

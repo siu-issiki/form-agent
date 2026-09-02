@@ -792,6 +792,56 @@ describe("SubmissionEvidenceRecorder", () => {
 			"evidence.capture_failed",
 		]);
 	});
+
+	test("times out a stalled capture without changing the outcome", async () => {
+		const driver: Pick<RestrictedBrowserDriver, "captureScreenshot"> = {
+			captureScreenshot: () => new Promise<Uint8Array>(() => {}),
+		};
+		const evidence = new InMemoryEvidenceObjectStore();
+		const store = new InMemoryJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const recorder = new SubmissionEvidenceRecorder(
+			driver,
+			evidence,
+			store,
+			input.id,
+			"run-token-1",
+			() => "2026-08-28T00:00:02.000Z",
+			20,
+		);
+		const warnings: string[] = [];
+		const originalWarn = console.warn;
+		console.warn = (message: unknown) => {
+			warnings.push(String(message));
+		};
+
+		let result: Awaited<ReturnType<typeof recorder.capture>>;
+		try {
+			result = await recorder.capture("after_submit");
+		} finally {
+			console.warn = originalWarn;
+		}
+
+		expect(result).toEqual({
+			captured: false,
+			failureCode: "CAPTURE_TIMEOUT",
+		});
+		expect(store.events).toEqual([
+			{
+				jobId: input.id,
+				attempt: 1,
+				type: "evidence.capture_failed",
+				data: { stage: "after_submit", failureCode: "CAPTURE_TIMEOUT" },
+			},
+		]);
+		expect(
+			warnings.some((message) => {
+				const parsed = JSON.parse(message) as { event?: string };
+				return parsed.event === "submission_evidence_timeout";
+			}),
+		).toBe(true);
+	});
 });
 
 class RecordEvidenceCapturedRejectingJobStore extends InMemoryJobStore {

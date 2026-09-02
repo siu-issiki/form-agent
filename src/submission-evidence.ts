@@ -5,6 +5,15 @@ export type { EvidenceFailureCode, EvidenceStage };
 
 export const EVIDENCE_CONTENT_TYPE = "image/jpeg";
 
+/**
+ * Upper bound for a single evidence capture (screenshot -> R2 put -> D1
+ * record). `after_submit` capture runs in the `submitting` state, before
+ * `recordSent`, so a stall here would otherwise be caught only by the
+ * agent's overall deadline and turn the run into `uncertain` -- breaking the
+ * "best effort, never change the outcome" contract for evidence capture.
+ */
+export const EVIDENCE_CAPTURE_TIMEOUT_MS = 15_000;
+
 export interface EvidenceObjectStore {
 	put(
 		key: string,
@@ -82,10 +91,45 @@ export class SubmissionEvidenceRecorder {
 		private readonly jobId: string,
 		private readonly runToken: string,
 		private readonly now: () => string = () => new Date().toISOString(),
+		private readonly timeoutMs: number = EVIDENCE_CAPTURE_TIMEOUT_MS,
 	) {}
 
 	async capture(stage: EvidenceStage): Promise<EvidenceCaptureResult> {
 		const eventId = crypto.randomUUID();
+		const objectKey = evidenceObjectKey(this.jobId, stage, eventId);
+
+		let timer!: ReturnType<typeof setTimeout>;
+		const timedOut = new Promise<EvidenceCaptureResult>((resolve) => {
+			timer = setTimeout(() => {
+				// The R2 put and/or D1 record may still land after this fires,
+				// leaving an orphaned object -- keep the key in the log so it can
+				// be matched against D1 and cleaned up manually.
+				console.warn(
+					JSON.stringify({
+						event: "submission_evidence_timeout",
+						stage,
+						objectKey,
+					}),
+				);
+				resolve(this.#failed(stage, "CAPTURE_TIMEOUT"));
+			}, this.timeoutMs);
+		});
+
+		try {
+			return await Promise.race([
+				this.#captureUnbounded(stage, eventId, objectKey),
+				timedOut,
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	async #captureUnbounded(
+		stage: EvidenceStage,
+		eventId: string,
+		objectKey: string,
+	): Promise<EvidenceCaptureResult> {
 		let bytes: Uint8Array;
 		try {
 			bytes = await this.driver.captureScreenshot();
@@ -96,7 +140,6 @@ export class SubmissionEvidenceRecorder {
 			return this.#failed(stage, "SCREENSHOT_FAILED");
 		}
 
-		const objectKey = evidenceObjectKey(this.jobId, stage, eventId);
 		let sha256: string;
 		try {
 			sha256 = await sha256Hex(bytes);

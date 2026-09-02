@@ -41,7 +41,8 @@ export type EvidenceFailureCode =
 	| "SCREENSHOT_FAILED"
 	| "OBJECT_STORE_FAILED"
 	| "EVENT_NOT_RECORDED"
-	| "NO_BROWSER_SESSION";
+	| "NO_BROWSER_SESSION"
+	| "CAPTURE_TIMEOUT";
 
 export interface JobEvent {
 	jobId: string;

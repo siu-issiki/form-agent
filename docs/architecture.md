@@ -220,6 +220,8 @@ pending / running / failed ── retry 上限超過 ──► dead_lettered
 
 `before_submit` の撮影失敗は送信前の唯一のブロッキング条件であり、二重送信防止と同様に「不確実なら送信しない」方針に従う。`after_submit` と `prohibited` は既存の結果確定ロジックに影響しない。送信後 URL の検証に使う値は `after_submit` の撮影より前に取得しておき、撮影失敗で CDP 接続が閉じても送信結果（`sent` / `uncertain`）は変わらない。
 
+撮影・保存・記録は合計 15 秒で打ち切り、超過時は `CAPTURE_TIMEOUT` として記録する。`after_submit` の stall が全体期限による `uncertain` を招かないようにするため。
+
 ## データモデル
 
 ### jobs
@@ -265,7 +267,7 @@ Provider、model、input / output token、処理時間、BrowserUse 待ち時間
 
 現在保存するイベントは `job.retry_scheduled`、`job.dead_lettered`、`agent.tool_diagnostic`、`evidence.captured`、`evidence.capture_failed` である。retry イベントにはreason code、発生元、attempt、実行時間、retry時点のProvider呼び出し累計を保存する。tool diagnosticにはturn、固定のtool名、処理stage、固定のresult codeだけを保存する。
 
-`evidence.captured` の `data_json` は `{ stage, objectKey, sha256, byteLength, contentType: "image/jpeg" }` を保存する。`stage` は `before_submit` / `after_submit` / `prohibited` の固定値であり、`objectKey` は `jobId` / `stage` / `eventId` から機械的に組み立てた R2 オブジェクトキーである。`evidence.capture_failed` の `data_json` は `{ stage, failureCode }` を保存する。`failureCode` は `SCREENSHOT_FAILED` / `OBJECT_STORE_FAILED` / `EVENT_NOT_RECORDED` / `NO_BROWSER_SESSION` の固定値である。
+`evidence.captured` の `data_json` は `{ stage, objectKey, sha256, byteLength, contentType: "image/jpeg" }` を保存する。`stage` は `before_submit` / `after_submit` / `prohibited` の固定値であり、`objectKey` は `jobId` / `stage` / `eventId` から機械的に組み立てた R2 オブジェクトキーである。`evidence.capture_failed` の `data_json` は `{ stage, failureCode }` を保存する。`failureCode` は `SCREENSHOT_FAILED` / `OBJECT_STORE_FAILED` / `EVENT_NOT_RECORDED` / `NO_BROWSER_SESSION` / `CAPTURE_TIMEOUT` の固定値である。
 
 どのイベントにも秘密情報、URL、フォーム値、自由記述のエラー本文を含めない。証跡イベントの `objectKey` も `jobId` / `stage` / `eventId` の組み合わせだけで構成されており、この方針を維持している。
 
@@ -423,6 +425,7 @@ PoC はまず 1 並列の production で開始し、管理下テストサイト�
 - CSVから抽出した外部form hostをジョブ単位の完全一致allowlistへ安全に反映する運用検証。
 - Provider abstraction と fallback。
 - 外部 API E2E は GitHub Actions の通常 CI に含めず、手動実行に限定する。
+- R2 アップロード後・D1 記録前に Worker が停止した場合の孤児オブジェクトは検出できない。intent イベントの先行記録または R2 ライフサイクルルールで対処する。
 
 ### 運用・ポリシー
 
