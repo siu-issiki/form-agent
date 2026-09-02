@@ -23,6 +23,7 @@ import {
 	createSubmitActivationFailureLog,
 	denyRelatedBrowserTargets,
 	ENTER_KEY_DOWN_EVENT,
+	getSubmissionRequestDisposition,
 	HAS_SAME_FORM_OWNER_FUNCTION,
 	IS_COMPOSED_DESCENDANT_FUNCTION,
 	IS_ELEMENT_FOCUSED_FUNCTION,
@@ -45,6 +46,7 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 			{
 				backendNodeId: 1,
 				nodeName: "#document",
+				frameId: "frame-main",
 				children: [
 					{
 						backendNodeId: 2,
@@ -86,6 +88,7 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 				backendNodeId: 2,
 				action: "https://example.com/send",
 				method: "post",
+				frameId: "frame-main",
 				fields: [
 					{ backendNodeId: 3, tag: "input" },
 					{ backendNodeId: 6, tag: "textarea" },
@@ -93,6 +96,45 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 					{ backendNodeId: 8, tag: "input" },
 				],
 			},
+		]);
+	});
+
+	test("tracks the owning frame for top and iframe forms", () => {
+		const discovery = discoverCdpForms(
+			{
+				backendNodeId: 1,
+				nodeName: "#document",
+				children: [
+					{
+						backendNodeId: 2,
+						nodeName: "FORM",
+						children: [{ backendNodeId: 3, nodeName: "INPUT" }],
+					},
+					{
+						backendNodeId: 4,
+						nodeName: "IFRAME",
+						frameId: "frame-child",
+						contentDocument: {
+							backendNodeId: 5,
+							nodeName: "#document",
+							children: [
+								{
+									backendNodeId: 6,
+									nodeName: "FORM",
+									children: [{ backendNodeId: 7, nodeName: "INPUT" }],
+								},
+							],
+						},
+					},
+				],
+			},
+			"https://example.com/",
+			"frame-main",
+		);
+
+		expect(discovery.forms.map(({ frameId }) => frameId)).toEqual([
+			"frame-main",
+			"frame-child",
 		]);
 	});
 
@@ -247,6 +289,58 @@ describe("BrowserUseCdpDriver child target policy", () => {
 				expected,
 			),
 		).toThrow();
+		expect(() =>
+			assertExpectedSubmissionRequest(
+				{
+					url: "https://example.com/search?company=AnyReach",
+					method: "GET",
+				},
+				createExpectedSubmissionRequest("https://example.com/search", "get"),
+			),
+		).not.toThrow();
+		expect(() =>
+			assertExpectedSubmissionRequest(
+				{ url: "https://example.com/other", method: "GET" },
+				createExpectedSubmissionRequest("https://example.com/search", "get"),
+			),
+		).toThrow();
+	});
+
+	test("claims only the first expected GET document navigation", () => {
+		const expected = createExpectedSubmissionRequest(
+			"https://example.com/search",
+			"get",
+		);
+		const request = {
+			url: "https://example.com/search?company=AnyReach",
+			method: "GET",
+		};
+		const disposition = (
+			resourceType: string,
+			frameId: string,
+			count: number,
+			inFlight: boolean,
+		) =>
+			getSubmissionRequestDisposition(
+				request,
+				resourceType,
+				frameId,
+				expected,
+				"form-frame",
+				true,
+				true,
+				count,
+				inFlight,
+			);
+
+		expect(disposition("Document", "form-frame", 0, false)).toBe("claim");
+		expect(disposition("Document", "other-frame", 0, false)).toBe("ignore");
+		expect(disposition("Document", "", 0, false)).toBe("block");
+		expect(disposition("Fetch", "form-frame", 0, false)).toBe("ignore");
+		expect(disposition("Image", "form-frame", 0, false)).toBe("ignore");
+		expect(disposition("Script", "form-frame", 0, false)).toBe("ignore");
+		expect(disposition("Document", "form-frame", 0, true)).toBe("block");
+		expect(disposition("Document", "form-frame", 1, false)).toBe("block");
 	});
 
 	test("classifies uncertain submissions without persisting request data", () => {

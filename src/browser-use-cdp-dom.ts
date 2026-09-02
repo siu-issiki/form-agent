@@ -7,6 +7,7 @@ export interface CdpDomNode {
 	nodeValue?: string;
 	baseURL?: string;
 	documentURL?: string;
+	frameId?: string;
 	attributes?: string[];
 	children?: CdpDomNode[];
 	shadowRoots?: CdpDomNode[];
@@ -29,6 +30,7 @@ export interface CdpFormCandidate {
 	backendNodeId: number;
 	action: string;
 	method: string;
+	frameId?: string;
 	fields: CdpFieldCandidate[];
 }
 
@@ -45,6 +47,7 @@ const FIELD_TAGS = new Set(["input", "textarea", "select", "button"]);
 export function discoverCdpForms(
 	root: CdpDomNode,
 	currentUrl: string,
+	topFrameId?: string,
 ): CdpFormDiscovery {
 	const parentByBackendId = new Map<number, number | null>();
 	const formsByBackendId = new Map<number, CdpFormCandidate>();
@@ -54,8 +57,16 @@ export function discoverCdpForms(
 	let closedShadowRootCount = 0;
 	let nodeCount = 0;
 
-	const visit = (node: CdpDomNode, parentBackendNodeId: number | null) => {
+	const visit = (
+		node: CdpDomNode,
+		parentBackendNodeId: number | null,
+		inheritedFrameId?: string,
+	) => {
 		nodeCount += 1;
+		const frameId =
+			node.nodeName.toLowerCase() === "#document"
+				? (node.frameId ?? inheritedFrameId)
+				: inheritedFrameId;
 		parentByBackendId.set(node.backendNodeId, parentBackendNodeId);
 		if (node.shadowRootType) {
 			shadowRootCount += 1;
@@ -69,6 +80,7 @@ export function discoverCdpForms(
 				backendNodeId: node.backendNodeId,
 				action: resolveFormAction(attributes.action, currentUrl),
 				method: (attributes.method || "get").toLowerCase(),
+				...(frameId ? { frameId } : {}),
 				fields: [],
 			};
 			formsByBackendId.set(node.backendNodeId, form);
@@ -78,12 +90,25 @@ export function discoverCdpForms(
 			fields.push({ node, tag });
 		}
 
-		for (const child of composedChildren(node)) {
-			visit(child, node.backendNodeId);
+		for (const child of [
+			...(node.children ?? []),
+			...(node.shadowRoots ?? []),
+		]) {
+			visit(child, node.backendNodeId, frameId);
+		}
+		if (node.contentDocument) {
+			visit(
+				node.contentDocument,
+				node.backendNodeId,
+				node.frameId ?? node.contentDocument.frameId ?? frameId,
+			);
+		}
+		if (node.templateContent) {
+			visit(node.templateContent, node.backendNodeId, frameId);
 		}
 	};
 
-	visit(root, null);
+	visit(root, null, root.frameId ?? topFrameId);
 
 	for (const { node, tag } of fields) {
 		const attributes = parseAttributes(node.attributes);

@@ -89,11 +89,13 @@ interface ElementState {
 
 interface ElementReference {
 	backendNodeId: number;
+	frameId?: string;
 }
 
 interface PausedRequest {
 	requestId: string;
 	resourceType?: string;
+	frameId?: string;
 	request: { url: string; method: string };
 }
 
@@ -103,6 +105,7 @@ interface ExpectedSubmissionRequest {
 }
 
 type SubmissionRequestBlockStage = "expected_request" | "network_policy";
+type GetSubmissionRequestDisposition = "claim" | "block" | "ignore";
 
 export type SubmitActivationStage =
 	| "scroll"
@@ -120,6 +123,7 @@ export type SubmitActivationStage =
 	| "dispatch";
 
 export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
+	#topFrameId: string | undefined;
 	#targetDomain: string | undefined;
 	#allowedHosts: string[] = [];
 	#submissionRequestAllowed = false;
@@ -128,6 +132,10 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#submissionRequestObserved: (() => void) | undefined;
 	#expectedSubmissionRequest: ExpectedSubmissionRequest | undefined;
 	#submissionAttemptInProgress = false;
+	#expectedSubmissionFrameId: string | undefined;
+	#getSubmissionGuard:
+		| { request: ExpectedSubmissionRequest; frameId?: string }
+		| undefined;
 	#submissionRequestBlockStage: SubmissionRequestBlockStage | undefined;
 	#validatedSubmitInputBackendNodeId: number | undefined;
 	#targetPolicyError: Error | undefined;
@@ -264,6 +272,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				fieldIndex += 1;
 				elements.set(elementId, {
 					backendNodeId: candidate.backendNodeId,
+					...(candidateForm.frameId ? { frameId: candidateForm.frameId } : {}),
 				});
 				fields.push({
 					elementId,
@@ -436,6 +445,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			state.formAction,
 			state.formMethod,
 		);
+		this.#expectedSubmissionFrameId = reference.frameId;
 	}
 
 	async submit(
@@ -448,6 +458,14 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			throw createBrowserSubmitDiagnosticError("SUBMIT_VALIDATE", error);
 		}
 		this.#interactionStarted = true;
+		if (this.#expectedSubmissionRequest?.method === "GET") {
+			this.#getSubmissionGuard ??= {
+				request: this.#expectedSubmissionRequest,
+				...(this.#expectedSubmissionFrameId
+					? { frameId: this.#expectedSubmissionFrameId }
+					: {}),
+			};
+		}
 		let beforeConfirmationCount: number;
 		try {
 			beforeConfirmationCount = await this.#confirmationBodyCount();
@@ -515,6 +533,11 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			if (sessionId === this.sessionId) this.#clearElements();
 		});
 		await this.#send("Page.enable");
+		this.#topFrameId = (
+			await this.#send<{ frameTree: { frame: { id: string } } }>(
+				"Page.getFrameTree",
+			)
+		).frameTree.frame.id;
 		await this.#send("Runtime.enable");
 		await this.#send("DOM.enable", { includeWhitespace: "none" });
 		await this.#send("Accessibility.enable");
@@ -533,30 +556,57 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		);
 		let blockStage: SubmissionRequestBlockStage = "network_policy";
 		let claimedSubmissionRequest = false;
+		let submissionRelatedRequest = unsafeRequest;
 		try {
 			if (!this.#targetDomain) {
 				throw new Error("Browser domain scope is not configured");
 			}
-			if (unsafeRequest && this.#submissionRequestAllowed) {
+			let expectedSubmissionRequest = false;
+			const getSubmissionGuard = this.#getSubmissionGuard;
+			const getSubmissionDisposition = getSubmissionRequestDisposition(
+				paused.request,
+				paused.resourceType,
+				paused.frameId,
+				getSubmissionGuard?.request,
+				getSubmissionGuard?.frameId,
+				getSubmissionGuard !== undefined,
+				this.#submissionRequestAllowed,
+				this.#submissionRequestCount,
+				this.#submissionRequestInFlight,
+			);
+			submissionRelatedRequest ||= getSubmissionDisposition !== "ignore";
+			if (getSubmissionDisposition === "block") {
 				blockStage = "expected_request";
-				assertExpectedSubmissionRequest(
-					paused.request,
-					this.#expectedSubmissionRequest,
-				);
+				throw new BrowserElementError();
 			}
+			if (getSubmissionDisposition === "claim") {
+				expectedSubmissionRequest = true;
+			}
+			if (this.#submissionRequestAllowed) {
+				if (unsafeRequest) {
+					blockStage = "expected_request";
+					assertExpectedSubmissionRequest(
+						paused.request,
+						this.#expectedSubmissionRequest,
+					);
+					expectedSubmissionRequest = true;
+				}
+			}
+			const canClaimSubmissionRequest =
+				expectedSubmissionRequest &&
+				this.#submissionRequestCount === 0 &&
+				!this.#submissionRequestInFlight;
 			blockStage = "network_policy";
 			assertAllowedBrowserRequest(
 				paused.request.url,
 				this.#targetDomain,
 				paused.request.method,
-				this.#submissionRequestAllowed &&
-					this.#submissionRequestCount === 0 &&
-					!this.#submissionRequestInFlight,
+				canClaimSubmissionRequest,
 				!this.#formDataEntered && paused.resourceType !== "Document",
 				this.dryRun && this.#interactionStarted,
 				this.#allowedHosts,
 			);
-			if (unsafeRequest) {
+			if (canClaimSubmissionRequest) {
 				this.#submissionRequestInFlight = true;
 				claimedSubmissionRequest = true;
 			}
@@ -566,13 +616,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 						requestId: paused.requestId,
 					}),
 				() => {
-					if (!unsafeRequest) return;
+					if (!claimedSubmissionRequest) return;
 					this.#submissionRequestCount += 1;
 					this.#submissionRequestObserved?.();
 				},
 			);
 		} catch {
-			if (unsafeRequest && this.#submissionAttemptInProgress) {
+			if (submissionRelatedRequest && this.#submissionAttemptInProgress) {
 				this.#submissionRequestBlockStage ??= blockStage;
 			}
 			await this.#send("Fetch.failRequest", {
@@ -630,6 +680,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		this.#successfulInputBackendNodeIds.clear();
 		this.#expectedSubmissionRequest = undefined;
 		this.#validatedSubmitInputBackendNodeId = undefined;
+		this.#expectedSubmissionFrameId = undefined;
 	}
 
 	async #discoverForms(url: string): Promise<{
@@ -642,7 +693,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				"DOM.getDocument",
 				{ depth: -1, pierce: true },
 			);
-			const discovery = discoverCdpForms(root, url);
+			const discovery = discoverCdpForms(root, url, this.#topFrameId);
 			if (
 				discovery.candidateFieldCount > 0 ||
 				attempt === MAX_DOM_DISCOVERY_ATTEMPTS
@@ -1340,15 +1391,52 @@ export function assertExpectedSubmissionRequest(
 	request: { url: string; method: string },
 	expected: ExpectedSubmissionRequest | undefined,
 ): void {
-	const url = new URL(request.url);
-	url.hash = "";
-	if (
-		!expected ||
-		request.method.toUpperCase() !== expected.method ||
-		url.toString() !== expected.url
-	) {
+	if (!isExpectedSubmissionRequest(request, expected)) {
 		throw new BrowserElementError();
 	}
+}
+
+export function isExpectedSubmissionRequest(
+	request: { url: string; method: string },
+	expected: ExpectedSubmissionRequest | undefined,
+): boolean {
+	const url = new URL(request.url);
+	url.hash = "";
+	if (!expected || request.method.toUpperCase() !== expected.method)
+		return false;
+	if (expected.method !== "GET") return url.toString() === expected.url;
+	const expectedUrl = new URL(expected.url);
+	return (
+		url.origin === expectedUrl.origin && url.pathname === expectedUrl.pathname
+	);
+}
+
+export function getSubmissionRequestDisposition(
+	request: { url: string; method: string },
+	resourceType: string | undefined,
+	requestFrameId: string | undefined,
+	expected: ExpectedSubmissionRequest | undefined,
+	expectedFrameId: string | undefined,
+	getSubmissionGuardActive: boolean,
+	submissionRequestAllowed: boolean,
+	submissionRequestCount: number,
+	submissionRequestInFlight: boolean,
+): GetSubmissionRequestDisposition {
+	if (
+		!getSubmissionGuardActive ||
+		resourceType !== "Document" ||
+		expected?.method !== "GET" ||
+		!isExpectedSubmissionRequest(request, expected)
+	) {
+		return "ignore";
+	}
+	if (!requestFrameId || !expectedFrameId) return "block";
+	if (requestFrameId !== expectedFrameId) return "ignore";
+	return submissionRequestAllowed &&
+		submissionRequestCount === 0 &&
+		!submissionRequestInFlight
+		? "claim"
+		: "block";
 }
 
 const SET_SELECT_VALUE_FUNCTION = `function(value) {
