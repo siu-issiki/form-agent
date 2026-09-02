@@ -3,7 +3,10 @@ import { beforeEach, describe, expect, test } from "vitest";
 import { AgentExecutionError } from "../src/agent-executor";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobInput } from "../src/job";
-import type { SubmitReviewInput } from "../src/restricted-browser";
+import type {
+	SubmitReviewInput,
+	SubmitReviewReasonCode,
+} from "../src/restricted-browser";
 import { SubmitReviewUnavailableError } from "../src/restricted-browser";
 import {
 	MAX_REVIEW_PAGE_TEXT_LENGTH,
@@ -98,7 +101,7 @@ describe("ResponsesSubmitReviewer", () => {
 		const requests: ReviewRequestBody[] = [];
 		const reviewer = createReviewer(async (_resource, init) => {
 			requests.push(JSON.parse(String(init?.body)) as ReviewRequestBody);
-			return Response.json(reviewResponse("deny", "UNCLEAR"));
+			return Response.json(reviewResponse("deny", "UNCLEAR", "Unverifiable."));
 		});
 
 		await reviewer.review(
@@ -215,9 +218,17 @@ describe("readReviewDecision", () => {
 		],
 		[
 			"a reason code outside the enum",
-			reviewResponse("deny", "ARBITRARY_REASON" as "UNCLEAR"),
+			reviewResponse("deny", "ARBITRARY_REASON" as SubmitReviewReasonCode),
 		],
 		["a decision outside the enum", reviewResponse("maybe" as "allow")],
+		[
+			"an allow carrying a denial reason code",
+			reviewResponse("allow", "SALES_PROHIBITED"),
+		],
+		[
+			"a deny carrying the allow reason code",
+			reviewResponse("deny", "INPUTS_MATCH"),
+		],
 	])("rejects %s", (_name, response) => {
 		const error = (() => {
 			try {
@@ -315,7 +326,7 @@ function reviewInput(
 
 function reviewResponse(
 	decision: "allow" | "deny",
-	reasonCode: "INPUTS_MATCH" | "INPUT_MISMATCH" | "UNCLEAR" = "INPUTS_MATCH",
+	reasonCode: SubmitReviewReasonCode = "INPUTS_MATCH",
 	reason = "The inputs match the job payload.",
 ) {
 	return {

@@ -19,6 +19,7 @@ const job: Job = {
 	payload: {},
 	status: "running",
 	attemptCount: 1,
+	submitReviewDenialCount: 0,
 	runToken: "browser-use-smoke",
 	result: null,
 	createdAt: "2026-08-28T00:00:00.000Z",

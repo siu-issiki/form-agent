@@ -17,6 +17,7 @@ const input: AgentRunInput = {
 		payload: { message: "Hello" },
 		status: "running",
 		attemptCount: 1,
+		submitReviewDenialCount: 0,
 		runToken: "run-token-1",
 		result: null,
 		createdAt: "2026-08-28T00:00:00.000Z",

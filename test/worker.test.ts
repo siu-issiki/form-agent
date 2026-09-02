@@ -2096,12 +2096,16 @@ describe("ResponsesAgentExecutor", () => {
 			resultCode: "SUBMIT_REVIEW_DENIED",
 		});
 		expect(JSON.stringify(diagnostics)).not.toContain("wrong field");
-		const counter = await env.DB.prepare(
-			"SELECT provider_request_count FROM jobs WHERE id = ?",
+		const counters = await env.DB.prepare(
+			"SELECT provider_request_count, submit_review_denial_count FROM jobs WHERE id = ?",
 		)
 			.bind(input.id)
-			.first<{ provider_request_count: number }>();
-		expect(counter?.provider_request_count).toBe(7);
+			.first<{
+				provider_request_count: number;
+				submit_review_denial_count: number;
+			}>();
+		expect(counters?.provider_request_count).toBe(7);
+		expect(counters?.submit_review_denial_count).toBe(1);
 	});
 
 	test("keeps a reviewer provider failure classified instead of a browser failure", async () => {

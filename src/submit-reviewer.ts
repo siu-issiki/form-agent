@@ -240,7 +240,11 @@ export function readReviewDecision(response: JsonObject): SubmitReviewDecision {
 	if (
 		(decision !== "allow" && decision !== "deny") ||
 		!isSubmitReviewReasonCode(reasonCode) ||
-		typeof reason !== "string"
+		typeof reason !== "string" ||
+		// INPUTS_MATCH is the only allow code, and it can never justify a deny.
+		// A contradictory pair means the reviewer did not follow the schema, so
+		// it is rejected instead of being read as either verdict.
+		(decision === "allow") !== (reasonCode === "INPUTS_MATCH")
 	) {
 		throw invalidProviderResponse();
 	}

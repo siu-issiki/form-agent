@@ -226,7 +226,6 @@ export class RestrictedBrowserTools {
 	#inputRevision = 0;
 	#observationRevision = -1;
 	#submitAttempted = false;
-	#reviewDenialCount = 0;
 
 	private constructor(
 		private readonly driver: RestrictedBrowserDriver,
@@ -447,8 +446,17 @@ export class RestrictedBrowserTools {
 			bytes: before.body,
 		});
 		if (decision.decision === "deny") {
-			this.#reviewDenialCount += 1;
-			if (this.#reviewDenialCount < MAX_SUBMIT_REVIEW_DENIALS) {
+			// The denial budget lives in D1, so a Queue redelivery resumes with
+			// the same budget instead of granting another correction.
+			const denialCount = await this.jobs.recordSubmitReviewDenial(
+				this.jobId,
+				this.runToken,
+				this.now(),
+			);
+			if (denialCount === null) {
+				throw new SubmissionNotAuthorizedError();
+			}
+			if (denialCount < MAX_SUBMIT_REVIEW_DENIALS) {
 				// Force a fresh observation so the next attempt reviews the
 				// corrected page instead of the denied one.
 				this.#inputRevision += 1;

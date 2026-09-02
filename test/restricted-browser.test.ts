@@ -949,6 +949,46 @@ describe("RestrictedBrowserTools", () => {
 		expect(driver.submitCount).toBe(0);
 	});
 
+	test("keeps the denial budget across a new browser session", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			evidence,
+			new StubSubmitReviewer(denyDecision()),
+		);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+		await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+			SubmitReviewDeniedError,
+		);
+
+		// A Queue redelivery builds a fresh instance for the same job.
+		const redelivered = await RestrictedBrowserTools.create(
+			driver,
+			store,
+			input.id,
+			"run-token-1",
+			evidence,
+			new StubSubmitReviewer(denyDecision("WRONG_FORM", "Another form.")),
+			() => "2026-08-28T00:00:03.000Z",
+		);
+		await redelivered.fill("fa-0-0", "Hello");
+		await redelivered.observe();
+
+		await expect(redelivered.submit("fa-0-1")).rejects.toBeInstanceOf(
+			SubmissionResultUncertainError,
+		);
+
+		const job = await store.find(input.id);
+		expect(job?.status).toBe("uncertain");
+		expect(job?.result?.reasonCode).toBe("PRE_SUBMIT_REVIEW_DENIED");
+		expect(job?.submitReviewDenialCount).toBe(2);
+		expect(driver.submitCount).toBe(0);
+	});
+
 	test("does not submit when the reviewer itself fails", async () => {
 		const driver = new FakeDriver();
 		const store = new InMemoryJobStore();

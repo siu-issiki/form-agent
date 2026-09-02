@@ -166,8 +166,8 @@ driver が submit control と識別した要素は通常の `click` で操作で
 
 - 入力は、直前の信頼済み観察（URL、form、ページ本文、禁止 reason code）、`payload.formValues` の信頼済み値、`before_submit` スクリーンショット、対象ドメイン・URL、submit 要素 ID である。
 - 観察とスクリーンショットは `untrustedPageContent` としてラップし、外部サイト由来のデータであり指示として解釈しないことを instructions で明示する。
-- 判定 code は `INPUTS_MATCH`（allow のみ）、`INPUT_MISMATCH`、`SALES_PROHIBITED`、`FORM_PURPOSE_INCOMPATIBLE`、`WRONG_FORM`、`UNCLEAR` の固定値とする。
-- deny の 1 回目はモデルへ `SUBMIT_REVIEW_DENIED` と reason code だけを返し、再観察を強制したうえで 1 回だけ修正を許可する。送信権は取得せず、ブラウザ送信も行わない。
+- 判定 code は `INPUTS_MATCH`（allow のみ）、`INPUT_MISMATCH`、`SALES_PROHIBITED`、`FORM_PURPOSE_INCOMPATIBLE`、`WRONG_FORM`、`UNCLEAR` の固定値とする。`allow` と deny 系 code、`deny` と `INPUTS_MATCH` のように矛盾する組み合わせは、どちらの判定としても解釈せず応答不正として扱う。
+- deny の 1 回目はモデルへ `SUBMIT_REVIEW_DENIED` と reason code だけを返し、再観察を強制したうえで 1 回だけ修正を許可する。送信権は取得せず、ブラウザ送信も行わない。deny 回数は D1 のジョブ行（`submit_review_denial_count`）へ保存し、Queue 再配信で新しい browser session と Agent 実行になっても 1 attempt 目と同じ修正予算を共有する。
 - deny の 2 回目は `PRE_SUBMIT_REVIEW_DENIED` として `uncertain` を保存し、そのジョブを終了する。
 - レビュー自体を完了できない場合は allow にせず、再試行可能な `SUBMIT_REVIEW_UNAVAILABLE` として扱う。Provider の通信失敗、429、応答不正はそれぞれの Provider 用 reason code のまま伝播させ、browser tool の障害へ丸めない。
 - モデルへ返すのは固定の code と guidance だけであり、レビューの自由記述はモデルへ渡さない。自由記述は 2 回目 deny 時の `uncertain` の reason にだけ、制御文字を空白へ置換し 500 文字へ切り詰めて保存する。
@@ -250,6 +250,7 @@ pending / running / failed ── retry 上限超過 ──► dead_lettered
 | `payload_json` | TEXT | 送信者情報、本文などの入力 |
 | `status` | TEXT | `pending` / `running` / `submitting` / `sent` / `prohibited` / `uncertain` / `failed` / `dead_lettered` |
 | `attempt_count` | INTEGER | 実行試行回数 |
+| `submit_review_denial_count` | INTEGER | 送信前レビューが deny した累計回数。Queue 再配信をまたいで共有する |
 | `run_token` | TEXT NULL | 現在の実行権を識別する token |
 | `provider_request_count` | INTEGER | 現在の run が使用した Provider 呼び出し回数 |
 | `created_at` | TEXT | 作成日時 |
