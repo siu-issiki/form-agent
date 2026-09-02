@@ -193,7 +193,7 @@ function readSubmitActivationStrategy(
 	params: BrowserToolParams,
 ): SubmitActivationStrategy {
 	const value = params.activationStrategy;
-	if (value === "mouse" || value === "enter") return value;
+	if (value === "dom" || value === "mouse" || value === "enter") return value;
 	throw new BrowserToolInputError();
 }
 

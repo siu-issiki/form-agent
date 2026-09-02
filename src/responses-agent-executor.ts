@@ -619,8 +619,8 @@ function isElementId(value: unknown): value is string {
 
 function isSubmitActivationStrategy(
 	value: unknown,
-): value is "mouse" | "enter" {
-	return value === "mouse" || value === "enter";
+): value is "dom" | "mouse" | "enter" {
+	return value === "dom" || value === "mouse" || value === "enter";
 }
 
 function readResponseOutput(value: JsonObject): JsonObject[] {
@@ -733,7 +733,7 @@ function systemPrompt(dryRun: boolean): string {
 		"For fill and select, choose only a payloadKey from payload.formValues. The trusted handler resolves its value; never invent personal or company data.",
 		"Use select for select elements, checkboxes, and radio controls. Click is only for a non-submit button with type=button.",
 		"Before submit, re-observe and verify the target, all values, required fields, and that submit has not been attempted.",
-		"Choose submit activationStrategy from the observed DOM: prefer mouse for visible button or input submit controls; use enter only when keyboard activation is more appropriate.",
+		"Choose submit activationStrategy from the observed DOM: prefer dom for button or input submit controls; use mouse only when a trusted click gesture is required, or enter when keyboard activation is required.",
 		"Use submit exactly once. Only submit can report sent.",
 		"If meaning or submission outcome is unclear, call finish with uncertain. For technical failures, call finish with failed.",
 	];
@@ -787,7 +787,7 @@ const AGENT_TOOLS = [
 	),
 	functionTool(
 		"submit",
-		"Submit once with a model-selected constrained CDP activation after confirming the target, required fields, values, and absence of sales prohibitions. Mouse coordinates are derived from the live DOM by the trusted handler.",
+		"Submit once with a model-selected constrained CDP activation after confirming the target, required fields, values, and absence of sales prohibitions. Prefer DOM activation; mouse coordinates are derived from the live DOM only when explicitly selected.",
 		{
 			elementId: {
 				type: "string",
@@ -796,7 +796,7 @@ const AGENT_TOOLS = [
 			},
 			activationStrategy: {
 				type: "string",
-				enum: ["mouse", "enter"],
+				enum: ["dom", "mouse", "enter"],
 			},
 		},
 	),

@@ -124,6 +124,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#expectedSubmissionRequest: ExpectedSubmissionRequest | undefined;
 	#submissionAttemptInProgress = false;
 	#submissionRequestBlockStage: SubmissionRequestBlockStage | undefined;
+	#validatedSubmitInputBackendNodeId: number | undefined;
 	#targetPolicyError: Error | undefined;
 	#elementGeneration = 0;
 	#elements = new Map<string, ElementReference>();
@@ -382,6 +383,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 
 	async validateSubmit(elementId: string): Promise<void> {
 		this.#expectedSubmissionRequest = undefined;
+		this.#validatedSubmitInputBackendNodeId = undefined;
 		const reference = this.#element(elementId);
 		const state = await this.#inspectElement(reference.backendNodeId);
 		if (
@@ -403,6 +405,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				)
 			) {
 				hasInputInSubmitForm = true;
+				this.#validatedSubmitInputBackendNodeId = inputBackendNodeId;
 				break;
 			}
 		}
@@ -575,6 +578,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		this.#elements.clear();
 		this.#successfulInputBackendNodeIds.clear();
 		this.#expectedSubmissionRequest = undefined;
+		this.#validatedSubmitInputBackendNodeId = undefined;
 	}
 
 	async #discoverForms(
@@ -665,6 +669,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		backendNodeId: number,
 		argumentBackendNodeId: number,
 		functionDeclaration: string,
+		args: unknown[] = [],
 	): Promise<TResult> {
 		const [resolved, argumentResolved] = await Promise.all([
 			this.#send<ResolvedNode>("DOM.resolveNode", { backendNodeId }),
@@ -695,7 +700,10 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				{
 					objectId,
 					functionDeclaration,
-					arguments: [{ objectId: argumentObjectId }],
+					arguments: [
+						{ objectId: argumentObjectId },
+						...args.map((value) => ({ value })),
+					],
 					returnByValue: true,
 				},
 			);
@@ -891,6 +899,24 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				activationStrategy,
 			}),
 		);
+		if (activationStrategy === "dom") {
+			const inputBackendNodeId = this.#validatedSubmitInputBackendNodeId;
+			const expectedRequest = this.#expectedSubmissionRequest;
+			if (!inputBackendNodeId || !expectedRequest) {
+				throw new BrowserElementError();
+			}
+			await this.#activatePreparedSubmit(async () => {
+				const activated =
+					await this.#callFunctionOnElementWithElementArgument<boolean>(
+						backendNodeId,
+						inputBackendNodeId,
+						ACTIVATE_SUBMIT_FUNCTION,
+						[expectedRequest.url, expectedRequest.method],
+					);
+				if (!activated) throw new BrowserElementError();
+			}, "dom");
+			return;
+		}
 		if (activationStrategy === "mouse") {
 			let hitTestAttempts = 0;
 			const point = await this.#prepareMouseClick(
@@ -1241,9 +1267,10 @@ export function submitUncertainReasonCode(
 	if (blockStage === "network_policy") {
 		return "SUBMIT_NETWORK_POLICY_BLOCKED";
 	}
-	return activationStrategy === "mouse"
-		? "SUBMIT_MOUSE_REQUEST_NOT_OBSERVED"
-		: "SUBMIT_ENTER_REQUEST_NOT_OBSERVED";
+	if (activationStrategy === "dom") return "SUBMIT_DOM_REQUEST_NOT_OBSERVED";
+	if (activationStrategy === "mouse")
+		return "SUBMIT_MOUSE_REQUEST_NOT_OBSERVED";
+	return "SUBMIT_ENTER_REQUEST_NOT_OBSERVED";
 }
 
 export function assertExpectedSubmissionRequest(
@@ -1266,6 +1293,28 @@ const SET_SELECT_VALUE_FUNCTION = `function(value) {
   this.value = value;
   this.dispatchEvent(new Event("input", { bubbles: true }));
   this.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
+}`;
+
+export const ACTIVATE_SUBMIT_FUNCTION = `function(input, expectedAction, expectedMethod) {
+  if (!this.isConnected || this.disabled || !this.form || !input?.isConnected || input.form !== this.form) return false;
+  const tag = typeof this.tagName === "string" ? this.tagName.toLowerCase() : "";
+  const type = typeof this.type === "string" ? this.type.toLowerCase() : "";
+  const submitLike = (tag === "button" && (!type || type === "submit")) || (tag === "input" && ["submit", "image"].includes(type));
+  if (!submitLike) return false;
+  const rect = this.getBoundingClientRect();
+  const style = getComputedStyle(this);
+  if (rect.width <= 0 || rect.height <= 0 || style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+  const target = (this.getAttribute("formtarget") ?? this.form.getAttribute("target") ?? "").trim().toLowerCase();
+  if (target && target !== "_self") return false;
+  const rawAction = this.hasAttribute("formaction") ? this.formAction : this.form.action;
+  const action = new URL(rawAction);
+  action.hash = "";
+  const method = (this.hasAttribute("formmethod") ? this.formMethod : this.form.method).toUpperCase();
+  if (action.toString() !== expectedAction || method !== expectedMethod) return false;
+  const nativeClick = HTMLElement.prototype.click;
+  if (typeof nativeClick !== "function") return false;
+  nativeClick.call(this);
   return true;
 }`;
 
