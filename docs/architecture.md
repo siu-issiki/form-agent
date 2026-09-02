@@ -139,7 +139,8 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 - 1 試行につき最大 1 browser session とし、終了時に接続を閉じる。Queue retry では同じジョブに対して新しい Agent 実行と session を開始する。
 - proxy country は `jp`、session timeout は 15 分とする。CDP URL の `timeout=15` は session の寿命が 15 分であることを意味する。
 - CDP WebSocket が自発的に閉じた場合、close code、reason（200 文字まで）、`wasClean`、未完了コマンド数を値を含めずに記録する。
-- 接続確立（CDP 接続から初期化完了まで）が一過性の障害で失敗した場合だけ、10 秒 → 20 秒 → 30 秒の待機を挟んで最大 3 回再接続する。再試行は送信前の接続段階に限定し、フォームへの副作用はない。API key 不正や endpoint 不正のような恒久的な失敗は再試行しない。
+- 接続確立（CDP 接続から初期化完了まで）が一過性の障害で失敗した場合だけ、10 秒 → 20 秒 → 30 秒の待機を挟んで最大 3 回再接続する。再試行は送信前の接続段階に限定し、フォームへの副作用はない。
+- 再試行の可否は失敗の種別で決める。WebSocket upgrade が拒否された場合は HTTP status が 408、429、5xx のときだけ再試行し、401 / 403 / 404 等の恒久的な拒否は即座に失敗させる。upgrade 要求自体が失敗したネットワーク障害、接続断、コマンド timeout は再試行する。endpoint 不正や API key 未設定は接続を試みずに失敗させる。
 - popup、Worker、Service Worker、WebSocket 等の迂回経路を遮断する。
 - CDP の `DOM.getDocument` を `pierce: true` で取得し、通常 DOM と open / closed Shadow DOM を Worker 側で走査する。
 - 観測した同一ページ・許可hostのリンクを最大20件までモデルへ返し、サイト内別ページのフォーム探索に利用する。

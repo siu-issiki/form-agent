@@ -5,6 +5,7 @@ import {
 	assertCdpMessageWithinLimit,
 	BrowserUseCdpConnection,
 	BrowserUseCdpPayloadTooLargeError,
+	BrowserUseCdpUpgradeRejectedError,
 	MAX_CDP_MESSAGE_CHARACTERS,
 } from "../src/browser-use-cdp";
 import {
@@ -1932,5 +1933,214 @@ describe("BrowserUseCdpConnection close logging", () => {
 		expect(webSocket.closeCalls).toEqual([
 			{ code: 1000, reason: "Form Agent run complete" },
 		]);
+	});
+});
+
+describe("BrowserUseCdpDriver.connect upgrade classification", () => {
+	test("does not retry an unauthorized upgrade", async () => {
+		let connectAttempts = 0;
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await BrowserUseCdpDriver.connect(
+				"api-key",
+				connectJob,
+				true,
+				"wss://connect.browser-use.com",
+				{
+					retryDelaysMs: [10, 20, 30],
+					sleep: async () => {},
+					connectConnection: async () => {
+						connectAttempts += 1;
+						throw new BrowserUseCdpUpgradeRejectedError(401);
+					},
+				},
+			);
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect(caught).toBeInstanceOf(BrowserUseCdpUpgradeRejectedError);
+		expect((caught as BrowserUseCdpUpgradeRejectedError).status).toBe(401);
+		expect(connectAttempts).toBe(1);
+		expect(captured.warnings).toEqual([]);
+	});
+
+	test("retries an upgrade rejected by a server error", async () => {
+		let connectAttempts = 0;
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await BrowserUseCdpDriver.connect(
+				"api-key",
+				connectJob,
+				true,
+				"wss://connect.browser-use.com",
+				{
+					retryDelaysMs: [10, 20, 30],
+					sleep: async () => {},
+					connectConnection: async () => {
+						connectAttempts += 1;
+						throw new BrowserUseCdpUpgradeRejectedError(503);
+					},
+				},
+			);
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect((caught as BrowserUseCdpUpgradeRejectedError).status).toBe(503);
+		expect(connectAttempts).toBe(4);
+		expect(captured.warnings).toHaveLength(3);
+		expect(JSON.parse(captured.warnings[0] ?? "{}")).toEqual({
+			event: "browser_use_connect_retry",
+			attempt: 1,
+			delayMs: 10,
+			reason: "CDP_UPGRADE_REJECTED",
+			status: 503,
+		});
+	});
+
+	test("retries a failed upgrade request", async () => {
+		let connectAttempts = 0;
+		const captured = captureWarnings();
+		const failure = new Error("Browser Use CDP connection failed");
+
+		let caught: unknown;
+		try {
+			await BrowserUseCdpDriver.connect(
+				"api-key",
+				connectJob,
+				true,
+				"wss://connect.browser-use.com",
+				{
+					retryDelaysMs: [10, 20, 30],
+					sleep: async () => {},
+					connectConnection: async () => {
+						connectAttempts += 1;
+						throw failure;
+					},
+				},
+			);
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect(caught).toBe(failure);
+		expect(connectAttempts).toBe(4);
+		expect(JSON.parse(captured.warnings[0] ?? "{}")).toEqual({
+			event: "browser_use_connect_retry",
+			attempt: 1,
+			delayMs: 10,
+			reason: "CDP_CONNECTION_FAILED",
+		});
+	});
+
+	test("classifies a rejected upgrade response by its status", async () => {
+		let caught: unknown;
+		try {
+			await BrowserUseCdpConnection.connect(
+				"wss://connect.browser-use.com/session",
+				(async () =>
+					new Response("no", { status: 403 })) as unknown as typeof fetch,
+			);
+		} catch (error) {
+			caught = error;
+		}
+
+		expect(caught).toBeInstanceOf(BrowserUseCdpUpgradeRejectedError);
+		expect((caught as BrowserUseCdpUpgradeRejectedError).status).toBe(403);
+		expect((caught as Error).message).toBe("Browser Use CDP connection failed");
+	});
+
+	test("treats a rejected upgrade request as a network failure", async () => {
+		let caught: unknown;
+		try {
+			await BrowserUseCdpConnection.connect(
+				"wss://connect.browser-use.com/session",
+				(async () => {
+					throw new TypeError("Network connection lost");
+				}) as unknown as typeof fetch,
+			);
+		} catch (error) {
+			caught = error;
+		}
+
+		expect(caught).toBeInstanceOf(Error);
+		expect(caught).not.toBeInstanceOf(BrowserUseCdpUpgradeRejectedError);
+		expect((caught as Error).message).toBe("Browser Use CDP connection failed");
+	});
+});
+
+describe("BrowserUseCdpConnection close diagnostics", () => {
+	test("records the close diagnostics when an error precedes the close", async () => {
+		const webSocket = new FakeWebSocket();
+		const connection = await BrowserUseCdpConnection.connect(
+			"wss://connect.browser-use.com/session",
+			stubUpgradeFetch(webSocket),
+		);
+		const pending = connection.send("Page.enable");
+		const captured = captureWarnings();
+		try {
+			webSocket.emit("error", {});
+			webSocket.emit("close", {
+				code: 1006,
+				reason: "abnormal closure",
+				wasClean: false,
+			});
+		} finally {
+			captured.restore();
+		}
+
+		await expect(pending).rejects.toThrow("Browser Use CDP connection closed");
+		const events = captured.warnings.map(
+			(warning) => (JSON.parse(warning) as { event: string }).event,
+		);
+		expect(events).toEqual(["browser_use_cdp_error", "browser_use_cdp_closed"]);
+		expect(JSON.parse(captured.warnings[1] ?? "{}")).toEqual({
+			event: "browser_use_cdp_closed",
+			code: 1006,
+			reason: "abnormal closure",
+			wasClean: false,
+			pending: 0,
+		});
+	});
+
+	test("records the close diagnostics once when a close precedes an error", async () => {
+		const webSocket = new FakeWebSocket();
+		const connection = await BrowserUseCdpConnection.connect(
+			"wss://connect.browser-use.com/session",
+			stubUpgradeFetch(webSocket),
+		);
+		const pending = connection.send("Page.enable");
+		const captured = captureWarnings();
+		try {
+			webSocket.emit("close", {
+				code: 1011,
+				reason: "server error",
+				wasClean: false,
+			});
+			webSocket.emit("error", {});
+		} finally {
+			captured.restore();
+		}
+
+		await expect(pending).rejects.toThrow("Browser Use CDP connection closed");
+		expect(captured.warnings).toHaveLength(1);
+		expect(JSON.parse(captured.warnings[0] ?? "{}")).toEqual({
+			event: "browser_use_cdp_closed",
+			code: 1011,
+			reason: "server error",
+			wasClean: false,
+			pending: 1,
+		});
 	});
 });

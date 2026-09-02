@@ -29,6 +29,8 @@ export class BrowserUseCdpConnection {
 	#listeners = new Map<string, Set<CdpEventListener>>();
 	#lastResponseCharacters = new Map<string, number>();
 	#closed = false;
+	#closeRequested = false;
+	#closeLogged = false;
 
 	private constructor(private readonly webSocket: WebSocket) {
 		webSocket.addEventListener("message", (event) => this.#onMessage(event));
@@ -45,12 +47,17 @@ export class BrowserUseCdpConnection {
 			throw new Error("A secure CDP WebSocket endpoint is required");
 		}
 		url.protocol = "https:";
-		const response = await fetchImpl(url, {
-			headers: { Upgrade: "websocket" },
-		});
+		let response: Response;
+		try {
+			response = await fetchImpl(url, {
+				headers: { Upgrade: "websocket" },
+			});
+		} catch {
+			throw new Error("Browser Use CDP connection failed");
+		}
 		if (response.status !== 101 || !response.webSocket) {
 			await response.body?.cancel();
-			throw new Error("Browser Use CDP connection failed");
+			throw new BrowserUseCdpUpgradeRejectedError(response.status);
 		}
 		response.webSocket.accept();
 		return new BrowserUseCdpConnection(response.webSocket);
@@ -104,6 +111,7 @@ export class BrowserUseCdpConnection {
 
 	close(): void {
 		if (this.#closed) return;
+		this.#closeRequested = true;
 		this.#closed = true;
 		this.webSocket.close(1000, "Form Agent run complete");
 		this.#rejectPending();
@@ -118,6 +126,7 @@ export class BrowserUseCdpConnection {
 				caught instanceof BrowserUseCdpPayloadTooLargeError
 					? caught
 					: new BrowserUseCdpPayloadTooLargeError();
+			this.#closeRequested = true;
 			this.#closed = true;
 			this.webSocket.close(1009, "CDP message is too large");
 			this.#rejectPending(error);
@@ -147,16 +156,19 @@ export class BrowserUseCdpConnection {
 	}
 
 	#onClose(event: CloseEvent): void {
+		if (!this.#closeRequested && !this.#closeLogged) {
+			this.#closeLogged = true;
+			console.warn(
+				JSON.stringify({
+					event: "browser_use_cdp_closed",
+					code: event.code,
+					reason: (event.reason ?? "").slice(0, MAX_CLOSE_REASON_CHARACTERS),
+					wasClean: event.wasClean,
+					pending: this.#pending.size,
+				}),
+			);
+		}
 		if (this.#closed) return;
-		console.warn(
-			JSON.stringify({
-				event: "browser_use_cdp_closed",
-				code: event.code,
-				reason: (event.reason ?? "").slice(0, MAX_CLOSE_REASON_CHARACTERS),
-				wasClean: event.wasClean,
-				pending: this.#pending.size,
-			}),
-		);
 		this.#closed = true;
 		this.#rejectPending();
 	}
@@ -176,6 +188,13 @@ export class BrowserUseCdpConnection {
 			pending.reject(error);
 		}
 		this.#pending.clear();
+	}
+}
+
+export class BrowserUseCdpUpgradeRejectedError extends Error {
+	constructor(readonly status: number) {
+		super("Browser Use CDP connection failed");
+		this.name = "BrowserUseCdpUpgradeRejectedError";
 	}
 }
 

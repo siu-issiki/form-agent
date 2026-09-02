@@ -1,6 +1,9 @@
 import { assertAllowedBrowserRequest } from "./browser-network-policy";
 import { SUBMISSION_CONFIRMATION_PATTERN } from "./browser-submit-confirmation";
-import { BrowserUseCdpConnection } from "./browser-use-cdp";
+import {
+	BrowserUseCdpConnection,
+	BrowserUseCdpUpgradeRejectedError,
+} from "./browser-use-cdp";
 import {
 	type CdpDomNode,
 	type CdpFormDiscovery,
@@ -51,25 +54,38 @@ export interface BrowserUseConnectOptions {
 	) => Promise<BrowserUseCdpConnection>;
 }
 
+export function isRetryableUpgradeStatus(status: number): boolean {
+	return status === 408 || status === 429 || status >= 500;
+}
+
 function isRetryableConnectError(error: unknown): boolean {
+	if (error instanceof BrowserUseCdpUpgradeRejectedError) {
+		return isRetryableUpgradeStatus(error.status);
+	}
 	return (
 		error instanceof Error &&
 		RETRYABLE_CONNECT_ERROR_MESSAGES.has(error.message)
 	);
 }
 
-export function connectFailureReason(error: unknown): string {
-	if (!(error instanceof Error)) return "UNKNOWN";
+export function connectFailureDetail(error: unknown): {
+	reason: string;
+	status?: number;
+} {
+	if (error instanceof BrowserUseCdpUpgradeRejectedError) {
+		return { reason: "CDP_UPGRADE_REJECTED", status: error.status };
+	}
+	if (!(error instanceof Error)) return { reason: "UNKNOWN" };
 	switch (error.message) {
 		case "Browser Use CDP connection failed":
-			return "CDP_CONNECTION_FAILED";
+			return { reason: "CDP_CONNECTION_FAILED" };
 		case "Browser Use CDP connection is closed":
 		case "Browser Use CDP connection closed":
-			return "CDP_CONNECTION_CLOSED";
+			return { reason: "CDP_CONNECTION_CLOSED" };
 		case "Browser Use CDP command timed out":
-			return "CDP_COMMAND_TIMEOUT";
+			return { reason: "CDP_COMMAND_TIMEOUT" };
 		default:
-			return "UNKNOWN";
+			return { reason: "UNKNOWN" };
 	}
 }
 
@@ -260,7 +276,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 						event: "browser_use_connect_retry",
 						attempt,
 						delayMs,
-						reason: connectFailureReason(lastError),
+						...connectFailureDetail(lastError),
 					}),
 				);
 				await sleep(delayMs);
