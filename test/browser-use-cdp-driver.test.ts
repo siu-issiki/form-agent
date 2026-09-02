@@ -46,6 +46,7 @@ import {
 	submitUncertainReasonCode,
 	toFormSnapshot,
 	toObservedFieldState,
+	waitForSubmissionConfirmation,
 } from "../src/browser-use-cdp-driver";
 import {
 	BrowserElementError,
@@ -460,7 +461,6 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 		const root = {
 			backendNodeId: 1,
 			nodeName: "#document",
-			frameId: "top-frame",
 			children: [
 				{ backendNodeId: 2, nodeName: "BODY" },
 				{
@@ -477,8 +477,12 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 			],
 		};
 
-		expect(discoverCdpBodyBackendNodeIds(root, 20, "top-frame")).toEqual([2]);
-		expect(discoverCdpBodyBackendNodeIds(root, 20, "form-frame")).toEqual([5]);
+		expect(
+			discoverCdpBodyBackendNodeIds(root, 20, "top-frame", "top-frame"),
+		).toEqual([2]);
+		expect(
+			discoverCdpBodyBackendNodeIds(root, 20, "form-frame", "top-frame"),
+		).toEqual([5]);
 	});
 });
 
@@ -1084,6 +1088,54 @@ describe("BrowserUseCdpDriver child target policy", () => {
 });
 
 describe("BrowserUseCdpDriver submission confirmation", () => {
+	test("waits beyond the former five-second window for a late confirmation", async () => {
+		let elapsed = 0;
+		let reads = 0;
+		const result = await waitForSubmissionConfirmation(
+			async () => {
+				reads += 1;
+				return elapsed >= 6_000
+					? {
+							outcome: "sent" as const,
+							formUrl: "https://example.com/complete",
+						}
+					: null;
+			},
+			async (milliseconds) => {
+				elapsed += milliseconds;
+			},
+			15_000,
+			() => elapsed,
+		);
+
+		expect(result).toEqual({
+			outcome: "sent",
+			formUrl: "https://example.com/complete",
+		});
+		expect(elapsed).toBe(6_000);
+		expect(reads).toBe(6);
+	});
+
+	test("stops confirmation checks at the configured deadline", async () => {
+		let elapsed = 0;
+		let reads = 0;
+		const result = await waitForSubmissionConfirmation(
+			async () => {
+				reads += 1;
+				return null;
+			},
+			async (milliseconds) => {
+				elapsed += milliseconds;
+			},
+			3_500,
+			() => elapsed,
+		);
+
+		expect(result).toBeNull();
+		expect(elapsed).toBe(3_500);
+		expect(reads).toBe(5);
+	});
+
 	test("accepts only a navigation of the submitted form frame", () => {
 		const revisions = new Map([
 			["form-frame", 2],
