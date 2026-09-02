@@ -508,11 +508,24 @@ export function detectProhibitedTextReasonCodes(
 function trustObservedForms(forms: unknown[]): unknown[] {
 	return forms.map((form) => {
 		if (!isRecord(form)) return form;
-		const { prohibitionText, ...visibleForm } = form;
-		if (typeof prohibitionText !== "string") return visibleForm;
+		const { prohibitionText, prohibitionTexts, ...visibleForm } = form;
+		const texts = Array.isArray(prohibitionTexts)
+			? prohibitionTexts.filter(
+					(value): value is string => typeof value === "string",
+				)
+			: typeof prohibitionText === "string"
+				? [prohibitionText]
+				: null;
+		if (!texts) return visibleForm;
+		const codes: ProhibitedReasonCode[] = [];
+		for (const text of texts) {
+			for (const code of detectProhibitedTextReasonCodes(text)) {
+				if (!codes.includes(code)) codes.push(code);
+			}
+		}
 		return {
 			...visibleForm,
-			prohibitedReasonCodes: detectProhibitedTextReasonCodes(prohibitionText),
+			prohibitedReasonCodes: codes,
 		};
 	});
 }

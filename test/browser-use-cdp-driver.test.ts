@@ -52,7 +52,7 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 	test("reads preceding warnings and form text without including a footer", () => {
 		const readContext = runInNewContext(
 			`(${READ_FORM_PROHIBITION_CONTEXT_FUNCTION})`,
-		) as (this: object, maxLength: number) => string;
+		) as (this: object, maxLength: number) => string[];
 
 		expect(
 			readContext.call(
@@ -68,13 +68,13 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 				},
 				100,
 			),
-		).toBe("一般お問い合わせフォーム 営業利用は禁止です");
+		).toEqual(["一般お問い合わせフォーム", "営業利用は禁止です"]);
 	});
 
 	test("crosses a shadow host but excludes unrelated header context", () => {
 		const readContext = runInNewContext(
 			`(${READ_FORM_PROHIBITION_CONTEXT_FUNCTION})`,
-		) as (this: object, maxLength: number) => string;
+		) as (this: object, maxLength: number) => string[];
 		const body = { tagName: "BODY" };
 		const header = {
 			tagName: "HEADER",
@@ -106,25 +106,25 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 			getRootNode: () => ({ host }),
 		};
 
-		const result = readContext.call(form, 200);
+		const result = readContext.call(form, 200).join(" ");
 		expect(result).toContain("営業利用は禁止です");
 		expect(result).not.toContain("採用お問い合わせ専用サイト");
 	});
 
-	test("keeps form text ahead of oversized preceding context", () => {
+	test("keeps an outside warning separate from oversized form text", () => {
 		const readContext = runInNewContext(
 			`(${READ_FORM_PROHIBITION_CONTEXT_FUNCTION})`,
-		) as (this: object, maxLength: number) => string;
+		) as (this: object, maxLength: number) => string[];
 		const previous = {
-			tagName: "DIV",
-			innerText: "x".repeat(500),
+			tagName: "ASIDE",
+			innerText: "営業目的の利用は禁止です",
 			previousElementSibling: null,
 			matches: () => false,
 			querySelector: () => null,
 		};
 		const form = {
 			tagName: "FORM",
-			innerText: "営業目的の利用は禁止です",
+			innerText: "x".repeat(500),
 			previousElementSibling: previous,
 			parentElement: { tagName: "BODY" },
 		};

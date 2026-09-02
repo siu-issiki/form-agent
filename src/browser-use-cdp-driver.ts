@@ -23,6 +23,7 @@ import {
 } from "./restricted-browser";
 
 const MAX_PAGE_TEXT = 20_000;
+const MAX_PROHIBITION_SEGMENT_TEXT = 4_000;
 const MAX_OBSERVED_FORMS = 10;
 const MAX_OBSERVED_FIELDS = 100;
 const MAX_DOM_DISCOVERY_ATTEMPTS = 5;
@@ -273,7 +274,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			action: string;
 			method: string;
 			fields: unknown[];
-			prohibitionText: string;
+			prohibitionTexts: string[];
 		}> = [];
 		let fieldIndex = 0;
 
@@ -314,30 +315,29 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				});
 			}
 			if (fields.length > 0) {
-				const formProhibitionText = await this.#callFunctionOnElement<string>(
-					candidateForm.backendNodeId,
-					READ_FORM_PROHIBITION_CONTEXT_FUNCTION,
-					[MAX_PAGE_TEXT],
-				);
+				const formProhibitionTexts = await this.#callFunctionOnElement<
+					string[]
+				>(candidateForm.backendNodeId, READ_FORM_PROHIBITION_CONTEXT_FUNCTION, [
+					MAX_PROHIBITION_SEGMENT_TEXT,
+				]);
 				const frameOwnerBackendNodeId = candidateForm.frameId
 					? findCdpFrameOwnerBackendNodeId(root, candidateForm.frameId)
 					: undefined;
-				const parentProhibitionText = frameOwnerBackendNodeId
-					? await this.#callFunctionOnElement<string>(
+				const parentProhibitionTexts = frameOwnerBackendNodeId
+					? await this.#callFunctionOnElement<string[]>(
 							frameOwnerBackendNodeId,
 							READ_FORM_PROHIBITION_CONTEXT_FUNCTION,
-							[MAX_PAGE_TEXT],
+							[MAX_PROHIBITION_SEGMENT_TEXT],
 						)
-					: "";
+					: [];
 				forms.push({
 					action: candidateForm.action,
 					method: candidateForm.method,
 					fields,
-					prohibitionText:
-						`${formProhibitionText} ${parentProhibitionText}`.slice(
-							0,
-							MAX_PAGE_TEXT,
-						),
+					prohibitionTexts: [
+						...formProhibitionTexts,
+						...parentProhibitionTexts,
+					],
 				});
 			}
 		}
@@ -1730,22 +1730,39 @@ export const CHECK_FORM_VALIDITY_FUNCTION = `function() {
 }`;
 
 export const READ_FORM_PROHIBITION_CONTEXT_FUNCTION = `function(maxLength) {
-  const texts = [this.innerText ?? ""];
-  let current = this;
-  for (let depth = 0; depth < 3 && current; depth += 1) {
-    let sibling = current.previousElementSibling;
-    const siblingLimit = depth === 0 ? 3 : 1;
-    for (let count = 0; count < siblingLimit && sibling; count += 1) {
-      if (sibling.matches?.("form") || sibling.querySelector?.("form")) break;
-      if (!["HEADER", "NAV", "FOOTER"].includes(sibling.tagName)) {
-        texts.push(String(sibling.innerText ?? "").slice(0, maxLength));
-      }
-      sibling = sibling.previousElementSibling;
-    }
-    current = current.parentElement ?? current.getRootNode?.()?.host ?? null;
-    if (!current || current.tagName === "BODY") break;
-  }
-  return texts.join(" ").slice(0, maxLength);
+  const texts = [];
+  const appendText = (value) => {
+    const text = String(value ?? "");
+    texts.push(text.slice(0, maxLength));
+    if (text.length > maxLength) texts.push(text.slice(-maxLength));
+  };
+  appendText(this.innerText);
+	const appendPrevious = (element, limit) => {
+		let sibling = element?.previousElementSibling;
+		for (let count = 0; count < limit && sibling; count += 1) {
+			if (sibling.matches?.("form") || sibling.querySelector?.("form")) break;
+			if (!["HEADER", "NAV", "FOOTER"].includes(sibling.tagName)) {
+				appendText(sibling.innerText);
+			}
+			sibling = sibling.previousElementSibling;
+		}
+	};
+	appendPrevious(this, 3);
+	let current = this.parentElement;
+	for (let depth = 0; depth < 2 && current && current.tagName !== "BODY"; depth += 1) {
+		appendPrevious(current, 1);
+		current = current.parentElement;
+	}
+	const host = this.getRootNode?.()?.host ?? null;
+	if (host) {
+		appendPrevious(host, 1);
+		current = host.parentElement;
+		for (let depth = 0; depth < 2 && current && current.tagName !== "BODY"; depth += 1) {
+			appendPrevious(current, 1);
+			current = current.parentElement;
+		}
+	}
+  return texts;
 }`;
 
 export const HAS_SAME_FORM_OWNER_FUNCTION = `function(input) {
