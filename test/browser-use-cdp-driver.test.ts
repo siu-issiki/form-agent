@@ -457,7 +457,6 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 		const root = {
 			backendNodeId: 1,
 			nodeName: "#document",
-			frameId: "top-frame",
 			children: [
 				{ backendNodeId: 2, nodeName: "BODY" },
 				{
@@ -474,8 +473,12 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 			],
 		};
 
-		expect(discoverCdpBodyBackendNodeIds(root, 20, "top-frame")).toEqual([2]);
-		expect(discoverCdpBodyBackendNodeIds(root, 20, "form-frame")).toEqual([5]);
+		expect(
+			discoverCdpBodyBackendNodeIds(root, 20, "top-frame", "top-frame"),
+		).toEqual([2]);
+		expect(
+			discoverCdpBodyBackendNodeIds(root, 20, "form-frame", "top-frame"),
+		).toEqual([5]);
 	});
 });
 

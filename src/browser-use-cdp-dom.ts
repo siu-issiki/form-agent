@@ -196,6 +196,7 @@ export function discoverCdpBodyBackendNodeIds(
 	root: CdpDomNode,
 	maxBodies = 20,
 	targetFrameId?: string,
+	topFrameId?: string,
 ): number[] {
 	const backendNodeIds: number[] = [];
 	const visit = (node: CdpDomNode, inheritedFrameId?: string) => {
@@ -224,7 +225,7 @@ export function discoverCdpBodyBackendNodeIds(
 		}
 		if (node.templateContent) visit(node.templateContent, frameId);
 	};
-	visit(root, root.frameId);
+	visit(root, root.frameId ?? topFrameId);
 	return backendNodeIds;
 }
 
