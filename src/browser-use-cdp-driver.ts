@@ -4,6 +4,7 @@ import { BrowserUseCdpConnection } from "./browser-use-cdp";
 import {
 	type CdpDomNode,
 	type CdpFormDiscovery,
+	discoverCdpBodyBackendNodeIds,
 	discoverCdpForms,
 	discoverCdpNavigationLinks,
 } from "./browser-use-cdp-dom";
@@ -447,7 +448,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		this.#interactionStarted = true;
 		let beforeText: string;
 		try {
-			beforeText = await this.#bodyText();
+			beforeText = await this.#documentText();
 		} catch (error) {
 			throw createBrowserSubmitDiagnosticError(
 				"SUBMIT_READ_BEFORE_TEXT",
@@ -469,7 +470,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			while (Date.now() < deadline) {
 				const confirmation = await readSubmissionConfirmation(
 					beforeText,
-					() => this.#bodyText(),
+					() => this.#documentText(),
 					() => this.currentUrl(),
 				);
 				if (confirmation) return confirmation;
@@ -580,6 +581,22 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		return this.#evaluate<string>(
 			`(document.body?.innerText ?? "").slice(0, ${MAX_PAGE_TEXT})`,
 		);
+	}
+
+	async #documentText(): Promise<string> {
+		const { root } = await this.#send<{ root: CdpDomNode }>("DOM.getDocument", {
+			depth: -1,
+			pierce: true,
+		});
+		const texts = await Promise.all(
+			discoverCdpBodyBackendNodeIds(root).map((backendNodeId) =>
+				this.#callFunctionOnElement<string>(
+					backendNodeId,
+					READ_ELEMENT_TEXT_FUNCTION,
+				),
+			),
+		);
+		return texts.join("\n").slice(0, MAX_PAGE_TEXT);
 	}
 
 	#element(elementId: string): ElementReference {
@@ -1251,6 +1268,10 @@ const INSPECT_ELEMENT_FUNCTION = String.raw`function() {
     readOnly: Boolean(element.readOnly),
     checked: Boolean(element.checked)
   };
+}`;
+
+const READ_ELEMENT_TEXT_FUNCTION = `function() {
+  return String(this.innerText || "").slice(0, 20000);
 }`;
 
 export function createExpectedSubmissionRequest(

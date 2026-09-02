@@ -7,6 +7,7 @@ import {
 	MAX_CDP_MESSAGE_CHARACTERS,
 } from "../src/browser-use-cdp";
 import {
+	discoverCdpBodyBackendNodeIds,
 	discoverCdpForms,
 	discoverCdpNavigationLinks,
 } from "../src/browser-use-cdp-dom";
@@ -202,6 +203,21 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 			{ url: "https://example.com/contact", text: "" },
 			{ url: "https://forms.example.com/directory/contact", text: "" },
 		]);
+	});
+
+	test("discovers body nodes in the top document and iframe documents", () => {
+		expect(
+			discoverCdpBodyBackendNodeIds({
+				backendNodeId: 1,
+				nodeName: "#document",
+				children: [{ backendNodeId: 2, nodeName: "BODY" }],
+				contentDocument: {
+					backendNodeId: 3,
+					nodeName: "#document",
+					children: [{ backendNodeId: 4, nodeName: "BODY" }],
+				},
+			}),
+		).toEqual([2, 4]);
 	});
 });
 
