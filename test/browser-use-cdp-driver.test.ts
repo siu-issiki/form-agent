@@ -7,6 +7,7 @@ import {
 	MAX_CDP_MESSAGE_CHARACTERS,
 } from "../src/browser-use-cdp";
 import {
+	discoverCdpBodyBackendNodeIds,
 	discoverCdpForms,
 	discoverCdpNavigationLinks,
 } from "../src/browser-use-cdp-dom";
@@ -17,6 +18,7 @@ import {
 	BLOCK_BROWSER_ESCAPE_EXPRESSION,
 	CHECK_FORM_VALIDITY_FUNCTION,
 	centerOfQuad,
+	continueSubmissionRequest,
 	createExpectedSubmissionRequest,
 	createSubmitActivationFailureLog,
 	denyRelatedBrowserTargets,
@@ -202,6 +204,21 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 			{ url: "https://example.com/contact", text: "" },
 			{ url: "https://forms.example.com/directory/contact", text: "" },
 		]);
+	});
+
+	test("discovers body nodes in the top document and iframe documents", () => {
+		expect(
+			discoverCdpBodyBackendNodeIds({
+				backendNodeId: 1,
+				nodeName: "#document",
+				children: [{ backendNodeId: 2, nodeName: "BODY" }],
+				contentDocument: {
+					backendNodeId: 3,
+					nodeName: "#document",
+					children: [{ backendNodeId: 4, nodeName: "BODY" }],
+				},
+			}),
+		).toEqual([2, 4]);
 	});
 });
 
@@ -797,9 +814,33 @@ describe("BrowserUseCdpDriver submission confirmation", () => {
 		expect(completed).toBe(true);
 	});
 
+	test("records a submission request only after CDP continues it", async () => {
+		let observed = false;
+		await expect(
+			continueSubmissionRequest(
+				async () => {
+					throw new Error("CDP continue failed");
+				},
+				() => {
+					observed = true;
+				},
+			),
+		).rejects.toThrow("CDP continue failed");
+		expect(observed).toBe(false);
+
+		await continueSubmissionRequest(
+			async () => undefined,
+			() => {
+				observed = true;
+			},
+		);
+		expect(observed).toBe(true);
+	});
+
 	test("classifies a confirmation read failure without persisting its message", async () => {
 		const failure = readSubmissionConfirmation(
-			"Contact form",
+			0,
+			true,
 			async () => {
 				throw new Error("Browser Use CDP connection closed");
 			},
@@ -816,8 +857,9 @@ describe("BrowserUseCdpDriver submission confirmation", () => {
 
 	test("classifies a confirmation URL failure", async () => {
 		const failure = readSubmissionConfirmation(
-			"Contact form",
-			async () => "送信が完了しました。ありがとうございました。",
+			0,
+			true,
+			async () => 1,
 			async () => {
 				throw new Error("Browser Use CDP command timed out");
 			},
@@ -828,6 +870,28 @@ describe("BrowserUseCdpDriver submission confirmation", () => {
 			stage: "POST_SUBMIT_URL_CHECK",
 			diagnosticCode: "CDP_COMMAND_TIMEOUT",
 		});
+	});
+
+	test("does not accept confirmation without an allowed request", async () => {
+		await expect(
+			readSubmissionConfirmation(
+				0,
+				false,
+				async () => 1,
+				async () => "https://example.com/contact",
+			),
+		).resolves.toBeNull();
+	});
+
+	test("does not accept confirmation bodies that existed before submit", async () => {
+		await expect(
+			readSubmissionConfirmation(
+				1,
+				true,
+				async () => 1,
+				async () => "https://example.com/contact",
+			),
+		).resolves.toBeNull();
 	});
 
 	test("accepts a confirmation that appears after submit", () => {

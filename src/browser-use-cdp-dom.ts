@@ -147,6 +147,22 @@ export function discoverCdpNavigationLinks(
 	return links;
 }
 
+export function discoverCdpBodyBackendNodeIds(
+	root: CdpDomNode,
+	maxBodies = 20,
+): number[] {
+	const backendNodeIds: number[] = [];
+	const visit = (node: CdpDomNode) => {
+		if (backendNodeIds.length >= maxBodies) return;
+		if (node.nodeName.toLowerCase() === "body") {
+			backendNodeIds.push(node.backendNodeId);
+		}
+		for (const child of composedChildren(node)) visit(child);
+	};
+	visit(root);
+	return backendNodeIds;
+}
+
 function descendantText(node: CdpDomNode): string {
 	let text = node.nodeName === "#text" ? (node.nodeValue ?? "") : "";
 	for (const child of composedChildren(node)) {

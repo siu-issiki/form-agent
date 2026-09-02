@@ -1,9 +1,10 @@
 import { assertAllowedBrowserRequest } from "./browser-network-policy";
-import { hasNewSubmissionConfirmation } from "./browser-submit-confirmation";
+import { SUBMISSION_CONFIRMATION_PATTERN } from "./browser-submit-confirmation";
 import { BrowserUseCdpConnection } from "./browser-use-cdp";
 import {
 	type CdpDomNode,
 	type CdpFormDiscovery,
+	discoverCdpBodyBackendNodeIds,
 	discoverCdpForms,
 	discoverCdpNavigationLinks,
 } from "./browser-use-cdp-dom";
@@ -25,7 +26,8 @@ const MAX_OBSERVED_FORMS = 10;
 const MAX_OBSERVED_FIELDS = 100;
 const MAX_DOM_DISCOVERY_ATTEMPTS = 5;
 const DOM_DISCOVERY_RETRY_DELAY_MS = 500;
-const CONFIRMATION_WAIT_MS = 5_000;
+const MAX_CONFIRMATION_SNAPSHOTS = 5;
+const CONFIRMATION_POLL_INTERVAL_MS = 1_000;
 const SUBMISSION_PERMISSION_WINDOW_MS = 2_000;
 const MAX_SUBMIT_MOUSE_PREPARATION_ATTEMPTS = 3;
 
@@ -121,6 +123,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#targetDomain: string | undefined;
 	#allowedHosts: string[] = [];
 	#submissionRequestAllowed = false;
+	#submissionRequestInFlight = false;
 	#submissionRequestCount = 0;
 	#submissionRequestObserved: (() => void) | undefined;
 	#expectedSubmissionRequest: ExpectedSubmissionRequest | undefined;
@@ -445,9 +448,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			throw createBrowserSubmitDiagnosticError("SUBMIT_VALIDATE", error);
 		}
 		this.#interactionStarted = true;
-		let beforeText: string;
+		let beforeConfirmationCount: number;
 		try {
-			beforeText = await this.#bodyText();
+			beforeConfirmationCount = await this.#confirmationBodyCount();
 		} catch (error) {
 			throw createBrowserSubmitDiagnosticError(
 				"SUBMIT_READ_BEFORE_TEXT",
@@ -465,15 +468,19 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			} catch (error) {
 				throw createBrowserSubmitDiagnosticError("SUBMIT_ACTIVATE", error);
 			}
-			const deadline = Date.now() + CONFIRMATION_WAIT_MS;
-			while (Date.now() < deadline) {
+			for (
+				let snapshot = 0;
+				snapshot < MAX_CONFIRMATION_SNAPSHOTS;
+				snapshot += 1
+			) {
+				await delay(CONFIRMATION_POLL_INTERVAL_MS);
 				const confirmation = await readSubmissionConfirmation(
-					beforeText,
-					() => this.#bodyText(),
+					beforeConfirmationCount,
+					this.#submissionRequestCount > 0,
+					() => this.#confirmationBodyCount(),
 					() => this.currentUrl(),
 				);
 				if (confirmation) return confirmation;
-				await delay(250);
 			}
 		} finally {
 			this.#submissionRequestAllowed = false;
@@ -525,6 +532,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			paused.request.method.toUpperCase(),
 		);
 		let blockStage: SubmissionRequestBlockStage = "network_policy";
+		let claimedSubmissionRequest = false;
 		try {
 			if (!this.#targetDomain) {
 				throw new Error("Browser domain scope is not configured");
@@ -541,18 +549,28 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				paused.request.url,
 				this.#targetDomain,
 				paused.request.method,
-				this.#submissionRequestAllowed && this.#submissionRequestCount === 0,
+				this.#submissionRequestAllowed &&
+					this.#submissionRequestCount === 0 &&
+					!this.#submissionRequestInFlight,
 				!this.#formDataEntered && paused.resourceType !== "Document",
 				this.dryRun && this.#interactionStarted,
 				this.#allowedHosts,
 			);
 			if (unsafeRequest) {
-				this.#submissionRequestCount += 1;
-				this.#submissionRequestObserved?.();
+				this.#submissionRequestInFlight = true;
+				claimedSubmissionRequest = true;
 			}
-			await this.#send("Fetch.continueRequest", {
-				requestId: paused.requestId,
-			});
+			await continueSubmissionRequest(
+				() =>
+					this.#send("Fetch.continueRequest", {
+						requestId: paused.requestId,
+					}),
+				() => {
+					if (!unsafeRequest) return;
+					this.#submissionRequestCount += 1;
+					this.#submissionRequestObserved?.();
+				},
+			);
 		} catch {
 			if (unsafeRequest && this.#submissionAttemptInProgress) {
 				this.#submissionRequestBlockStage ??= blockStage;
@@ -561,6 +579,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				requestId: paused.requestId,
 				errorReason: "BlockedByClient",
 			}).catch(() => undefined);
+		} finally {
+			if (claimedSubmissionRequest) this.#submissionRequestInFlight = false;
 		}
 	}
 
@@ -580,6 +600,23 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		return this.#evaluate<string>(
 			`(document.body?.innerText ?? "").slice(0, ${MAX_PAGE_TEXT})`,
 		);
+	}
+
+	async #confirmationBodyCount(): Promise<number> {
+		const { root } = await this.#send<{ root: CdpDomNode }>("DOM.getDocument", {
+			depth: -1,
+			pierce: true,
+		});
+		const matches = await Promise.all(
+			discoverCdpBodyBackendNodeIds(root).map((backendNodeId) =>
+				this.#callFunctionOnElement<boolean>(
+					backendNodeId,
+					HAS_CONFIRMATION_TEXT_FUNCTION,
+					[SUBMISSION_CONFIRMATION_PATTERN],
+				),
+			),
+		);
+		return matches.filter(Boolean).length;
 	}
 
 	#element(elementId: string): ElementReference {
@@ -966,6 +1003,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			resolveSubmissionRequestObserved = resolve;
 		});
 		this.#submissionRequestCount = 0;
+		this.#submissionRequestInFlight = false;
 		this.#submissionRequestObserved = resolveSubmissionRequestObserved;
 		this.#submissionRequestAllowed = true;
 		try {
@@ -1126,18 +1164,27 @@ export async function runSubmissionActivationWithinPermissionWindow(
 	]);
 }
 
+export async function continueSubmissionRequest(
+	continueRequest: () => Promise<unknown>,
+	recordObserved: () => void,
+): Promise<void> {
+	await continueRequest();
+	recordObserved();
+}
+
 export async function readSubmissionConfirmation(
-	beforeText: string,
-	readAfterText: () => Promise<string>,
+	beforeCount: number,
+	requestObserved: boolean,
+	readAfterCount: () => Promise<number>,
 	readCurrentUrl: () => Promise<string>,
 ): Promise<BrowserSubmitResult | null> {
-	let afterText: string;
+	let afterCount: number;
 	try {
-		afterText = await readAfterText();
+		afterCount = await readAfterCount();
 	} catch (error) {
 		throw createBrowserSubmitDiagnosticError("SUBMIT_READ_AFTER_TEXT", error);
 	}
-	if (!hasNewSubmissionConfirmation(beforeText, afterText)) return null;
+	if (!requestObserved || afterCount <= beforeCount) return null;
 	try {
 		return { outcome: "sent", formUrl: await readCurrentUrl() };
 	} catch (error) {
@@ -1251,6 +1298,10 @@ const INSPECT_ELEMENT_FUNCTION = String.raw`function() {
     readOnly: Boolean(element.readOnly),
     checked: Boolean(element.checked)
   };
+}`;
+
+const HAS_CONFIRMATION_TEXT_FUNCTION = `function(pattern) {
+  return new RegExp(pattern, "i").test(String(this.innerText || ""));
 }`;
 
 export function createExpectedSubmissionRequest(
