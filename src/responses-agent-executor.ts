@@ -1004,7 +1004,6 @@ function systemPrompt(dryRun: boolean): string {
 		"Match each field to a payload.formValues key by meaning; the trusted handler supplies the value.",
 		"Before submit, re-observe and confirm every required field on the target form holds the intended payload key.",
 		"Use submit exactly once.",
-		"submit runs an independent pre-submit review. If it returns SUBMIT_REVIEW_DENIED, change at least one field with fill or select using payloadKeys only, re-observe, and submit once more. Only INPUT_MISMATCH is correctable; any other denial ends the job as uncertain, and so does a second denial.",
 		"If meaning or submission outcome is unclear, call finish_uncertain. For technical failures, call finish_failed.",
 	];
 	if (dryRun) {
@@ -1084,7 +1083,7 @@ const AGENT_TOOLS = [
 	),
 	functionTool(
 		"submit",
-		"Submit the form that owns elementId. Accepted only once per job, only after at least one successful fill or select, only against an observe taken after the last input, and only when the handler found no prohibition on that form and native validation passes. Reports sent or uncertain; a rejected call returns an error code and nothing is sent.",
+		"Submit the form that owns elementId. Accepted only once per job, only after at least one successful fill or select, only against an observe taken after the last input, and only when the handler found no prohibition on that form and native validation passes. An independent review runs before anything is sent; a denial returns SUBMIT_REVIEW_DENIED with guidance, and only an INPUT_MISMATCH denial can be corrected once. Reports sent or uncertain; a rejected call returns an error code and nothing is sent.",
 		{
 			elementId: {
 				...ELEMENT_ID_PROPERTY,
