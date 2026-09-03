@@ -3767,6 +3767,8 @@ interface FakeOption {
 	value: string;
 	text: string;
 	selected: boolean;
+	disabled: boolean;
+	parentElement: { tagName: string; disabled: boolean } | null;
 }
 
 interface FakeRadio {
@@ -3779,28 +3781,48 @@ interface FakeRadio {
 	checked: boolean;
 	labels: Array<{ textContent: string }>;
 	ariaLabel: string | null;
+	ariaLabelledBy: string | null;
 	ancestorLabel: string | null;
 	getAttribute(name: string): string | null;
 	closest(selector: string): { textContent: string } | null;
-	getRootNode(): { querySelectorAll(selector: string): FakeRadio[] };
+	getRootNode(): {
+		querySelectorAll(selector: string): FakeRadio[];
+		getElementById(id: string): { textContent: string } | undefined;
+	};
 	click(): void;
 }
 
 /** A minimal option list the select page function can walk. */
-function fakeSelect(options: Array<[value: string, text: string]>): {
+function fakeSelect(
+	options: Array<{
+		value: string;
+		text: string;
+		disabled?: boolean;
+		group?: { tagName: string; disabled: boolean };
+	}>,
+): {
 	tagName: string;
 	options: FakeOption[];
 	dispatchEvent(): boolean;
 } {
 	return {
 		tagName: "SELECT",
-		options: options.map(([value, text]) => ({
-			value,
-			text,
+		options: options.map((option) => ({
+			value: option.value,
+			text: option.text,
 			selected: false,
+			disabled: option.disabled === true,
+			parentElement: option.group ?? null,
 		})),
 		dispatchEvent: () => true,
 	};
+}
+
+/** Builds the same option list from value / text pairs, all enabled. */
+function fakeSelectOf(
+	options: Array<[value: string, text: string]>,
+): ReturnType<typeof fakeSelect> {
+	return fakeSelect(options.map(([value, text]) => ({ value, text })));
 }
 
 /**
@@ -3813,6 +3835,11 @@ function fakeRadioGroup(
 		value: string;
 		label?: string;
 		ariaLabel?: string;
+		/**
+		 * Text held by the elements this radio's aria-labelledby points at. An
+		 * array becomes several space-separated ids, as a real page writes them.
+		 */
+		labelledBy?: string | string[];
 		name?: string;
 		disabled?: boolean;
 		ownForm?: boolean;
@@ -3820,7 +3847,19 @@ function fakeRadioGroup(
 ): FakeRadio[] {
 	const form = {};
 	const group: FakeRadio[] = [];
+	const labelledByTargets = new Map<string, { textContent: string }>();
 	for (const member of members) {
+		const labelledByTexts =
+			member.labelledBy === undefined
+				? []
+				: Array.isArray(member.labelledBy)
+					? member.labelledBy
+					: [member.labelledBy];
+		// The ids carry an "s" on purpose, so a split on a broken whitespace
+		// pattern loses them instead of quietly passing.
+		const labelledByIds = labelledByTexts.map(
+			(_, index) => `labels-${member.value}-${index}`,
+		);
 		const radio: FakeRadio = {
 			tagName: "INPUT",
 			type: "radio",
@@ -3831,14 +3870,22 @@ function fakeRadioGroup(
 			checked: false,
 			labels: member.label === undefined ? [] : [{ textContent: member.label }],
 			ariaLabel: member.ariaLabel ?? null,
+			ariaLabelledBy:
+				labelledByIds.length === 0 ? null : labelledByIds.join(" "),
 			ancestorLabel: null,
-			getAttribute: (name: string) =>
-				name === "aria-label" ? radio.ariaLabel : null,
+			getAttribute: (name: string) => {
+				if (name === "aria-label") return radio.ariaLabel;
+				if (name === "aria-labelledby") return radio.ariaLabelledBy;
+				return null;
+			},
 			closest: () =>
 				radio.ancestorLabel === null
 					? null
 					: { textContent: radio.ancestorLabel },
-			getRootNode: () => ({ querySelectorAll: () => group }),
+			getRootNode: () => ({
+				querySelectorAll: () => group,
+				getElementById: (id: string) => labelledByTargets.get(id),
+			}),
 			click() {
 				for (const other of group) {
 					if (other.name === radio.name && other.form === radio.form) {
@@ -3848,6 +3895,11 @@ function fakeRadioGroup(
 				radio.checked = true;
 			},
 		};
+		labelledByIds.forEach((id, index) => {
+			labelledByTargets.set(id, {
+				textContent: labelledByTexts[index] as string,
+			});
+		});
 		group.push(radio);
 	}
 	return group;
@@ -3885,7 +3937,7 @@ function matchesChoiceCandidate(): (
 describe("choice candidate matching in the page", () => {
 	test("takes the first candidate an option offers by value or by text", () => {
 		const setOption = selectOptionByCandidate();
-		const element = fakeSelect([
+		const element = fakeSelectOf([
 			["", "選択してください"],
 			["shaken", "車検のご予約"],
 			["other", "その他"],
@@ -3894,14 +3946,16 @@ describe("choice candidate matching in the page", () => {
 		expect(setOption.call(element, ["その他のお問い合わせ", "その他"])).toBe(
 			true,
 		);
-		expect(element.options.filter((option) => option.selected)).toEqual([
-			{ value: "other", text: "その他", selected: true },
-		]);
+		expect(
+			element.options
+				.filter((option) => option.selected)
+				.map((option) => option.value),
+		).toEqual(["other"]);
 	});
 
 	test("prefers the earlier candidate over the earlier option", () => {
 		const setOption = selectOptionByCandidate();
-		const element = fakeSelect([
+		const element = fakeSelectOf([
 			["shaken", "車検のご予約"],
 			["other", "その他"],
 		]);
@@ -3912,7 +3966,7 @@ describe("choice candidate matching in the page", () => {
 
 	test("matches an option text case-insensitively after trimming", () => {
 		const setOption = selectOptionByCandidate();
-		const element = fakeSelect([["email", "  E-Mail  "]]);
+		const element = fakeSelectOf([["email", "  E-Mail  "]]);
 
 		expect(setOption.call(element, ["e-mail"])).toBe(true);
 		expect(element.options[0]?.selected).toBe(true);
@@ -3920,7 +3974,7 @@ describe("choice candidate matching in the page", () => {
 
 	test("never selects a placeholder option with an empty value", () => {
 		const setOption = selectOptionByCandidate();
-		const element = fakeSelect([
+		const element = fakeSelectOf([
 			["", "選択してください"],
 			["other", "その他"],
 		]);
@@ -3929,9 +3983,51 @@ describe("choice candidate matching in the page", () => {
 		expect(element.options.some((option) => option.selected)).toBe(false);
 	});
 
+	test("skips a disabled option and moves on to the next candidate", () => {
+		const setOption = selectOptionByCandidate();
+		const element = fakeSelect([
+			{ value: "shaken", text: "車検のご予約", disabled: true },
+			{ value: "other", text: "その他" },
+		]);
+
+		expect(setOption.call(element, ["車検のご予約", "その他"])).toBe(true);
+		expect(
+			element.options
+				.filter((option) => option.selected)
+				.map((option) => option.value),
+		).toEqual(["other"]);
+	});
+
+	test("skips an option under a disabled optgroup", () => {
+		const setOption = selectOptionByCandidate();
+		const closedGroup = { tagName: "OPTGROUP", disabled: true };
+		const openGroup = { tagName: "OPTGROUP", disabled: false };
+		const element = fakeSelect([
+			{ value: "shaken", text: "車検のご予約", group: closedGroup },
+			{ value: "other", text: "その他", group: openGroup },
+		]);
+
+		expect(setOption.call(element, ["車検のご予約", "その他"])).toBe(true);
+		expect(
+			element.options
+				.filter((option) => option.selected)
+				.map((option) => option.value),
+		).toEqual(["other"]);
+	});
+
+	test("reports no match when every matching option is disabled", () => {
+		const setOption = selectOptionByCandidate();
+		const element = fakeSelect([
+			{ value: "shaken", text: "車検のご予約", disabled: true },
+		]);
+
+		expect(setOption.call(element, ["車検のご予約"])).toBe(false);
+		expect(element.options.some((option) => option.selected)).toBe(false);
+	});
+
 	test("reports no match instead of guessing an option", () => {
 		const setOption = selectOptionByCandidate();
-		const element = fakeSelect([["shaken", "車検のご予約"]]);
+		const element = fakeSelectOf([["shaken", "車検のご予約"]]);
 
 		expect(setOption.call(element, ["その他"])).toBe(false);
 		expect(element.options.some((option) => option.selected)).toBe(false);
@@ -3992,6 +4088,41 @@ describe("choice candidate matching in the page", () => {
 
 		expect(setRadio.call(byValue as object, ["email"])).toBe("selected");
 		expect(setRadio.call(byAria as object, ["メール"])).toBe("selected");
+	});
+
+	test("matches a radio labelled only through aria-labelledby", () => {
+		const setRadio = selectRadioByCandidate();
+		const [byLabelledBy] = fakeRadioGroup([
+			{ value: "e", labelledBy: "メール" },
+		]);
+
+		expect(setRadio.call(byLabelledBy as object, ["メール"])).toBe("selected");
+		expect(byLabelledBy?.checked).toBe(true);
+	});
+
+	test("resolves every id of a multi-target aria-labelledby", () => {
+		const setRadio = selectRadioByCandidate();
+		const [byParts] = fakeRadioGroup([
+			{ value: "e", labelledBy: ["ご希望の", "連絡方法"] },
+		]);
+		const [byJoined] = fakeRadioGroup([
+			{ value: "p", labelledBy: ["ご希望の", "連絡方法"], name: "joined" },
+		]);
+
+		expect(setRadio.call(byParts as object, ["連絡方法"])).toBe("selected");
+		expect(setRadio.call(byJoined as object, ["ご希望の 連絡方法"])).toBe(
+			"selected",
+		);
+	});
+
+	test("matches a checkbox labelled only through aria-labelledby", () => {
+		const matches = matchesChoiceCandidate();
+		const [consent] = fakeRadioGroup([
+			{ value: "agreed", labelledBy: "同意する" },
+		]);
+
+		expect(matches.call(consent as object, ["同意する"])).toBe(true);
+		expect(matches.call(consent as object, ["同意"])).toBe(false);
 	});
 
 	test("answers not_candidate when no candidate matches the radio", () => {

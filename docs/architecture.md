@@ -159,7 +159,7 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 - 起動時（run で最初の navigate。coordinator が `job.targetUrl` へ行う bootstrap）だけ 25 秒待ち、`PAGE_NOT_READY`になった場合は driver 内部で 1 回だけ navigate をやり直す。実サイトでは render-blocking な subresource の cold start で 10 秒を超えることがあり、1 件が`PAGE_NOT_READY`で失敗したためである。
 - 再試行は navigation 回数を増やす前に行うため、dry-run の「bootstrap 後の再 navigate 禁止」には掛からない。回数は成否にかかわらず bootstrap 全体で 1 回だけ増える。
 - モデルが呼ぶ通常の`navigate`は従来どおり 10 秒・再試行なしとする。サイトは既に暖まっており、そこで固まるのはモデルが判断すべき事象だからである。
-- 上限は bootstrap 全体で readyState 待ち 25 秒 × 2 + `Page.navigate`（CDP command timeout 15 秒）× 2 の最大 80 秒である。
+- 上限は bootstrap 全体で最大 110 秒である。1 回の試行は `Page.navigate`（CDP command timeout 15 秒）と readyState 待ちからなり、後者は締切の直前に開始した `document.readyState` の評価が同じ command timeout まで伸びうるため、25 秒ではなく最大 40 秒を見込む。これを 2 回行う。
 - readyState の評価が接続断（`Browser Use CDP connection is closed` / `... connection closed` / `... command could not be sent`）で失敗した場合は待ち続けず、その場で throw する。abort 時は coordinator の`close()`が bootstrap 中の driver（`#pendingDriver`）を閉じるため、待ちは即座に終わり、termination grace 30 秒の内側で session の stop が走る。
 - popup、Worker、Service Worker、WebSocket 等の迂回経路を遮断する。
 - CDP の `DOM.getDocument` を `pierce: true` で取得し、通常 DOM と open / closed Shadow DOM を Worker 側で走査する。

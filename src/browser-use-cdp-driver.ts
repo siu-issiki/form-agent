@@ -2609,10 +2609,18 @@ export function getSubmissionRequestDisposition(
 const CHOICE_CANDIDATE_HELPERS = `
   const normalizeText = (text) => String(text ?? "").trim().toLowerCase();
   const labelTexts = (element) => {
-    const texts = Array.from(element.labels ?? []).map((label) => label.textContent ?? "");
-    texts.push(element.getAttribute("aria-label") ?? "");
-    texts.push(element.closest("label")?.textContent ?? "");
-    return texts.map(normalizeText).filter(Boolean);
+    const root = element.getRootNode();
+    const labels = Array.from(element.labels ?? []).map((label) => normalizeText(label.textContent)).filter(Boolean);
+    const labelledBy = (element.getAttribute("aria-labelledby") ?? "").split(/\\s+/).filter(Boolean)
+      .map((id) => normalizeText(root.getElementById?.(id)?.textContent)).filter(Boolean);
+    const texts = [...labels, ...labelledBy];
+    // observe joins several labels into one string, so the joined form has to
+    // match a candidate as well as each part does.
+    if (labels.length > 1) texts.push(labels.join(" "));
+    if (labelledBy.length > 1) texts.push(labelledBy.join(" "));
+    texts.push(normalizeText(element.getAttribute("aria-label")));
+    texts.push(normalizeText(element.closest("label")?.textContent));
+    return texts.filter(Boolean);
   };
   const candidateRank = (element, candidates) => {
     const texts = labelTexts(element);
@@ -2629,11 +2637,18 @@ const CHOICE_CANDIDATE_HELPERS = `
  * Selects the option matching the earliest candidate, by option value or by
  * the same option text `observe` reports. A placeholder option with an empty
  * value is never chosen, because submitting it is the same as choosing nothing.
+ * A disabled option, and an option under a disabled optgroup, is skipped so
+ * that a candidate the user could never pick does not block a later one.
  */
 export const SELECT_OPTION_BY_CANDIDATE_FUNCTION = `function(candidates) {
   if (this.tagName !== "SELECT" || !Array.isArray(candidates)) return false;
   const normalizeText = (text) => String(text ?? "").trim().toLowerCase();
-  const options = Array.from(this.options).filter((option) => option.value !== "");
+  const isSelectable = (option) => {
+    if (option.value === "" || option.disabled) return false;
+    const group = option.parentElement;
+    return !(group && group.tagName === "OPTGROUP" && group.disabled);
+  };
+  const options = Array.from(this.options).filter(isSelectable);
   for (const candidate of candidates) {
     if (typeof candidate !== "string" || !candidate) continue;
     const wanted = normalizeText(candidate);

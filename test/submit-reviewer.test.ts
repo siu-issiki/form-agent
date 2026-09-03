@@ -397,6 +397,23 @@ describe("reviewPayload", () => {
 		);
 	});
 
+	test("tells the reviewer that the checkbox keywords name a state", () => {
+		expect(SUBMIT_REVIEW_INSTRUCTIONS).toContain(
+			'the candidates "checked" and "true" mean the box must be checked',
+		);
+		expect(SUBMIT_REVIEW_INSTRUCTIONS).toContain(
+			'"unchecked" and "false" mean it must be unchecked',
+		);
+		expect(SUBMIT_REVIEW_INSTRUCTIONS).toContain(
+			"These keywords name a state, not a label",
+		);
+		// The same reading has to cover a single value, which is how a consent
+		// checkbox has always been carried in the payload.
+		expect(SUBMIT_REVIEW_INSTRUCTIONS).toContain(
+			"when the entry is a single value instead of a list",
+		);
+	});
+
 	test("propagates a truncation already reported by the driver", () => {
 		const payload = reviewPayload(
 			reviewInput({
