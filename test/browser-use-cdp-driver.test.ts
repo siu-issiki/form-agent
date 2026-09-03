@@ -3814,6 +3814,7 @@ function scriptedCdpResponse(
 async function scriptedDriver(
 	connection: ScriptedCdpConnection,
 	dryRun = true,
+	targetDomain = "example.com",
 ): Promise<BrowserUseCdpDriver> {
 	const captured = captureLogs();
 	try {
@@ -3827,7 +3828,7 @@ async function scriptedDriver(
 					connection as unknown as BrowserUseCdpConnection,
 			},
 		);
-		await driver.restrictToDomain("example.com", []);
+		await driver.restrictToDomain(targetDomain, []);
 		return driver;
 	} finally {
 		captured.restore();
@@ -5011,5 +5012,181 @@ describe("BrowserUseCdpDriver verification provider requests", () => {
 				false,
 			),
 		).toBe("ignore");
+	});
+});
+
+const FRAMED_TARGET_DOMAIN = "example.co.jp";
+const FRAMED_PAGE_URL = "https://example.co.jp/contact";
+const FRAMED_FORM_ACTION = "https://example.co.jp/send";
+const FRAMED_WIDGET_ACTION = "https://forms.example.co.jp/widget";
+const THIRD_PARTY_FRAME_URL = "https://www.google.com/recaptcha/api2/anchor";
+
+/** A page with one form of its own and one form inside a child frame. */
+const FRAMED_PAGE_DOCUMENT = {
+	backendNodeId: 1,
+	nodeName: "#document",
+	children: [
+		{
+			backendNodeId: 2,
+			nodeName: "FORM",
+			attributes: ["action", "/send", "method", "post"],
+			children: [{ backendNodeId: 3, nodeName: "INPUT" }],
+		},
+		{
+			backendNodeId: 20,
+			nodeName: "IFRAME",
+			frameId: "frame-2",
+			children: [],
+			contentDocument: {
+				backendNodeId: 21,
+				nodeName: "#document",
+				frameId: "frame-2",
+				children: [
+					{
+						backendNodeId: 22,
+						nodeName: "FORM",
+						attributes: ["action", FRAMED_WIDGET_ACTION, "method", "post"],
+						children: [{ backendNodeId: 30, nodeName: "INPUT" }],
+					},
+				],
+			},
+		},
+	],
+};
+
+/**
+ * Answers the framed fixture page, reporting the child frame URL the frame
+ * tree carries. The URL is omitted when the driver should not know it.
+ */
+function framedCdpConnection(childFrameUrl?: string): ScriptedCdpConnection {
+	const connection = new ScriptedCdpConnection();
+	connection.respond = (method, params) => {
+		if (method === "Page.getFrameTree") {
+			return {
+				frameTree: {
+					frame: { id: "frame-1", url: FRAMED_PAGE_URL },
+					childFrames: [
+						{
+							frame: {
+								id: "frame-2",
+								parentId: "frame-1",
+								...(childFrameUrl === undefined ? {} : { url: childFrameUrl }),
+							},
+						},
+					],
+				},
+			};
+		}
+		if (method === "DOM.getDocument") return { root: FRAMED_PAGE_DOCUMENT };
+		if (
+			method === "Runtime.evaluate" &&
+			String(params.expression ?? "") === "location.href"
+		) {
+			return { result: { value: FRAMED_PAGE_URL } };
+		}
+		return scriptedCdpResponse(method, params);
+	};
+	return connection;
+}
+
+async function observeFramedPage(connection: ScriptedCdpConnection): Promise<{
+	actions: string[];
+	logs: string[];
+}> {
+	const driver = await scriptedDriver(connection, true, FRAMED_TARGET_DOMAIN);
+	const captured = captureLogs();
+	try {
+		const observation = await driver.observe();
+		return {
+			actions: observation.forms.map((form) => form.action),
+			logs: captured.logs,
+		};
+	} finally {
+		captured.restore();
+	}
+}
+
+function framedObservationLog(logs: readonly string[]): unknown {
+	return logEvents(logs).find(
+		(entry) =>
+			(entry as { event?: string }).event === "browser_dom_observation",
+	);
+}
+
+describe("BrowserUseCdpDriver third-party frame forms", () => {
+	test("leaves a form inside a third-party frame out of the observation", async () => {
+		const connection = framedCdpConnection(THIRD_PARTY_FRAME_URL);
+
+		const { actions, logs } = await observeFramedPage(connection);
+
+		expect(actions).toEqual([FRAMED_FORM_ACTION]);
+		expect(framedObservationLog(logs)).toMatchObject({
+			skippedThirdPartyForms: 1,
+			observedFieldCount: 1,
+		});
+		expect(
+			countSent(
+				connection,
+				"Page.createIsolatedWorld",
+				(params) => params.frameId === "frame-2",
+			),
+		).toBe(0);
+	});
+
+	test("keeps a form inside a frame on the target domain", async () => {
+		const connection = framedCdpConnection(FRAMED_WIDGET_ACTION);
+
+		const { actions, logs } = await observeFramedPage(connection);
+
+		expect(actions).toEqual([FRAMED_FORM_ACTION, FRAMED_WIDGET_ACTION]);
+		expect(framedObservationLog(logs)).toMatchObject({
+			skippedThirdPartyForms: 0,
+			observedFieldCount: 2,
+		});
+	});
+
+	test("skips only the form whose frame context a CDP failure withheld", async () => {
+		const connection = framedCdpConnection();
+		connection.fail = (method, params) =>
+			method === "Page.createIsolatedWorld" && params.frameId === "frame-2"
+				? cdpCommandError("Page.createIsolatedWorld", "OTHER")
+				: null;
+
+		const { actions, logs } = await observeFramedPage(connection);
+
+		expect(actions).toEqual([FRAMED_FORM_ACTION]);
+		expect(
+			logEvents(logs).filter(
+				(entry) =>
+					(entry as { event?: string }).event === "browser_form_skipped",
+			),
+		).toEqual([
+			{ event: "browser_form_skipped", reason: "FRAME_CONTEXT_UNAVAILABLE" },
+		]);
+		expect(framedObservationLog(logs)).toMatchObject({
+			skippedThirdPartyForms: 0,
+			observedFieldCount: 1,
+		});
+	});
+
+	test("still fails the observation when the top frame context is withheld", async () => {
+		const connection = framedCdpConnection(FRAMED_WIDGET_ACTION);
+		connection.fail = (method, params) =>
+			method === "Page.createIsolatedWorld" && params.frameId === "frame-1"
+				? cdpCommandError("Page.createIsolatedWorld", "OTHER")
+				: null;
+		const driver = await scriptedDriver(connection, true, FRAMED_TARGET_DOMAIN);
+		const captured = captureLogs();
+
+		let caught: unknown;
+		try {
+			await driver.observe();
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect(caught).toBeInstanceOf(BrowserUseCdpCommandError);
 	});
 });

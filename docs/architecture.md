@@ -181,6 +181,8 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 - CDP の `DOM.getDocument` を `pierce: true` で取得し、通常 DOM と open / closed Shadow DOM を Worker 側で走査する。
 - 観測した同一ページ・許可hostのリンクを最大20件までモデルへ返し、サイト内別ページのフォーム探索に利用する。
 - top documentとiframe documentを同じDOM探索対象とし、送信完了文言も各document bodyで確認する。
+- ただし第三者フレーム（検証サービス等）内のフォームは観察対象外とする。bootstrapの`Page.getFrameTree`と`Page.frameNavigated`から各frameのURLを追跡し、フォームが属するframeのURLが対象ドメイン・ジョブ固有の許可hostの範囲外であれば、そのフォームとフィールドを観察結果に含めない。対象ドメイン外のフォームは元々送信対象にならない（送信requestのclaim判定は対象ドメインのフォームactionに一致する`Document` requestだけを対象とする）ため、安全性は変わらない。reCAPTCHAのanchor iframe内のチェックボックスがフォームとして拾われ、別originのframeに対する`Page.createIsolatedWorld` / `Runtime.callFunctionOn`が失敗して観察全体が`BROWSER_TOOL_UNAVAILABLE`になっていた実測への対策である。スキップ件数は`browser_dom_observation`の`skippedThirdPartyForms`に件数だけ出し、URLは出さない。
+- frameのURLが不明な場合（frame treeにもnavigationイベントにも現れていない場合、および`about:blank` / `srcdoc`のように埋め込み元のoriginを継承する場合）は従来どおり観察する。この場合に限り、禁止根拠の読み取りで使う`Page.createIsolatedWorld` / `Runtime.callFunctionOn`がCDP errorになったフォームだけをスキップし、`browser_form_skipped`（`reason`は`FRAME_CONTEXT_UNAVAILABLE`の固定値）を1行出して観察を続行する。トップフレームと、対象ドメイン内と判定できたframeでのCDP失敗は従来どおりrun全体のエラーにする。スキップの結果フォームが1件も残らない場合は、フォーム不在の観察としてモデルへ返り、`prohibited`の`NO_FORM_PRESENT`は信頼済みhandlerが観察のform 0件から判定する。
 - CDP の単一 response は 4 MiB を上限とし、超過時は再試行せず `BROWSER_PAYLOAD_TOO_LARGE` で終了する。
 
 ### 制限付き browser tool
@@ -444,7 +446,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 - CDP DOM tree から `form` と可視 `input` / `textarea` / `select` / `button` を観察し、`form` 属性による外部関連付けにも対応する。各フィールドは tag、type、name、role、label、placeholder、必須、現在値、選択肢を返し、checkbox / radio では `checked` も返す。password の値は常に空文字で返す。select の option と radio / checkbox の label は、候補一致の根拠としてモデルとレビューの双方が参照する。
 - 探索上限は最大 25 form candidate、200 field candidate、モデルへ返す観察結果は最大 10 form、合計 100 field、本文 20,000 文字までとする。
 - open / closed Shadow DOMは探索対象で、管理下テストでは送信まで検証済みである。ただし実サイトでの互換性検証は継続する。
-- cross-origin iframeはジョブ固有の外部host許可を使う管理下テストで送信まで検証済みである。contenteditableと独自UI componentは未対応または未検証である。
+- cross-origin iframeはジョブ固有の外部host許可を使う管理下テストで送信まで検証済みである。対象ドメインとジョブ固有の許可hostの範囲外にあるframe内のフォームは観察対象外とする。contenteditableと独自UI componentは未対応または未検証である。
 - popup、別 tab、Service Worker を利用するフォームは未対応である。
 - 確認を挟むmulti-stepは管理下テストで検証済みである。ファイル添付とCAPTCHAは未対応である。
 - 送信完了は、許可したrequestを観測し、日本語の送信完了表現または`thank you`が5秒以内に新たに出現した場合に確定する。期待済みGET Documentは、送信対象frameの遷移と同じframe内の完了文言を必須にする。他frameの完了文言は判定に利用しない。
