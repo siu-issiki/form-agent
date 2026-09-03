@@ -295,7 +295,7 @@ attempt上限で終端したジョブは、Queue consumerが結果を保存す�
 
 `outcome: exceededCpu`によるWorkerの強制終了は、Cloudflareダッシュボードの Workers Logs で`outcome = exceededCpu`を検索して調査する。ログの保持期間はPaidプランで7日であるため、7日以内に確認する。`cpuTime`と`wallTime`を併せて読み、CPU上限（既定30秒。Paidプランでは`limits.cpu_ms`で変更できるが未設定）に達していない強制終了であれば上限引き上げでは解消しない。
 
-既知事象（2026-09-03時点で未解決）: 選択肢候補リストのdeploy以降、`exceededCpu`の発生率が1%程度から30〜40%へ急増した。同時刻に複数呼び出しが揃って停止するクラスターが多く、停止時の`cpuTime`は正常完了時より小さい値だった。コード側の回帰かFreeプランの執行強化かは未切り分けである。切り分けと恒久対応として、Cloudflare WorkersをPaidプランへ移行する方針とした（CPU上限が10 msから30秒になる）。移行後も再発する場合は、`job.redelivery_ignored`とセッションleakの有無（本節前段の「attempt上限で終端したジョブ」の記述を参照）を併せて確認する。
+既知事象（2026-09-03解決）: 選択肢候補リストのdeploy以降、`exceededCpu`の発生率が1%程度から30〜40%へ急増した。同時刻に複数呼び出しが揃って停止するクラスターが多く、停止時の`cpuTime`は正常完了時より小さい値だった。当日夕方にCloudflare WorkersをPaid、BrowserUseをdev（有料）プランへ移行し、同一コードを再deployしたところ`exceededCpu`が0件になったため、原因はFreeプランのCPU上限執行と判断した。再発する場合は、`job.redelivery_ignored`とセッションleakの有無（本節前段の「attempt上限で終端したジョブ」の記述を参照）を併せて確認する。
 
 ## 重複Queue配送の検証
 
