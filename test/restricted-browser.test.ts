@@ -506,15 +506,15 @@ describe("RestrictedBrowserTools", () => {
 		}
 	});
 
-	test("does not read ordinary business-hours wording as a sales prohibition", () => {
-		expect(
-			detectProhibitedTextReasonCodes(
-				"営業時間外のお電話はお断りしております。",
-			),
-		).toEqual([]);
-		expect(
-			detectProhibitedTextReasonCodes("営業日以外は対応しておりません。"),
-		).toEqual([]);
+	test("does not read ordinary business vocabulary as a sales prohibition", () => {
+		for (const text of [
+			"営業時間外のお電話はお断りしております。",
+			"営業日以外は対応しておりません。",
+			"自営業の方はご応募をご遠慮ください。",
+			"営業利益に関するお問い合わせはご遠慮ください。",
+		]) {
+			expect(detectProhibitedTextReasonCodes(text)).toEqual([]);
+		}
 	});
 
 	test("takes a sales prohibition from the page text outside every form", () => {

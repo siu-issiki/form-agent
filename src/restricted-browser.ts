@@ -996,13 +996,15 @@ const FORM_PURPOSE_HEADING_FILLER =
 	"[\\s|｜/／・\\-‐−–—:：、。]|に関する|に関して|についての|について|関連|向け|専用|の|ご|お問い?合わ?せ|問い?合わ?せ|ご?相談|ご?依頼|受付|窓口|フォーム|ページ|情報|エントリー|応募|申込み?|申し込み|入力|送信|はこちら|専門";
 
 /**
- * Words naming an unsolicited sales approach. Bare 「営業」 also starts ordinary
- * business vocabulary ("営業時間", "営業日", "営業担当"), so it is guarded by a
- * negative lookahead; the compound forms are listed ahead of it so they keep
- * matching whatever the lookahead grows to exclude.
+ * Words naming an unsolicited sales approach. Bare 「営業」 also sits inside
+ * ordinary business vocabulary ("営業時間", "営業利益", "自営業"), so it is
+ * guarded on both sides: a negative lookbehind for 「自営業」 and a negative
+ * lookahead for the common compounds that describe a company's own operations.
+ * The sales compounds are listed ahead of the bare word so they keep matching
+ * whatever the lookahead grows to exclude.
  */
 const SALES_SUBJECTS =
-	"営業目的|営業活動|営業メール|営業(?:の)?ご?提案|勧誘目的|営業(?!時間|日|所|部|担当|中|カレンダー|マン|職|エリア|拠点|センター|本部|時|日程)|勧誘|セールス|売り込み|売込み|sales|solicitation";
+	"営業(?:を|の)?目的(?:と)?|営業活動|営業メール|営業(?:の)?ご?提案|勧誘目的|(?<!自)営業(?!時間|日|所|部|担当|中|カレンダー|マン|職|エリア|拠点|センター|本部|時|日程|利益|成績|年度|許可|秘密|報告|支援|力|計画|戦略|会議|実績|収益|外|停止|終了|再開|開始|情報|方針|内容|範囲|活動報告)|勧誘|セールス|売り込み|売込み|sales|solicitation";
 
 /**
  * Ways a page refuses something. Softened refusals ("お控えください",
