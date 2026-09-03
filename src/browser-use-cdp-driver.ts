@@ -2364,19 +2364,21 @@ export async function denyRelatedBrowserTargets(
 			isVerificationProviderUrl(attached.targetInfo.url ?? "")
 		) {
 			verificationSessions.add(attached.sessionId);
-			hooks.onVerificationFrame?.();
-			void resumeVerificationProviderTarget(
-				connection,
-				attached.sessionId,
-			).catch(() => {
-				// Without the full setup the frame would run unpoliced, so it is
-				// closed and the widget fails the way it did before.
-				verificationSessions.delete(attached.sessionId);
-				onPolicyFailure(
-					new Error("A verification provider target could not be restricted"),
-				);
-				closeTarget(attached.targetInfo.targetId);
-			});
+			void resumeVerificationProviderTarget(connection, attached.sessionId)
+				.then(() => {
+					// Counted only once the frame is actually left open under the
+					// restricted session, so the log matches what happened.
+					hooks.onVerificationFrame?.();
+				})
+				.catch(() => {
+					// Without the full setup the frame would run unpoliced, so it is
+					// closed and the widget fails the way it did before.
+					verificationSessions.delete(attached.sessionId);
+					onPolicyFailure(
+						new Error("A verification provider target could not be restricted"),
+					);
+					closeTarget(attached.targetInfo.targetId);
+				});
 			return;
 		}
 		closeTarget(attached.targetInfo.targetId);
