@@ -14,6 +14,7 @@ import {
 	findCdpFrameOwnerBackendNodeId,
 } from "./browser-use-cdp-dom";
 import {
+	type BrowserSession,
 	BrowserUseApiError,
 	BrowserUseClient,
 	type BrowserUseFetch,
@@ -70,6 +71,7 @@ export interface BrowserUseConnectOptions {
 	fetcher?: BrowserUseFetch;
 	connectConnection?: (
 		webSocketUrl: string,
+		signal?: AbortSignal,
 	) => Promise<BrowserUseCdpConnection>;
 }
 
@@ -395,7 +397,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		const sleep = options.sleep ?? ((ms: number) => sleepMs(ms, signal));
 		const openConnection =
 			options.connectConnection ??
-			((target: string) => BrowserUseCdpConnection.connect(target));
+			((target: string, connectSignal?: AbortSignal) =>
+				BrowserUseCdpConnection.connect(
+					target,
+					fetch,
+					undefined,
+					connectSignal,
+				));
 
 		assertConnectNotAborted(signal);
 		if (job.attemptCount > 1) {
@@ -417,6 +425,11 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				await sleep(delayMs);
 			}
 			assertConnectNotAborted(signal);
+			// A previous attempt may have created a session the provider kept but
+			// never handed back, so the leftovers are collected before retrying.
+			if (attempt > 0) {
+				await reclaimJobSessions(client, job.id, signal);
+			}
 			try {
 				return await BrowserUseCdpDriver.#connectOnce(
 					client,
@@ -429,6 +442,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 					signal,
 				);
 			} catch (error) {
+				// An abort ends the run, so it is never reported as a retry.
+				assertConnectNotAborted(signal);
 				if (!isRetryableConnectError(error)) throw error;
 				lastError = error;
 			}
@@ -443,15 +458,28 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		job: Job,
 		dryRun: boolean,
 		attempt: number,
-		openConnection: (webSocketUrl: string) => Promise<BrowserUseCdpConnection>,
+		openConnection: (
+			webSocketUrl: string,
+			signal?: AbortSignal,
+		) => Promise<BrowserUseCdpConnection>,
 		signal: AbortSignal | undefined,
 	): Promise<BrowserUseCdpDriver> {
-		const session = await client.createBrowser({
-			timeoutMinutes: SESSION_TIMEOUT_MINUTES,
-			proxyCountryCode: "jp",
-			metadata: { jobId: job.id, dryRun: String(dryRun) },
-			...(signal ? { signal } : {}),
-		});
+		let session: BrowserSession;
+		try {
+			session = await client.createBrowser({
+				timeoutMinutes: SESSION_TIMEOUT_MINUTES,
+				proxyCountryCode: "jp",
+				metadata: { jobId: job.id, dryRun: String(dryRun) },
+				...(signal ? { signal } : {}),
+			});
+		} catch (error) {
+			// The provider may have started a session even though the response was
+			// unusable, so the identifier it reported is released here.
+			if (error instanceof BrowserUseResponseError && error.sessionId) {
+				await stopBrowserSession({ client, id: error.sessionId });
+			}
+			throw error;
+		}
 		const handle: BrowserSessionHandle = { client, id: session.id };
 		try {
 			assertConnectNotAborted(signal);
@@ -492,11 +520,14 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	static async #establish(
 		webSocketUrl: string,
 		dryRun: boolean,
-		openConnection: (webSocketUrl: string) => Promise<BrowserUseCdpConnection>,
+		openConnection: (
+			webSocketUrl: string,
+			signal?: AbortSignal,
+		) => Promise<BrowserUseCdpConnection>,
 		signal: AbortSignal | undefined,
 		browserSession: BrowserSessionHandle | undefined,
 	): Promise<BrowserUseCdpDriver> {
-		const connection = await openConnection(webSocketUrl);
+		const connection = await openConnection(webSocketUrl, signal);
 		// Closing the connection rejects every in-flight command, so an abort
 		// during setup fails fast instead of waiting out the CDP command timeout.
 		const onAbort = () => connection.close();

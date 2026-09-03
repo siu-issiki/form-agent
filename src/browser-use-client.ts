@@ -34,9 +34,11 @@ export class BrowserUseApiError extends Error {
 
 	/**
 	 * A rejected request only repeats when the provider reported a transient
-	 * condition, so an authentication or validation failure ends the run.
+	 * condition, so an authentication or validation failure ends the run. A
+	 * redirect is never followed, so repeating it would only redirect again.
 	 */
 	get retryable(): boolean {
+		if (this.status >= 300 && this.status < 400) return false;
 		return this.status === 408 || this.status === 429 || this.status >= 500;
 	}
 }
@@ -53,9 +55,16 @@ export class BrowserUseRequestError extends Error {
 }
 
 export class BrowserUseResponseError extends Error {
-	constructor(message: string) {
+	/**
+	 * A create call that reached the provider may have started a session even
+	 * when the response is unusable. The identifier lets the caller release it.
+	 */
+	readonly sessionId: string | undefined;
+
+	constructor(message: string, sessionId?: string) {
 		super(message);
 		this.name = "BrowserUseResponseError";
+		this.sessionId = sessionId;
 	}
 }
 
@@ -100,6 +109,7 @@ export class BrowserUseClient {
 		if (session.status !== "active" || !session.cdpUrl) {
 			throw new BrowserUseResponseError(
 				"Browser Use did not return an active session with a CDP URL",
+				session.id,
 			);
 		}
 		return session;
@@ -164,11 +174,13 @@ export class BrowserUseClient {
 		try {
 			response = await this.fetcher(url, {
 				...init,
+				redirect: "manual",
 				...(signal ? { signal } : {}),
 			});
 		} catch {
 			throw new BrowserUseRequestError();
 		}
+		assertNotRedirected(operation, response);
 		if (!response.ok) {
 			await response.body?.cancel().catch(() => undefined);
 			throw new BrowserUseApiError(operation, response.status);
@@ -210,12 +222,14 @@ export async function resolveCdpWebSocketUrl(
 			{
 				method: "GET",
 				headers: new Headers({ "X-Browser-Use-API-Key": apiKey }),
+				redirect: "manual",
 				...(signal ? { signal } : {}),
 			},
 		);
 	} catch {
 		throw new BrowserUseRequestError();
 	}
+	assertNotRedirected("resolve", response);
 	if (!response.ok) {
 		await response.body?.cancel().catch(() => undefined);
 		throw new BrowserUseApiError("resolve", response.status);
@@ -239,6 +253,23 @@ export async function resolveCdpWebSocketUrl(
 		throw invalidCdpEndpoint();
 	}
 	return resolved.toString();
+}
+
+/**
+ * Redirects are never followed, because the API key travels in a header and a
+ * cross-origin redirect would carry it to whatever host the provider names.
+ */
+function assertNotRedirected(
+	operation: BrowserUseOperation,
+	response: Response,
+): void {
+	const type = (response as { type?: string }).type;
+	if (
+		type === "opaqueredirect" ||
+		(response.status >= 300 && response.status < 400)
+	) {
+		throw new BrowserUseApiError(operation, response.status);
+	}
 }
 
 export function assertBrowserUseHost(url: URL): void {

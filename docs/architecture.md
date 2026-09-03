@@ -139,8 +139,9 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 - session は REST API v4（`https://api.browser-use.com/api/v4`）で明示的に作成し、応答の `cdpUrl` へ CDP 接続する。ジョブ終了時は正常・異常・deadline のいずれでも `PATCH /browsers/{id}` の `stop` を呼び、session を停止してから実行を終える。停止は best-effort であり、成否を `browser_use_session_stopped` に `ok` と status だけで記録する。
 - 明示停止を行う理由は、CDP 接続を閉じても managed browser が止まらないためである。BrowserUse の公式ドキュメントは「`browser.close()`, disconnecting CDP, or `client.close()` does not stop the managed browser. Use `client.browsers.stop(browser.id)`」と記載しており、2026-09-03 の 5 並列計測では CDP 切断後も session が寿命まで残り、同時 session 数を食いつぶして close code 1011 / `LIMIT` を招いた。
 - proxy country は `jp`、session timeout は 12 分とする。12 分は run deadline 10 分と termination grace 30 秒の外側に置いた backstop であり、明示停止が届かなかった場合にだけ効く。
-- session には `metadata.jobId` と `metadata.dryRun` を付ける。Queue retry（`attemptCount` が 2 以上）では、create の前に `GET /browsers?filterBy=active` から同じ `jobId` の session を stop して残骸を回収し、件数を `browser_use_session_reclaimed` に記録する。同一 `jobId` の session は `claimRun` の排他により同時に 1 件しか存在しないため、回収対象は必ず終了済み attempt のものである。
+- session には `metadata.jobId` と `metadata.dryRun` を付ける。Queue retry（`attemptCount` が 2 以上）の初回試行と、接続再試行の 2 回目以降では、create の前に `GET /browsers?filterBy=active` から同じ `jobId` の session を stop して残骸を回収し、件数を `browser_use_session_reclaimed` に記録する。create の応答が失われた場合や `cdpUrl` を欠く場合でも、次の create までに前回の session を解放できる。同一 `jobId` の session は `claimRun` の排他により同時に 1 件しか存在しないため、回収対象は必ず終了済み attempt のものである。
 - `cdpUrl` は接続前・API key 付与前に host を検証し、`browser-use.com` またはそのサブドメイン以外は `Invalid Browser Use CDP endpoint` として失敗させる。`wss:` はそのまま使い、`https:` の場合だけ `GET <cdpUrl>/json/version` で `webSocketDebuggerUrl` を取得する。取得した URL も同じ host 検証を通し、`ws:` は `cdpUrl` と同一 host のときだけ `wss:` へ昇格させる。
+- API key を付ける REST 呼び出しと `/json/version` 取得は `redirect: "manual"` とし、redirect を追わない。3xx 応答は再試行不可の API 失敗として扱い、cross-origin redirect 先へ `X-Browser-Use-API-Key` が転送されないようにする。
 - CDP WebSocket が自発的に閉じた場合、close code、reason の文字数、reason を固定分類した hint（`NONE` / `LIMIT` / `AUTH` / `TIMEOUT` / `OTHER`）、`wasClean`、未完了コマンド数を記録する。相手から渡された reason の自由文そのものはログに残さない。
 - 接続確立（CDP 接続から初期化完了まで）が一過性の障害で失敗した場合だけ、10 秒 → 20 秒 → 30 秒の待機を挟んで最大 3 回再接続する。再試行は送信前の接続段階に限定し、フォームへの副作用はない。
 - 再試行の可否は失敗の種別で決める。WebSocket upgrade が拒否された場合は HTTP status が 408、429、5xx のときだけ再試行し、401 / 403 / 404 等の恒久的な拒否は即座に失敗させる。upgrade 要求自体が失敗したネットワーク障害、接続断、コマンド timeout は再試行する。endpoint 不正や API key 未設定は接続を試みずに失敗させる。
@@ -148,7 +149,7 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 - session を作成した後の失敗（abort、`cdpUrl` 不正、CDP 接続・初期化の失敗）では、元のエラーを投げ直す前にその session を stop する。恒久的に拒否された session 要求は `BROWSER_SESSION_REJECTED` として再試行不可の failed にし、診断イベントには status に応じて `BROWSER_SESSION_LIMIT`（429）または `BROWSER_SESSION_API_FAILED` を記録する。再試行可能な失敗は従来どおり `BROWSER_TOOL_UNAVAILABLE` とする。
 - 恒久的な upgrade 拒否（401 / 403 / 404 等）は `BROWSER_UPGRADE_REJECTED` として再試行不可の failed にし、Queue の再配信を行わない。診断イベントには `CDP_UPGRADE_REJECTED` を記録する。
 - upgrade 成功後の close も、close code 1008（policy violation）または reason が認証を示す場合は再試行しない。`BROWSER_CONNECTION_REJECTED` として再試行不可の failed にする。
-- 再試行の待機は agent の deadline で中断される。実行が abort された時点で待機と接続試行を打ち切り、`AGENT_TIMEOUT` として終了するため、termination grace を待機で消費しない。abort は接続確立中の CDP コマンドも打ち切り、作成済み session を stop してから終了する。接続が abort より後に完了した場合は、scope 設定と bootstrap navigate へ進まずに session を停止する。
+- 再試行の待機は agent の deadline で中断される。実行が abort された時点で待機と接続試行を打ち切り、`AGENT_TIMEOUT` として終了するため、termination grace を待機で消費しない。abort は WebSocket upgrade の要求と接続確立中の CDP コマンドも打ち切り、作成済み session を stop してから終了する。abort 中の失敗は再試行として記録せず、`browser_use_connect_retry` を出さない。接続が abort より後に完了した場合は、scope 設定と bootstrap navigate へ進まずに session を停止する。
 - 実行は session の stop が完了するまで戻らない。stop には 10 秒の timeout を置き、termination grace 30 秒の内側に収める。
 - popup、Worker、Service Worker、WebSocket 等の迂回経路を遮断する。
 - CDP の `DOM.getDocument` を `pierce: true` で取得し、通常 DOM と open / closed Shadow DOM を Worker 側で走査する。

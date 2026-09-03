@@ -298,3 +298,86 @@ describe("resolveCdpWebSocketUrl", () => {
 		).rejects.toBeInstanceOf(BrowserUseRequestError);
 	});
 });
+
+describe("BrowserUseClient redirect handling", () => {
+	test("never follows a redirect on a request that carries the API key", async () => {
+		const inits: Array<RequestInit | undefined> = [];
+		const client = new BrowserUseClient("secret-key", async (_url, init) => {
+			inits.push(init);
+			return Response.json(activeSession, { status: 201 });
+		});
+
+		await client.createBrowser();
+		await client.stopBrowser("session-001");
+		await client.listBrowsers("active").catch(() => undefined);
+
+		expect(inits.map((init) => init?.redirect)).toEqual([
+			"manual",
+			"manual",
+			"manual",
+		]);
+	});
+
+	test("reports a redirected create as a non-retryable failure", async () => {
+		let calls = 0;
+		const client = new BrowserUseClient("secret-key", async () => {
+			calls += 1;
+			return new Response(null, {
+				status: 302,
+				headers: { Location: "https://evil.example/api/v4/browsers" },
+			});
+		});
+
+		const error = await client.createBrowser().catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(BrowserUseApiError);
+		expect(error.operation).toBe("create");
+		expect(error.status).toBe(302);
+		expect(error.retryable).toBe(false);
+		expect(calls).toBe(1);
+	});
+
+	test("reports the session id when the create response is unusable", async () => {
+		const client = new BrowserUseClient("secret-key", async () =>
+			Response.json({ ...activeSession, cdpUrl: null }, { status: 201 }),
+		);
+
+		const error = await client.createBrowser().catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(BrowserUseResponseError);
+		expect(error.sessionId).toBe("session-001");
+	});
+
+	test("reports a stopped create response with its session id", async () => {
+		const client = new BrowserUseClient("secret-key", async () =>
+			Response.json({ ...activeSession, status: "stopped" }, { status: 201 }),
+		);
+
+		const error = await client.createBrowser().catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(BrowserUseResponseError);
+		expect(error.sessionId).toBe("session-001");
+	});
+
+	test("does not resend the API key to a redirected debugger endpoint", async () => {
+		const inits: Array<RequestInit | undefined> = [];
+		const error = await resolveCdpWebSocketUrl(
+			"https://cdp.browser-use.com/session-001",
+			async (_url, init) => {
+				inits.push(init);
+				return new Response(null, {
+					status: 302,
+					headers: { Location: "https://evil.example/json/version" },
+				});
+			},
+			"secret-key",
+		).catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(BrowserUseApiError);
+		expect(error.operation).toBe("resolve");
+		expect(error.status).toBe(302);
+		expect(error.retryable).toBe(false);
+		expect(inits).toHaveLength(1);
+		expect(inits[0]?.redirect).toBe("manual");
+	});
+});
