@@ -15,6 +15,8 @@ import {
 	ObservationStaleError,
 	type ObservedFieldState,
 	observationFingerprint,
+	type ProhibitedReasonCode,
+	ProhibitionEvidenceError,
 	type RestrictedBrowserDriver,
 	RestrictedBrowserTools,
 	readTrustedFormValues,
@@ -291,7 +293,7 @@ describe("RestrictedBrowserTools", () => {
 
 		await expect(
 			tools.validateProhibited("SALES_PROHIBITED", input.targetUrl),
-		).resolves.toBeUndefined();
+		).resolves.toBe("REASON_CODES");
 		await expect(
 			tools.validateProhibited("NO_FORM_PRESENT", input.targetUrl),
 		).rejects.toBeInstanceOf(BrowserElementError);
@@ -321,7 +323,7 @@ describe("RestrictedBrowserTools", () => {
 
 		await expect(
 			tools.validateProhibited("SALES_PROHIBITED", input.targetUrl),
-		).resolves.toBeUndefined();
+		).resolves.toBe("REASON_CODES");
 	});
 
 	test("requires a fresh observation before accepting a prohibited outcome", async () => {
@@ -349,7 +351,7 @@ describe("RestrictedBrowserTools", () => {
 		try {
 			await expect(
 				tools.validateProhibited("SALES_PROHIBITED", input.targetUrl),
-			).resolves.toBeUndefined();
+			).resolves.toBe("REASON_CODES");
 		} finally {
 			logs.restore();
 		}
@@ -396,6 +398,241 @@ describe("RestrictedBrowserTools", () => {
 			tools.validateProhibited("SALES_PROHIBITED", input.targetUrl),
 		).rejects.toBeInstanceOf(BrowserElementError);
 		expect(driver.observeCount).toBe(1);
+	});
+
+	test("accepts a prohibition sentence quoted verbatim from the page", async () => {
+		const driver = new FakeDriver();
+		driver.observationForms = defaultObservedForms("一般お問い合わせフォーム");
+		// A refusal the fixed patterns do not recognise, stated plainly.
+		driver.pageText =
+			"お問い合わせ窓口。恐れ入りますが、営業のご連絡につきましては対応しておりません。";
+		const tools = await createTools(driver);
+		await tools.observe();
+		const logs = captureLogs();
+
+		try {
+			await expect(
+				tools.validateProhibited(
+					"SALES_PROHIBITED",
+					input.targetUrl,
+					"営業のご連絡につきましては対応しておりません。",
+				),
+			).resolves.toBe("PROHIBITION_EVIDENCE_VERIFIED");
+		} finally {
+			logs.restore();
+		}
+
+		// Accepted without a re-observation, and the quote never reaches the log.
+		expect(driver.observeCount).toBe(1);
+		expect(logs.entries).toEqual([
+			{
+				event: "browser_prohibition_evidence",
+				outcome: "PROHIBITION_EVIDENCE_VERIFIED",
+			},
+		]);
+	});
+
+	test("rejects a prohibition sentence the page does not contain", async () => {
+		const driver = new FakeDriver();
+		driver.observationForms = defaultObservedForms("一般お問い合わせフォーム");
+		driver.pageText = "お問い合わせ窓口。お気軽にご連絡ください。";
+		const tools = await createTools(driver);
+		await tools.observe();
+		const logs = captureLogs();
+
+		let rejected: unknown;
+		try {
+			rejected = await tools
+				.validateProhibited(
+					"SALES_PROHIBITED",
+					input.targetUrl,
+					"営業目的のご連絡は固くお断りいたします。",
+				)
+				.catch((error: unknown) => error);
+		} finally {
+			logs.restore();
+		}
+
+		expect(rejected).toBeInstanceOf(ProhibitionEvidenceError);
+		expect((rejected as ProhibitionEvidenceError).code).toBe(
+			"PROHIBITION_EVIDENCE_NOT_FOUND",
+		);
+		expect(logs.entries).toContainEqual({
+			event: "browser_prohibition_evidence",
+			outcome: "PROHIBITION_EVIDENCE_NOT_FOUND",
+		});
+	});
+
+	test("rejects a quoted sentence that states no refusal", async () => {
+		const driver = new FakeDriver();
+		driver.observationForms = defaultObservedForms("一般お問い合わせフォーム");
+		driver.pageText = "会社案内。営業部の紹介はこちらをご覧ください。";
+		const tools = await createTools(driver);
+		await tools.observe();
+		const logs = captureLogs();
+
+		let rejected: unknown;
+		try {
+			rejected = await tools
+				.validateProhibited(
+					"SALES_PROHIBITED",
+					input.targetUrl,
+					"営業部の紹介はこちらをご覧ください。",
+				)
+				.catch((error: unknown) => error);
+		} finally {
+			logs.restore();
+		}
+
+		expect(rejected).toBeInstanceOf(ProhibitionEvidenceError);
+		expect((rejected as ProhibitionEvidenceError).code).toBe(
+			"PROHIBITION_EVIDENCE_WEAK",
+		);
+		expect(logs.entries).toContainEqual({
+			event: "browser_prohibition_evidence",
+			outcome: "PROHIBITION_EVIDENCE_WEAK",
+		});
+	});
+
+	test("refuses a quoted sentence that accepts rather than refuses", async () => {
+		const cases: Array<[ProhibitedReasonCode, string]> = [
+			["SALES_PROHIBITED", "当社では営業のご提案も受け付けております。"],
+			["SALES_PROHIBITED", "営業のご提案には対応いたします。"],
+			[
+				"FORM_PURPOSE_INCOMPATIBLE",
+				"採用に関するお問い合わせも受け付けております。",
+			],
+			[
+				"FORM_PURPOSE_INCOMPATIBLE",
+				"採用以外のお問い合わせも受け付けています。",
+			],
+		];
+		for (const [reasonCode, sentence] of cases) {
+			const driver = new FakeDriver();
+			driver.observationForms = defaultObservedForms(
+				"一般お問い合わせフォーム",
+			);
+			driver.pageText = `お問い合わせ窓口。${sentence}`;
+			const tools = await createTools(driver);
+			await tools.observe();
+			const logs = captureLogs();
+
+			let rejected: unknown;
+			try {
+				rejected = await tools
+					.validateProhibited(reasonCode, input.targetUrl, sentence)
+					.catch((error: unknown) => error);
+			} finally {
+				logs.restore();
+			}
+
+			expect(rejected).toBeInstanceOf(ProhibitionEvidenceError);
+			expect((rejected as ProhibitionEvidenceError).code).toBe(
+				"PROHIBITION_EVIDENCE_WEAK",
+			);
+		}
+	});
+
+	test("accepts a quoted refusal phrased as かねます or 対象外", async () => {
+		const cases: Array<[ProhibitedReasonCode, string]> = [
+			// Too far apart for the fixed patterns, which bound the distance
+			// between the subject and the refusal.
+			[
+				"SALES_PROHIBITED",
+				"営業のご連絡につきましては、担当部署の体制および対応方針の都合により、誠に恐縮ながら対応しかねます。",
+			],
+			["FORM_PURPOSE_INCOMPATIBLE", "採用以外のお問い合わせは対象外です。"],
+		];
+		for (const [reasonCode, sentence] of cases) {
+			const driver = new FakeDriver();
+			driver.observationForms = defaultObservedForms(
+				"一般お問い合わせフォーム",
+			);
+			driver.pageText = `お問い合わせ窓口。${sentence}`;
+			const tools = await createTools(driver);
+			await tools.observe();
+			const logs = captureLogs();
+
+			try {
+				await expect(
+					tools.validateProhibited(reasonCode, input.targetUrl, sentence),
+				).resolves.toBe("PROHIBITION_EVIDENCE_VERIFIED");
+			} finally {
+				logs.restore();
+			}
+		}
+	});
+
+	test("matches a quote across full-width spaces and line breaks", async () => {
+		const driver = new FakeDriver();
+		driver.observationForms = defaultObservedForms("一般お問い合わせフォーム");
+		driver.pageText =
+			"ご案内\n　営業のご連絡につきましては\n対応しておりません。　ご了承ください。";
+		const tools = await createTools(driver);
+		await tools.observe();
+		const logs = captureLogs();
+
+		try {
+			await expect(
+				tools.validateProhibited(
+					"SALES_PROHIBITED",
+					input.targetUrl,
+					"営業のご連絡につきましては 対応しておりません。",
+				),
+			).resolves.toBe("PROHIBITION_EVIDENCE_VERIFIED");
+		} finally {
+			logs.restore();
+		}
+	});
+
+	test("re-observes once when a truncated page text lacks the quote", async () => {
+		const driver = new FakeDriver();
+		driver.observationForms = defaultObservedForms("一般お問い合わせフォーム");
+		driver.pageText = "お問い合わせ窓口のご案内。";
+		const tools = await createTools(driver);
+		await tools.observe();
+		driver.pageText =
+			"お問い合わせ窓口のご案内。営業のご連絡につきましては対応しておりません。";
+		const logs = captureLogs();
+
+		try {
+			await expect(
+				tools.validateProhibited(
+					"SALES_PROHIBITED",
+					input.targetUrl,
+					"営業のご連絡につきましては対応しておりません。",
+				),
+			).resolves.toBe("PROHIBITION_EVIDENCE_VERIFIED");
+		} finally {
+			logs.restore();
+		}
+
+		expect(driver.observeCount).toBe(2);
+	});
+
+	test("never accepts a quote for a missing form", async () => {
+		const driver = new FakeDriver();
+		driver.observationForms = defaultObservedForms("一般お問い合わせフォーム");
+		driver.pageText = "お問い合わせフォームは設置しておりません。";
+		const tools = await createTools(driver);
+		await tools.observe();
+		const logs = captureLogs();
+
+		try {
+			await expect(
+				tools.validateProhibited(
+					"NO_FORM_PRESENT",
+					input.targetUrl,
+					"お問い合わせフォームは設置しておりません。",
+				),
+			).rejects.toBeInstanceOf(BrowserElementError);
+		} finally {
+			logs.restore();
+		}
+
+		expect(logs.entries).not.toContainEqual(
+			expect.objectContaining({ event: "browser_prohibition_evidence" }),
+		);
 	});
 
 	test("rejects a prohibited outcome after the observed hash route changes", async () => {
@@ -490,6 +727,60 @@ describe("RestrictedBrowserTools", () => {
 				],
 			}),
 		).toEqual(["SALES_PROHIBITED", "FORM_PURPOSE_INCOMPATIBLE"]);
+	});
+
+	test("detects softened and emphatic sales refusals", () => {
+		for (const text of [
+			"営業を目的としたお問い合わせはご遠慮ください。",
+			"大変恐縮ですが営業目的のメールはお控えください。",
+			"営業・売り込み・勧誘目的でのご連絡は一切お断りいたします。",
+			"お問い合わせフォームからの営業メールやご提案に関するメールはご遠慮ください。",
+			"このフォームはお客様専用となります。営業メールはご遠慮ください。",
+			"営業支援サービスのご案内はお断りしております。",
+			"営業部からのご提案はお断りしております。",
+			"営業担当者からのご案内はお断りしております。",
+			"営業目的のお問い合わせには対応しかねます。",
+		]) {
+			expect(detectProhibitedTextReasonCodes(text)).toContain(
+				"SALES_PROHIBITED",
+			);
+		}
+	});
+
+	test("does not read ordinary business vocabulary as a sales prohibition", () => {
+		for (const text of [
+			"営業時間外のお電話はお断りしております。",
+			"営業日以外は対応しておりません。",
+			"自営業の方はご応募をご遠慮ください。",
+			"営業利益に関するお問い合わせはご遠慮ください。",
+		]) {
+			expect(detectProhibitedTextReasonCodes(text)).toEqual([]);
+		}
+	});
+
+	test("reads 対象外 as a purpose restriction", () => {
+		expect(
+			detectProhibitedTextReasonCodes("採用以外のお問い合わせは対象外です。"),
+		).toEqual(["FORM_PURPOSE_INCOMPATIBLE"]);
+	});
+
+	test("takes a sales prohibition from the page text outside every form", () => {
+		expect(
+			detectProhibitedReasonCodes({
+				forms: [{ prohibitedReasonCodes: [] }, { prohibitedReasonCodes: [] }],
+				pageText:
+					"お問い合わせ窓口のご案内。営業目的のメールはお控えください。",
+			}),
+		).toEqual(["SALES_PROHIBITED"]);
+	});
+
+	test("keeps a form-only purpose restriction out of the page text detection", () => {
+		expect(
+			detectProhibitedReasonCodes({
+				forms: [{ prohibitedReasonCodes: ["FORM_PURPOSE_INCOMPATIBLE"] }],
+				pageText: "一般のお問い合わせはこちらのフォームからお願いします。",
+			}),
+		).toEqual(["FORM_PURPOSE_INCOMPATIBLE"]);
 	});
 
 	test("forgets successful inputs after navigation", async () => {

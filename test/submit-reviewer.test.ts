@@ -3,7 +3,10 @@ import { beforeEach, describe, expect, test, vi } from "vitest";
 import { AgentExecutionError } from "../src/agent-executor";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobInput } from "../src/job";
-import type { ProviderUsage } from "../src/openai-responses-client";
+import {
+	MAX_PROVIDER_REQUESTS,
+	type ProviderUsage,
+} from "../src/openai-responses-client";
 import type {
 	SubmitReviewInput,
 	SubmitReviewReasonCode,
@@ -166,9 +169,9 @@ describe("ResponsesSubmitReviewer", () => {
 
 		expect(await providerRequestCount()).toBe(1);
 		await env.DB.prepare(
-			"UPDATE jobs SET provider_request_count = 21 WHERE id = ?",
+			"UPDATE jobs SET provider_request_count = ? WHERE id = ?",
 		)
-			.bind(input.id)
+			.bind(MAX_PROVIDER_REQUESTS, input.id)
 			.run();
 
 		const error = await reviewer

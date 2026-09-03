@@ -2659,6 +2659,201 @@ describe("ResponsesAgentExecutor", () => {
 		]);
 	});
 
+	test("accepts a prohibition the model quotes from the observed page", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const quote = "営業のご連絡につきましては対応しておりません。";
+		const driver = new WorkerFakeBrowserDriver();
+		// A refusal the fixed patterns do not detect, stated plainly on the page.
+		driver.pageText = `お問い合わせ窓口のご案内。${quote}`;
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-finish", "finish_prohibited", {
+				formUrl: input.targetUrl,
+				reasonCode: "SALES_PROHIBITED",
+				reason: "The page refuses sales contact.",
+				evidence: quote,
+			}),
+		];
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () => {
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+		const logs: string[] = [];
+		const spy = vi.spyOn(console, "log").mockImplementation((message) => {
+			logs.push(String(message));
+		});
+
+		let result: Awaited<ReturnType<typeof executor.execute>> | undefined;
+		try {
+			result = await executor.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				new AbortController().signal,
+			);
+		} finally {
+			spy.mockRestore();
+		}
+
+		expect(result).toMatchObject({
+			outcome: "prohibited",
+			reasonCode: "SALES_PROHIBITED",
+		});
+		expect(await readAgentToolDiagnostics(input.id)).toContainEqual({
+			turn: 2,
+			toolName: "finish",
+			stage: "finish_validation",
+			resultCode: "PROHIBITION_EVIDENCE_VERIFIED",
+		});
+		// The quoted sentence stays out of the result, the events, and the logs.
+		expect(JSON.stringify(result)).not.toContain(quote);
+		const events = await env.DB.prepare(
+			"SELECT data_json FROM events WHERE job_id = ?",
+		)
+			.bind(input.id)
+			.all<{ data_json: string }>();
+		for (const row of events.results) {
+			expect(row.data_json).not.toContain(quote);
+		}
+		for (const entry of logs) {
+			expect(entry).not.toContain(quote);
+		}
+		expect(
+			logs
+				.filter((entry) => entry.includes('"browser_prohibition_evidence"'))
+				.map((entry) => JSON.parse(entry) as Record<string, unknown>),
+		).toEqual([
+			{
+				event: "browser_prohibition_evidence",
+				outcome: "PROHIBITION_EVIDENCE_VERIFIED",
+			},
+		]);
+	});
+
+	test("refuses a prohibition quote the observed page does not contain", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const driver = new WorkerFakeBrowserDriver();
+		driver.pageText = "お問い合わせ窓口のご案内。お気軽にご連絡ください。";
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-fabricated", "finish_prohibited", {
+				formUrl: input.targetUrl,
+				reasonCode: "SALES_PROHIBITED",
+				reason: "The page refuses sales contact.",
+				evidence: "営業目的のご連絡は固くお断りいたします。",
+			}),
+			functionResponse("call-uncertain", "finish_uncertain", {
+				reasonCode: "PROHIBITION_UNVERIFIED",
+				reason: "The quoted sentence could not be verified.",
+			}),
+		];
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () => {
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toMatchObject({
+			outcome: "uncertain",
+			reasonCode: "PROHIBITION_UNVERIFIED",
+		});
+		expect(await readAgentToolDiagnostics(input.id)).toContainEqual({
+			turn: 2,
+			toolName: "finish",
+			stage: "finish_validation",
+			resultCode: "PROHIBITION_EVIDENCE_NOT_FOUND",
+		});
+	});
+
+	test("refuses a quote that names no refusal", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const driver = new WorkerFakeBrowserDriver();
+		driver.pageText = "会社案内。営業部の紹介はこちらをご覧ください。";
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-weak", "finish_prohibited", {
+				formUrl: input.targetUrl,
+				reasonCode: "SALES_PROHIBITED",
+				reason: "The page mentions sales.",
+				evidence: "営業部の紹介はこちらをご覧ください。",
+			}),
+			functionResponse("call-uncertain", "finish_uncertain", {
+				reasonCode: "PROHIBITION_UNVERIFIED",
+				reason: "The quoted sentence states no refusal.",
+			}),
+		];
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () => {
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toMatchObject({
+			outcome: "uncertain",
+			reasonCode: "PROHIBITION_UNVERIFIED",
+		});
+		expect(await readAgentToolDiagnostics(input.id)).toContainEqual({
+			turn: 2,
+			toolName: "finish",
+			stage: "finish_validation",
+			resultCode: "PROHIBITION_EVIDENCE_WEAK",
+		});
+	});
+
 	test("rejects an unknown prohibited reason code", async () => {
 		const store = new D1JobStore(env.DB);
 		await store.create(input, "2026-08-28T00:00:00.000Z");
@@ -3623,7 +3818,7 @@ describe("ResponsesAgentExecutor", () => {
 
 	test("grants extra turns for the correction the review allows", () => {
 		expect(MAX_PROVIDER_REQUESTS).toBe(MAX_TURNS + CORRECTION_TURNS + 2);
-		expect(MAX_PROVIDER_REQUESTS).toBe(21);
+		expect(MAX_PROVIDER_REQUESTS).toBe(45);
 	});
 
 	test("keeps a reviewer provider failure classified instead of a browser failure", async () => {
@@ -4029,6 +4224,65 @@ describe("ResponsesAgentExecutor", () => {
 			code: "NAVIGATION_NOT_ALLOWED",
 			turn: 2,
 		});
+	});
+
+	test("logs how the turn budget was spent when the limit is reached", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		// Every turn observes, so the agent never finishes and burns the budget.
+		let call = 0;
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () => {
+				call += 1;
+				if (call > MAX_TURNS) throw new Error("Unexpected provider request");
+				return Response.json(
+					functionResponse(`call-observe-${call}`, "observe", {}),
+				);
+			}) as typeof fetch,
+			createBrowserDriver: async () => new WorkerFakeBrowserDriver(),
+		});
+		const logs: string[] = [];
+		const spy = vi.spyOn(console, "log").mockImplementation((message) => {
+			logs.push(String(message));
+		});
+
+		let result: Awaited<ReturnType<typeof executor.execute>> | undefined;
+		try {
+			result = await executor.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				new AbortController().signal,
+			);
+		} finally {
+			spy.mockRestore();
+		}
+
+		expect(result).toMatchObject({
+			outcome: "failed",
+			reasonCode: "AGENT_TURN_LIMIT",
+		});
+		const limits = logs
+			.filter((entry) => entry.includes('"agent_turn_limit_reached"'))
+			.map((entry) => JSON.parse(entry) as Record<string, unknown>);
+		// Counts only: no job ID, URL, or page text.
+		expect(limits).toEqual([
+			{
+				event: "agent_turn_limit_reached",
+				observations: MAX_TURNS,
+				toolCalls: MAX_TURNS,
+				toolErrors: 0,
+			},
+		]);
 	});
 });
 

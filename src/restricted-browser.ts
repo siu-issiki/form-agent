@@ -330,6 +330,35 @@ export class FormStateChangedError extends BrowserElementError {
 	}
 }
 
+/** How a prohibition claim was verified, or why the quote was refused. */
+export type ProhibitionEvidenceOutcome =
+	| "PROHIBITION_EVIDENCE_VERIFIED"
+	| "PROHIBITION_EVIDENCE_NOT_FOUND"
+	| "PROHIBITION_EVIDENCE_WEAK";
+
+/** How `validateProhibited` accepted the claim. */
+export type ProhibitionVerification =
+	| "REASON_CODES"
+	| "PROHIBITION_EVIDENCE_VERIFIED";
+
+/**
+ * The model quoted a sentence for the prohibition but the handler could not
+ * confirm it against the observed page text. The code says which check failed
+ * so the diagnostic can distinguish a fabricated quote from a real sentence
+ * that does not state a refusal.
+ */
+export class ProhibitionEvidenceError extends BrowserElementError {
+	constructor(
+		readonly code: Exclude<
+			ProhibitionEvidenceOutcome,
+			"PROHIBITION_EVIDENCE_VERIFIED"
+		>,
+	) {
+		super();
+		this.name = "ProhibitionEvidenceError";
+	}
+}
+
 export class SubmissionNotAuthorizedError extends Error {
 	constructor() {
 		super("The job did not grant submission permission");
@@ -584,10 +613,18 @@ export class RestrictedBrowserTools {
 		await this.#assertCurrentUrlAllowed();
 	}
 
+	/**
+	 * Accepts a prohibition claim either from the handler's own pattern
+	 * detection or from a sentence the model quoted, when that sentence is
+	 * present verbatim in the observed page text. The quote is verified, never
+	 * trusted: the fixed patterns cannot cover every Japanese refusal, but the
+	 * model still cannot invent a prohibition the page does not state.
+	 */
 	async validateProhibited(
 		reasonCode: ProhibitedReasonCode,
 		formUrl: string | null,
-	): Promise<void> {
+		evidence?: string | null,
+	): Promise<ProhibitionVerification> {
 		const observation = this.#latestObservation;
 		// Observing after the last input stays the model's obligation, and a URL
 		// mismatch is not something a fresh observation can repair.
@@ -603,26 +640,56 @@ export class RestrictedBrowserTools {
 		) {
 			throw new BrowserElementError();
 		}
-		if (observation.prohibitedReasonCodes?.includes(reasonCode)) return;
+		if (observation.prohibitedReasonCodes?.includes(reasonCode)) {
+			return "REASON_CODES";
+		}
+		let evidenceOutcome = checkProhibitionEvidence(
+			reasonCode,
+			evidence,
+			observation.pageText,
+		);
+		if (evidenceOutcome === "PROHIBITION_EVIDENCE_VERIFIED") {
+			logProhibitionEvidence(evidenceOutcome);
+			return "PROHIBITION_EVIDENCE_VERIFIED";
+		}
 		// Whether the handler can read a prohibition depends on the page's own
 		// rendering, so one fresh observation is allowed for each input
-		// revision. It replaces the driver's element set, which the
+		// revision. It also gives a truncated page text a second chance to carry
+		// the quoted sentence. It replaces the driver's element set, which the
 		// PROHIBITION_NOT_VERIFIED guidance already tells the model to re-read.
 		if (this.#prohibitionReverifiedRevision === this.#inputRevision) {
-			throw new BrowserElementError();
+			if (evidenceOutcome) logProhibitionEvidence(evidenceOutcome);
+			throw evidenceOutcome
+				? new ProhibitionEvidenceError(evidenceOutcome)
+				: new BrowserElementError();
 		}
 		this.#prohibitionReverifiedRevision = this.#inputRevision;
 		const reobserved = await this.observe();
-		// The re-observation must describe the same page, otherwise the codes it
+		// The re-observation must describe the same page, otherwise anything it
 		// carries would corroborate a URL that was never checked.
-		const verified =
+		const samePage =
 			canonicalNavigationPermissionUrl(reobserved.url) ===
-				canonicalNavigationPermissionUrl(observation.url) &&
+			canonicalNavigationPermissionUrl(observation.url);
+		const verified =
+			samePage &&
 			reobserved.prohibitedReasonCodes?.includes(reasonCode) === true;
 		console.log(JSON.stringify({ event: "prohibition_reverified", verified }));
-		if (!verified) {
-			throw new BrowserElementError();
+		if (verified) return "REASON_CODES";
+		if (samePage) {
+			evidenceOutcome = checkProhibitionEvidence(
+				reasonCode,
+				evidence,
+				reobserved.pageText,
+			);
+			if (evidenceOutcome === "PROHIBITION_EVIDENCE_VERIFIED") {
+				logProhibitionEvidence(evidenceOutcome);
+				return "PROHIBITION_EVIDENCE_VERIFIED";
+			}
 		}
+		if (evidenceOutcome) logProhibitionEvidence(evidenceOutcome);
+		throw evidenceOutcome
+			? new ProhibitionEvidenceError(evidenceOutcome)
+			: new BrowserElementError();
 	}
 
 	/**
@@ -934,6 +1001,7 @@ export function detectProhibitedReasonCodes(
 ): ProhibitedReasonCode[] {
 	const codes: ProhibitedReasonCode[] = [];
 	if (observation.forms.length === 0) return ["NO_FORM_PRESENT"];
+	const pageCodes = detectProhibitedTextReasonCodes(observation.pageText ?? "");
 	if (observation.forms.every(hasTrustedFormProhibitionMetadata)) {
 		const formCodes = observation.forms.map(readProhibitedReasonCodes);
 		if (formCodes.every((formCode) => formCode.length > 0)) {
@@ -943,9 +1011,23 @@ export function detectProhibitedReasonCodes(
 				}
 			}
 		}
-		return codes;
+	} else {
+		for (const code of pageCodes) {
+			if (!codes.includes(code)) codes.push(code);
+		}
 	}
-	return detectProhibitedTextReasonCodes(observation.pageText ?? "");
+	// A sales prohibition applies to the whole page, so the page text is
+	// consulted for it even when every form carries trusted metadata. The notice
+	// is often a site-wide line far from the form, out of reach of the
+	// form-local text the page function collects. `FORM_PURPOSE_INCOMPATIBLE`
+	// stays form-local because it describes who one specific form serves.
+	if (
+		pageCodes.includes("SALES_PROHIBITED") &&
+		!codes.includes("SALES_PROHIBITED")
+	) {
+		codes.push("SALES_PROHIBITED");
+	}
+	return codes;
 }
 
 /**
@@ -966,7 +1048,7 @@ const FORM_PURPOSE_LIMITERS = "専用|のみ|限定|に限ります|に限らせ
  * a refusal follows it closely.
  */
 const FORM_PURPOSE_REFUSALS =
-	"受け付けて(?:おりません|いません|ません)|受け付けません|受付(?:して)?(?:おりません|いません|ません)|お断り|ご遠慮|承って(?:おりません|いません|ません)|承りません|承れません|(?:いた|致)しかねます|対応して(?:おりません|いません)|お受けして(?:おりません|いません)|ご利用(?:いただけません|になれません)|できません";
+	"受け付けて(?:おりません|いません|ません)|受け付けません|受付(?:して)?(?:おりません|いません|ません)|お断り|ご遠慮|承って(?:おりません|いません|ません)|承りません|承れません|(?:いた|致)?しかねます|かねます|対象外|対応して(?:おりません|いません)|お受けして(?:おりません|いません)|ご利用(?:いただけません|になれません)|できません";
 
 /**
  * Generic connectors allowed between a purpose word and a limiter. Requiring
@@ -980,6 +1062,28 @@ const FORM_PURPOSE_CONNECTORS =
 const FORM_PURPOSE_HEADING_FILLER =
 	"[\\s|｜/／・\\-‐−–—:：、。]|に関する|に関して|についての|について|関連|向け|専用|の|ご|お問い?合わ?せ|問い?合わ?せ|ご?相談|ご?依頼|受付|窓口|フォーム|ページ|情報|エントリー|応募|申込み?|申し込み|入力|送信|はこちら|専門";
 
+/**
+ * Words naming an unsolicited sales approach. Bare 「営業」 also sits inside
+ * ordinary business vocabulary ("営業時間", "営業利益", "自営業"), so it is
+ * guarded on both sides: a negative lookbehind for 「自営業」 and a negative
+ * lookahead for the common compounds that describe a company's own operations.
+ * The sales compounds are listed ahead of the bare word so they keep matching
+ * whatever the lookahead grows to exclude. The exclusions lean towards missing
+ * a prohibition rather than inventing one, because a miss is recovered by the
+ * quoted-evidence path in `validateProhibited` while a false positive silently
+ * drops a legitimate inquiry.
+ */
+const SALES_SUBJECTS =
+	"営業(?:を|の)?目的(?:と)?|営業活動|営業メール|営業(?:の)?ご?提案|勧誘目的|(?<!自)営業(?!時間|日|所|中|カレンダー|マン|職|エリア|拠点|センター|本部|時|日程|利益|成績|年度|許可|秘密|報告|力|会議|実績|収益|外|停止|終了|再開|開始|活動報告)|勧誘|セールス|売り込み|売込み|sales|solicitation";
+
+/**
+ * Ways a page refuses something. Softened refusals ("お控えください",
+ * "ご遠慮ください") carry the same meaning as an outright ban and appear far
+ * more often on Japanese contact pages.
+ */
+const SALES_REFUSALS =
+	"禁止|お断り|受け付け(?:て)?(?:おりません|いません|ません|ない)|ご遠慮|お?控え(?:ください|下さい|いただ|頂)|控えて|一切お断り|固くお断り|お断りして|お断りいたし|お断り致し|受け付けかね|対応(?:いた|致)しかね|(?:いた|致)?しかねます|かねます|対象外|ご対応(?:でき|出来)ません|返信(?:いた|致)しません|返答(?:いた|致)しません";
+
 export const PROHIBITION_TEXT_PATTERN_SOURCES = {
 	explicitAllowances: [
 		"(営業|勧誘|セールス).{0,40}(も|を)?受け付け(?:て)?(?:います|ております)",
@@ -987,8 +1091,8 @@ export const PROHIBITION_TEXT_PATTERN_SOURCES = {
 		"(sales|solicitation).{0,40}(?:is|are) not prohibited",
 	],
 	salesProhibited: [
-		"(営業|勧誘|セールス).{0,40}(禁止|お断り|受け付け(?:て)?(?:おりません|いません|ません|ない)|ご遠慮)",
-		"(禁止|お断り|受け付け(?:て)?(?:おりません|いません|ません|ない)|ご遠慮).{0,40}(営業|勧誘|セールス)",
+		`(?:${SALES_SUBJECTS}).{0,40}(?:${SALES_REFUSALS})`,
+		`(?:${SALES_REFUSALS}).{0,40}(?:${SALES_SUBJECTS})`,
 		"(sales|solicitation).{0,40}(prohibited|not accepted|do not use)",
 	],
 	formPurposeIncompatible: [
@@ -1034,6 +1138,94 @@ export function detectProhibitedTextReasonCodes(
 		codes.push("FORM_PURPOSE_INCOMPATIBLE");
 	}
 	return codes;
+}
+
+/** Shortest and longest quote the evidence check will consider. */
+export const MIN_PROHIBITION_EVIDENCE_LENGTH = 8;
+export const MAX_PROHIBITION_EVIDENCE_LENGTH = 300;
+
+/**
+ * Refusals a quoted sentence may carry. Only negative forms count: the stems
+ * 「受け付け」「受付」「対応」「承って」 also open the acceptance a page states
+ * ("営業のご提案も受け付けております"), which would turn an invitation into a
+ * prohibition.
+ */
+const EVIDENCE_REFUSALS =
+	/受け付けて(?:おりません|いません|ません)|受け付けません|受付(?:して)?(?:おりません|いません|ません)|お断り|ご遠慮|遠慮ください|禁止|お控え|控えて|承って(?:おりません|いません|ません)|承りません|対応(?:して)?(?:おりません|いません)|(?:いた|致)?しかねます|かねます|対象外|できません|しません|not accepted|prohibited|do not|refrain|decline/;
+
+/**
+ * Words a quoted sentence must contain for each reason code. They are looser
+ * than the detection patterns because the sentence itself is already proven to
+ * exist on the page; the check only rules out a quote that names something else
+ * entirely, such as a heading about the sales department.
+ */
+const PROHIBITION_EVIDENCE_VOCABULARY: Record<
+	Exclude<ProhibitedReasonCode, "NO_FORM_PRESENT">,
+	readonly [RegExp, RegExp]
+> = {
+	SALES_PROHIBITED: [
+		/営業|勧誘|セールス|売り込み|売込み|sales|solicitation|ソリシテーション/,
+		EVIDENCE_REFUSALS,
+	],
+	FORM_PURPOSE_INCOMPATIBLE: [
+		new RegExp(FORM_PURPOSE_WORDS),
+		// 「以外」 on its own introduces a general inquiry form as often as it
+		// excludes one, so it counts only through the refusal that follows it.
+		new RegExp(`専用|のみ|限定|に限|${EVIDENCE_REFUSALS.source}`),
+	],
+};
+
+/**
+ * Normalizes a page or a quote for comparison. NFKC folds the full-width forms
+ * a page may use, and collapsing runs of whitespace absorbs the line breaks and
+ * ideographic spaces that layout adds between the words of one sentence.
+ */
+function normalizeForEvidence(value: string): string {
+	return value.normalize("NFKC").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+/**
+ * Returns how a quoted prohibition sentence fared against the page text, or
+ * null when there is no quote to check. `NO_FORM_PRESENT` is a structural claim
+ * about the page rather than a statement on it, so no quote can support it.
+ */
+function checkProhibitionEvidence(
+	reasonCode: ProhibitedReasonCode,
+	evidence: string | null | undefined,
+	pageText: string | undefined,
+): ProhibitionEvidenceOutcome | null {
+	if (reasonCode === "NO_FORM_PRESENT") return null;
+	if (typeof evidence !== "string") return null;
+	const quote = normalizeForEvidence(evidence);
+	if (
+		quote.length < MIN_PROHIBITION_EVIDENCE_LENGTH ||
+		evidence.length > MAX_PROHIBITION_EVIDENCE_LENGTH
+	) {
+		return "PROHIBITION_EVIDENCE_NOT_FOUND";
+	}
+	if (!normalizeForEvidence(pageText ?? "").includes(quote)) {
+		return "PROHIBITION_EVIDENCE_NOT_FOUND";
+	}
+	// A sentence that states the opposite is refused outright, so a quote such
+	// as "営業のご提案も受け付けております" cannot be read as a prohibition.
+	if (
+		PROHIBITION_TEXT_PATTERN_SOURCES.explicitAllowances.some((source) =>
+			new RegExp(source).test(quote),
+		)
+	) {
+		return "PROHIBITION_EVIDENCE_WEAK";
+	}
+	const [subject, refusal] = PROHIBITION_EVIDENCE_VOCABULARY[reasonCode];
+	return subject.test(quote) && refusal.test(quote)
+		? "PROHIBITION_EVIDENCE_VERIFIED"
+		: "PROHIBITION_EVIDENCE_WEAK";
+}
+
+/** Fixed outcome only: the quote itself never reaches the log. */
+function logProhibitionEvidence(outcome: ProhibitionEvidenceOutcome): void {
+	console.log(
+		JSON.stringify({ event: "browser_prohibition_evidence", outcome }),
+	);
 }
 
 function trustObservedForms(forms: unknown[]): unknown[] {
