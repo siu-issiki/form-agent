@@ -1074,30 +1074,8 @@ describe("BrowserUseCdpDriver child target policy", () => {
 	});
 
 	test("pauses and closes related worker and popup targets", async () => {
-		const calls: Array<{
-			method: string;
-			params: Record<string, unknown>;
-			sessionId?: string;
-		}> = [];
-		let attachedListener:
-			| ((params: unknown, sessionId: string | undefined) => void)
-			| undefined;
+		const { calls, connection, emit } = relatedTargetHarness();
 		const failures: Error[] = [];
-		const connection = {
-			on(method: string, listener: typeof attachedListener) {
-				expect(method).toBe("Target.attachedToTarget");
-				attachedListener = listener;
-				return () => undefined;
-			},
-			async send<TResult>(
-				method: string,
-				params: Record<string, unknown> = {},
-				sessionId?: string,
-			): Promise<TResult> {
-				calls.push({ method, params, sessionId });
-				return { success: true } as TResult;
-			},
-		};
 
 		await denyRelatedBrowserTargets(connection, "primary", (error) =>
 			failures.push(error),
@@ -1116,7 +1094,8 @@ describe("BrowserUseCdpDriver child target policy", () => {
 			["worker-1", "worker"],
 			["popup-1", "page"],
 		] as const) {
-			attachedListener?.(
+			emit(
+				"Target.attachedToTarget",
 				{
 					sessionId: `${targetId}-session`,
 					targetInfo: { targetId, type },
@@ -1140,6 +1119,214 @@ describe("BrowserUseCdpDriver child target policy", () => {
 			},
 		]);
 		expect(failures).toEqual([]);
+	});
+
+	test("keeps a verification widget iframe target and polices its requests", async () => {
+		const harness = relatedTargetHarness();
+		const failures: Error[] = [];
+		let frameCount = 0;
+		let requestCount = 0;
+
+		await denyRelatedBrowserTargets(
+			harness.connection,
+			"primary",
+			(error) => failures.push(error),
+			{
+				onVerificationFrame: () => {
+					frameCount += 1;
+				},
+				onVerificationRequest: () => {
+					requestCount += 1;
+				},
+			},
+		);
+		harness.emit(
+			"Target.attachedToTarget",
+			{
+				sessionId: "widget-session",
+				targetInfo: {
+					targetId: "widget-1",
+					type: "iframe",
+					url: "https://www.google.com/recaptcha/api2/anchor?k=key",
+				},
+				waitingForDebugger: true,
+			},
+			"primary",
+		);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(harness.calls.slice(1)).toEqual([
+			{
+				method: "Fetch.enable",
+				params: { patterns: [{ urlPattern: "*" }] },
+				sessionId: "widget-session",
+			},
+			{
+				method: "Target.setAutoAttach",
+				params: {
+					autoAttach: true,
+					waitForDebuggerOnStart: true,
+					flatten: true,
+				},
+				sessionId: "widget-session",
+			},
+			{ method: "Page.enable", params: {}, sessionId: "widget-session" },
+			{
+				method: "Page.addScriptToEvaluateOnNewDocument",
+				params: { source: BLOCK_BROWSER_ESCAPE_EXPRESSION },
+				sessionId: "widget-session",
+			},
+			{
+				method: "Runtime.runIfWaitingForDebugger",
+				params: {},
+				sessionId: "widget-session",
+			},
+		]);
+		expect(frameCount).toBe(1);
+
+		for (const [requestId, url, resourceType] of [
+			["allow-1", "https://www.gstatic.com/recaptcha/x.js", "Script"],
+			["allow-2", "https://www.google.com/recaptcha/api2/bframe", "Document"],
+			["deny-1", "https://evil.example/", "Document"],
+			["deny-2", "https://www.google.com/search", "XHR"],
+		] as const) {
+			harness.emit(
+				"Fetch.requestPaused",
+				{ requestId, resourceType, request: { url, method: "GET" } },
+				"widget-session",
+			);
+		}
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(
+			harness.calls.filter((call) => call.method.startsWith("Fetch.c")),
+		).toEqual([
+			{
+				method: "Fetch.continueRequest",
+				params: { requestId: "allow-1" },
+				sessionId: "widget-session",
+			},
+			{
+				method: "Fetch.continueRequest",
+				params: { requestId: "allow-2" },
+				sessionId: "widget-session",
+			},
+		]);
+		expect(
+			harness.calls.filter((call) => call.method === "Fetch.failRequest"),
+		).toEqual([
+			{
+				method: "Fetch.failRequest",
+				params: { requestId: "deny-1", errorReason: "BlockedByClient" },
+				sessionId: "widget-session",
+			},
+			{
+				method: "Fetch.failRequest",
+				params: { requestId: "deny-2", errorReason: "BlockedByClient" },
+				sessionId: "widget-session",
+			},
+		]);
+		expect(requestCount).toBe(2);
+		expect(
+			harness.calls.some((call) => call.method === "Target.closeTarget"),
+		).toBe(false);
+		expect(failures).toEqual([]);
+	});
+
+	test("closes an iframe target outside the verification allowlist", async () => {
+		const harness = relatedTargetHarness();
+		const failures: Error[] = [];
+		let frameCount = 0;
+
+		await denyRelatedBrowserTargets(
+			harness.connection,
+			"primary",
+			(error) => failures.push(error),
+			{
+				onVerificationFrame: () => {
+					frameCount += 1;
+				},
+			},
+		);
+		for (const [targetId, url] of [
+			["frame-1", "https://evil.example/recaptcha/api2/anchor"],
+			["frame-2", "https://www.google.com.evil.example/recaptcha/api2/anchor"],
+			["frame-3", "https://www.google.com/search"],
+		] as const) {
+			harness.emit(
+				"Target.attachedToTarget",
+				{
+					sessionId: `${targetId}-session`,
+					targetInfo: { targetId, type: "iframe", url },
+					waitingForDebugger: true,
+				},
+				"primary",
+			);
+		}
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(harness.calls.slice(1)).toEqual([
+			{
+				method: "Target.closeTarget",
+				params: { targetId: "frame-1" },
+				sessionId: undefined,
+			},
+			{
+				method: "Target.closeTarget",
+				params: { targetId: "frame-2" },
+				sessionId: undefined,
+			},
+			{
+				method: "Target.closeTarget",
+				params: { targetId: "frame-3" },
+				sessionId: undefined,
+			},
+		]);
+		expect(frameCount).toBe(0);
+		expect(failures).toEqual([]);
+	});
+
+	test("closes an allowlisted iframe target that was not paused", async () => {
+		const harness = relatedTargetHarness();
+		const failures: Error[] = [];
+		let frameCount = 0;
+
+		await denyRelatedBrowserTargets(
+			harness.connection,
+			"primary",
+			(error) => failures.push(error),
+			{
+				onVerificationFrame: () => {
+					frameCount += 1;
+				},
+			},
+		);
+		harness.emit(
+			"Target.attachedToTarget",
+			{
+				sessionId: "widget-session",
+				targetInfo: {
+					targetId: "widget-1",
+					type: "iframe",
+					url: "https://www.google.com/recaptcha/api2/anchor?k=key",
+				},
+				waitingForDebugger: false,
+			},
+			"primary",
+		);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(harness.calls.slice(1)).toEqual([
+			{
+				method: "Target.closeTarget",
+				params: { targetId: "widget-1" },
+				sessionId: undefined,
+			},
+		]);
+		expect(frameCount).toBe(0);
+		expect(failures.map((error) => error.message)).toEqual([
+			"A related browser target was not paused",
+		]);
 	});
 
 	test("blocks page-realm socket, peer, worker, popup, and service worker escapes", async () => {
@@ -1179,24 +1366,14 @@ describe("BrowserUseCdpDriver child target policy", () => {
 	});
 
 	test("fails the policy when a related target was not paused", async () => {
-		let attachedListener:
-			| ((params: unknown, sessionId: string | undefined) => void)
-			| undefined;
+		const { connection, emit } = relatedTargetHarness();
 		const failures: Error[] = [];
-		const connection = {
-			on(_method: string, listener: typeof attachedListener) {
-				attachedListener = listener;
-				return () => undefined;
-			},
-			async send<TResult>(): Promise<TResult> {
-				return { success: true } as TResult;
-			},
-		};
 
 		await denyRelatedBrowserTargets(connection, "primary", (error) =>
 			failures.push(error),
 		);
-		attachedListener?.(
+		emit(
+			"Target.attachedToTarget",
 			{
 				sessionId: "worker-session",
 				targetInfo: { targetId: "worker-1", type: "worker" },
@@ -1853,6 +2030,69 @@ function captureLogs(): { logs: string[]; restore: () => void } {
 
 function logEvents(logs: readonly string[]): unknown[] {
 	return logs.map((entry) => JSON.parse(entry));
+}
+
+/**
+ * A connection stub for the related-target policy that records the session each
+ * command was sent on and keeps every listener the policy registers.
+ */
+function relatedTargetHarness(): {
+	calls: Array<{
+		method: string;
+		params: Record<string, unknown>;
+		sessionId?: string;
+	}>;
+	connection: {
+		on(
+			method: string,
+			listener: (params: unknown, sessionId: string | undefined) => void,
+		): () => void;
+		send<TResult>(
+			method: string,
+			params?: Record<string, unknown>,
+			sessionId?: string,
+		): Promise<TResult>;
+	};
+	emit(method: string, params: unknown, sessionId?: string): void;
+} {
+	const calls: Array<{
+		method: string;
+		params: Record<string, unknown>;
+		sessionId?: string;
+	}> = [];
+	const listeners = new Map<
+		string,
+		Set<(params: unknown, sessionId: string | undefined) => void>
+	>();
+	return {
+		calls,
+		connection: {
+			on(
+				method: string,
+				listener: (params: unknown, sessionId: string | undefined) => void,
+			) {
+				const handlers = listeners.get(method) ?? new Set();
+				handlers.add(listener);
+				listeners.set(method, handlers);
+				return () => {
+					handlers.delete(listener);
+				};
+			},
+			async send<TResult>(
+				method: string,
+				params: Record<string, unknown> = {},
+				sessionId?: string,
+			): Promise<TResult> {
+				calls.push({ method, params, sessionId });
+				return { success: true } as TResult;
+			},
+		},
+		emit(method: string, params: unknown, sessionId?: string): void {
+			for (const handler of listeners.get(method) ?? []) {
+				handler(params, sessionId);
+			}
+		},
+	};
 }
 
 class FakeCdpConnection {
@@ -3471,18 +3711,21 @@ class ScriptedCdpConnection {
 		return undefined;
 	}
 
+	/** A Set per method, the way the real connection keeps its listeners. */
 	readonly listeners = new Map<
 		string,
-		(params: Record<string, unknown>, sessionId?: string) => void
+		Set<(params: Record<string, unknown>, sessionId?: string) => void>
 	>();
 
 	on(
 		method: string,
 		handler: (params: Record<string, unknown>, sessionId?: string) => void,
 	): () => void {
-		this.listeners.set(method, handler);
+		const handlers = this.listeners.get(method) ?? new Set();
+		handlers.add(handler);
+		this.listeners.set(method, handlers);
 		return () => {
-			this.listeners.delete(method);
+			handlers.delete(handler);
 		};
 	}
 
@@ -3492,7 +3735,9 @@ class ScriptedCdpConnection {
 		params: Record<string, unknown>,
 		sessionId = "session-1",
 	): void {
-		this.listeners.get(method)?.(params, sessionId);
+		for (const handler of this.listeners.get(method) ?? []) {
+			handler(params, sessionId);
+		}
 	}
 
 	close(): void {
@@ -4651,6 +4896,102 @@ describe("BrowserUseCdpDriver verification provider requests", () => {
 			captured.restore();
 		}
 		expect(logEvents(captured.logs)).toContainEqual({
+			event: "browser_verification_requests",
+			count: 1,
+		});
+	});
+
+	test("continues the widget iframe document only below the top frame", async () => {
+		const connection = new ScriptedCdpConnection();
+		const driver = await scriptedDriver(connection);
+		const anchor = "https://www.google.com/recaptcha/api2/anchor?k=key";
+
+		connection.emit("Fetch.requestPaused", {
+			requestId: "widget-frame",
+			resourceType: "Document",
+			frameId: "frame-2",
+			request: { url: anchor, method: "GET" },
+		});
+		connection.emit("Fetch.requestPaused", {
+			requestId: "top-frame",
+			resourceType: "Document",
+			frameId: "frame-1",
+			request: { url: anchor, method: "GET" },
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(
+			connection.sent.filter(
+				(entry) => entry.method === "Fetch.continueRequest",
+			),
+		).toEqual([
+			{
+				method: "Fetch.continueRequest",
+				params: { requestId: "widget-frame" },
+			},
+		]);
+		expect(
+			connection.sent.filter((entry) => entry.method === "Fetch.failRequest"),
+		).toEqual([
+			{
+				method: "Fetch.failRequest",
+				params: { requestId: "top-frame", errorReason: "BlockedByClient" },
+			},
+		]);
+
+		const captured = captureLogs();
+		try {
+			await driver.close();
+		} finally {
+			captured.restore();
+		}
+	});
+
+	test("counts the kept widget iframe and the requests it made", async () => {
+		const connection = new ScriptedCdpConnection();
+		const driver = await scriptedDriver(connection);
+
+		connection.emit(
+			"Target.attachedToTarget",
+			{
+				sessionId: "widget-session",
+				targetInfo: {
+					targetId: "widget-1",
+					type: "iframe",
+					url: "https://www.google.com/recaptcha/api2/anchor?k=key",
+				},
+				waitingForDebugger: true,
+			},
+			"session-1",
+		);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		connection.emit(
+			"Fetch.requestPaused",
+			{
+				requestId: "widget-reload",
+				resourceType: "XHR",
+				request: {
+					url: "https://www.google.com/recaptcha/api2/reload?k=key",
+					method: "POST",
+				},
+			},
+			"widget-session",
+		);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(countSent(connection, "Target.closeTarget")).toBe(0);
+		const captured = captureLogs();
+		try {
+			await driver.close();
+		} finally {
+			captured.restore();
+		}
+		const events = logEvents(captured.logs);
+		expect(events).toContainEqual({
+			event: "browser_verification_frames",
+			count: 1,
+		});
+		expect(events).toContainEqual({
 			event: "browser_verification_requests",
 			count: 1,
 		});

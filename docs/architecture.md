@@ -177,7 +177,7 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 - モデルが呼ぶ通常の`navigate`は従来どおり 10 秒・再試行なしとする。サイトは既に暖まっており、そこで固まるのはモデルが判断すべき事象だからである。
 - 上限は bootstrap 全体で最大 110 秒である。1 回の試行は `Page.navigate`（CDP command timeout 15 秒）と readyState 待ちからなり、後者は締切の直前に開始した `document.readyState` の評価が同じ command timeout まで伸びうるため、25 秒ではなく最大 40 秒を見込む。これを 2 回行う。
 - readyState の評価が接続断（`Browser Use CDP connection is closed` / `... connection closed` / `... command could not be sent`）で失敗した場合は待ち続けず、その場で throw する。abort 時は coordinator の`close()`が bootstrap 中の driver（`#pendingDriver`）を閉じるため、待ちは即座に終わり、termination grace 30 秒の内側で session の stop が走る。
-- popup、Worker、Service Worker、WebSocket 等の迂回経路を遮断する。
+- popup、Worker、Service Worker、WebSocket 等の迂回経路を遮断する。ただし固定allowlistのhostにある `iframe` target だけは、同じ制限を適用したうえで開いたままにする（「検証サービスのiframe」を参照）。
 - CDP の `DOM.getDocument` を `pierce: true` で取得し、通常 DOM と open / closed Shadow DOM を Worker 側で走査する。
 - 観測した同一ページ・許可hostのリンクを最大20件までモデルへ返し、サイト内別ページのフォーム探索に利用する。
 - top documentとiframe documentを同じDOM探索対象とし、送信完了文言も各document bodyで確認する。
@@ -393,7 +393,7 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 - HTTP(S) の通信先を対象企業の登録可能ドメインとサブドメイン、またはジョブごとに登録した完全一致の外部hostへ限定する。
 - 上記の例外として、既知の検証サービス（reCAPTCHA / hCaptcha / Turnstile）のhostだけをコード内の固定allowlist `VERIFICATION_PROVIDER_ALLOWLIST` として全ジョブで許可する。`www.google.com` / `www.gstatic.com` / `recaptcha.net` / `www.recaptcha.net` は `/recaptcha/` 配下のみ、`hcaptcha.com` はサブドメインを含めて全パス、`challenges.cloudflare.com` は全パスとする。scheme は https のみ、methodは `GET` / `POST` のみとする。reCAPTCHA v3 はtokenを `POST` するため `GET` だけでは足りない。widgetへの通信を遮断すると「reCAPTCHAに接続できません」と表示され、人手を必要としないreCAPTCHA v3やTurnstileまで `CAPTCHA_REQUIRED` になるためである。2026-09-02 の実サイトdry-run 50件では `CAPTCHA_REQUIRED` 7件のうち4件がこの表示によるものだった。
 - POST 等の非safe HTTP methodまたは期待済みGET Documentは、送信権取得後の最初の 1 回だけ許可する。
-- 固定allowlistは経路を広げない範囲に限定する。`Document`（ページ遷移）は対象外でsubresourceとXHR / fetchだけを通し、ジョブ単位の `allowedHosts` の仕組みは変更しない。送信requestのclaim判定は対象ドメインのフォームactionに一致する `Document` requestだけを対象とするため、allowlistのhostが送信先としてclaimされることはなく、1回限りの送信権も消費しない。残存リスクとして、検証サービスへ送られるtelemetry（ページURLやbrowser fingerprintを含み得る）は許容する。widgetの動作に必要であり、送信先が既知の検証サービスに限られるためである。allowlist経由で通したrequestの件数はrun終了時に `browser_verification_requests` として1行だけ出力し、URLや値は出さない。0件のときは出力しない。
+- 固定allowlistは経路を広げない範囲に限定する。トップフレームの `Document`（ページ遷移）は対象外で、subresourceとXHR / fetch、およびトップフレーム以外の `Document` だけを通し、ジョブ単位の `allowedHosts` の仕組みは変更しない。送信requestのclaim判定は対象ドメインのフォームactionに一致する `Document` requestだけを対象とするため、allowlistのhostが送信先としてclaimされることはなく、1回限りの送信権も消費しない。残存リスクとして、検証サービスへ送られるtelemetry（ページURLやbrowser fingerprintを含み得る）は許容する。widgetの動作に必要であり、送信先が既知の検証サービスに限られるためである。allowlist経由で通したrequestの件数はrun終了時に `browser_verification_requests` として1行だけ出力し、URLや値は出さない。0件のときは出力しない。
 - popup、Worker、Service Worker、WebSocket、WebRTC 等の迂回経路を遮断する。
 - Provider / BrowserUse の認証情報と D1 の実行権をモデル入力・tool 出力へ渡さない。
 - Agent に返すジョブ情報から `runToken` を除外する。
@@ -403,6 +403,21 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 - レビューのdenyで修正を許可するのは`INPUT_MISMATCH`だけとし、実際の`fill` / `select`と観察指紋の変化を次の`submit`の前提にする。deny予算はD1のジョブ行に保存し、実行と再配信をまたいで共有する。
 - レビューのallowから送信権取得までの間に、現在URLと観察済み全フィールドの値・チェック状態を読み直し、あわせてhidden / disabledを含むform全体のsnapshotをレビュー前後で比較し、1件でも異なれば送信しない。
 - ジョブ間で browser session、cookie、入力データを共有しない。
+
+#### 検証サービスのiframe
+
+reCAPTCHA / hCaptcha / Turnstile の widget 本体は iframe で読み込まれ、Chrome のサイト分離によって別 target（OOPIF）として `Target.attachedToTarget` される。host allowlist だけでは widget は動かない。widget の iframe 自体がトップフレーム以外の `Document` request であり、その target も迂回経路として無条件に閉じられていたためである。実サイトの dry-run では allowlist 追加後も「reCAPTCHAに接続できません」が残った。
+
+そこで、`type` が `iframe` で `targetInfo.url` が固定allowlist（scheme は https、host は完全一致、`hcaptcha.com` のみサブドメイン可、`/recaptcha/` 系はパス前方一致）に一致する target だけを閉じずに残す。残す target には、debugger の一時停止（`waitForDebuggerOnStart`）を解除する前に、ページ本体と同じ制限を適用する。
+
+- `Fetch.enable`（全パターン）を掛け、その session の `Fetch.requestPaused` は固定allowlistに一致するものだけ continue し、それ以外はすべて `failRequest` する。iframe 内の `Document` request も allowlist に一致する場合だけ通す。
+- `Target.setAutoAttach` を同じ設定で掛け、iframe から派生する target（Worker、popup、入れ子の iframe）も同じ判定を通す。
+- ページ本体と同じ escape blocker を `Page.addScriptToEvaluateOnNewDocument` で widget のスクリプトより先に評価し、`Fetch` で捕捉できない `WebSocket` / `WebTransport` / `RTCPeerConnection` / `Worker` / `window.open` を iframe 内でも塞ぐ。
+- 上記のいずれかが失敗した場合、および `waitingForDebugger` が false の場合は、制限を掛けきれていないため従来どおり `Target.closeTarget` し、policy failure を記録する。この場合 widget は従来と同じく接続に失敗する。
+
+信頼境界は次のとおり維持される。iframe は cross-origin なので親ページの DOM を読めず、入力値も送信先も見えない。iframe 内の通信は固定allowlistに限定される。iframe が `window.top.location` で親フレームを遷移させようとしても、それはトップフレームの `Document` request なので既存の遮断で止まる。残存リスクは従来と同じく検証サービスへ送られる telemetry であり、widget の動作に必要なため許容する。
+
+開いたままにした target の件数は run 終了時に `browser_verification_frames` として1行だけ出力し、0件のときは出力しない。iframe 内で通した request は `browser_verification_requests` の件数に含める。どちらも URL や値は出さない。
 
 `submitting` 中に Worker が停止し、結果保存まで到達しなかった場合は自動再送せず、人間の確認対象にする。人手照合、DLQ確認、緊急停止、安全な再開のrunbookは [operations.md](operations.md) に定義済みである。照合用の専用 API / UI は未実装である。
 

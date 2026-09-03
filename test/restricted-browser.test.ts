@@ -3,6 +3,7 @@ import type { AgentTools } from "../src/agent-runtime";
 import {
 	assertAllowedBrowserRequest,
 	isVerificationProviderRequest,
+	isVerificationProviderUrl,
 	VERIFICATION_PROVIDER_ALLOWLIST,
 } from "../src/browser-network-policy";
 import { InMemoryJobStore, type JobInput } from "../src/job";
@@ -203,6 +204,90 @@ describe("RestrictedBrowserTools", () => {
 				"Document",
 			),
 		).toThrow(NavigationPolicyError);
+	});
+
+	test("allows the widget iframe document only below the top frame", () => {
+		const anchor = "https://www.google.com/recaptcha/api2/anchor?k=key";
+		expect(isVerificationProviderRequest(anchor, "GET", "Document", true)).toBe(
+			true,
+		);
+		expect(isVerificationProviderRequest(anchor, "GET", "Document")).toBe(
+			false,
+		);
+		expect(
+			assertAllowedBrowserRequest(
+				anchor,
+				"form-agent.dev",
+				"GET",
+				false,
+				false,
+				true,
+				[],
+				"Document",
+				true,
+			),
+		).toBe(true);
+		expect(() =>
+			assertAllowedBrowserRequest(
+				anchor,
+				"form-agent.dev",
+				"GET",
+				false,
+				false,
+				true,
+				[],
+				"Document",
+				false,
+			),
+		).toThrow(NavigationPolicyError);
+	});
+
+	test("keeps a subframe document on other hosts blocked", () => {
+		for (const url of [
+			"https://evil.example/frame",
+			"https://www.google.com.evil.example/recaptcha/api2/anchor",
+			"https://www.google.com/search?q=form",
+		]) {
+			expect(isVerificationProviderRequest(url, "GET", "Document", true)).toBe(
+				false,
+			);
+			expect(() =>
+				assertAllowedBrowserRequest(
+					url,
+					"form-agent.dev",
+					"GET",
+					false,
+					false,
+					true,
+					[],
+					"Document",
+					true,
+				),
+			).toThrow(NavigationPolicyError);
+		}
+	});
+
+	test("matches a verification provider URL by host, scheme and path only", () => {
+		for (const url of [
+			"https://www.google.com/recaptcha/api2/anchor?k=key",
+			"https://www.gstatic.com/recaptcha/releases/abc/recaptcha__ja.js",
+			"https://newassets.hcaptcha.com/captcha/v1/frame",
+			"https://challenges.cloudflare.com/turnstile/v0/api.js",
+		]) {
+			expect(isVerificationProviderUrl(url)).toBe(true);
+		}
+		for (const url of [
+			"http://www.google.com/recaptcha/api2/anchor",
+			"https://www.google.com/search",
+			"https://google.com/recaptcha/api2/anchor",
+			"https://www.google.com.evil.example/recaptcha/api2/anchor",
+			"https://hcaptcha.com.evil.example/captcha/v1/frame",
+			"https://user:pass@www.google.com/recaptcha/api2/anchor",
+			"about:blank",
+			"",
+		]) {
+			expect(isVerificationProviderUrl(url)).toBe(false);
+		}
 	});
 
 	test("keeps verification provider requests outside the submission claim", () => {

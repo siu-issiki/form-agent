@@ -1,6 +1,7 @@
 import {
 	assertAllowedBrowserRequest,
 	isVerificationProviderRequest,
+	isVerificationProviderUrl,
 } from "./browser-network-policy";
 import { SUBMISSION_CONFIRMATION_PATTERN } from "./browser-submit-confirmation";
 import {
@@ -193,6 +194,7 @@ export const ENTER_KEY_DOWN_EVENT = {
 interface TargetInfo {
 	targetId: string;
 	type: string;
+	url?: string;
 }
 
 interface AttachedTarget {
@@ -305,6 +307,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#submissionRedirectRequestId: string | undefined;
 	#submissionRequestCount = 0;
 	#verificationProviderRequestCount = 0;
+	#verificationProviderFrameCount = 0;
 	#submissionRequestObserved: (() => void) | undefined;
 	#expectedSubmissionRequest: ExpectedSubmissionRequest | undefined;
 	#submissionAttemptInProgress = false;
@@ -547,6 +550,14 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				JSON.stringify({
 					event: "browser_verification_requests",
 					count: this.#verificationProviderRequestCount,
+				}),
+			);
+		}
+		if (this.#verificationProviderFrameCount > 0) {
+			console.log(
+				JSON.stringify({
+					event: "browser_verification_frames",
+					count: this.#verificationProviderFrameCount,
 				}),
 			);
 		}
@@ -1099,6 +1110,14 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			(error) => {
 				this.#targetPolicyError ??= error;
 			},
+			{
+				onVerificationFrame: () => {
+					this.#verificationProviderFrameCount += 1;
+				},
+				onVerificationRequest: () => {
+					this.#verificationProviderRequestCount += 1;
+				},
+			},
 		);
 		this.connection.on("Fetch.requestPaused", (params, sessionId) => {
 			if (sessionId === this.sessionId) {
@@ -1167,6 +1186,11 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		const unsafeRequest = !["GET", "HEAD", "OPTIONS"].includes(
 			paused.request.method.toUpperCase(),
 		);
+		// The widget's own iframe loads as a `Document` request below the top
+		// frame. Only a request known to come from a subframe may take that path,
+		// so an unknown `frameId` keeps counting as the top frame.
+		const subframeRequest =
+			paused.frameId !== undefined && paused.frameId !== this.#topFrameId;
 		// A known verification widget (reCAPTCHA / hCaptcha / Turnstile) is never
 		// the form submission, so it stays outside the submission claim and out of
 		// the block-stage diagnostics.
@@ -1174,6 +1198,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			paused.request.url,
 			paused.request.method,
 			paused.resourceType,
+			subframeRequest,
 		);
 		let blockStage: SubmissionRequestBlockStage = "network_policy";
 		let claimedSubmissionRequest = false;
@@ -1258,6 +1283,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 					),
 				this.#allowedHosts,
 				paused.resourceType,
+				subframeRequest,
 			);
 			if (canClaimSubmissionRequest) {
 				this.#submissionRequestInFlight = true;
@@ -2234,21 +2260,47 @@ export function assertDryRunNavigationAllowed(
 	if (dryRun && navigationCount > 0) throw new BrowserElementError();
 }
 
+/** Counters the driver keeps for the targets this policy let through. */
+export interface RelatedBrowserTargetHooks {
+	/** A verification widget iframe target was kept open. */
+	readonly onVerificationFrame?: () => void;
+	/** A request inside such an iframe was continued. */
+	readonly onVerificationRequest?: () => void;
+}
+
+const AUTO_ATTACH_PARAMS = {
+	autoAttach: true,
+	waitForDebuggerOnStart: true,
+	flatten: true,
+};
+
+/**
+ * Closes every browser target the run does not need, and keeps the one kind it
+ * does: the out-of-process iframe Chrome creates for a verification widget.
+ * Site isolation puts `https://www.google.com/recaptcha/api2/anchor` and the
+ * hCaptcha / Turnstile equivalents in their own target, so closing them made
+ * the widget report "cannot connect" even with the host allowlist in place.
+ *
+ * A kept target is policed the same way the page is: `Fetch` intercepts every
+ * request in it and only the allowlist passes, nested targets auto-attach into
+ * this same handler, and the escape blocker runs before the widget's own
+ * scripts so `WebSocket` / `Worker` cannot route around `Fetch`. The iframe is
+ * cross-origin, so it can neither read the page's DOM nor read back what it
+ * posts to its own origin; a `window.top.location` navigation from inside it is
+ * still a top-frame `Document` request and stays blocked by the request policy.
+ */
 export async function denyRelatedBrowserTargets(
 	connection: Pick<BrowserUseCdpConnection, "on" | "send">,
 	parentSessionId: string,
 	onPolicyFailure: (error: Error) => void,
+	hooks: RelatedBrowserTargetHooks = {},
 ): Promise<void> {
-	connection.on("Target.attachedToTarget", (params, sessionId) => {
-		if (sessionId !== parentSessionId) return;
-		const attached = params as AttachedTarget;
-		if (!attached.waitingForDebugger) {
-			onPolicyFailure(new Error("A related browser target was not paused"));
-		}
+	// Sessions of the verification iframes kept open, so their paused requests
+	// are told apart from the page's own and judged by the allowlist alone.
+	const verificationSessions = new Set<string>();
+	const closeTarget = (targetId: string) => {
 		void connection
-			.send<{ success: boolean }>("Target.closeTarget", {
-				targetId: attached.targetInfo.targetId,
-			})
+			.send<{ success: boolean }>("Target.closeTarget", { targetId })
 			.then((result) => {
 				if (!result.success) {
 					onPolicyFailure(
@@ -2261,16 +2313,103 @@ export async function denyRelatedBrowserTargets(
 					new Error("A related browser target could not be closed"),
 				);
 			});
+	};
+
+	connection.on("Fetch.requestPaused", (params, sessionId) => {
+		if (sessionId === undefined || !verificationSessions.has(sessionId)) return;
+		const paused = params as PausedRequest;
+		// Inside the widget's own frame a `Document` request is the widget, not a
+		// page navigation, so subframe `Document` requests may pass the allowlist.
+		const allowed = isVerificationProviderRequest(
+			paused.request.url,
+			paused.request.method,
+			paused.resourceType,
+			true,
+		);
+		if (!allowed) {
+			void connection
+				.send(
+					"Fetch.failRequest",
+					{ requestId: paused.requestId, errorReason: "BlockedByClient" },
+					sessionId,
+				)
+				.catch(() => undefined);
+			return;
+		}
+		void connection
+			.send("Fetch.continueRequest", { requestId: paused.requestId }, sessionId)
+			.then(() => {
+				hooks.onVerificationRequest?.();
+			})
+			.catch(() => undefined);
+	});
+
+	connection.on("Target.attachedToTarget", (params, sessionId) => {
+		if (
+			sessionId !== parentSessionId &&
+			(sessionId === undefined || !verificationSessions.has(sessionId))
+		) {
+			return;
+		}
+		const attached = params as AttachedTarget;
+		// Interception has to be installed before the target runs, so a target that
+		// is already running is closed even when its URL is on the allowlist.
+		if (!attached.waitingForDebugger) {
+			onPolicyFailure(new Error("A related browser target was not paused"));
+			closeTarget(attached.targetInfo.targetId);
+			return;
+		}
+		if (
+			attached.targetInfo.type === "iframe" &&
+			isVerificationProviderUrl(attached.targetInfo.url ?? "")
+		) {
+			verificationSessions.add(attached.sessionId);
+			hooks.onVerificationFrame?.();
+			void resumeVerificationProviderTarget(
+				connection,
+				attached.sessionId,
+			).catch(() => {
+				// Without the full setup the frame would run unpoliced, so it is
+				// closed and the widget fails the way it did before.
+				verificationSessions.delete(attached.sessionId);
+				onPolicyFailure(
+					new Error("A verification provider target could not be restricted"),
+				);
+				closeTarget(attached.targetInfo.targetId);
+			});
+			return;
+		}
+		closeTarget(attached.targetInfo.targetId);
 	});
 	await connection.send(
 		"Target.setAutoAttach",
-		{
-			autoAttach: true,
-			waitForDebuggerOnStart: true,
-			flatten: true,
-		},
+		AUTO_ATTACH_PARAMS,
 		parentSessionId,
 	);
+}
+
+/**
+ * Applies the page's own restrictions to a verification widget target and then
+ * releases it from the debugger pause. Every step has to land before the widget
+ * runs, so a rejection leaves the caller to close the target.
+ */
+async function resumeVerificationProviderTarget(
+	connection: Pick<BrowserUseCdpConnection, "send">,
+	sessionId: string,
+): Promise<void> {
+	await connection.send(
+		"Fetch.enable",
+		{ patterns: [{ urlPattern: "*" }] },
+		sessionId,
+	);
+	await connection.send("Target.setAutoAttach", AUTO_ATTACH_PARAMS, sessionId);
+	await connection.send("Page.enable", {}, sessionId);
+	await connection.send(
+		"Page.addScriptToEvaluateOnNewDocument",
+		{ source: BLOCK_BROWSER_ESCAPE_EXPRESSION },
+		sessionId,
+	);
+	await connection.send("Runtime.runIfWaitingForDebugger", {}, sessionId);
 }
 
 export const BLOCK_BROWSER_ESCAPE_EXPRESSION = `(() => {
