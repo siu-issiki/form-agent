@@ -173,6 +173,27 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 
 driver が submit control と識別した要素は通常の `click` で操作できない。非submitの`click`、`fill`、`select`はDOMイベントを発火する前にbrowser requestを遮断し、`navigate`は直前の観察で得たfragmentを含む完全一致URLのtop-frame Document requestだけを1回許可する。`submit` 中も遮断を解除せず、全入力が同じform ownerに属し、最後の入力・選択・click後に再観察され、選択したformに禁止根拠が検出されていないことを検証してから D1 を `running` から `submitting` へ更新し、最初の期待済み送信requestと、そのrequest IDに直接連なるsafeなredirectだけを許可する。非safe HTTP methodはaction URLとmethod、GETはactionのorigin / path、`Document` resource、送信対象frameを照合する。モデルはDOM activationを優先して選択し、trusted click gestureまたはkeyboard activationが必要な場合だけmouse / Enterを選ぶ。mouseのhit testは1 animation frameごとに最大3回試行する。
 
+#### 要素操作中の CDP コマンド失敗
+
+`click` / `fill` / `select` の実行中に CDP が error 応答（`Browser Use CDP command failed`）を返した場合は、run 全体の再試行可能エラーにせず要素エラーとして扱い、モデルへ `ELEMENT_UNAVAILABLE` と再観察の guidance を返す。並列実行時は layout 確定前の `DOM.getBoxModel` / `DOM.scrollIntoViewIfNeeded` がこの失敗を返しやすく、ページが動いただけの失敗で run を終わらせないためである。診断イベントには `ELEMENT_OPERATION_CDP_FAILED` を記録し、通常の要素エラーと区別する。
+
+変換する範囲は次のとおりである。
+
+- `click`: 要素の検査から mouse の `mousePressed` 送信まで。`mouseReleased` の失敗は変換しない。press を送った時点で click がページへ届いた可能性があり、要素エラーを返すと再観察後の再 click で二重 click になり得るためである。
+- `fill` / `select`: 要素解決後の操作全体。どちらも冪等（select-all して置換、値の setter）であり、再実行しても入力が重複しない。
+
+接続断（`Browser Use CDP connection closed`）、timeout、送信失敗、payload 上限超過は変換せず、従来どおり run の失敗として扱う。後続の tool 呼び出しでも回復しないためである。`submit` 経路は変換対象外であり、送信権取得後の失敗を `uncertain` に倒す既存の契約を維持する。
+
+#### 禁止フォームへの submit
+
+選択した form に禁止根拠がある場合、`submit` は `SUBMIT_PROHIBITED` を返し、`prohibitedReasonCodes` と `pageProhibited` を添える。`prohibitedReasonCodes` には、その form の code のうちページ単位の検出結果にも含まれるものだけを載せる。`finish_prohibited` はページ単位の検出結果に対して検証されるため、モデルが必ず通る code を選べるようにするためである。ページ単位の検出はすべての form に code がある場合にだけ成立するので、複数 form のページで選択 form だけが禁止の場合は `pageProhibited: false` となり、guidance は他の問い合わせフォームを探すか `finish_uncertain` を呼ぶよう指示する。以前は通常の要素エラーだったため、モデルが `finish_failed` を選ぶことがあった。
+
+#### 禁止根拠検証時の再観察
+
+`finish_prohibited` の検証（`validateProhibited`）は、観察が最新でありページ URL も一致しているのに `prohibitedReasonCodes` に該当 code が無い場合だけ、信頼済み handler 自身が 1 度だけ再観察して判定し直す。回数は input revision ごとに 1 回に制限し、結果を `prohibition_reverified` イベント（`verified` の真偽値のみ）へ記録する。禁止文言の読み取りは iframe の描画タイミングに依存し、モデルが読めている禁止を handler が読めないことがあるためである。
+
+観察が最新でない場合（最後の入力後に観察していない場合）と URL が一致しない場合は、従来どおり再観察せずに拒否する。観察義務はモデルの契約であり、URL 不一致は再観察で解消しないためである。再観察は driver の要素集合を新しい generation で置き換えるため、モデルが保持していた elementId は無効になる。`PROHIBITION_NOT_VERIFIED` の guidance は再観察を指示しているため、この副作用は許容する。
+
 ### 送信前の独立レビュー
 
 `submit` は送信権を取得する前に、agent とは履歴を共有しない独立したレビューを 1 回通す。レビューは同じ Responses API に対して tool を一切渡さず、strict JSON schema で `allow` / `deny` だけを返させる。
@@ -303,7 +324,9 @@ Provider、model、input / output token、処理時間、BrowserUse 待ち時間
 | `data_json` | TEXT | 秘密情報を除いたイベント詳細 |
 | `created_at` | TEXT | 発生日時 |
 
-現在保存するイベントは `job.retry_scheduled`、`job.dead_lettered`、`agent.tool_diagnostic`、`evidence.captured`、`evidence.capture_failed` である。retry イベントにはreason code、発生元、attempt、実行時間、retry時点のProvider呼び出し累計を保存する。tool diagnosticにはturn、固定のtool名、処理stage、固定のresult codeだけを保存する。
+現在保存するイベントは `job.retry_scheduled`、`job.dead_lettered`、`job.redelivery_ignored`、`agent.tool_diagnostic`、`evidence.captured`、`evidence.capture_failed` である。retry イベントにはreason code、発生元、attempt、実行時間、retry時点のProvider呼び出し累計を保存する。tool diagnosticにはturn、固定のtool名、処理stage、固定のresult codeだけを保存する。
+
+`job.redelivery_ignored` は、Queue の再配信を実行せずに ack した場合に best-effort で記録し、`data_json` はジョブの `status` だけを保存する。Worker が `submitting` 中に停止したジョブは再配信されても状態が `submitting` のまま残るため、`updated_at` 以外の手掛かりで見つけられるようにするためである。記録に失敗しても ack は変わらない。
 
 `evidence.captured` の `data_json` は `{ stage, objectKey, sha256, byteLength, contentType: "image/jpeg" }` を保存する。`stage` は `before_submit` / `after_submit` / `prohibited` の固定値であり、`objectKey` は `jobId` / `stage` / `eventId` から機械的に組み立てた R2 オブジェクトキーである。`evidence.capture_failed` の `data_json` は `{ stage, failureCode }` を保存する。`failureCode` は `SCREENSHOT_FAILED` / `OBJECT_STORE_FAILED` / `EVENT_NOT_RECORDED` / `NO_BROWSER_SESSION` / `CAPTURE_TIMEOUT` の固定値である。
 
@@ -468,7 +491,7 @@ consumer は `max_concurrency: 3` とする。5 並列では session を毎回�
 ### 実装
 
 - 利用者別の認証・権限管理と、ジョブ一覧・キャンセル API。
-- 実Workerを`submitting`中に停止した場合に、`submitting`のまま再配信がackされ、再送されないことの検証。
+- 実Workerを`submitting`中に停止した場合の検証。Workers テストで「再配信は ack され、状態は `submitting` のまま、`job.redelivery_ignored` が記録される」経路は固定済みであり、実機での強制停止確認だけが残る。
 - 禁止判定の固定パターンを実サイトの表現へ合わせて拡張し、誤検出と未検出を監査する仕組み。
 - 観察済みリンク自体がGET型副作用を持つサイトの識別またはサイト単位の許可方式。
 - 状態遷移、tool、token、時間、費用の observability。
@@ -480,9 +503,9 @@ consumer は `max_concurrency: 3` とする。5 並列では session を毎回�
 - Provider abstraction と fallback。
 - 外部 API E2E は GitHub Actions の通常 CI に含めず、手動実行に限定する。
 - Worker の `outcome: exceededCpu` の原因特定。報告 `cpuTime` 165 ms に対して強制終了しているため、CPU 上限の引き上げでは説明できない。Workers Logs の保持期間が Free プランで 3 日であるため、再発時は 3 日以内に調査する。
-- 並列時に `multi-step` で毎回発生する turn 6 `click` の CDP コマンド失敗（3 並列でも再現、受信 0）。逐次では合格する。click 中の CDP 失敗を run 全体の再試行可能エラーではなく要素エラーとしてモデルへ返し、再観察させる方式を検討する。`external-iframe` の送信後読み取り失敗は明示停止後の再計測では再現しなかった。
-- `external-iframe-tertiary` で、モデルが観察本文から禁止を読み取っているのに信頼済み handler の禁止根拠検証（iframe 親ページ側の近接要素）が通らず `FINISH_PROHIBITION_NOT_VERIFIED` になり、`uncertain` で終了した例が 1 件（4 回中）。iframe 内容の描画タイミングに依存する可能性があり、再観察後の再検証を含めて確認する。
-- 禁止フォームの submit を信頼済み handler がブロックした後、モデルが `finish_prohibited` ではなく `finish_failed` を選ぶ（`external-iframe-secondary`、3 回中 2 回）。ブロック時の tool エラーを `SUBMIT_PROHIBITED` として分け、observe の `prohibitedReasonCodes` で `finish_prohibited` を呼ぶ guidance を返す。
+- 並列時に `multi-step` で毎回発生する turn 6 `click` の CDP コマンド失敗（3 並列でも再現、受信 0）。click / fill / select 中の CDP コマンド失敗を要素エラーへ変換する対応は実装済みであり、3 並列 3 回の実行で `multi-step` が続行して `sent` になることの確認が残る。`external-iframe` の送信後読み取り失敗は明示停止後の再計測では再現しなかった。
+- `external-iframe-tertiary` で、モデルが観察本文から禁止を読み取っているのに信頼済み handler の禁止根拠検証（iframe 親ページ側の近接要素）が通らず `FINISH_PROHIBITION_NOT_VERIFIED` になり、`uncertain` で終了した例が 1 件（4 回中）。`validateProhibited` の 1 回限りの再観察は実装済みであり、3 並列 3 回の実行で `FINISH_PROHIBITION_NOT_VERIFIED` が減ることの確認が残る。残る場合は診断とともに記録する。
+- 禁止フォームの submit を信頼済み handler がブロックした後、モデルが `finish_prohibited` ではなく `finish_failed` を選ぶ（`external-iframe-secondary`、3 回中 2 回）。`SUBMIT_PROHIBITED` への分離と guidance、system prompt への追記は実装済みであり、`external-iframe-secondary` が `prohibited` で終わることの確認が残る。
 - BrowserUse のプランと同時 session 上限をダッシュボードで確認する。3 並列で 429 が消えることは 19 シナリオで確認済み。並列数を上げる場合は Pay as you go（同時 10）へ変更してから再計測する。
 - R2 アップロード後・D1 記録前に Worker が停止した場合の孤児オブジェクトは検出できない。intent イベントの先行記録または R2 ライフサイクルルールで対処する。
 - 送信前レビューの残存リスク対応: `dom` activation で照合と `requestSubmit` を同一 JS 実行内で行い、`mouse` / `enter` は activation 直前に再照合する。snapshot に禁止文言・label・option・action / method を含める。修正の証明を変更したコントロールの value / checked 差分に限定する。form 再探索の切り詰めを検出して fail-closed にする。いずれも管理下テストシステムでの E2E と併せて実施する。

@@ -31,11 +31,13 @@ import {
 } from "../src/responses-agent-executor";
 import {
 	BrowserElementError,
+	BrowserElementOperationError,
 	BrowserFormInvalidError,
 	type BrowserSubmitResult,
 	type ObservedFieldState,
 	type RestrictedBrowserDriver,
 	type SubmitActivationStrategy,
+	SubmitProhibitedError,
 	type SubmitReviewer,
 } from "../src/restricted-browser";
 import { R2EvidenceObjectStore } from "../src/submission-evidence";
@@ -95,6 +97,14 @@ test("reports native form invalidity separately from an unavailable element", ()
 	expect(classifyToolDiagnostic(new BrowserElementError())).toBe(
 		"ELEMENT_UNAVAILABLE",
 	);
+	expect(
+		classifyToolDiagnostic(new BrowserElementOperationError("click")),
+	).toBe("ELEMENT_OPERATION_CDP_FAILED");
+	expect(
+		classifyToolDiagnostic(
+			new SubmitProhibitedError(["SALES_PROHIBITED"], true),
+		),
+	).toBe("SUBMIT_PROHIBITED");
 });
 
 beforeEach(async () => {
@@ -924,7 +934,13 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	screenshotError: Error | null = null;
 	submitActivationStrategies: SubmitActivationStrategy[] = [];
 	filledValues: string[] = [];
+	observeCount = 0;
+	clickCount = 0;
+	/** Thrown by the first click only, so a retry can succeed. */
+	firstClickError: Error | null = null;
 	observationForms: unknown[] = workerObservedForms();
+	/** Replayed per observe call when set; the last entry repeats. */
+	observationFormsSequence: unknown[][] | null = null;
 	fieldStates: ObservedFieldState[] = workerFieldStates();
 	/** Replayed in order; the last entry repeats. */
 	formSnapshots: string[] = ['["form"]'];
@@ -946,15 +962,25 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	}
 	async observe() {
 		this.observed = true;
+		this.observeCount += 1;
+		const sequence = this.observationFormsSequence;
+		const forms = sequence
+			? (sequence[Math.min(this.observeCount - 1, sequence.length - 1)] ?? [])
+			: this.observationForms;
 		return {
 			url: this.url,
 			// A real observation is a snapshot, not a live view of the page.
-			forms: structuredClone(this.observationForms),
+			forms: structuredClone(forms),
 			...(this.pageText ? { pageText: this.pageText } : {}),
 			...(this.pageTextTruncated ? { pageTextTruncated: true } : {}),
 		};
 	}
-	async clickNonSubmit(): Promise<void> {}
+	async clickNonSubmit(): Promise<void> {
+		this.clickCount += 1;
+		const error = this.firstClickError;
+		this.firstClickError = null;
+		if (error) throw error;
+	}
 	async fill(elementId: string, value: string): Promise<void> {
 		this.filledValues.push(value);
 		this.#applyValue(elementId, value);
@@ -1007,7 +1033,7 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	}
 }
 
-function workerObservedForms(): unknown[] {
+function workerObservedForms(prohibitionText?: string): unknown[] {
 	return [
 		{
 			fields: [
@@ -1015,6 +1041,7 @@ function workerObservedForms(): unknown[] {
 				{ elementId: "fa-0-1", tag: "input", type: "submit", value: "Send" },
 				{ elementId: "fa-0-2", tag: "input", type: "text", value: "" },
 			],
+			...(prohibitionText === undefined ? {} : { prohibitionText }),
 		},
 	];
 }
@@ -2190,6 +2217,234 @@ describe("ResponsesAgentExecutor", () => {
 				turn: 4,
 				toolName: "submit",
 				stage: "submit",
+				resultCode: "OK",
+			},
+		]);
+	});
+
+	test("continues after a click whose CDP command failed", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const driver = new WorkerFakeBrowserDriver();
+		driver.firstClickError = new BrowserElementOperationError("click");
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-click", "click", { elementId: "fa-0-2" }),
+			functionResponse("call-reobserve", "observe", {}),
+			functionResponse("call-retry-click", "click", { elementId: "fa-0-2" }),
+			functionResponse("call-fill", "fill", {
+				elementId: "fa-0-0",
+				payloadKey: "message",
+			}),
+			functionResponse("call-confirm", "observe", {}),
+			functionResponse("call-submit", "submit", {
+				elementId: "fa-0-1",
+				activationStrategy: "mouse",
+			}),
+			reviewResponse("allow"),
+		];
+		const requests: unknown[] = [];
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async (_url: unknown, init: RequestInit) => {
+				requests.push(JSON.parse(String(init.body)));
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as unknown as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toEqual({ outcome: "sent", formUrl: input.targetUrl });
+		expect(driver.clickCount).toBe(2);
+		const reobserveRequest = requests[2] as {
+			input: Array<{ type?: string; call_id?: string; output?: string }>;
+		};
+		expect(
+			reobserveRequest.input.find(
+				(item) =>
+					item.type === "function_call_output" && item.call_id === "call-click",
+			)?.output,
+		).toBe(
+			JSON.stringify({
+				error: "ELEMENT_UNAVAILABLE",
+				guidance: TOOL_ERROR_GUIDANCE.ELEMENT_UNAVAILABLE,
+			}),
+		);
+		const diagnostics = await readAgentToolDiagnostics(input.id);
+		expect(
+			diagnostics.filter(
+				(entry) => entry.resultCode === "ELEMENT_OPERATION_CDP_FAILED",
+			),
+		).toEqual([
+			{
+				turn: 2,
+				toolName: "click",
+				stage: "click",
+				resultCode: "ELEMENT_OPERATION_CDP_FAILED",
+			},
+		]);
+	});
+
+	test("finishes as prohibited after the handler blocks a prohibited submit", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const driver = new WorkerFakeBrowserDriver();
+		driver.observationForms = workerObservedForms(
+			"営業目的での利用は禁止しています。",
+		);
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-fill", "fill", {
+				elementId: "fa-0-0",
+				payloadKey: "message",
+			}),
+			functionResponse("call-confirm", "observe", {}),
+			functionResponse("call-submit", "submit", {
+				elementId: "fa-0-1",
+				activationStrategy: "mouse",
+			}),
+			functionResponse("call-finish", "finish_prohibited", {
+				formUrl: input.targetUrl,
+				reasonCode: "SALES_PROHIBITED",
+				reason: "The page prohibits sales outreach.",
+			}),
+		];
+		const requests: unknown[] = [];
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async (_url: unknown, init: RequestInit) => {
+				requests.push(JSON.parse(String(init.body)));
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as unknown as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toMatchObject({
+			outcome: "prohibited",
+			reasonCode: "SALES_PROHIBITED",
+		});
+		expect(driver.submitCount).toBe(0);
+		const finishRequest = requests[4] as {
+			input: Array<{ type?: string; call_id?: string; output?: string }>;
+		};
+		expect(
+			finishRequest.input.find(
+				(item) =>
+					item.type === "function_call_output" &&
+					item.call_id === "call-submit",
+			)?.output,
+		).toBe(
+			JSON.stringify({
+				error: "SUBMIT_PROHIBITED",
+				prohibitedReasonCodes: ["SALES_PROHIBITED"],
+				pageProhibited: true,
+				guidance: TOOL_ERROR_GUIDANCE.SUBMIT_PROHIBITED,
+			}),
+		);
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{ turn: 1, toolName: "observe", stage: "observe", resultCode: "OK" },
+			{ turn: 2, toolName: "fill", stage: "fill", resultCode: "OK" },
+			{ turn: 3, toolName: "observe", stage: "observe", resultCode: "OK" },
+			{
+				turn: 4,
+				toolName: "submit",
+				stage: "submit",
+				resultCode: "SUBMIT_PROHIBITED",
+			},
+			{
+				turn: 5,
+				toolName: "finish",
+				stage: "finish_validation",
+				resultCode: "OK",
+			},
+		]);
+	});
+
+	test("accepts a prohibited finish that only the handler's re-observation proves", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const driver = new WorkerFakeBrowserDriver();
+		driver.observationFormsSequence = [
+			workerObservedForms("一般お問い合わせフォーム"),
+			workerObservedForms("営業目的での利用は禁止しています。"),
+		];
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-finish", "finish_prohibited", {
+				formUrl: input.targetUrl,
+				reasonCode: "SALES_PROHIBITED",
+				reason: "The page prohibits sales outreach.",
+			}),
+		];
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () => {
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toMatchObject({
+			outcome: "prohibited",
+			reasonCode: "SALES_PROHIBITED",
+		});
+		expect(driver.observeCount).toBe(2);
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{ turn: 1, toolName: "observe", stage: "observe", resultCode: "OK" },
+			{
+				turn: 2,
+				toolName: "finish",
+				stage: "finish_validation",
 				resultCode: "OK",
 			},
 		]);
@@ -3381,6 +3636,54 @@ describe("Queue orchestration", () => {
 		expect(result.retryMessages).toEqual([]);
 		expect(persisted?.status).toBe("uncertain");
 		expect(persisted?.result?.reasonCode).toBe("AGENT_RESULT_CONFLICT");
+	});
+
+	test("acknowledges a redelivery of a submitting job without running it", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "message-1", "2026-08-28T00:00:01.000Z");
+		await store.claimSubmission(
+			input.id,
+			"message-1",
+			"2026-08-28T00:00:02.000Z",
+		);
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
+			{
+				id: "message-1",
+				timestamp: new Date("2026-08-28T00:00:03.000Z"),
+				body: { jobId: input.id },
+				attempts: 2,
+			},
+		]);
+		const ctx = createExecutionContext();
+		let executions = 0;
+		const executor: AgentExecutor = {
+			async execute() {
+				executions += 1;
+				return { outcome: "sent", formUrl: input.targetUrl };
+			},
+		};
+
+		await consumeJobBatch(batch, env, executor);
+		const result = await getQueueResult(batch, ctx);
+		const persisted = await store.find(input.id);
+		const { results: events } = await env.DB.prepare(
+			"SELECT attempt, type, data_json FROM events WHERE job_id = ?",
+		)
+			.bind(input.id)
+			.all<{ attempt: number; type: string; data_json: string }>();
+
+		expect(executions).toBe(0);
+		expect(result.explicitAcks).toEqual(["message-1"]);
+		expect(result.retryMessages).toEqual([]);
+		expect(persisted?.status).toBe("submitting");
+		expect(events).toEqual([
+			{
+				attempt: 1,
+				type: "job.redelivery_ignored",
+				data_json: JSON.stringify({ status: "submitting" }),
+			},
+		]);
 	});
 
 	test("marks a safe job state as dead-lettered", async () => {

@@ -93,6 +93,8 @@ export type AgentToolDiagnosticCode =
 	| "PAGE_EVALUATION_FAILED"
 	| "PAYLOAD_TOO_LARGE"
 	| "ELEMENT_UNAVAILABLE"
+	| "ELEMENT_OPERATION_CDP_FAILED"
+	| "SUBMIT_PROHIBITED"
 	| "FORM_INVALID"
 	| "NAVIGATION_POLICY"
 	| "TOOL_INPUT_INVALID"
@@ -276,6 +278,34 @@ export class D1JobStore implements JobStore {
 				id,
 				runToken,
 			)
+			.run();
+
+		return result.meta.changes === 1;
+	}
+
+	/**
+	 * Records that a redelivered message was acknowledged without running the
+	 * job. A run that stopped between `claimSubmission` and the persisted
+	 * result leaves the job in `submitting`, which an operator can otherwise
+	 * only find from `updated_at`.
+	 */
+	async recordRedeliveryIgnored(
+		id: string,
+		status: JobStatus,
+		now: string,
+	): Promise<boolean> {
+		const result = await this.db
+			.prepare(
+				`INSERT INTO events (
+          id, job_id, attempt, type, data_json, created_at
+        )
+        SELECT ?, id, attempt_count, 'job.redelivery_ignored', json_object(
+          'status', ?
+        ), ?
+        FROM jobs
+        WHERE id = ?`,
+			)
+			.bind(crypto.randomUUID(), status, now, id)
 			.run();
 
 		return result.meta.changes === 1;

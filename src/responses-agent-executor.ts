@@ -39,6 +39,7 @@ import {
 import {
 	assertAllowedTargetUrl,
 	BrowserElementError,
+	BrowserElementOperationError,
 	BrowserFormInvalidError,
 	type BrowserObservation,
 	CorrectionRequiredError,
@@ -49,6 +50,7 @@ import {
 	SubmissionEvidenceError,
 	SubmissionNotAuthorizedError,
 	SubmissionResultUncertainError,
+	SubmitProhibitedError,
 	SubmitReviewDeniedError,
 	type SubmitReviewer,
 	SubmitReviewUnavailableError,
@@ -575,6 +577,12 @@ async function executeToolCall(
 		if (originalError instanceof ObservationStaleError) {
 			return toolError("OBSERVATION_STALE");
 		}
+		if (originalError instanceof SubmitProhibitedError) {
+			return toolError("SUBMIT_PROHIBITED", {
+				prohibitedReasonCodes: originalError.reasonCodes,
+				pageProhibited: originalError.pageProhibited,
+			});
+		}
 		if (originalError instanceof BrowserFormInvalidError) {
 			return toolError("FORM_INVALID");
 		}
@@ -730,6 +738,10 @@ export function classifyToolDiagnostic(
 	}
 	if (error instanceof BrowserToolInputError || error instanceof SyntaxError) {
 		return "TOOL_INPUT_INVALID";
+	}
+	if (error instanceof SubmitProhibitedError) return "SUBMIT_PROHIBITED";
+	if (error instanceof BrowserElementOperationError) {
+		return "ELEMENT_OPERATION_CDP_FAILED";
 	}
 	if (error instanceof BrowserFormInvalidError) return "FORM_INVALID";
 	if (error instanceof BrowserElementError) return "ELEMENT_UNAVAILABLE";
@@ -952,7 +964,9 @@ export const TOOL_ERROR_GUIDANCE = {
 	FORM_INVALID:
 		"Native validation failed. Re-observe, fill every required field from payload.formValues, and fix invalid values.",
 	ELEMENT_UNAVAILABLE:
-		"The elementId is not usable for this tool. Re-observe and use an elementId from the latest result. Submit controls are only usable via submit.",
+		"The elementId is not usable for this tool. Re-observe and use an elementId from the latest result. Submit controls are only usable via submit. The page may also have changed while the element was being operated, so observe again and continue from the latest result.",
+	SUBMIT_PROHIBITED:
+		"The trusted handler found a prohibition on the selected form. Do not submit it. If pageProhibited is true, call finish_prohibited with one of prohibitedReasonCodes. If pageProhibited is false, another form on the page may be the inquiry form: observe again and use it, and if no other inquiry form exists, call finish_uncertain.",
 	PROHIBITION_NOT_VERIFIED:
 		"The trusted handler found no prohibition evidence in the latest observation for that reasonCode. Re-observe; if no evidence exists, continue the form or finish with uncertain.",
 	JOB_STATE_CONFLICT:
@@ -1004,6 +1018,7 @@ function systemPrompt(dryRun: boolean): string {
 		"Match each field to a payload.formValues key by meaning; the trusted handler supplies the value.",
 		"Before submit, re-observe and confirm every required field on the target form holds the intended payload key.",
 		"Only one submission is sent per job. A submit call that the pre-submit review denies sends nothing and, when the guidance says the inputs are correctable, may be retried once after correcting them.",
+		"If submit returns SUBMIT_PROHIBITED, follow its guidance: finish_prohibited when pageProhibited is true, otherwise use another inquiry form or finish_uncertain. Never call finish_failed for a prohibition.",
 		"If meaning or submission outcome is unclear, call finish_uncertain. For technical failures, call finish_failed.",
 	];
 	if (dryRun) {

@@ -223,6 +223,35 @@ export class BrowserFormInvalidError extends BrowserElementError {
 	}
 }
 
+export type BrowserElementOperation = "click" | "fill" | "select";
+
+/**
+ * A CDP command failed while an element was being operated. The page most
+ * likely moved under the operation, so the model re-observes and continues
+ * instead of the whole run ending as a browser failure.
+ */
+export class BrowserElementOperationError extends BrowserElementError {
+	constructor(readonly operation: BrowserElementOperation) {
+		super();
+		this.name = "BrowserElementOperationError";
+	}
+}
+
+/**
+ * The form that owns the submit control carries a prohibition. It is separate
+ * from a plain element error so that the model is told to finish as prohibited
+ * instead of treating the block as a technical failure.
+ */
+export class SubmitProhibitedError extends BrowserElementError {
+	constructor(
+		readonly reasonCodes: ProhibitedReasonCode[],
+		readonly pageProhibited: boolean,
+	) {
+		super();
+		this.name = "SubmitProhibitedError";
+	}
+}
+
 /** The latest observation is older than the latest trusted input. */
 export class ObservationStaleError extends BrowserElementError {
 	constructor() {
@@ -315,6 +344,8 @@ export class RestrictedBrowserTools {
 	#latestObservation: BrowserObservation | undefined;
 	#inputRevision = 0;
 	#observationRevision = -1;
+	/** Bounds the handler's own re-observation to one per input revision. */
+	#prohibitionReverifiedRevision = -1;
 	#submitAttempted = false;
 	#deniedFingerprint: string | undefined;
 	#correctionInputApplied = false;
@@ -473,11 +504,23 @@ export class RestrictedBrowserTools {
 		if (this.#observationRevision !== this.#inputRevision) {
 			throw new ObservationStaleError();
 		}
-		if (
-			prohibitedReasonCodesForElement(this.#latestObservation, elementId)
-				.length > 0
-		) {
-			throw new BrowserElementError();
+		const formReasonCodes = prohibitedReasonCodesForElement(
+			this.#latestObservation,
+			elementId,
+		);
+		if (formReasonCodes.length > 0) {
+			// Only codes the page-level detection also carries can pass
+			// `validateProhibited`, so the model is never handed a code that its
+			// `finish_prohibited` call would then be rejected for.
+			const pageReasonCodes =
+				this.#latestObservation?.prohibitedReasonCodes ?? [];
+			const verifiable = formReasonCodes.filter((code) =>
+				pageReasonCodes.includes(code),
+			);
+			throw new SubmitProhibitedError(
+				verifiable.length > 0 ? verifiable : formReasonCodes,
+				verifiable.length > 0,
+			);
 		}
 		await this.#assertCurrentUrlAllowed();
 		await this.driver.validateSubmit(elementId);
@@ -489,15 +532,38 @@ export class RestrictedBrowserTools {
 		formUrl: string | null,
 	): Promise<void> {
 		const observation = this.#latestObservation;
+		// Observing after the last input stays the model's obligation, and a URL
+		// mismatch is not something a fresh observation can repair.
+		if (this.#observationRevision !== this.#inputRevision || !observation) {
+			throw new BrowserElementError();
+		}
 		if (
-			this.#observationRevision !== this.#inputRevision ||
-			!observation?.prohibitedReasonCodes?.includes(reasonCode) ||
 			(formUrl !== null &&
 				canonicalNavigationUrl(formUrl) !==
 					canonicalNavigationUrl(observation.url)) ||
 			canonicalNavigationPermissionUrl(await this.driver.currentUrl()) !==
 				canonicalNavigationPermissionUrl(observation.url)
 		) {
+			throw new BrowserElementError();
+		}
+		if (observation.prohibitedReasonCodes?.includes(reasonCode)) return;
+		// Whether the handler can read a prohibition depends on the page's own
+		// rendering, so one fresh observation is allowed for each input
+		// revision. It replaces the driver's element set, which the
+		// PROHIBITION_NOT_VERIFIED guidance already tells the model to re-read.
+		if (this.#prohibitionReverifiedRevision === this.#inputRevision) {
+			throw new BrowserElementError();
+		}
+		this.#prohibitionReverifiedRevision = this.#inputRevision;
+		const reobserved = await this.observe();
+		// The re-observation must describe the same page, otherwise the codes it
+		// carries would corroborate a URL that was never checked.
+		const verified =
+			canonicalNavigationPermissionUrl(reobserved.url) ===
+				canonicalNavigationPermissionUrl(observation.url) &&
+			reobserved.prohibitedReasonCodes?.includes(reasonCode) === true;
+		console.log(JSON.stringify({ event: "prohibition_reverified", verified }));
+		if (!verified) {
 			throw new BrowserElementError();
 		}
 	}
