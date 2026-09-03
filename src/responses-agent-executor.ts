@@ -60,6 +60,7 @@ import {
 import type { EvidenceObjectStore } from "./submission-evidence";
 import { ResponsesSubmitReviewer } from "./submit-reviewer";
 
+const RUN_METRICS_WRITE_TIMEOUT_MS = 2_000;
 const MAX_PROVIDER_OUTPUT_TOKENS = 4_096;
 const MAX_PROVIDER_REQUEST_BYTES = 128 * 1_024;
 const MAX_JOB_PROMPT_LENGTH = 64_000;
@@ -202,20 +203,47 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 		}
 	}
 
+	/**
+	 * Best-effort and bounded: the write runs inside the executor's deadline
+	 * race, so a slow D1 must not let the timeout win over a run result that
+	 * #run already settled. A write cut off by the bound is reported, not
+	 * awaited.
+	 */
 	async #recordRunMetrics(
 		input: AgentRunInput,
 		metrics: AgentRunMetrics,
 	): Promise<void> {
-		try {
-			await new D1JobStore(this.#db).recordAgentRunMetrics(
-				input.job.id,
-				input.runToken,
-				input.job.attemptCount,
-				metrics,
-				new Date().toISOString(),
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timedOut = new Promise<"TIMEOUT">((resolve) => {
+			timer = setTimeout(
+				() => resolve("TIMEOUT"),
+				RUN_METRICS_WRITE_TIMEOUT_MS,
 			);
-		} catch {
-			console.warn("agent_run_metrics_write_failed");
+		});
+		try {
+			const write = new D1JobStore(this.#db)
+				.recordAgentRunMetrics(
+					input.job.id,
+					input.runToken,
+					input.job.attemptCount,
+					metrics,
+					new Date().toISOString(),
+				)
+				.then(
+					() => "OK" as const,
+					() => "WRITE_FAILED" as const,
+				);
+			const result = await Promise.race([write, timedOut]);
+			if (result !== "OK") {
+				console.warn(
+					JSON.stringify({
+						event: "agent_run_metrics_not_recorded",
+						reason: result,
+					}),
+				);
+			}
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
 		}
 	}
 

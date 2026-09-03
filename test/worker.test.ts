@@ -2300,7 +2300,79 @@ describe("ResponsesAgentExecutor", () => {
 			reason: "No inquiry form is present.",
 		});
 		expect(await readRunMetrics(jobInput.id)).toEqual([]);
-		expect(warnings).toContain("agent_run_metrics_write_failed");
+		expect(warnings).toContain(
+			JSON.stringify({
+				event: "agent_run_metrics_not_recorded",
+				reason: "WRITE_FAILED",
+			}),
+		);
+	});
+
+	test("does not let a stalled run metrics write hold the run result", async () => {
+		const jobInput = { ...input, id: "job-run-metrics-stalled" };
+		const store = new D1JobStore(env.DB);
+		await store.create(jobInput, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			jobInput.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-finish", "finish_prohibited", {
+				formUrl: jobInput.targetUrl,
+				reasonCode: "NO_FORM_PRESENT",
+				reason: "No inquiry form is present.",
+			}),
+		];
+		const driver = new WorkerFakeBrowserDriver();
+		driver.observationForms = [];
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () => {
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+		// A D1 write that never settles must not keep execute() from returning
+		// the result that #run already settled.
+		const recordMetrics = vi
+			.spyOn(D1JobStore.prototype, "recordAgentRunMetrics")
+			.mockImplementation(() => new Promise<boolean>(() => {}));
+		const warnings: unknown[] = [];
+		const warn = vi
+			.spyOn(console, "warn")
+			.mockImplementation((message: unknown) => {
+				warnings.push(message);
+			});
+
+		const startedAt = Date.now();
+		let result: Awaited<ReturnType<typeof executor.execute>>;
+		try {
+			result = await executor.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				new AbortController().signal,
+			);
+		} finally {
+			recordMetrics.mockRestore();
+			warn.mockRestore();
+		}
+
+		expect(result.outcome).toBe("prohibited");
+		expect(Date.now() - startedAt).toBeLessThan(5_000);
+		expect(warnings).toContain(
+			JSON.stringify({
+				event: "agent_run_metrics_not_recorded",
+				reason: "TIMEOUT",
+			}),
+		);
 	});
 
 	test("normalizes prohibited reason code aliases", async () => {
