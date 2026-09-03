@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentTools } from "../src/agent-runtime";
-import { assertAllowedBrowserRequest } from "../src/browser-network-policy";
+import {
+	assertAllowedBrowserRequest,
+	isVerificationProviderRequest,
+	VERIFICATION_PROVIDER_ALLOWLIST,
+} from "../src/browser-network-policy";
 import { InMemoryJobStore, type JobInput } from "../src/job";
 import {
 	BrowserElementError,
@@ -111,6 +115,128 @@ describe("RestrictedBrowserTools", () => {
 			),
 		).toThrow(NavigationPolicyError);
 	});
+	test("allows the fixed verification provider hosts on every job", () => {
+		for (const [url, method] of [
+			["https://www.google.com/recaptcha/api.js?render=key", "GET"],
+			["https://www.google.com/recaptcha/api2/reload?k=key", "POST"],
+			[
+				"https://www.gstatic.com/recaptcha/releases/abc/recaptcha__ja.js",
+				"GET",
+			],
+			["https://recaptcha.net/recaptcha/api.js", "GET"],
+			["https://www.recaptcha.net/recaptcha/api2/reload", "POST"],
+			["https://hcaptcha.com/1/api.js", "GET"],
+			["https://sub.hcaptcha.com/x", "GET"],
+			["https://challenges.cloudflare.com/turnstile/v0/api.js", "GET"],
+		] as const) {
+			expect(
+				assertAllowedBrowserRequest(url, "form-agent.dev", method, false),
+			).toBe(true);
+		}
+	});
+
+	test("rejects lookalike hosts, other paths and non-https verification URLs", () => {
+		for (const [url, method] of [
+			["https://www.google.com/search?q=form", "GET"],
+			["https://www.gstatic.com/other/script.js", "GET"],
+			["http://www.google.com/recaptcha/api.js", "GET"],
+			["https://hcaptcha.com.evil.example/1/api.js", "GET"],
+			["https://www.google.com.evil.example/recaptcha/api.js", "GET"],
+			["https://google.com/recaptcha/api.js", "GET"],
+			["https://www.google.com/recaptcha/api2/reload", "PUT"],
+			["https://user:pass@www.google.com/recaptcha/api.js", "GET"],
+		] as const) {
+			expect(isVerificationProviderRequest(url, method)).toBe(false);
+			expect(() =>
+				assertAllowedBrowserRequest(
+					url,
+					"form-agent.dev",
+					method,
+					false,
+					false,
+					true,
+				),
+			).toThrow(NavigationPolicyError);
+		}
+	});
+
+	test("keeps verification provider requests allowed after a dry-run interaction", () => {
+		expect(
+			assertAllowedBrowserRequest(
+				"https://www.google.com/recaptcha/api2/reload?k=key",
+				"form-agent.dev",
+				"POST",
+				false,
+				false,
+				true,
+			),
+		).toBe(true);
+		expect(() =>
+			assertAllowedBrowserRequest(
+				"https://cdn.jsdelivr.net/form.js",
+				"form-agent.dev",
+				"GET",
+				false,
+				false,
+				true,
+			),
+		).toThrow(NavigationPolicyError);
+	});
+
+	test("never lets a verification provider host become a navigation", () => {
+		expect(
+			isVerificationProviderRequest(
+				"https://www.google.com/recaptcha/api.js",
+				"GET",
+				"Document",
+			),
+		).toBe(false);
+		expect(() =>
+			assertAllowedBrowserRequest(
+				"https://www.google.com/recaptcha/api.js",
+				"form-agent.dev",
+				"GET",
+				false,
+				false,
+				false,
+				[],
+				"Document",
+			),
+		).toThrow(NavigationPolicyError);
+	});
+
+	test("keeps verification provider requests outside the submission claim", () => {
+		// The submission claim is never spent on these hosts: they pass without
+		// any submission authorization, so the one-shot permission stays unused.
+		expect(
+			assertAllowedBrowserRequest(
+				"https://www.google.com/recaptcha/api2/reload",
+				"form-agent.dev",
+				"POST",
+				false,
+			),
+		).toBe(true);
+		expect(
+			assertAllowedBrowserRequest(
+				"https://form-agent.dev/contact",
+				"form-agent.dev",
+				"POST",
+				true,
+			),
+		).toBe(false);
+	});
+
+	test("pins the verification provider allowlist to known hosts", () => {
+		expect(VERIFICATION_PROVIDER_ALLOWLIST).toEqual([
+			{ host: "www.google.com", pathPrefix: "/recaptcha/" },
+			{ host: "www.gstatic.com", pathPrefix: "/recaptcha/" },
+			{ host: "recaptcha.net", pathPrefix: "/recaptcha/" },
+			{ host: "www.recaptcha.net", pathPrefix: "/recaptcha/" },
+			{ host: "hcaptcha.com", allowSubdomains: true },
+			{ host: "challenges.cloudflare.com" },
+		]);
+	});
+
 	test("allows only the target domain and its subdomains", async () => {
 		const driver = new FakeDriver();
 		driver.navigationLinks = [

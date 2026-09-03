@@ -1,4 +1,7 @@
-import { assertAllowedBrowserRequest } from "./browser-network-policy";
+import {
+	assertAllowedBrowserRequest,
+	isVerificationProviderRequest,
+} from "./browser-network-policy";
 import { SUBMISSION_CONFIRMATION_PATTERN } from "./browser-submit-confirmation";
 import {
 	BrowserUseCdpClosedError,
@@ -301,6 +304,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#submissionRequestInFlight = false;
 	#submissionRedirectRequestId: string | undefined;
 	#submissionRequestCount = 0;
+	#verificationProviderRequestCount = 0;
 	#submissionRequestObserved: (() => void) | undefined;
 	#expectedSubmissionRequest: ExpectedSubmissionRequest | undefined;
 	#submissionAttemptInProgress = false;
@@ -538,6 +542,14 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async #close(): Promise<void> {
+		if (this.#verificationProviderRequestCount > 0) {
+			console.log(
+				JSON.stringify({
+					event: "browser_verification_requests",
+					count: this.#verificationProviderRequestCount,
+				}),
+			);
+		}
 		this.#notifyPageChanged();
 		this.connection.close();
 		if (this.browserSession) {
@@ -1155,9 +1167,18 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		const unsafeRequest = !["GET", "HEAD", "OPTIONS"].includes(
 			paused.request.method.toUpperCase(),
 		);
+		// A known verification widget (reCAPTCHA / hCaptcha / Turnstile) is never
+		// the form submission, so it stays outside the submission claim and out of
+		// the block-stage diagnostics.
+		const verificationProviderRequest = isVerificationProviderRequest(
+			paused.request.url,
+			paused.request.method,
+			paused.resourceType,
+		);
 		let blockStage: SubmissionRequestBlockStage = "network_policy";
 		let claimedSubmissionRequest = false;
-		let submissionRelatedRequest = unsafeRequest;
+		let submissionRelatedRequest =
+			unsafeRequest && !verificationProviderRequest;
 		try {
 			if (!this.#targetDomain) {
 				throw new Error("Browser domain scope is not configured");
@@ -1171,19 +1192,20 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 					this.#expectedSubmissionFrameId,
 				);
 			const getSubmissionGuard = this.#getSubmissionGuard;
-			const getSubmissionDisposition = canContinueSubmissionRedirect
-				? "ignore"
-				: getSubmissionRequestDisposition(
-						paused.request,
-						paused.resourceType,
-						paused.frameId,
-						getSubmissionGuard?.request,
-						getSubmissionGuard?.frameId,
-						getSubmissionGuard !== undefined,
-						this.#submissionRequestAllowed,
-						this.#submissionRequestCount,
-						this.#submissionRequestInFlight,
-					);
+			const getSubmissionDisposition =
+				canContinueSubmissionRedirect || verificationProviderRequest
+					? "ignore"
+					: getSubmissionRequestDisposition(
+							paused.request,
+							paused.resourceType,
+							paused.frameId,
+							getSubmissionGuard?.request,
+							getSubmissionGuard?.frameId,
+							getSubmissionGuard !== undefined,
+							this.#submissionRequestAllowed,
+							this.#submissionRequestCount,
+							this.#submissionRequestInFlight,
+						);
 			submissionRelatedRequest ||= getSubmissionDisposition !== "ignore";
 			if (getSubmissionDisposition === "block") {
 				blockStage = "expected_request";
@@ -1192,7 +1214,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			if (getSubmissionDisposition === "claim") {
 				expectedSubmissionRequest = true;
 			}
-			if (this.#submissionRequestAllowed) {
+			if (this.#submissionRequestAllowed && !verificationProviderRequest) {
 				if (unsafeRequest) {
 					blockStage = "expected_request";
 					assertExpectedSubmissionRequest(
@@ -1221,7 +1243,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				expectedNavigationRequest.claimed = true;
 			}
 			blockStage = "network_policy";
-			assertAllowedBrowserRequest(
+			const allowedByVerificationProvider = assertAllowedBrowserRequest(
 				paused.request.url,
 				this.#targetDomain,
 				paused.request.method,
@@ -1235,6 +1257,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 						canContinueSubmissionRedirect,
 					),
 				this.#allowedHosts,
+				paused.resourceType,
 			);
 			if (canClaimSubmissionRequest) {
 				this.#submissionRequestInFlight = true;
@@ -1249,6 +1272,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 						requestId: paused.requestId,
 					}),
 				() => {
+					if (allowedByVerificationProvider) {
+						this.#verificationProviderRequestCount += 1;
+					}
 					if (!claimedSubmissionRequest) return;
 					this.#submissionRequestCount += 1;
 					this.#submissionRequestObserved?.();

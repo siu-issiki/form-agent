@@ -3471,8 +3471,28 @@ class ScriptedCdpConnection {
 		return undefined;
 	}
 
-	on(): () => void {
-		return () => {};
+	readonly listeners = new Map<
+		string,
+		(params: Record<string, unknown>, sessionId?: string) => void
+	>();
+
+	on(
+		method: string,
+		handler: (params: Record<string, unknown>, sessionId?: string) => void,
+	): () => void {
+		this.listeners.set(method, handler);
+		return () => {
+			this.listeners.delete(method);
+		};
+	}
+
+	/** Delivers a CDP event to the driver the way the connection would. */
+	emit(
+		method: string,
+		params: Record<string, unknown>,
+		sessionId = "session-1",
+	): void {
+		this.listeners.get(method)?.(params, sessionId);
 	}
 
 	close(): void {
@@ -4583,5 +4603,72 @@ describe("bootstrap navigation readiness", () => {
 
 		expect((caught as Error).message).toBe("Browser page did not become ready");
 		expect(countSent(connection, "Page.navigate")).toBe(1);
+	});
+});
+
+describe("BrowserUseCdpDriver verification provider requests", () => {
+	test("continues a reCAPTCHA request, blocks other hosts and counts the run", async () => {
+		const connection = new ScriptedCdpConnection();
+		const driver = await scriptedDriver(connection);
+
+		connection.emit("Fetch.requestPaused", {
+			requestId: "verify-1",
+			resourceType: "XHR",
+			frameId: "frame-1",
+			request: {
+				url: "https://www.google.com/recaptcha/api2/reload?k=key",
+				method: "POST",
+			},
+		});
+		connection.emit("Fetch.requestPaused", {
+			requestId: "other-1",
+			resourceType: "XHR",
+			frameId: "frame-1",
+			request: { url: "https://analytics.example/collect", method: "POST" },
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(
+			connection.sent.filter(
+				(entry) => entry.method === "Fetch.continueRequest",
+			),
+		).toEqual([
+			{ method: "Fetch.continueRequest", params: { requestId: "verify-1" } },
+		]);
+		expect(
+			connection.sent.filter((entry) => entry.method === "Fetch.failRequest"),
+		).toEqual([
+			{
+				method: "Fetch.failRequest",
+				params: { requestId: "other-1", errorReason: "BlockedByClient" },
+			},
+		]);
+
+		const captured = captureLogs();
+		try {
+			await driver.close();
+		} finally {
+			captured.restore();
+		}
+		expect(logEvents(captured.logs)).toContainEqual({
+			event: "browser_verification_requests",
+			count: 1,
+		});
+	});
+
+	test("never claims a verification provider host as the submission request", () => {
+		expect(
+			getSubmissionRequestDisposition(
+				{ url: "https://www.google.com/recaptcha/api2/reload", method: "GET" },
+				"XHR",
+				"frame-1",
+				{ url: "https://www.google.com/recaptcha/api2/reload", method: "GET" },
+				"frame-1",
+				true,
+				true,
+				0,
+				false,
+			),
+		).toBe("ignore");
 	});
 });
