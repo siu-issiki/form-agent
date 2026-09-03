@@ -1074,7 +1074,7 @@ export const TOOL_ERROR_GUIDANCE = {
 	UNKNOWN_TOOL:
 		"Call only navigate, observe, click, fill, select, submit, or finish.",
 	INVALID_TOOL_INPUT:
-		"Use only elementId, payloadKey, url, and activationStrategy values that satisfy the tool schema and come from the latest observe result or payload.formValues.",
+		"Use only elementId, payloadKey, url, and activationStrategy values that satisfy the tool schema and come from the latest observe result or payload.formValues. Keys whose value is a list of candidates are for select only; use single-value keys with fill.",
 	NAVIGATION_NOT_ALLOWED:
 		"Navigate only to the current URL or an exact URL from the latest observe.navigationLinks.",
 	OBSERVATION_STALE:
@@ -1086,7 +1086,7 @@ export const TOOL_ERROR_GUIDANCE = {
 	FORM_INVALID:
 		"Native validation failed. Re-observe, fill every required field from payload.formValues, and fix invalid values.",
 	ELEMENT_UNAVAILABLE:
-		"The elementId is not usable for this tool. Re-observe and use an elementId from the latest result. Submit controls are only usable via submit. The page may also have changed while the element was being operated, so observe again and continue from the latest result.",
+		"The elementId is not usable for this tool. Re-observe and use an elementId from the latest result. Submit controls are only usable via submit. The page may also have changed while the element was being operated, so observe again and continue from the latest result. Among the radio buttons of the same group, choose the one that matches the earliest candidate.",
 	SUBMIT_PROHIBITED:
 		"The trusted handler found a prohibition on the selected form. Do not submit it. If pageProhibited is true, call finish_prohibited with one of prohibitedReasonCodes. If pageProhibited is false, another form on the page may be the inquiry form: observe again and use it, and if no other inquiry form exists, call finish_uncertain.",
 	PROHIBITION_NOT_VERIFIED:
@@ -1138,6 +1138,7 @@ function systemPrompt(dryRun: boolean): string {
 		"When the current page has no inquiry form but observe returned navigationLinks that look like a contact or inquiry page, navigate there and observe again before deciding that no form exists.",
 		"When outreach is prohibited, no inquiry form exists, or the form's stated purpose excludes this inquiry, finish as prohibited instead of submitting.",
 		"Match each field to a payload.formValues key by meaning; the trusted handler supplies the value.",
+		"Some payload keys carry an ordered list of candidate labels for a choice control. For a select, radio, or checkbox, pick the payloadKey whose candidates match the control's options or label as shown in observe; the trusted handler selects the first matching candidate and rejects the call when none matches.",
 		"Before submit, re-observe and confirm every required field on the target form holds the intended payload key.",
 		"Only one submission is sent per job. A submit call that the pre-submit review denies sends nothing and, when the guidance says the inputs are correctable, may be retried once after correcting them.",
 		"If submit returns SUBMIT_PROHIBITED, follow its guidance: finish_prohibited when pageProhibited is true, otherwise use another inquiry form or finish_uncertain. Never call finish_failed for a prohibition.",
@@ -1153,7 +1154,7 @@ function systemPrompt(dryRun: boolean): string {
 
 const OBSERVE_TOOL = functionTool(
 	"observe",
-	"Return the current page URL, the forms on it with their fields (each field carries an elementId of the form fa-… that click, fill, select, and submit accept), the navigationLinks that navigate will accept, the page text, and the prohibitedReasonCodes the trusted handler detected. Call it after every navigate, and again after the last fill or select: submit and finish_prohibited are accepted only against an observation taken after the most recent input.",
+	"Return the current page URL, the forms on it with their fields (each field carries an elementId of the form fa-… that click, fill, select, and submit accept), the navigationLinks that navigate will accept, the page text, and the prohibitedReasonCodes the trusted handler detected. A select field lists its options and a radio or checkbox field carries its label, which is what a candidate list is matched against. Call it after every navigate, and again after the last fill or select: submit and finish_prohibited are accepted only against an observation taken after the most recent input.",
 	{},
 );
 
@@ -1204,7 +1205,7 @@ const AGENT_TOOLS = [
 	),
 	functionTool(
 		"fill",
-		"Fill one text-like field (input or textarea) with the value that payload.formValues holds under payloadKey. The handler supplies the value; a payloadKey that is not present in payload.formValues is rejected.",
+		"Fill one text-like field (input or textarea) with the value that payload.formValues holds under payloadKey. The handler supplies the value; a payloadKey that is not present in payload.formValues, or whose value is a list of candidates, is rejected.",
 		{
 			elementId: ELEMENT_ID_PROPERTY,
 			payloadKey: PAYLOAD_KEY_PROPERTY,
@@ -1212,7 +1213,7 @@ const AGENT_TOOLS = [
 	),
 	functionTool(
 		"select",
-		"Set a select element, checkbox, or radio control to the value that payload.formValues holds under payloadKey. Use this, not click, for every checkbox and radio input.",
+		"Set a select element, checkbox, or radio control from what payload.formValues holds under payloadKey. When that value is an ordered list of candidates, the handler applies the first candidate the control offers and rejects the call when none matches. Use this, not click, for every checkbox and radio input.",
 		{
 			elementId: ELEMENT_ID_PROPERTY,
 			payloadKey: PAYLOAD_KEY_PROPERTY,

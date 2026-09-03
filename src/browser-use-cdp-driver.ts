@@ -52,6 +52,14 @@ const CONFIRMATION_POLL_INTERVAL_MS = 1_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MS = 15_000;
 const SUBMISSION_PERMISSION_WINDOW_MS = 2_000;
 const MAX_MOUSE_PREPARATION_ATTEMPTS = 3;
+const READY_STATE_TIMEOUT_MS = 10_000;
+/**
+ * The first navigation of a run pays for the cold start of the page and its
+ * render-blocking subresources, so it waits longer and is retried once. Later
+ * navigations keep the short wait: by then the site is warm and a stalled load
+ * is a signal the model should act on instead of waiting out.
+ */
+const BOOTSTRAP_READY_STATE_TIMEOUT_MS = 25_000;
 /** The CDP connection reports a per-command error response with this message. */
 const CDP_COMMAND_FAILED_MESSAGE = "Browser Use CDP command failed";
 const CONNECT_RETRY_DELAYS_MS = [10_000, 20_000, 30_000];
@@ -698,6 +706,29 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 
 	async navigate(url: string): Promise<void> {
 		assertDryRunNavigationAllowed(this.dryRun, this.#navigationCount);
+		// The bootstrap navigation is the one the coordinator issues before the
+		// model runs. It is counted once for the whole bootstrap, so the retry
+		// below stays inside the single navigation the dry-run guard allows.
+		const bootstrap = this.#navigationCount === 0;
+		this.#navigationCount += 1;
+		const readyStateTimeoutMs = bootstrap
+			? BOOTSTRAP_READY_STATE_TIMEOUT_MS
+			: READY_STATE_TIMEOUT_MS;
+		try {
+			await this.#navigateOnce(url, readyStateTimeoutMs);
+			return;
+		} catch (error) {
+			if (!bootstrap || !isPageNotReadyError(error) || this.connection.closed) {
+				throw error;
+			}
+			console.log(
+				JSON.stringify({ event: "browser_bootstrap_navigate_retried" }),
+			);
+		}
+		await this.#navigateOnce(url, readyStateTimeoutMs);
+	}
+
+	async #navigateOnce(url: string, readyStateTimeoutMs: number): Promise<void> {
 		this.#expectedNavigationRequest = this.#blockNonSubmitRequests
 			? {
 					url: canonicalHttpRequestUrl(url),
@@ -705,14 +736,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 					claimed: false,
 				}
 			: undefined;
-		this.#navigationCount += 1;
 		this.#clearElements();
 		try {
 			const result = await this.#send<{ errorText?: string }>("Page.navigate", {
 				url,
 			});
 			if (result.errorText) throw new Error("Browser navigation failed");
-			await this.#waitForReadyState();
+			await this.#waitForReadyState(readyStateTimeoutMs);
 		} finally {
 			this.#expectedNavigationRequest = undefined;
 		}
@@ -953,45 +983,70 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		});
 	}
 
-	async select(elementId: string, value: string): Promise<void> {
+	/**
+	 * Applies the first of `candidates` that the control actually offers. The
+	 * candidates are payload values the registrant allowed, so the page decides
+	 * only which one fits; it never contributes a value of its own. Page
+	 * functions therefore return fixed tokens, never page text.
+	 */
+	async select(
+		elementId: string,
+		candidates: readonly string[],
+	): Promise<void> {
 		const reference = this.#element(elementId);
+		const candidateList = [...candidates];
 		await this.#asElementOperation("select", async () => {
 			const state = await this.#inspectElement(reference.backendNodeId);
-			if (!state.ok || !state.visible || state.disabled) {
+			if (
+				!state.ok ||
+				!state.visible ||
+				state.disabled ||
+				candidateList.length === 0
+			) {
 				throw new BrowserElementError();
 			}
 			this.#interactionStarted = true;
 			this.#formDataEntered = true;
 			this.#blockNonSubmitRequests = true;
 			if (state.tag === "select") {
-				const changed = await this.#callFunctionOnElement<boolean>(
+				const selected = await this.#callFunctionOnElement<unknown>(
 					reference.backendNodeId,
-					SET_SELECT_VALUE_FUNCTION,
-					[value],
+					SELECT_OPTION_BY_CANDIDATE_FUNCTION,
+					[candidateList],
 				);
-				if (!changed) throw new BrowserElementError();
+				if (selected !== true) throw new BrowserElementError();
 				this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
 				return;
 			}
-			const desiredChecked =
-				value === "true" || value === "checked" || value === state.value;
 			if (state.type === "checkbox") {
-				const changed = await this.#callFunctionOnElement<boolean>(
+				const desiredChecked =
+					desiredCheckboxState(candidateList) ??
+					((await this.#callFunctionOnElement<unknown>(
+						reference.backendNodeId,
+						MATCHES_CHOICE_CANDIDATE_FUNCTION,
+						[candidateList],
+					)) === true
+						? true
+						: undefined);
+				if (desiredChecked === undefined) throw new BrowserElementError();
+				const changed = await this.#callFunctionOnElement<unknown>(
 					reference.backendNodeId,
 					SET_CHECKED_VALUE_FUNCTION,
 					[desiredChecked],
 				);
-				if (!changed) throw new BrowserElementError();
+				if (changed !== true) throw new BrowserElementError();
 				this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
 				return;
 			}
-			if (state.type === "radio" && value === state.value) {
-				const changed = await this.#callFunctionOnElement<boolean>(
-					reference.backendNodeId,
-					SET_CHECKED_VALUE_FUNCTION,
-					[true],
+			if (state.type === "radio") {
+				const outcome = readRadioSelectionOutcome(
+					await this.#callFunctionOnElement<unknown>(
+						reference.backendNodeId,
+						SELECT_RADIO_BY_CANDIDATE_FUNCTION,
+						[candidateList],
+					),
 				);
-				if (!changed) throw new BrowserElementError();
+				if (outcome !== "selected") throw new BrowserElementError();
 				this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
 				return;
 			}
@@ -1342,12 +1397,18 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 	}
 
-	async #waitForReadyState(): Promise<void> {
-		const deadline = Date.now() + 10_000;
+	async #waitForReadyState(timeoutMs: number): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
 		while (Date.now() < deadline) {
-			const readyState = await this.#evaluate<string>(
-				"document.readyState",
-			).catch(() => "loading");
+			let readyState: string;
+			try {
+				readyState = await this.#evaluate<string>("document.readyState");
+			} catch (error) {
+				// A closed connection never recovers, so waiting out the deadline
+				// would only delay the run's own termination.
+				if (isCdpConnectionUnusableError(error)) throw error;
+				readyState = "loading";
+			}
 			if (readyState === "interactive" || readyState === "complete") return;
 			await delay(100);
 		}
@@ -2215,6 +2276,61 @@ export function hasExpectedFrameNavigated(
 	);
 }
 
+export type RadioSelectionOutcome =
+	| "selected"
+	| "not_candidate"
+	| "higher_priority_exists";
+
+/**
+ * The radio page function may only answer with one of three fixed tokens. Any
+ * other value means the page answered for itself, which is never trusted.
+ */
+export function readRadioSelectionOutcome(
+	value: unknown,
+): RadioSelectionOutcome {
+	if (
+		value === "selected" ||
+		value === "not_candidate" ||
+		value === "higher_priority_exists"
+	) {
+		return value;
+	}
+	throw new BrowserElementError();
+}
+
+/**
+ * Reads the intended checkbox state from the candidate list. The first
+ * candidate that names a state wins, which keeps the candidate order the only
+ * rule for every choice control. `undefined` means the list names no state and
+ * the control's own value or label has to decide.
+ */
+export function desiredCheckboxState(
+	candidates: readonly string[],
+): boolean | undefined {
+	for (const candidate of candidates) {
+		if (candidate === "checked" || candidate === "true") return true;
+		if (candidate === "unchecked" || candidate === "false") return false;
+	}
+	return undefined;
+}
+
+/** A CDP connection in this state cannot carry another command. */
+export function isCdpConnectionUnusableError(error: unknown): boolean {
+	return (
+		error instanceof Error &&
+		(error.message === "Browser Use CDP connection is closed" ||
+			error.message === "Browser Use CDP connection closed" ||
+			error.message === "Browser Use CDP command could not be sent")
+	);
+}
+
+export function isPageNotReadyError(error: unknown): boolean {
+	return (
+		error instanceof Error &&
+		error.message === "Browser page did not become ready"
+	);
+}
+
 export function assertDryRunNavigationAllowed(
 	dryRun: boolean,
 	navigationCount: number,
@@ -2484,12 +2600,97 @@ export function getSubmissionRequestDisposition(
 		: "block";
 }
 
-const SET_SELECT_VALUE_FUNCTION = `function(value) {
-  if (this.tagName !== "SELECT" || !Array.from(this.options).some((option) => option.value === value)) return false;
-  this.value = value;
-  this.dispatchEvent(new Event("input", { bubbles: true }));
-  this.dispatchEvent(new Event("change", { bubbles: true }));
-  return true;
+/**
+ * In-page helpers shared by the radio group scan and the checkbox match, so
+ * that a candidate means the same thing for every choice control. Matching is
+ * an exact comparison against the control value or the trimmed, case-folded
+ * label; no partial or fuzzy match is ever made.
+ */
+const CHOICE_CANDIDATE_HELPERS = `
+  const normalizeText = (text) => String(text ?? "").trim().toLowerCase();
+  const labelTexts = (element) => {
+    const root = element.getRootNode();
+    // observe reports several labels, and several aria-labelledby targets, as
+    // one joined string each. Only those joined forms are compared, so a
+    // candidate can never match a fragment the model was never shown; a
+    // question label shared by a whole radio group is one such fragment.
+    const labels = Array.from(element.labels ?? []).map((label) => normalizeText(label.textContent)).filter(Boolean).join(" ");
+    const labelledBy = (element.getAttribute("aria-labelledby") ?? "").split(/\\s+/).filter(Boolean)
+      .map((id) => normalizeText(root.getElementById?.(id)?.textContent)).filter(Boolean).join(" ");
+    return [
+      labels,
+      labelledBy,
+      normalizeText(element.getAttribute("aria-label")),
+      normalizeText(element.closest("label")?.textContent),
+    ].filter(Boolean);
+  };
+  const candidateRank = (element, candidates) => {
+    const texts = labelTexts(element);
+    for (let index = 0; index < candidates.length; index += 1) {
+      const candidate = candidates[index];
+      if (typeof candidate !== "string" || !candidate) continue;
+      if (element.value === candidate || texts.includes(normalizeText(candidate))) return index;
+    }
+    return -1;
+  };
+`;
+
+/**
+ * Selects the option matching the earliest candidate, by option value or by
+ * the same option text `observe` reports. A placeholder option with an empty
+ * value is never chosen, because submitting it is the same as choosing nothing.
+ * A disabled option, and an option under a disabled optgroup, is skipped so
+ * that a candidate the user could never pick does not block a later one.
+ */
+export const SELECT_OPTION_BY_CANDIDATE_FUNCTION = `function(candidates) {
+  if (this.tagName !== "SELECT" || !Array.isArray(candidates)) return false;
+  const normalizeText = (text) => String(text ?? "").trim().toLowerCase();
+  const isSelectable = (option) => {
+    if (option.value === "" || option.disabled) return false;
+    const group = option.parentElement;
+    return !(group && group.tagName === "OPTGROUP" && group.disabled);
+  };
+  const options = Array.from(this.options).filter(isSelectable);
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" || !candidate) continue;
+    const wanted = normalizeText(candidate);
+    const match = options.find((option) => option.value === candidate || normalizeText(option.text) === wanted);
+    if (!match) continue;
+    // Deselecting first keeps a multi-select from carrying an earlier choice.
+    for (const option of this.options) option.selected = false;
+    match.selected = true;
+    this.dispatchEvent(new Event("input", { bubbles: true }));
+    this.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  }
+  return false;
+}`;
+
+/**
+ * Checks the radio only when no other enabled radio of the same group matches
+ * an earlier candidate, so the registrant's order decides which one is used
+ * even when the DOM order differs. Answers with one of three fixed tokens.
+ */
+export const SELECT_RADIO_BY_CANDIDATE_FUNCTION = `function(candidates) {
+  if (this.tagName !== "INPUT" || this.type !== "radio" || !Array.isArray(candidates)) return "not_candidate";
+  ${CHOICE_CANDIDATE_HELPERS}
+  const own = candidateRank(this, candidates);
+  if (own < 0) return "not_candidate";
+  const root = this.getRootNode();
+  for (const radio of Array.from(root.querySelectorAll?.('input[type="radio"]') ?? [])) {
+    if (radio === this || radio.disabled || radio.name !== this.name || radio.form !== this.form) continue;
+    const rank = candidateRank(radio, candidates);
+    if (rank >= 0 && rank < own) return "higher_priority_exists";
+  }
+  if (!this.checked) this.click();
+  return this.checked ? "selected" : "not_candidate";
+}`;
+
+/** Whether the control's own value or label equals one of the candidates. */
+export const MATCHES_CHOICE_CANDIDATE_FUNCTION = `function(candidates) {
+  if (!Array.isArray(candidates)) return false;
+  ${CHOICE_CANDIDATE_HELPERS}
+  return candidateRank(this, candidates) >= 0;
 }`;
 
 export const ACTIVATE_SUBMIT_FUNCTION = `function(input, expectedAction, expectedMethod) {

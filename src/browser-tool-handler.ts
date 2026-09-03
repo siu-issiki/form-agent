@@ -10,6 +10,7 @@ import {
 	type SubmitActivationStrategy,
 	type SubmitReviewDecision,
 	type SubmitReviewer,
+	type TrustedFormValue,
 } from "./restricted-browser";
 import {
 	type EvidenceObjectStore,
@@ -49,6 +50,11 @@ export class BrowserToolSetupError extends Error {
 
 export class BrowserToolCoordinator {
 	#driver: RestrictedBrowserDriver | undefined;
+	/**
+	 * Holds the driver while the scope setup and the bootstrap navigate run, so
+	 * that an abort in that window still closes the provider session.
+	 */
+	#pendingDriver: RestrictedBrowserDriver | undefined;
 	#tools: RestrictedBrowserTools | undefined;
 	#scopeKey: string | undefined;
 	#operationTail: Promise<void> = Promise.resolve();
@@ -205,18 +211,26 @@ export class BrowserToolCoordinator {
 			case "click":
 				await tools.click(readElementId(params));
 				return { result: { ok: true } };
-			case "fill":
-				await tools.fill(
-					readElementId(params),
-					readPayloadValue(job, params, 8_192),
-				);
+			case "fill": {
+				const elementId = readElementId(params);
+				const value = readPayloadValue(job, params, 8_192);
+				// A candidate list belongs to a choice control, so it is never a
+				// legal value for a text-like field.
+				if (typeof value !== "string") {
+					throw new BrowserToolInputError();
+				}
+				await tools.fill(elementId, value);
 				return { result: { ok: true } };
-			case "select":
+			}
+			case "select": {
+				const elementId = readElementId(params);
+				const value = readPayloadValue(job, params, 2_048);
 				await tools.select(
-					readElementId(params),
-					readPayloadValue(job, params, 2_048),
+					elementId,
+					typeof value === "string" ? [value] : value,
 				);
 				return { result: { ok: true } };
+			}
 			case "submit": {
 				const job = await tools.submit(
 					readElementId(params),
@@ -239,8 +253,9 @@ export class BrowserToolCoordinator {
 	}
 
 	async #close(): Promise<void> {
-		const driver = this.#driver;
+		const driver = this.#driver ?? this.#pendingDriver;
 		this.#driver = undefined;
+		this.#pendingDriver = undefined;
 		this.#tools = undefined;
 		this.#scopeKey = undefined;
 		await driver?.close?.();
@@ -273,10 +288,13 @@ export class BrowserToolCoordinator {
 		}
 		this.#connectDurationMs = Math.max(0, Date.now() - connectStartedAt);
 		this.#browserConnected = true;
+		this.#pendingDriver = driver;
 		// The run may have been aborted while the session was being created. The
 		// provider session is released here because close() already ran and no
-		// longer holds this driver.
+		// longer holds this driver. driver.close() is idempotent, so closing it
+		// again from close() is harmless.
 		if (this.#closed) {
+			this.#pendingDriver = undefined;
 			await driver.close?.().catch(() => undefined);
 			throw new BrowserToolInputError();
 		}
@@ -303,11 +321,14 @@ export class BrowserToolCoordinator {
 				throw new BrowserToolInputError();
 			}
 			this.#driver = driver;
+			this.#pendingDriver = undefined;
 			this.#tools = tools;
 			this.#scopeKey = key;
 			return { job, tools };
 		} catch (error) {
 			await driver.close?.().catch(() => undefined);
+			// A closed driver must not stay reachable through close().
+			this.#pendingDriver = undefined;
 			throw error;
 		}
 	}
@@ -329,7 +350,7 @@ function readPayloadValue(
 	job: Job,
 	params: BrowserToolParams,
 	maxLength: number,
-): string {
+): TrustedFormValue {
 	const payloadKey = readString(params, "payloadKey", 64);
 	if (!PAYLOAD_KEY_PATTERN.test(payloadKey)) {
 		throw new BrowserToolInputError();
@@ -339,7 +360,10 @@ function readPayloadValue(
 		throw new BrowserToolInputError();
 	}
 	const value = trusted[payloadKey];
-	if (typeof value !== "string" || value.length > maxLength) {
+	if (value === undefined) {
+		throw new BrowserToolInputError();
+	}
+	if (typeof value === "string" && value.length > maxLength) {
 		throw new BrowserToolInputError();
 	}
 	return value;

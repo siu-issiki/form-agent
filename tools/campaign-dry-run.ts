@@ -6,14 +6,19 @@ import {
 	mapRegistrationValues,
 	type RedirectResolution,
 	type RegistrationEntry,
+	readChoiceCandidates,
 	resolveRedirectHosts,
 } from "../src/campaign-import";
 import type { JobInput } from "../src/job";
+import type { TrustedFormValue } from "../src/restricted-browser";
 
 const PRODUCTION_BASE_URL = "https://form-agent.form-agent.workers.dev";
 
 const options = parseOptions(Bun.argv.slice(2));
 const registration = await readRegistration(options.registrationPath);
+const choices = options.choicesPath
+	? readChoiceCandidates(await Bun.file(options.choicesPath).json())
+	: {};
 const csvText = await Bun.file(options.csvPath).text();
 const rows = parse(csvText, {
 	columns: true,
@@ -51,8 +56,9 @@ for (const candidate of filtered.eligible) {
 		registrationValues,
 		options.campaign,
 		resolution,
+		choices,
 	);
-	const formValues = job.payload.formValues as Record<string, string>;
+	const formValues = job.payload.formValues as Record<string, TrustedFormValue>;
 	console.log(
 		JSON.stringify({
 			event: "campaign_job_preview",
@@ -60,6 +66,8 @@ for (const candidate of filtered.eligible) {
 			companyId: job.companyId,
 			formValueKeys: Object.keys(formValues).sort(),
 			formValueCount: Object.keys(formValues).length,
+			// Only the key count is logged; a candidate list is payload data.
+			choiceKeyCount: Object.values(formValues).filter(Array.isArray).length,
 			allowedHostCount: job.allowedHosts.length,
 			requestBytes: new TextEncoder().encode(JSON.stringify(job)).byteLength,
 		}),
@@ -91,6 +99,7 @@ if (options.submit) {
 
 interface Options {
 	registrationPath: string;
+	choicesPath: string | undefined;
 	csvPath: string;
 	campaign: string;
 	limit: number;
@@ -108,7 +117,15 @@ function parseOptions(args: string[]): Options {
 			continue;
 		}
 		if (!arg?.startsWith("--")) throw new Error("Invalid argument");
-		if (!["--registration", "--csv", "--campaign", "--limit"].includes(arg)) {
+		if (
+			![
+				"--registration",
+				"--choices",
+				"--csv",
+				"--campaign",
+				"--limit",
+			].includes(arg)
+		) {
 			throw new Error(`Unknown argument: ${arg}`);
 		}
 		const value = args[index + 1];
@@ -131,6 +148,7 @@ function parseOptions(args: string[]): Options {
 
 	return {
 		registrationPath,
+		choicesPath: values.get("choices"),
 		csvPath,
 		campaign,
 		limit,

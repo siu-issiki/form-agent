@@ -15,6 +15,7 @@ import {
 	ResponsesSubmitReviewer,
 	readReviewDecision,
 	reviewPayload,
+	SUBMIT_REVIEW_INSTRUCTIONS,
 	toBase64,
 } from "../src/submit-reviewer";
 
@@ -368,6 +369,49 @@ describe("reviewPayload", () => {
 		expect(payload.untrustedPageContent.prohibitedReasonCodes).toEqual([
 			"SALES_PROHIBITED",
 		]);
+	});
+
+	test("passes a candidate list to the reviewer as the ordered set it is", () => {
+		const payload = reviewPayload(
+			reviewInput({
+				formValues: {
+					message: "Hello",
+					inquiryType: ["その他のお問い合わせ", "その他"],
+				},
+			}),
+			true,
+		) as { formValues: Record<string, unknown> };
+
+		expect(payload.formValues).toEqual({
+			message: "Hello",
+			inquiryType: ["その他のお問い合わせ", "その他"],
+		});
+	});
+
+	test("tells the reviewer how a candidate list matches a choice control", () => {
+		expect(SUBMIT_REVIEW_INSTRUCTIONS).toContain(
+			"ordered set of candidate labels",
+		);
+		expect(SUBMIT_REVIEW_INSTRUCTIONS).toContain(
+			"select, radio, or checkbox as matching formValues",
+		);
+	});
+
+	test("tells the reviewer that the checkbox keywords name a state", () => {
+		expect(SUBMIT_REVIEW_INSTRUCTIONS).toContain(
+			'the candidates "checked" and "true" mean the box must be checked',
+		);
+		expect(SUBMIT_REVIEW_INSTRUCTIONS).toContain(
+			'"unchecked" and "false" mean it must be unchecked',
+		);
+		expect(SUBMIT_REVIEW_INSTRUCTIONS).toContain(
+			"These keywords name a state, not a label",
+		);
+		// The same reading has to cover a single value, which is how a consent
+		// checkbox has always been carried in the payload.
+		expect(SUBMIT_REVIEW_INSTRUCTIONS).toContain(
+			"when the entry is a single value instead of a list",
+		);
 	});
 
 	test("propagates a truncation already reported by the driver", () => {

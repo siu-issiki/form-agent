@@ -25,7 +25,8 @@ interface CreatedRun {
 	targetUrl: string;
 	targetDomain: string;
 	allowedHosts: string[];
-	formValues: Record<string, string>;
+	/** A value may be an ordered candidate list for one choice control. */
+	formValues: Record<string, string | string[]>;
 }
 
 interface JobResponse {

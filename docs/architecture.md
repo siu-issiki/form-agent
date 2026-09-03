@@ -20,7 +20,7 @@
 | 推論 Provider | 部分実装 | OpenAI Responses API のみ。モデル、回数、本文、出力 token を Worker 側で制限 |
 | BrowserUse | 実装済み | REST API v4 で standalone browser session を作成・停止し、CDP 接続では用途限定ツールだけを公開 |
 | E2E | 管理下範囲を実装済み | 常設テストシステムの13シナリオ、重複配送、送信後`uncertain`をproductionで検証済み。外部の実サイト送信は未実施 |
-| HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値を検証。一覧・キャンセルは未実装 |
+| HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値（単一文字列または選択肢候補リスト）を検証。一覧・キャンセルは未実装 |
 | Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
 | 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ、値を含まないagent tool診断イベント、ジョブ単位の実行メトリクス（turn、Provider 呼び出し、token、送信前レビュー、browser 接続時間、実行時間）。送信前・送信後・禁止判定時のスクリーンショット証跡を Cloudflare R2 へ保存し、D1 の `events` へ sha256 付きで記録する |
 | 並列検証 | 部分実施 | 2026-09-03 の 5 並列 19 シナリオで、session 明示停止の前後とも 15 件合格。明示停止後は CDP 切断（1011 / `LIMIT`）と `exceededCpu` が 0 件になり、18 session すべてを停止できたが、session 作成 API が 429 を 15 回返し 2 件が失敗した。実際の同時 session 上限は 5 未満と判断し、consumer を `max_concurrency: 3` にした。3 並列の 19 シナリオでは 17 件合格、429 / CDP 切断 / `exceededCpu` はいずれも 0 件、19 session すべてを停止できた |
@@ -115,7 +115,7 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 - `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返す。
 - `prohibited`のreason codeは`NO_FORM_PRESENT`、`SALES_PROHIBITED`、`FORM_PURPOSE_INCOMPATIBLE`だけを許可し、旧aliasは保存前に正規化する。
 - Agent 終了時または timeout 時に browser 接続を閉じる。
-- `fill` / `select`ではモデルに生の値を渡させず、`payload.formValues`内の`payloadKey`を指定させる。信頼済みhandlerがD1の保存値を解決し、存在しないキー、文字列以外、上限超過、空文字を拒否する。
+- `fill` / `select`ではモデルに生の値を渡させず、`payload.formValues`内の`payloadKey`を指定させる。信頼済みhandlerがD1の保存値を解決し、存在しないキー、契約外の型、上限超過、空文字を拒否する。値は単一文字列（最大8,192文字）または選択肢候補リスト（1〜10要素、各要素1〜256文字、合計2,048文字以下）のいずれかであり、候補リストは`select`だけが受け取る。`fill`に候補リストのキーを渡した場合は`INVALID_TOOL_INPUT`とする。
 
 ### 推論 Provider
 
@@ -151,6 +151,16 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 - upgrade 成功後の close も、close code 1008（policy violation）または reason が認証を示す場合は再試行しない。`BROWSER_CONNECTION_REJECTED` として再試行不可の failed にする。
 - 再試行の待機は agent の deadline で中断される。実行が abort された時点で待機と接続試行を打ち切り、`AGENT_TIMEOUT` として終了するため、termination grace を待機で消費しない。abort は WebSocket upgrade の要求と接続確立中の CDP コマンドも打ち切り、作成済み session を stop してから終了する。abort 中の失敗は再試行として記録せず、`browser_use_connect_retry` を出さない。接続が abort より後に完了した場合は、scope 設定と bootstrap navigate へ進まずに session を停止する。
 - 実行は session の stop が完了するまで戻らない。stop には 10 秒の timeout を置き、termination grace 30 秒の内側に収める。
+
+#### 起動時の読み込み待ち
+
+`navigate`は`Page.navigate`の後に`document.readyState`が`interactive`または`complete`になるまで 100 ms 間隔で待つ。待ち時間は navigation の位置で変える。
+
+- 起動時（run で最初の navigate。coordinator が `job.targetUrl` へ行う bootstrap）だけ 25 秒待ち、`PAGE_NOT_READY`になった場合は driver 内部で 1 回だけ navigate をやり直す。実サイトでは render-blocking な subresource の cold start で 10 秒を超えることがあり、1 件が`PAGE_NOT_READY`で失敗したためである。
+- 再試行は navigation 回数を増やす前に行うため、dry-run の「bootstrap 後の再 navigate 禁止」には掛からない。回数は成否にかかわらず bootstrap 全体で 1 回だけ増える。
+- モデルが呼ぶ通常の`navigate`は従来どおり 10 秒・再試行なしとする。サイトは既に暖まっており、そこで固まるのはモデルが判断すべき事象だからである。
+- 上限は bootstrap 全体で最大 110 秒である。1 回の試行は `Page.navigate`（CDP command timeout 15 秒）と readyState 待ちからなり、後者は締切の直前に開始した `document.readyState` の評価が同じ command timeout まで伸びうるため、25 秒ではなく最大 40 秒を見込む。これを 2 回行う。
+- readyState の評価が接続断（`Browser Use CDP connection is closed` / `... connection closed` / `... command could not be sent`）で失敗した場合は待ち続けず、その場で throw する。abort 時は coordinator の`close()`が bootstrap 中の driver（`#pendingDriver`）を閉じるため、待ちは即座に終わり、termination grace 30 秒の内側で session の stop が走る。
 - popup、Worker、Service Worker、WebSocket 等の迂回経路を遮断する。
 - CDP の `DOM.getDocument` を `pierce: true` で取得し、通常 DOM と open / closed Shadow DOM を Worker 側で走査する。
 - 観測した同一ページ・許可hostのリンクを最大20件までモデルへ返し、サイト内別ページのフォーム探索に利用する。
@@ -167,11 +177,23 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 | `observe` | 現在ページのフォーム、ラベル、選択肢、禁止事項を取得する |
 | `click` | 非 submit 要素だけをクリックする |
 | `fill` | text input / textarea へ値を入力する |
-| `select` | select / radio / checkbox を選択する |
+| `select` | select / radio / checkbox を、payload の候補リスト順に一致する最初の選択肢へ設定する |
 | `submit` | 送信前に独立レビュー（同一 Provider、ツールなし、strict JSON）を通し、D1 の送信権取得後に 1 回だけ送信する。deny は 1 回だけ修正可、2 回目で `uncertain` |
 | `finish` | 送信せず、構造化された終端結果を返す |
 
 driver が submit control と識別した要素は通常の `click` で操作できない。非submitの`click`、`fill`、`select`はDOMイベントを発火する前にbrowser requestを遮断し、`navigate`は直前の観察で得たfragmentを含む完全一致URLのtop-frame Document requestだけを1回許可する。`submit` 中も遮断を解除せず、全入力が同じform ownerに属し、最後の入力・選択・click後に再観察され、選択したformに禁止根拠が検出されていないことを検証してから D1 を `running` から `submitting` へ更新し、最初の期待済み送信requestと、そのrequest IDに直接連なるsafeなredirectだけを許可する。非safe HTTP methodはaction URLとmethod、GETはactionのorigin / path、`Document` resource、送信対象frameを照合する。モデルはDOM activationを優先して選択し、trusted click gestureまたはkeyboard activationが必要な場合だけmouse / Enterを選ぶ。mouseのhit testは1 animation frameごとに最大3回試行する。
+
+#### 選択肢候補（choice candidates）
+
+`payload.formValues`の値には、単一文字列に加えて「登録者が事前に許可した値の順序付き集合」である候補リストを指定できる。モデルは従来どおり`payloadKey`を指すだけで、どの候補が使われるかは信頼済み handler が決める。候補文字列はログ、診断イベント、tool の戻り値、エラーメッセージのいずれにも出さない。
+
+- `select`要素: 候補リストの順に、option の`value`との完全一致、または option の text（`observe`が返す label と同じ。trim・大文字小文字無視）との完全一致を探し、最初に一致した候補の option を選ぶ。`value`が空の placeholder option は候補に一致しても選ばない。ページ側関数の戻り値は boolean だけで、Worker は`=== true`のときだけ成功とみなす。
+- radio: 対象 radio の`value`、または関連ラベルが候補のいずれかに一致すれば対象とする。さらに同じ form owner・同じ`name`の radio 群を走査し、対象より前の候補に一致する別の（disabled でない）radio があれば選ばず、`ELEMENT_UNAVAILABLE`を返す。DOM 順ではなく候補順を優先させるためである。ページ側関数の戻り値は`selected` / `not_candidate` / `higher_priority_exists`の 3 値だけで、それ以外が返った場合は要素エラーにする。
+- 関連ラベルの照合対象は`observe`がモデルへ報告する形と揃える。`observe`は複数の`labels`を空白 1 つで連結した 1 本の文字列として、`aria-labelledby`の複数 id も同様に連結した 1 本として報告するため、候補と比較するのもその連結形だけであり、個々の断片は比較しない。断片一致を許すと、radio 群が共有する設問文言のような「モデルが見ていない部分文字列」で誤選択が起こりうるためである。`aria-label`と祖先`label`はそれぞれ 1 本の文字列としてそのまま比較する。
+- checkbox: 候補リストの順に見て、最初に現れた`checked` / `true`で check、`unchecked` / `false`で uncheck する。状態を表す候補が無い場合は、対象の`value`またはラベル（radio と同じ照合対象）が候補に一致したときだけ check する。いずれにも当てはまらなければ要素エラーとする（任意の文字列を uncheck として扱う旧挙動は廃止した。破壊的変更である）。
+- 曖昧一致（部分一致・類義語）は行わない。完全一致だけを認める。
+
+候補一致は必ずページ側の関数で行い、Worker はページから固定 token 以外を受け取らない。ページが任意の文字列を返しても、それが値として使われることはない。
 
 #### 要素操作中の CDP コマンド失敗
 
@@ -355,7 +377,7 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 - popup、Worker、Service Worker、WebSocket、WebRTC 等の迂回経路を遮断する。
 - Provider / BrowserUse の認証情報と D1 の実行権をモデル入力・tool 出力へ渡さない。
 - Agent に返すジョブ情報から `runToken` を除外する。
-- モデルが`fill` / `select`で指定できるのは`payload.formValues`内のキーだけとし、実際の値は信頼済みhandlerがD1から取得する。
+- モデルが`fill` / `select`で指定できるのは`payload.formValues`内のキーだけとし、実際の値は信頼済みhandlerがD1から取得する。候補リストの場合も、どの候補を使うかはページ側の完全一致だけで決まり、モデルは関与しない。
 - `observe`の結果を`untrusted_page_content`として明示し、ページ本文が信頼済みhandlerの上限（20,000文字）で切り詰められた場合は`pageTextTruncated`で通知する。
 - 送信直前に、直前の観察・`payload.formValues`・`before_submit`スクリーンショットを入力とする独立レビューを通し、`allow`以外では送信権を取得しない。
 - レビューのdenyで修正を許可するのは`INPUT_MISMATCH`だけとし、実際の`fill` / `select`と観察指紋の変化を次の`submit`の前提にする。deny予算はD1のジョブ行に保存し、実行と再配信をまたいで共有する。
@@ -363,6 +385,12 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 - ジョブ間で browser session、cookie、入力データを共有しない。
 
 `submitting` 中に Worker が停止し、結果保存まで到達しなかった場合は自動再送せず、人間の確認対象にする。人手照合、DLQ確認、緊急停止、安全な再開のrunbookは [operations.md](operations.md) に定義済みである。照合用の専用 API / UI は未実装である。
+
+### キャンペーン取り込み
+
+`tools/campaign-dry-run.ts` は CSV と登録値 JSON からジョブを組み立てる。選択肢が必要なサイト向けに `--choices <path>` を追加した。JSON は `Record<string, string[]>` で、キーは payload key の書式、値は候補リストの契約（1〜10 要素、各要素 1〜256 文字、合計 2,048 文字以下）で検証する。登録値・件名・本文とキーが衝突した場合は優先順位を設けずエラーにする。サンプルは `docs/examples/campaign-choices.example.json` にある。
+
+プライバシーポリシー同意などの必須 checkbox を agent に操作させるかは運用判断であり、サンプルには含めない。同意させる場合は `privacyConsent` のようなキーで `["checked"]` を渡す。
 
 ### Agent への安全指示
 
@@ -374,7 +402,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 
 - top-level navigation は対象企業ドメインとそのサブドメイン、またはジョブごとに登録した完全一致の外部hostだけを許可する。
 - フォーム入力前に限り、公開HTTPS hostのread-only subresource（`GET` / `HEAD` / `OPTIONS`）を許可する。入力開始後は対象企業ドメインとジョブ固有の許可host以外への通信を遮断する。
-- CDP DOM tree から `form` と可視 `input` / `textarea` / `select` / `button` を観察し、`form` 属性による外部関連付けにも対応する。各フィールドは tag、type、name、role、label、placeholder、必須、現在値、選択肢を返し、checkbox / radio では `checked` も返す。password の値は常に空文字で返す。
+- CDP DOM tree から `form` と可視 `input` / `textarea` / `select` / `button` を観察し、`form` 属性による外部関連付けにも対応する。各フィールドは tag、type、name、role、label、placeholder、必須、現在値、選択肢を返し、checkbox / radio では `checked` も返す。password の値は常に空文字で返す。select の option と radio / checkbox の label は、候補一致の根拠としてモデルとレビューの双方が参照する。
 - 探索上限は最大 25 form candidate、200 field candidate、モデルへ返す観察結果は最大 10 form、合計 100 field、本文 20,000 文字までとする。
 - open / closed Shadow DOMは探索対象で、管理下テストでは送信まで検証済みである。ただし実サイトでの互換性検証は継続する。
 - cross-origin iframeはジョブ固有の外部host許可を使う管理下テストで送信まで検証済みである。contenteditableと独自UI componentは未対応または未検証である。
@@ -456,6 +484,8 @@ consumer は `max_concurrency: 3` とする。5 並列では session を毎回�
 - [x] retryのreason code、発生元、attempt、実行時間、Provider呼び出し累計をD1イベントへ保存する。
 - [x] `DRY_RUN_COMPLETE`の前提として入力成功とnative form validityを検証する。
 - [x] `fill` / `select`の入力値を`payload.formValues`由来に限定する。
+- [x] 実サイトの必須 select / radio / checkbox へ、登録者が許可した選択肢候補リストで対応する。
+- [x] 起動時の読み込み待ちを 25 秒へ延ばし、`PAGE_NOT_READY`を 1 回だけ再試行する。
 - [x] production から旧 Sandbox Durable Object を削除する。
 - [x] CI で typecheck、lint、unit / Workers test、deploy dry-run を実行する。
 - [x] 使い捨てサイトでproduction実送信E2Eを3件実行し、`submitting`から`sent`、受信POST、送信ログを照合する。

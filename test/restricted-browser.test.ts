@@ -629,6 +629,28 @@ describe("RestrictedBrowserTools", () => {
 		expect(diagnostic.message).not.toContain("entered form body");
 	});
 
+	test("applies the first candidate the control offers", async () => {
+		const driver = new FakeDriver();
+		driver.selectOptions = { "fa-0-2": ["other"] };
+		const tools = await createTools(driver);
+		await tools.observe();
+
+		await tools.select("fa-0-2", ["その他のお問い合わせ", "other"]);
+
+		expect(driver.fieldStates[1]?.value).toBe("other");
+	});
+
+	test("rejects a select whose candidates the control does not offer", async () => {
+		const driver = new FakeDriver();
+		driver.selectOptions = { "fa-0-2": ["other"] };
+		const tools = await createTools(driver);
+		await tools.observe();
+
+		await expect(
+			tools.select("fa-0-2", ["その他のお問い合わせ"]),
+		).rejects.toBeInstanceOf(BrowserElementError);
+	});
+
 	test("derives the domain from the persisted job and installs a network policy", async () => {
 		const driver = new FakeDriver();
 		const tools = await createTools(driver);
@@ -1424,6 +1446,66 @@ describe("readTrustedFormValues", () => {
 		expect(readTrustedFormValues({})).toEqual({});
 		expect(readTrustedFormValues({ formValues: ["Hello"] })).toEqual({});
 	});
+
+	test("keeps a candidate list within the contract", () => {
+		expect(
+			readTrustedFormValues({
+				formValues: {
+					inquiryType: ["その他のお問い合わせ", "その他"],
+					contactMethod: ["メール"],
+				},
+			}),
+		).toEqual({
+			inquiryType: ["その他のお問い合わせ", "その他"],
+			contactMethod: ["メール"],
+		});
+	});
+
+	test("drops a candidate list that breaks an element or total limit", () => {
+		expect(
+			readTrustedFormValues({
+				formValues: {
+					empty: [],
+					tooMany: Array.from({ length: 11 }, (_, index) => `c${index}`),
+					emptyElement: ["ok", ""],
+					longElement: ["x".repeat(257)],
+					longTotal: Array.from({ length: 9 }, () => "x".repeat(256)),
+					mixed: ["ok", 1],
+					nested: [["ok"]],
+					kept: ["ok"],
+				},
+			}),
+		).toEqual({ kept: ["ok"] });
+	});
+
+	test("accepts a candidate list at every limit", () => {
+		expect(
+			readTrustedFormValues({
+				formValues: {
+					maxCount: Array.from({ length: 10 }, (_, index) => `c${index}`),
+					maxElement: ["x".repeat(256)],
+					maxTotal: Array.from({ length: 8 }, () => "x".repeat(256)),
+				},
+			}),
+		).toEqual({
+			maxCount: Array.from({ length: 10 }, (_, index) => `c${index}`),
+			maxElement: ["x".repeat(256)],
+			maxTotal: Array.from({ length: 8 }, () => "x".repeat(256)),
+		});
+	});
+
+	test("hands out a frozen copy the payload can no longer change", () => {
+		const candidates = ["メール", "Email"];
+		const trusted = readTrustedFormValues({
+			formValues: { contactMethod: candidates },
+		});
+
+		candidates[0] = "電話";
+
+		const resolved = trusted.contactMethod as string[];
+		expect(resolved).toEqual(["メール", "Email"]);
+		expect(Object.isFrozen(resolved)).toBe(true);
+	});
 });
 
 async function createToolsWithEvidence(
@@ -1573,6 +1655,8 @@ class FakeDriver implements RestrictedBrowserDriver {
 	observationFormsSequence: unknown[][] | null = null;
 	fieldStates: ObservedFieldState[] = defaultFieldStates();
 	fieldStatesError: Error | null = null;
+	/** Values each choice control offers, by elementId. */
+	selectOptions: Record<string, string[]> = {};
 	/** Replayed in order; the last entry repeats. */
 	formSnapshots: string[] = ['["form"]'];
 	formSnapshotCount = 0;
@@ -1621,8 +1705,16 @@ class FakeDriver implements RestrictedBrowserDriver {
 		this.applyValue(elementId, value);
 	}
 
-	async select(elementId: string, value: string): Promise<void> {
-		this.applyValue(elementId, value);
+	async select(
+		elementId: string,
+		candidates: readonly string[],
+	): Promise<void> {
+		const offered = this.selectOptions[elementId];
+		const chosen = offered
+			? candidates.find((candidate) => offered.includes(candidate))
+			: candidates[0];
+		if (chosen === undefined) throw new BrowserElementError();
+		this.applyValue(elementId, chosen);
 	}
 
 	/** Mirrors what a real browser shows on the next observation. */

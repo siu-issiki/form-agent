@@ -6,6 +6,7 @@ import {
 	mapRegistrationValues,
 	normalizeCompanyDomain,
 	type RegistrationEntry,
+	readChoiceCandidates,
 	resolveRedirectHosts,
 } from "../src/campaign-import";
 
@@ -138,6 +139,84 @@ describe("campaign import", () => {
 		expect(Object.keys(first.payload.formValues as object)).not.toContain(
 			"会社名",
 		);
+	});
+
+	test("merges choice candidates into the payload", async () => {
+		const candidate = filterCampaignRows([row()]).eligible[0];
+		if (!candidate) throw new Error("Expected an eligible candidate");
+		const job = await buildCampaignJob(
+			candidate,
+			mapRegistrationValues(registration),
+			"agb-shaken-dryrun-v1",
+			{
+				finalUrl: "https://acme.co.jp/contact",
+				allowedHosts: ["acme.co.jp"],
+			},
+			{ inquiryType: ["その他", "ご意見・ご要望"] },
+		);
+
+		expect(job.payload.formValues).toMatchObject({
+			inquiryType: ["その他", "ご意見・ご要望"],
+		});
+	});
+
+	test("refuses a choice key that a registration or content value already holds", async () => {
+		const candidate = filterCampaignRows([row()]).eligible[0];
+		if (!candidate) throw new Error("Expected an eligible candidate");
+		const resolution = {
+			finalUrl: "https://acme.co.jp/contact",
+			allowedHosts: ["acme.co.jp"],
+		};
+		const values = mapRegistrationValues(registration);
+		const build = (choices: Record<string, readonly string[]>) =>
+			buildCampaignJob(
+				candidate,
+				values,
+				"agb-shaken-dryrun-v1",
+				resolution,
+				choices,
+			);
+
+		await expect(build({ subject: ["その他"] })).rejects.toThrow(
+			"Choice key collides",
+		);
+		const registeredKey = Object.keys(values)[0];
+		if (!registeredKey) throw new Error("Expected a registration key");
+		await expect(build({ [registeredKey]: ["その他"] })).rejects.toThrow(
+			"Choice key collides",
+		);
+	});
+
+	test("validates a choices file against the candidate list contract", () => {
+		expect(
+			readChoiceCandidates({ inquiryType: ["その他", "ご意見・ご要望"] }),
+		).toEqual({ inquiryType: ["その他", "ご意見・ご要望"] });
+		expect(() => readChoiceCandidates(["その他"])).toThrow("Choices JSON");
+		expect(() => readChoiceCandidates({ "bad key": ["その他"] })).toThrow(
+			"invalid payload key",
+		);
+		expect(() => readChoiceCandidates({ inquiryType: "その他" })).toThrow(
+			"invalid candidate list",
+		);
+		expect(() => readChoiceCandidates({ inquiryType: [] })).toThrow(
+			"invalid candidate list",
+		);
+		expect(() =>
+			readChoiceCandidates({
+				inquiryType: Array.from({ length: 11 }, (_, index) => `c${index}`),
+			}),
+		).toThrow("invalid candidate list");
+	});
+
+	test("keeps the example choices file within the contract", async () => {
+		const example = await Bun.file(
+			"docs/examples/campaign-choices.example.json",
+		).json();
+
+		expect(Object.keys(readChoiceCandidates(example))).toEqual([
+			"inquiryType",
+			"contactMethod",
+		]);
 	});
 });
 

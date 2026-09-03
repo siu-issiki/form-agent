@@ -31,7 +31,7 @@ export interface AgentTools {
 	observe(): Promise<BrowserObservation>;
 	click(elementId: string): Promise<void>;
 	fill(elementId: string, value: string): Promise<void>;
-	select(elementId: string, value: string): Promise<void>;
+	select(elementId: string, candidates: readonly string[]): Promise<void>;
 	submit(
 		elementId: string,
 		activationStrategy: SubmitActivationStrategy,

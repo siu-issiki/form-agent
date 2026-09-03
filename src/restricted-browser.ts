@@ -42,7 +42,7 @@ export interface SubmitReviewInput {
 	targetDomain: string;
 	targetUrl: string;
 	currentUrl: string;
-	formValues: Record<string, string>;
+	formValues: Record<string, TrustedFormValue>;
 	observation: BrowserObservation;
 	submitElementId: string;
 	screenshot: { contentType: "image/jpeg"; bytes: Uint8Array } | null;
@@ -126,6 +126,54 @@ export class SubmitReviewUnavailableError extends Error {
 
 export const PAYLOAD_KEY_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 export const MAX_PAYLOAD_VALUE_LENGTH = 8_192;
+export const MAX_CANDIDATE_COUNT = 10;
+export const MAX_CANDIDATE_LENGTH = 256;
+export const MAX_CANDIDATE_TOTAL_LENGTH = 2_048;
+
+/**
+ * A trusted payload value is either a single value or an ordered set of
+ * candidate labels the registrant allowed for one choice control. The handler
+ * picks the first candidate the control actually offers; the model only ever
+ * names the key.
+ */
+export type TrustedFormValue = string | readonly string[];
+
+export function isTrustedPayloadString(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= MAX_PAYLOAD_VALUE_LENGTH
+	);
+}
+
+/** The candidate list contract shared by `POST /jobs` and the tool handler. */
+export function isTrustedCandidateList(
+	value: unknown,
+): value is readonly string[] {
+	if (
+		!Array.isArray(value) ||
+		value.length < 1 ||
+		value.length > MAX_CANDIDATE_COUNT
+	) {
+		return false;
+	}
+	let totalLength = 0;
+	for (const candidate of value) {
+		if (
+			typeof candidate !== "string" ||
+			candidate.length < 1 ||
+			candidate.length > MAX_CANDIDATE_LENGTH
+		) {
+			return false;
+		}
+		totalLength += candidate.length;
+	}
+	return totalLength <= MAX_CANDIDATE_TOTAL_LENGTH;
+}
+
+export function isTrustedFormValue(value: unknown): value is TrustedFormValue {
+	return isTrustedPayloadString(value) || isTrustedCandidateList(value);
+}
 
 /**
  * Narrows `job.payload.formValues` to the entries the trusted handler is
@@ -134,20 +182,22 @@ export const MAX_PAYLOAD_VALUE_LENGTH = 8_192;
  */
 export function readTrustedFormValues(
 	payload: Record<string, unknown>,
-): Record<string, string> {
+): Record<string, TrustedFormValue> {
 	const formValues = payload.formValues;
 	// A null prototype keeps inherited members such as `constructor` out of the
 	// result, so a payloadKey can only ever resolve to a job-supplied value.
-	const trusted: Record<string, string> = Object.create(null);
+	const trusted: Record<string, TrustedFormValue> = Object.create(null);
 	if (!isRecord(formValues) || Array.isArray(formValues)) return trusted;
 	for (const [key, value] of Object.entries(formValues)) {
-		if (
-			PAYLOAD_KEY_PATTERN.test(key) &&
-			typeof value === "string" &&
-			value.length > 0 &&
-			value.length <= MAX_PAYLOAD_VALUE_LENGTH
-		) {
+		if (!PAYLOAD_KEY_PATTERN.test(key)) continue;
+		if (isTrustedPayloadString(value)) {
 			trusted[key] = value;
+			continue;
+		}
+		if (isTrustedCandidateList(value)) {
+			// A frozen copy keeps a later mutation of the parsed payload from
+			// changing what the handler already resolved.
+			trusted[key] = Object.freeze([...value]);
 		}
 	}
 	return trusted;
@@ -179,7 +229,11 @@ export interface RestrictedBrowserDriver {
 	observe(): Promise<BrowserObservation>;
 	clickNonSubmit(elementId: string): Promise<void>;
 	fill(elementId: string, value: string): Promise<void>;
-	select(elementId: string, value: string): Promise<void>;
+	/**
+	 * Applies the first candidate the control actually offers. The candidates
+	 * come from the job payload, never from the model.
+	 */
+	select(elementId: string, candidates: readonly string[]): Promise<void>;
 	validateSubmit(elementId: string): Promise<void>;
 	/**
 	 * Re-reads the live state of every element named by the latest observation,
@@ -338,7 +392,7 @@ export class RestrictedBrowserTools {
 	readonly #targetDomain: string;
 	readonly #targetUrl: string;
 	readonly #allowedHosts: string[];
-	readonly #formValues: Record<string, string>;
+	readonly #formValues: Record<string, TrustedFormValue>;
 	readonly #successfulInputElementIds = new Set<string>();
 	readonly #allowedNavigationUrls = new Set<string>();
 	#latestObservation: BrowserObservation | undefined;
@@ -360,7 +414,7 @@ export class RestrictedBrowserTools {
 		targetDomain: string,
 		allowedHosts: readonly string[],
 		targetUrl: string,
-		formValues: Record<string, string>,
+		formValues: Record<string, TrustedFormValue>,
 		private readonly now: () => string = () => new Date().toISOString(),
 	) {
 		this.#targetDomain = normalizeTargetDomain(targetDomain);
@@ -486,8 +540,11 @@ export class RestrictedBrowserTools {
 		this.#correctionInputApplied = true;
 	}
 
-	async select(elementId: string, value: string): Promise<void> {
-		await this.driver.select(elementId, value);
+	async select(
+		elementId: string,
+		candidates: readonly string[],
+	): Promise<void> {
+		await this.driver.select(elementId, candidates);
 		await this.#assertCurrentUrlAllowed();
 		this.#successfulInputElementIds.add(elementId);
 		this.#inputRevision += 1;

@@ -1,8 +1,11 @@
 import { parse } from "tldts";
 import type { JobInput } from "./job";
 import {
+	isTrustedCandidateList,
 	normalizeAllowedHosts,
 	normalizeTargetDomain,
+	PAYLOAD_KEY_PATTERN,
+	type TrustedFormValue,
 } from "./restricted-browser";
 
 export interface RegistrationEntry {
@@ -181,12 +184,50 @@ export async function resolveRedirectHosts(
 	throw new Error("Redirect chain exceeds the allowed host limit");
 }
 
+/**
+ * Validates a choices file against the candidate-list contract. Choices are
+ * registrant-supplied values, so they are checked here exactly as `POST /jobs`
+ * checks them, before a job is ever built from them.
+ */
+export function readChoiceCandidates(
+	value: unknown,
+): Record<string, readonly string[]> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw new Error("Choices JSON must be an object of candidate lists");
+	}
+	const choices: Record<string, readonly string[]> = {};
+	for (const [key, candidates] of Object.entries(value)) {
+		if (!PAYLOAD_KEY_PATTERN.test(key)) {
+			throw new Error("Choices JSON holds an invalid payload key");
+		}
+		if (!isTrustedCandidateList(candidates)) {
+			throw new Error(`Choices JSON holds an invalid candidate list: ${key}`);
+		}
+		choices[key] = [...candidates];
+	}
+	return choices;
+}
+
 export async function buildCampaignJob(
 	candidate: CampaignCandidate,
 	registrationValues: Record<string, string>,
 	campaign: string,
 	resolution: RedirectResolution,
+	choices: Record<string, readonly string[]> = {},
 ): Promise<JobInput> {
+	const formValues: Record<string, TrustedFormValue> = {
+		...registrationValues,
+		subject: candidate.subject,
+		message: candidate.message,
+	};
+	for (const [key, candidates] of Object.entries(choices)) {
+		// No precedence is defined between a registration value and a choice
+		// list, so a collision is an operator mistake rather than a merge.
+		if (Object.hasOwn(formValues, key)) {
+			throw new Error(`Choice key collides with a registration value: ${key}`);
+		}
+		formValues[key] = candidates;
+	}
 	const identity = `${candidate.companyDomain}\n${candidate.targetUrl}`;
 	const companyId = `company-${(await sha256(candidate.companyDomain)).slice(0, 24)}`;
 	const id = `${safeCampaignName(campaign)}-${(await sha256(`${campaign}\n${identity}`)).slice(0, 32)}`;
@@ -203,11 +244,7 @@ export async function buildCampaignJob(
 			_formAgentMaxAttempts: 1,
 			campaign,
 			sourceRow: candidate.rowNumber,
-			formValues: {
-				...registrationValues,
-				subject: candidate.subject,
-				message: candidate.message,
-			},
+			formValues,
 			instruction:
 				"Fill exactly one compatible inquiry form with the supplied formValues. Call submit only after native validation; the trusted dry-run handler must stop before submission.",
 		},

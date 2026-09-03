@@ -9,7 +9,9 @@ import { DuplicateJobError, type Job, type JobInput } from "./job";
 import { ResponsesAgentExecutor } from "./responses-agent-executor";
 import {
 	assertAllowedTargetUrl,
+	isTrustedFormValue,
 	normalizeAllowedHosts,
+	PAYLOAD_KEY_PATTERN,
 } from "./restricted-browser";
 import { R2EvidenceObjectStore } from "./submission-evidence";
 
@@ -294,12 +296,12 @@ function hasValidFormValues(payload: Record<string, unknown>): boolean {
 	if (!isRecord(formValues) || Object.keys(formValues).length === 0) {
 		return false;
 	}
+	// A value is either a single string or an ordered candidate list for one
+	// choice control; both contracts live in restricted-browser so that the
+	// registration and the tool handler can never diverge.
 	return Object.entries(formValues).every(
 		([key, value]) =>
-			/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(key) &&
-			typeof value === "string" &&
-			value.length > 0 &&
-			value.length <= 8_192,
+			PAYLOAD_KEY_PATTERN.test(key) && isTrustedFormValue(value),
 	);
 }
 
