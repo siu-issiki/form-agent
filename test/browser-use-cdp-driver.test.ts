@@ -63,6 +63,7 @@ import {
 import type { Job } from "../src/job";
 import {
 	BrowserElementError,
+	BrowserElementOperationError,
 	BrowserSubmitDiagnosticError,
 	isReviewComparableField,
 } from "../src/restricted-browser";
@@ -3096,5 +3097,295 @@ describe("BrowserUseCdpDriver session stop accounting", () => {
 			stopped: 1,
 			failed: 1,
 		});
+	});
+});
+
+const ELEMENT_PAGE_URL = "https://example.com/contact";
+
+const ELEMENT_PAGE_DOCUMENT = {
+	backendNodeId: 1,
+	nodeName: "#document",
+	children: [
+		{
+			backendNodeId: 2,
+			nodeName: "FORM",
+			attributes: ["action", "/send", "method", "post"],
+			children: [
+				{ backendNodeId: 3, nodeName: "INPUT" },
+				{ backendNodeId: 4, nodeName: "SELECT" },
+				{ backendNodeId: 5, nodeName: "BUTTON" },
+			],
+		},
+	],
+};
+
+/** The elementIds the first observation of the fixture page hands out. */
+const TEXT_ELEMENT_ID = "fa-1-0";
+const SELECT_ELEMENT_ID = "fa-1-1";
+const BUTTON_ELEMENT_ID = "fa-1-2";
+const BUTTON_BACKEND_NODE_ID = 5;
+
+function cdpCommandFailed(): Error {
+	return new Error("Browser Use CDP command failed");
+}
+
+function elementFixtureState(backendNodeId: number): Record<string, unknown> {
+	const base = {
+		ok: true,
+		visible: true,
+		name: null,
+		label: "",
+		placeholder: null,
+		required: false,
+		value: "",
+		options: [] as Array<{ value: string; label: string }>,
+		submitLike: false,
+		target: "",
+		formAction: "",
+		formMethod: "post",
+		disabled: false,
+		readOnly: false,
+		checked: false,
+	};
+	if (backendNodeId === 3) return { ...base, tag: "input", type: "text" };
+	if (backendNodeId === 4) {
+		return {
+			...base,
+			tag: "select",
+			type: "",
+			options: [{ value: "sales", label: "Sales" }],
+		};
+	}
+	return { ...base, tag: "button", type: "button" };
+}
+
+/**
+ * Answers the CDP commands `observe` and the element operations send, so a
+ * test can fail one named command and watch how the driver reports it.
+ */
+class ScriptedCdpConnection {
+	closeCount = 0;
+	readonly sent: Array<{ method: string; params: Record<string, unknown> }> =
+		[];
+	fail:
+		| ((method: string, params: Record<string, unknown>) => Error | null)
+		| null = null;
+
+	send<TResult>(
+		method: string,
+		params: Record<string, unknown> = {},
+	): Promise<TResult> {
+		this.sent.push({ method, params });
+		const failure = this.fail?.(method, params);
+		if (failure) return Promise.reject(failure);
+		return Promise.resolve(scriptedCdpResponse(method, params) as TResult);
+	}
+
+	lastResponseCharacters(): number | undefined {
+		return undefined;
+	}
+
+	on(): () => void {
+		return () => {};
+	}
+
+	close(): void {
+		this.closeCount += 1;
+	}
+}
+
+function scriptedCdpResponse(
+	method: string,
+	params: Record<string, unknown>,
+): unknown {
+	switch (method) {
+		case "Target.getTargets":
+			return { targetInfos: [{ targetId: "target-1", type: "page" }] };
+		case "Target.attachToTarget":
+			return { sessionId: "session-1" };
+		case "Page.getFrameTree":
+			return { frameTree: { frame: { id: "frame-1" } } };
+		case "Page.createIsolatedWorld":
+			return { executionContextId: 11 };
+		case "Runtime.evaluate": {
+			const expression = String(params.expression ?? "");
+			if (expression === "location.href") {
+				return { result: { value: ELEMENT_PAGE_URL } };
+			}
+			if (expression === "document.readyState") {
+				return { result: { value: "complete" } };
+			}
+			if (expression.startsWith("(document.body")) {
+				return { result: { value: "Contact form" } };
+			}
+			return { result: {} };
+		}
+		case "DOM.getDocument":
+			return { root: ELEMENT_PAGE_DOCUMENT };
+		case "DOM.resolveNode":
+			return { object: { objectId: `object-${params.backendNodeId}` } };
+		case "Runtime.callFunctionOn": {
+			if (
+				params.functionDeclaration ===
+				READ_FORM_PROHIBITION_REASON_CODES_FUNCTION
+			) {
+				return { result: { value: [] } };
+			}
+			const backendNodeId = Number(
+				String(params.objectId ?? "").replace("object-", ""),
+			);
+			return { result: { value: elementFixtureState(backendNodeId) } };
+		}
+		case "Accessibility.getPartialAXTree":
+			return { nodes: [] };
+		case "DOM.getBoxModel":
+			return { model: { border: [0, 0, 20, 0, 20, 10, 0, 10] } };
+		case "DOM.getNodeForLocation":
+			return { backendNodeId: BUTTON_BACKEND_NODE_ID };
+		default:
+			return {};
+	}
+}
+
+/** Connects a driver to the fixture page and takes the first observation. */
+async function observedElementDriver(): Promise<{
+	driver: BrowserUseCdpDriver;
+	connection: ScriptedCdpConnection;
+}> {
+	const connection = new ScriptedCdpConnection();
+	const captured = captureLogs();
+	try {
+		const driver = await BrowserUseCdpDriver.connect(
+			"api-key",
+			connectJob,
+			true,
+			{
+				client: asClient(new FakeBrowserUseClient()),
+				connectConnection: async () =>
+					connection as unknown as BrowserUseCdpConnection,
+			},
+		);
+		await driver.restrictToDomain("example.com", []);
+		await driver.observe();
+		return { driver, connection };
+	} finally {
+		captured.restore();
+	}
+}
+
+describe("BrowserUseCdpDriver element operation failures", () => {
+	test("reports a failed click command as an element operation error", async () => {
+		const { driver, connection } = await observedElementDriver();
+		connection.fail = (method) =>
+			method === "DOM.getBoxModel" ? cdpCommandFailed() : null;
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await driver.clickNonSubmit(BUTTON_ELEMENT_ID);
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect(caught).toBeInstanceOf(BrowserElementOperationError);
+		expect((caught as BrowserElementOperationError).operation).toBe("click");
+		expect(captured.warnings.map((entry) => JSON.parse(entry))).toEqual([
+			{ event: "browser_element_operation_failed", operation: "click" },
+		]);
+	});
+
+	test("keeps a failed mouse release a run error so the click is not repeated", async () => {
+		const { driver, connection } = await observedElementDriver();
+		connection.fail = (method, params) =>
+			method === "Input.dispatchMouseEvent" && params.type === "mouseReleased"
+				? cdpCommandFailed()
+				: null;
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await driver.clickNonSubmit(BUTTON_ELEMENT_ID);
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect(caught).not.toBeInstanceOf(BrowserElementError);
+		expect((caught as Error).message).toBe("Browser Use CDP command failed");
+		expect(captured.warnings).toEqual([]);
+		expect(
+			connection.sent.filter(
+				(entry) =>
+					entry.method === "Input.dispatchMouseEvent" &&
+					entry.params.type === "mousePressed",
+			),
+		).toHaveLength(1);
+	});
+
+	test("keeps a closed connection during a click a run error", async () => {
+		const { driver, connection } = await observedElementDriver();
+		connection.fail = (method) =>
+			method === "DOM.getBoxModel"
+				? new Error("Browser Use CDP connection closed")
+				: null;
+
+		const caught = await driver
+			.clickNonSubmit(BUTTON_ELEMENT_ID)
+			.catch((error: unknown) => error);
+
+		expect(caught).not.toBeInstanceOf(BrowserElementError);
+		expect((caught as Error).message).toBe("Browser Use CDP connection closed");
+	});
+
+	test("reports a failed fill command as an element operation error", async () => {
+		const { driver, connection } = await observedElementDriver();
+		connection.fail = (method) =>
+			method === "DOM.focus" ? cdpCommandFailed() : null;
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await driver.fill(TEXT_ELEMENT_ID, "Hello");
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect(caught).toBeInstanceOf(BrowserElementOperationError);
+		expect((caught as BrowserElementOperationError).operation).toBe("fill");
+		expect(captured.warnings.map((entry) => JSON.parse(entry))).toEqual([
+			{ event: "browser_element_operation_failed", operation: "fill" },
+		]);
+	});
+
+	test("reports a failed select command as an element operation error", async () => {
+		const { driver, connection } = await observedElementDriver();
+		let callFunctionOnCount = 0;
+		connection.fail = (method) => {
+			if (method !== "Runtime.callFunctionOn") return null;
+			callFunctionOnCount += 1;
+			// The first call inspects the element; the second sets the value.
+			return callFunctionOnCount === 2 ? cdpCommandFailed() : null;
+		};
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await driver.select(SELECT_ELEMENT_ID, "sales");
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect(caught).toBeInstanceOf(BrowserElementOperationError);
+		expect((caught as BrowserElementOperationError).operation).toBe("select");
+		expect(captured.warnings.map((entry) => JSON.parse(entry))).toEqual([
+			{ event: "browser_element_operation_failed", operation: "select" },
+		]);
 	});
 });
