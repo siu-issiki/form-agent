@@ -13,6 +13,14 @@ import {
 	discoverCdpNavigationLinks,
 	findCdpFrameOwnerBackendNodeId,
 } from "./browser-use-cdp-dom";
+import {
+	BrowserUseApiError,
+	BrowserUseClient,
+	type BrowserUseFetch,
+	BrowserUseRequestError,
+	BrowserUseResponseError,
+	resolveCdpWebSocketUrl,
+} from "./browser-use-client";
 import type { Job } from "./job";
 import {
 	assertAllowedTargetUrl,
@@ -39,6 +47,13 @@ const SUBMISSION_CONFIRMATION_TIMEOUT_MS = 15_000;
 const SUBMISSION_PERMISSION_WINDOW_MS = 2_000;
 const MAX_SUBMIT_MOUSE_PREPARATION_ATTEMPTS = 3;
 const CONNECT_RETRY_DELAYS_MS = [10_000, 20_000, 30_000];
+/**
+ * The run deadline is 10 minutes and the termination grace is 30 seconds, so a
+ * 12 minute provider timeout only acts as a backstop when the explicit stop
+ * never reaches the provider.
+ */
+const SESSION_TIMEOUT_MINUTES = 12;
+const SESSION_STOP_TIMEOUT_MS = 10_000;
 
 const RETRYABLE_CONNECT_ERROR_MESSAGES = new Set([
 	"Browser Use CDP connection failed",
@@ -51,9 +66,16 @@ export interface BrowserUseConnectOptions {
 	retryDelaysMs?: readonly number[];
 	sleep?: (ms: number) => Promise<void>;
 	signal?: AbortSignal;
+	client?: BrowserUseClient;
+	fetcher?: BrowserUseFetch;
 	connectConnection?: (
 		webSocketUrl: string,
 	) => Promise<BrowserUseCdpConnection>;
+}
+
+interface BrowserSessionHandle {
+	client: BrowserUseClient;
+	id: string;
 }
 
 function isRetryableConnectError(error: unknown): boolean {
@@ -63,9 +85,80 @@ function isRetryableConnectError(error: unknown): boolean {
 	if (error instanceof BrowserUseCdpClosedError) {
 		return error.retryable;
 	}
+	if (error instanceof BrowserUseApiError) {
+		return error.retryable;
+	}
+	if (
+		error instanceof BrowserUseRequestError ||
+		error instanceof BrowserUseResponseError
+	) {
+		return true;
+	}
 	return (
 		error instanceof Error &&
 		RETRYABLE_CONNECT_ERROR_MESSAGES.has(error.message)
+	);
+}
+
+/**
+ * Stopping is best effort: the provider keeps the session alive until its own
+ * timeout when the stop fails, so the outcome is recorded and the caller keeps
+ * its original error.
+ */
+async function stopBrowserSession(
+	session: BrowserSessionHandle,
+): Promise<void> {
+	const startedAt = Date.now();
+	let ok = true;
+	let status: number | undefined;
+	try {
+		await session.client.stopBrowser(
+			session.id,
+			AbortSignal.timeout(SESSION_STOP_TIMEOUT_MS),
+		);
+	} catch (error) {
+		ok = false;
+		if (error instanceof BrowserUseApiError) status = error.status;
+	}
+	console.log(
+		JSON.stringify({
+			event: "browser_use_session_stopped",
+			ok,
+			...(status === undefined ? {} : { status }),
+			durationMs: Date.now() - startedAt,
+		}),
+	);
+}
+
+/**
+ * A queue retry inherits the sessions of the previous attempt when the Worker
+ * was killed before it could stop them. The job identifier is unique per run
+ * because claimRun serialises attempts, so every active session tagged with it
+ * belongs to an attempt that already ended.
+ */
+async function reclaimJobSessions(
+	client: BrowserUseClient,
+	jobId: string,
+	signal: AbortSignal | undefined,
+): Promise<void> {
+	let stopped = 0;
+	let ok = true;
+	try {
+		const sessions = await client.listBrowsers(
+			"active",
+			100,
+			signal ?? AbortSignal.timeout(SESSION_STOP_TIMEOUT_MS),
+		);
+		for (const session of sessions) {
+			if (session.metadata.jobId !== jobId) continue;
+			await stopBrowserSession({ client, id: session.id });
+			stopped += 1;
+		}
+	} catch {
+		ok = false;
+	}
+	console.log(
+		JSON.stringify({ event: "browser_use_session_reclaimed", ok, stopped }),
 	);
 }
 
@@ -83,6 +176,18 @@ export function connectFailureDetail(error: unknown): {
 } {
 	if (error instanceof BrowserUseCdpUpgradeRejectedError) {
 		return { reason: "CDP_UPGRADE_REJECTED", status: error.status };
+	}
+	if (error instanceof BrowserUseApiError) {
+		return {
+			reason: error.status === 429 ? "SESSION_LIMIT" : "SESSION_CREATE_FAILED",
+			status: error.status,
+		};
+	}
+	if (
+		error instanceof BrowserUseRequestError ||
+		error instanceof BrowserUseResponseError
+	) {
+		return { reason: "SESSION_CREATE_FAILED" };
 	}
 	if (!(error instanceof Error)) return { reason: "UNKNOWN" };
 	switch (error.message) {
@@ -260,37 +365,42 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#formDataEntered = false;
 	#interactionStarted = false;
 	#navigationCount = 0;
+	#closePromise: Promise<void> | undefined;
 	readonly #successfulInputBackendNodeIds = new Set<number>();
 
 	private constructor(
 		private readonly connection: BrowserUseCdpConnection,
 		private readonly sessionId: string,
 		private readonly dryRun: boolean,
+		private readonly browserSession: BrowserSessionHandle | undefined,
 	) {}
 
+	/**
+	 * The provider keeps a managed browser running after the CDP socket is gone,
+	 * so every session is created through the REST API and stopped again on the
+	 * way out. Leaving that stop undone consumes a concurrency slot until the
+	 * provider timeout expires.
+	 */
 	static async connect(
 		apiKey: string,
-		_job: Job,
+		job: Job,
 		dryRun = false,
-		endpoint = "wss://connect.browser-use.com",
 		options: BrowserUseConnectOptions = {},
 	): Promise<BrowserUseCdpDriver> {
 		if (!apiKey) throw new Error("Browser Use API key is required");
-		const url = new URL(endpoint);
-		if (url.protocol !== "wss:" || url.hostname !== "connect.browser-use.com") {
-			throw new Error("Invalid Browser Use CDP endpoint");
-		}
-		url.searchParams.set("apiKey", apiKey);
-		url.searchParams.set("proxyCountryCode", "jp");
-		url.searchParams.set("timeout", "15");
-		const webSocketUrl = url.toString();
-
+		const client = options.client ?? new BrowserUseClient(apiKey, fetch);
+		const fetcher = options.fetcher ?? fetch;
 		const retryDelaysMs = options.retryDelaysMs ?? CONNECT_RETRY_DELAYS_MS;
 		const signal = options.signal;
 		const sleep = options.sleep ?? ((ms: number) => sleepMs(ms, signal));
 		const openConnection =
 			options.connectConnection ??
 			((target: string) => BrowserUseCdpConnection.connect(target));
+
+		assertConnectNotAborted(signal);
+		if (job.attemptCount > 1) {
+			await reclaimJobSessions(client, job.id, signal);
+		}
 
 		let lastError: unknown;
 		for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
@@ -308,10 +418,15 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			}
 			assertConnectNotAborted(signal);
 			try {
-				return await BrowserUseCdpDriver.#establish(
-					webSocketUrl,
+				return await BrowserUseCdpDriver.#connectOnce(
+					client,
+					fetcher,
+					apiKey,
+					job,
 					dryRun,
+					attempt,
 					openConnection,
+					signal,
 				);
 			} catch (error) {
 				if (!isRetryableConnectError(error)) throw error;
@@ -321,13 +436,73 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		throw lastError;
 	}
 
+	static async #connectOnce(
+		client: BrowserUseClient,
+		fetcher: BrowserUseFetch,
+		apiKey: string,
+		job: Job,
+		dryRun: boolean,
+		attempt: number,
+		openConnection: (webSocketUrl: string) => Promise<BrowserUseCdpConnection>,
+		signal: AbortSignal | undefined,
+	): Promise<BrowserUseCdpDriver> {
+		const session = await client.createBrowser({
+			timeoutMinutes: SESSION_TIMEOUT_MINUTES,
+			proxyCountryCode: "jp",
+			metadata: { jobId: job.id, dryRun: String(dryRun) },
+			...(signal ? { signal } : {}),
+		});
+		const handle: BrowserSessionHandle = { client, id: session.id };
+		try {
+			assertConnectNotAborted(signal);
+			const cdpUrl = session.cdpUrl;
+			if (!cdpUrl) {
+				throw new BrowserUseResponseError(
+					"Browser Use did not return an active session with a CDP URL",
+				);
+			}
+			const cdpScheme = cdpUrl.startsWith("wss:") ? "wss" : "https";
+			const webSocketUrl = await resolveCdpWebSocketUrl(
+				cdpUrl,
+				fetcher,
+				apiKey,
+				signal,
+			);
+			const driver = await BrowserUseCdpDriver.#establish(
+				webSocketUrl,
+				dryRun,
+				openConnection,
+				signal,
+				handle,
+			);
+			console.log(
+				JSON.stringify({
+					event: "browser_use_session_created",
+					cdpScheme,
+					attempt,
+				}),
+			);
+			return driver;
+		} catch (error) {
+			await stopBrowserSession(handle);
+			throw error;
+		}
+	}
+
 	static async #establish(
 		webSocketUrl: string,
 		dryRun: boolean,
 		openConnection: (webSocketUrl: string) => Promise<BrowserUseCdpConnection>,
+		signal: AbortSignal | undefined,
+		browserSession: BrowserSessionHandle | undefined,
 	): Promise<BrowserUseCdpDriver> {
 		const connection = await openConnection(webSocketUrl);
+		// Closing the connection rejects every in-flight command, so an abort
+		// during setup fails fast instead of waiting out the CDP command timeout.
+		const onAbort = () => connection.close();
+		signal?.addEventListener("abort", onAbort, { once: true });
 		try {
+			assertConnectNotAborted(signal);
 			const { targetInfos } = await connection.send<{
 				targetInfos: TargetInfo[];
 			}>("Target.getTargets");
@@ -345,18 +520,33 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				"Target.attachToTarget",
 				{ targetId, flatten: true },
 			);
-			const driver = new BrowserUseCdpDriver(connection, sessionId, dryRun);
+			const driver = new BrowserUseCdpDriver(
+				connection,
+				sessionId,
+				dryRun,
+				browserSession,
+			);
 			await driver.#initialize();
 			return driver;
 		} catch (error) {
 			connection.close();
 			throw error;
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
 		}
 	}
 
 	async close(): Promise<void> {
+		this.#closePromise ??= this.#close();
+		return this.#closePromise;
+	}
+
+	async #close(): Promise<void> {
 		this.#notifyPageChanged();
 		this.connection.close();
+		if (this.browserSession) {
+			await stopBrowserSession(this.browserSession);
+		}
 	}
 
 	async restrictToDomain(

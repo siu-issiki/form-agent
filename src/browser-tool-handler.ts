@@ -53,6 +53,7 @@ export class BrowserToolCoordinator {
 	#scopeKey: string | undefined;
 	#operationTail: Promise<void> = Promise.resolve();
 	#closed = false;
+	#closePromise: Promise<void> | undefined;
 
 	constructor(
 		private readonly db: D1Database,
@@ -210,8 +211,17 @@ export class BrowserToolCoordinator {
 		}
 	}
 
+	/**
+	 * The close releases the provider session, so the caller must be able to wait
+	 * for it. A second call joins the first instead of returning early.
+	 */
 	async close(): Promise<void> {
 		this.#closed = true;
+		this.#closePromise ??= this.#close();
+		return this.#closePromise;
+	}
+
+	async #close(): Promise<void> {
 		const driver = this.#driver;
 		this.#driver = undefined;
 		this.#tools = undefined;
@@ -241,6 +251,13 @@ export class BrowserToolCoordinator {
 			driver = await this.createDriver(job);
 		} catch (error) {
 			throw new BrowserToolSetupError("driver_connect", error);
+		}
+		// The run may have been aborted while the session was being created. The
+		// provider session is released here because close() already ran and no
+		// longer holds this driver.
+		if (this.#closed) {
+			await driver.close?.().catch(() => undefined);
+			throw new BrowserToolInputError();
 		}
 		try {
 			let tools: RestrictedBrowserTools;

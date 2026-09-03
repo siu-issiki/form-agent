@@ -18,12 +18,12 @@
 | Queue / DLQ | 実装済み | production Queue、retry、DLQ、実POSTを伴う重複配信テスト |
 | Agent 実行 | 実装済み | Worker から OpenAI Responses API の function calling を直接実行 |
 | 推論 Provider | 部分実装 | OpenAI Responses API のみ。モデル、回数、本文、出力 token を Worker 側で制限 |
-| BrowserUse | 実装済み | standalone browser へ CDP 接続し、用途限定ツールだけを公開 |
+| BrowserUse | 実装済み | REST API v4 で standalone browser session を作成・停止し、CDP 接続では用途限定ツールだけを公開 |
 | E2E | 管理下範囲を実装済み | 常設テストシステムの13シナリオ、重複配送、送信後`uncertain`をproductionで検証済み。外部の実サイト送信は未実施 |
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値を検証。一覧・キャンセルは未実装 |
 | Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
 | 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ、値を含まないagent tool診断イベント。送信前・送信後・禁止判定時のスクリーンショット証跡を Cloudflare R2 へ保存し、D1 の `events` へ sha256 付きで記録する |
-| 並列検証 | 部分実施 | 2026-09-03 に 5 並列で管理下 12 シナリオを実行し 8 件合格。接続段階の `CDP_CONNECTION_CLOSED` が 10 秒間に 3 件発生したため、consumer は `max_concurrency: 5` のままとし、接続段階だけ再接続する |
+| 並列検証 | 部分実施 | 2026-09-03 の 5 並列 19 シナリオで 15 件合格。接続段階の close code 1011 / `LIMIT` が 16 件発生し、原因はジョブ終了後も session を停止していなかったことであった。consumer は `max_concurrency: 5` のままとし、session の明示停止を入れて再計測する |
 
 本書では、実装済みの構成を現在形で記述し、未実装または未検証の内容は「現在の制約」「PoC 計画」「残タスク・未決事項」に明示する。
 
@@ -136,14 +136,20 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 
 - BrowserUse Agent ではなく、standalone browser へ CDP 接続する。
 - BrowserUse API key と CDP URL はモデルへ渡さない。
-- 1 試行につき最大 1 browser session とし、終了時に接続を閉じる。Queue retry では同じジョブに対して新しい Agent 実行と session を開始する。
-- proxy country は `jp`、session timeout は 15 分とする。CDP URL の `timeout=15` は session の寿命が 15 分であることを意味する。
+- session は REST API v4（`https://api.browser-use.com/api/v4`）で明示的に作成し、応答の `cdpUrl` へ CDP 接続する。ジョブ終了時は正常・異常・deadline のいずれでも `PATCH /browsers/{id}` の `stop` を呼び、session を停止してから実行を終える。停止は best-effort であり、成否を `browser_use_session_stopped` に `ok` と status だけで記録する。
+- 明示停止を行う理由は、CDP 接続を閉じても managed browser が止まらないためである。BrowserUse の公式ドキュメントは「`browser.close()`, disconnecting CDP, or `client.close()` does not stop the managed browser. Use `client.browsers.stop(browser.id)`」と記載しており、2026-09-03 の 5 並列計測では CDP 切断後も session が寿命まで残り、同時 session 数を食いつぶして close code 1011 / `LIMIT` を招いた。
+- proxy country は `jp`、session timeout は 12 分とする。12 分は run deadline 10 分と termination grace 30 秒の外側に置いた backstop であり、明示停止が届かなかった場合にだけ効く。
+- session には `metadata.jobId` と `metadata.dryRun` を付ける。Queue retry（`attemptCount` が 2 以上）では、create の前に `GET /browsers?filterBy=active` から同じ `jobId` の session を stop して残骸を回収し、件数を `browser_use_session_reclaimed` に記録する。同一 `jobId` の session は `claimRun` の排他により同時に 1 件しか存在しないため、回収対象は必ず終了済み attempt のものである。
+- `cdpUrl` は接続前・API key 付与前に host を検証し、`browser-use.com` またはそのサブドメイン以外は `Invalid Browser Use CDP endpoint` として失敗させる。`wss:` はそのまま使い、`https:` の場合だけ `GET <cdpUrl>/json/version` で `webSocketDebuggerUrl` を取得する。取得した URL も同じ host 検証を通し、`ws:` は `cdpUrl` と同一 host のときだけ `wss:` へ昇格させる。
 - CDP WebSocket が自発的に閉じた場合、close code、reason の文字数、reason を固定分類した hint（`NONE` / `LIMIT` / `AUTH` / `TIMEOUT` / `OTHER`）、`wasClean`、未完了コマンド数を記録する。相手から渡された reason の自由文そのものはログに残さない。
 - 接続確立（CDP 接続から初期化完了まで）が一過性の障害で失敗した場合だけ、10 秒 → 20 秒 → 30 秒の待機を挟んで最大 3 回再接続する。再試行は送信前の接続段階に限定し、フォームへの副作用はない。
 - 再試行の可否は失敗の種別で決める。WebSocket upgrade が拒否された場合は HTTP status が 408、429、5xx のときだけ再試行し、401 / 403 / 404 等の恒久的な拒否は即座に失敗させる。upgrade 要求自体が失敗したネットワーク障害、接続断、コマンド timeout は再試行する。endpoint 不正や API key 未設定は接続を試みずに失敗させる。
+- session の作成・`cdpUrl` の解決が失敗した場合も同じ基準で扱う。REST API の status が 408、429、5xx なら再試行し、それ以外は再試行しない。API へ到達しなかった通信障害と、不正な JSON や `cdpUrl` 欠落のような一過性の応答異常は再試行する。再試行ログ `browser_use_connect_retry` の `reason` には、429 で `SESSION_LIMIT`、その他の作成・解決失敗で `SESSION_CREATE_FAILED` を記録する。
+- session を作成した後の失敗（abort、`cdpUrl` 不正、CDP 接続・初期化の失敗）では、元のエラーを投げ直す前にその session を stop する。恒久的に拒否された session 要求は `BROWSER_SESSION_REJECTED` として再試行不可の failed にし、診断イベントには status に応じて `BROWSER_SESSION_LIMIT`（429）または `BROWSER_SESSION_API_FAILED` を記録する。再試行可能な失敗は従来どおり `BROWSER_TOOL_UNAVAILABLE` とする。
 - 恒久的な upgrade 拒否（401 / 403 / 404 等）は `BROWSER_UPGRADE_REJECTED` として再試行不可の failed にし、Queue の再配信を行わない。診断イベントには `CDP_UPGRADE_REJECTED` を記録する。
 - upgrade 成功後の close も、close code 1008（policy violation）または reason が認証を示す場合は再試行しない。`BROWSER_CONNECTION_REJECTED` として再試行不可の failed にする。
-- 再試行の待機は agent の deadline で中断される。実行が abort された時点で待機と接続試行を打ち切り、`AGENT_TIMEOUT` として終了するため、termination grace を待機で消費しない。
+- 再試行の待機は agent の deadline で中断される。実行が abort された時点で待機と接続試行を打ち切り、`AGENT_TIMEOUT` として終了するため、termination grace を待機で消費しない。abort は接続確立中の CDP コマンドも打ち切り、作成済み session を stop してから終了する。接続が abort より後に完了した場合は、scope 設定と bootstrap navigate へ進まずに session を停止する。
+- 実行は session の stop が完了するまで戻らない。stop には 10 秒の timeout を置き、termination grace 30 秒の内側に収める。
 - popup、Worker、Service Worker、WebSocket 等の迂回経路を遮断する。
 - CDP の `DOM.getDocument` を `pierce: true` で取得し、通常 DOM と open / closed Shadow DOM を Worker 側で走査する。
 - 観測した同一ページ・許可hostのリンクを最大20件までモデルへ返し、サイト内別ページのフォーム探索に利用する。
@@ -364,6 +370,8 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 - Provider 呼び出し回数以外のtoken、rate limit、費用を保存しない。retryイベント以外の全体処理時間とBrowserUse待ち時間も保存しない。
 - agent tool診断はbrowser tool、`finish`、unknown tool dispatchを対象とする。`data_json`にはturn、固定tool名、stage、固定result codeだけを保存し、イベント共通列にはjob ID、attempt、記録時刻を保存する。送信前レビューはstage `submit_review`、result code `SUBMIT_REVIEW_ALLOWED` / `SUBMIT_REVIEW_DENIED` / `SUBMIT_REVIEW_UNAVAILABLE`として記録する。入力値、URL、自由記述エラー、全状態遷移は保存しない。
 - retry delay は 30 秒固定で、指数 backoff と jitter は未実装である。
+- Workers Logs を有効にし、invocation ごとの `outcome`、`cpuTime`、`wallTime`、`console` 出力を head sampling 100% で記録する。保持期間は 7 日であり、`outcome = exceededCpu` の調査は Cloudflare ダッシュボードの Workers Logs で 7 日以内に行う。ログに値、URL、自由文、session id を出さない方針は変わらない。
+- Worker の CPU 上限を 120 秒（既定 30 秒、Paid の最大 300 秒）に設定する。上限は Queue consumer にも適用される。ただし 2026-09-03 の `exceededCpu` は報告 `cpuTime` が 165 ms、`wallTime` が 91 秒であり、上限引き上げでは解消しない可能性が高いため、原因は Workers Logs で追跡する。
 
 ## 並列・リトライ方針
 
@@ -371,7 +379,9 @@ PoC はまず 1 並列の production で開始し、管理下テストサイト�
 
 2026-09-03 に 5 並列で管理下テストシステムの 12 シナリオを実行し、8 件が合格した。残りのうち 3 件は Worker 診断が stage `driver_connect`、code `CDP_CONNECTION_CLOSED` で、10 秒間に連続して発生した。発生時点で BrowserUse 側に既存 session が 3〜4 件あり、直前 2 分 40 秒で 9 session を作成していた。前後の接続は成功しているため、BrowserUse の同時 session 上限（プラン上 10）または session 作成レートの上限に達したと推定するが、当時は WebSocket の close code / reason を記録していなかったため原因は未確定である。
 
-consumer は `max_concurrency: 5` とする。5 並列の管理下計測で接続段階の切断が 3 件観測されたため、接続再試行（10 / 20 / 30 秒、最大 3 回）を緩和策として入れた。再試行でも接続できない場合は再試行可能エラーとして Queue の retry / DLQ へ進む。deploy 後に 19 シナリオの並列計測で `browser_use_connect_retry` と `browser_use_cdp_closed` の件数を確認する。BrowserUse のプラン上限（10）まで引き上げるのは、切断後の session 解放挙動を close code で確定してからとする。
+同日に 19 シナリオを同時登録して 5 並列で再計測し、15 件が合格した。close code 1011、`wasClean`、reason 分類 `LIMIT` の切断が 16 件、接続再試行が 15 回発生し、`native-get` は 10 / 20 / 30 秒の再接続 3 回でも解けなかった。Worker 側では `outcome: exceededCpu` による強制終了が 1 件あった。原因はジョブ終了後に session を停止しておらず、CDP 切断後も session が 15 分の寿命まで残って同時 session 上限を食いつぶしていたことである。REST API v4 での明示的な作成・停止を入れたため、deploy 後に同じ 19 シナリオ 5 並列を再計測する。
+
+consumer は `max_concurrency: 5` とする。5 並列の管理下計測で接続段階の切断が観測されたため、接続再試行（10 / 20 / 30 秒、最大 3 回）を緩和策として入れた。再試行でも接続できない場合は再試行可能エラーとして Queue の retry / DLQ へ進む。deploy 後の再計測では `browser_use_connect_retry`、`browser_use_cdp_closed`、`browser_use_session_stopped`、`browser_use_session_reclaimed` の件数を確認する。BrowserUse のプラン上限（10）まで引き上げるのは、明示停止後の同時 session 数が想定どおりに戻ることを確認してからとする。
 
 再接続は送信前の接続確立に限定するため、フォームへの副作用は発生しない。
 
@@ -466,7 +476,8 @@ consumer は `max_concurrency: 5` とする。5 並列の管理下計測で接�
 - CSVから抽出した外部form hostをジョブ単位の完全一致allowlistへ安全に反映する運用検証。
 - Provider abstraction と fallback。
 - 外部 API E2E は GitHub Actions の通常 CI に含めず、手動実行に限定する。
-- BrowserUse の同時 session 上限と、切断後に session が解放されるまでの遅延を、ダッシュボードまたは記録した close code で確定する。
+- Worker の `outcome: exceededCpu` の原因特定。報告 `cpuTime` 165 ms に対して強制終了しているため、CPU 上限の引き上げでは説明できない。Workers Logs の保持期間が 7 日であるため、再発時は 7 日以内に調査する。
+- 5 並列時に `multi-step` と `external-iframe` で発生する CDP 失敗。受信 1 件で `uncertain` に倒れた例があり、明示停止後の再計測で再現するかを確認する。
 - R2 アップロード後・D1 記録前に Worker が停止した場合の孤児オブジェクトは検出できない。intent イベントの先行記録または R2 ライフサイクルルールで対処する。
 - 送信前レビューの残存リスク対応: `dom` activation で照合と `requestSubmit` を同一 JS 実行内で行い、`mouse` / `enter` は activation 直前に再照合する。snapshot に禁止文言・label・option・action / method を含める。修正の証明を変更したコントロールの value / checked 差分に限定する。form 再探索の切り詰めを検出して fail-closed にする。いずれも管理下テストシステムでの E2E と併せて実施する。
 

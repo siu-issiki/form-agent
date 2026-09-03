@@ -26,7 +26,7 @@
   "SELECT id,status,attempt_count,updated_at FROM jobs WHERE status IN ('pending','running','submitting') ORDER BY updated_at;"
 ```
 
-`submitting`は強制再送せず、後述の照合対象にする。`running` / `submitting`が0件になったら、明示的な安全停止設定でWorkerをdeployする。
+`submitting`は強制再送せず、後述の照合対象にする。Worker強制終了時はbrowser sessionが残ることがあるため、「BrowserUse sessionの確認と停止」も併せて実施する。`running` / `submitting`が0件になったら、明示的な安全停止設定でWorkerをdeployする。
 
 ```bash
 ./node_modules/.bin/wrangler deploy \
@@ -184,6 +184,22 @@ DLQへ移動したジョブを確認する。
 ```
 
 `data_json`にはturn、固定のtool名、stage、result codeだけが入り、URL、会社名、フォーム値、モデルの自由文は保存されない。
+
+## BrowserUse sessionの確認と停止
+
+通常はジョブ終了時にWorkerがsessionを`stop`する。Workerが強制終了した場合、DLQへ落ちた場合、`stop`が失敗した場合はsessionが残るため、`BROWSER_USE_API_KEY`を持つ環境から確認する。API keyはシェル履歴へ残さず、`--env-file`で渡す。
+
+```bash
+bun --env-file=.env.production run tools/browser-use-sessions.ts list
+bun --env-file=.env.production run tools/browser-use-sessions.ts stop <SESSION_ID>
+bun --env-file=.env.production run tools/browser-use-sessions.ts stop-all
+```
+
+`list`はactive sessionのid、開始時刻、寿命、`metadata.jobId`だけを出力する。live viewとCDPのURLはsessionの操作権を与えるため出力しない。停止対象は、対応するジョブがD1上で終端状態になっているsessionに限る。`stop-all`は実行中ジョブがない保守時間にだけ使う。
+
+Worker側の記録は`browser_use_session_created`、`browser_use_session_stopped`、`browser_use_session_reclaimed`である。`browser_use_session_stopped`の`ok`が`false`の場合は`stop`が届いていないため、上記の`list`で残骸を確認する。
+
+`outcome: exceededCpu`によるWorkerの強制終了は、Cloudflareダッシュボードの Workers Logs で`outcome = exceededCpu`を検索して調査する。ログの保持期間は7日であるため、7日以内に確認する。`cpuTime`と`wallTime`を併せて読み、CPU上限（120秒）に達していない強制終了であれば上限引き上げでは解消しない。
 
 ## 重複Queue配送の検証
 
