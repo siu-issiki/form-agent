@@ -159,6 +159,8 @@ async function reclaimJobSessions(
 	let matched = 0;
 	let stopped = 0;
 	let failed = 0;
+	let activeTotal = 0;
+	let activeTagged = 0;
 	let ok = true;
 	try {
 		const sessions = await client.listBrowsers(
@@ -166,6 +168,10 @@ async function reclaimJobSessions(
 			100,
 			signal ?? AbortSignal.timeout(SESSION_STOP_TIMEOUT_MS),
 		);
+		// Counts only: they show whether the provider limit is consumed by this
+		// deployment (tagged with a jobId) or by sessions created elsewhere.
+		activeTotal = sessions.length;
+		activeTagged = sessions.filter((session) => session.metadata.jobId).length;
 		for (const session of sessions) {
 			if (session.metadata.jobId !== jobId) continue;
 			matched += 1;
@@ -185,6 +191,8 @@ async function reclaimJobSessions(
 		JSON.stringify({
 			event: "browser_use_session_reclaimed",
 			ok,
+			activeTotal,
+			activeTagged,
 			matched,
 			stopped,
 			failed,

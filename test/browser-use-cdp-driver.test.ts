@@ -2787,6 +2787,8 @@ describe("BrowserUseCdpDriver session lifecycle", () => {
 			{
 				event: "browser_use_session_reclaimed",
 				ok: true,
+				activeTotal: 3,
+				activeTagged: 2,
 				matched: 1,
 				stopped: 1,
 				failed: 0,
@@ -3078,6 +3080,8 @@ describe("BrowserUseCdpDriver session stop accounting", () => {
 		).toEqual({
 			event: "browser_use_session_reclaimed",
 			ok: false,
+			activeTotal: 3,
+			activeTagged: 3,
 			matched: 2,
 			stopped: 1,
 			failed: 1,
