@@ -8,7 +8,6 @@ const DEFAULT_TARGET_URL = "https://www.selenium.dev/selenium/web/blank.html";
 const SAFE_TERMINAL_REASON_CODES = new Set([
 	"DRY_RUN_COMPLETE",
 	"NO_FORM_PRESENT",
-	"NO_INQUIRY_FORM",
 ]);
 const SUCCESS_TERMINAL_STATUSES = new Set(["prohibited", "uncertain"]);
 const POLL_TERMINAL_STATUSES = new Set([
