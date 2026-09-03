@@ -258,11 +258,22 @@ export type CdpCommandErrorKind =
 	| "NOT_FOCUSABLE"
 	| "NO_EXECUTION_CONTEXT"
 	| "NO_NODE_AT_LOCATION"
+	| "CONTEXT_NOT_FOUND"
+	| "CONTEXT_DESTROYED"
+	| "FRAME_NOT_FOUND"
+	| "TARGET_NAVIGATED"
+	| "NOT_ALLOWED"
+	| "INTERNAL_ERROR"
+	| "INVALID_PARAMS"
+	| "METHOD_NOT_FOUND"
 	| "OTHER";
 
 /**
  * A CDP error message can quote page-derived text, so only these fixed
- * patterns are read from it and the message itself is never kept.
+ * patterns are read from it and the message itself is never kept. More
+ * specific patterns are listed before the broader fallbacks they would
+ * otherwise be shadowed by (e.g. CONTEXT_NOT_FOUND before the generic
+ * NO_EXECUTION_CONTEXT catch-all).
  */
 const COMMAND_ERROR_KIND_PATTERNS: ReadonlyArray<
 	readonly [CdpCommandErrorKind, readonly string[]]
@@ -278,6 +289,8 @@ const COMMAND_ERROR_KIND_PATTERNS: ReadonlyArray<
 	["NODE_DETACHED", ["not attached", "detached"]],
 	["NO_BOX_MODEL", ["box model", "layout object", "could not compute"]],
 	["NOT_FOCUSABLE", ["not focusable"]],
+	["CONTEXT_NOT_FOUND", ["cannot find context with specified id"]],
+	["CONTEXT_DESTROYED", ["execution context was destroyed"]],
 	["NO_EXECUTION_CONTEXT", ["execution context", "cannot find context"]],
 	// DOM.getNodeForLocation when the computed point is outside the viewport or
 	// the layout has not settled after scrolling.
@@ -285,9 +298,32 @@ const COMMAND_ERROR_KIND_PATTERNS: ReadonlyArray<
 		"NO_NODE_AT_LOCATION",
 		["no node found at given location", "no node at given location"],
 	],
+	[
+		"FRAME_NOT_FOUND",
+		[
+			"no frame for given id found",
+			"frame with the given id was not found",
+			"frame not found",
+		],
+	],
+	["TARGET_NAVIGATED", ["inspected target navigated or closed"]],
+	["NOT_ALLOWED", ["not allowed"]],
+	["INTERNAL_ERROR", ["internal error"]],
 ];
 
-export function classifyCdpCommandError(message: unknown): CdpCommandErrorKind {
+const COMMAND_ERROR_KIND_CODES: ReadonlyMap<number, CdpCommandErrorKind> =
+	new Map([
+		[-32602, "INVALID_PARAMS"],
+		[-32601, "METHOD_NOT_FOUND"],
+	]);
+
+export function classifyCdpCommandError(
+	message: unknown,
+	code?: number | null,
+): CdpCommandErrorKind {
+	const codeKind =
+		typeof code === "number" ? COMMAND_ERROR_KIND_CODES.get(code) : undefined;
+	if (codeKind) return codeKind;
 	if (typeof message !== "string") return "OTHER";
 	const normalized = message.trim().toLowerCase();
 	if (!normalized) return "OTHER";
@@ -322,10 +358,11 @@ function createCdpCommandError(
 		typeof error === "object" && error !== null
 			? (error as { code?: unknown; message?: unknown })
 			: {};
+	const code = typeof detail.code === "number" ? detail.code : null;
 	return new BrowserUseCdpCommandError(
 		method,
-		typeof detail.code === "number" ? detail.code : null,
-		classifyCdpCommandError(detail.message),
+		code,
+		classifyCdpCommandError(detail.message, code),
 	);
 }
 

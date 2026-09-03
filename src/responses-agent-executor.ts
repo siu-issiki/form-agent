@@ -804,7 +804,13 @@ async function executeToolCall(
 		// value, URL, or session id is logged.
 		const cdpDetail =
 			originalError instanceof BrowserUseCdpCommandError
-				? { method: originalError.method, kind: originalError.kind }
+				? {
+						method: originalError.method,
+						kind: originalError.kind,
+						...(originalError.code !== null
+							? { cdpCode: originalError.code }
+							: {}),
+					}
 				: undefined;
 		console.log(
 			JSON.stringify({

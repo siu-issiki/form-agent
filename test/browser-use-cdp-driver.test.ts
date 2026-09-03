@@ -2359,17 +2359,47 @@ describe("CDP command error classification", () => {
 		);
 		expect(
 			classifyCdpCommandError("Cannot find context with specified id"),
-		).toBe("NO_EXECUTION_CONTEXT");
+		).toBe("CONTEXT_NOT_FOUND");
 		expect(classifyCdpCommandError("No node found at given location")).toBe(
 			"NO_NODE_AT_LOCATION",
 		);
 		expect(classifyCdpCommandError("Execution context was destroyed.")).toBe(
+			"CONTEXT_DESTROYED",
+		);
+		expect(classifyCdpCommandError("Some other execution context error")).toBe(
 			"NO_EXECUTION_CONTEXT",
 		);
+		expect(classifyCdpCommandError("No frame for given id found")).toBe(
+			"FRAME_NOT_FOUND",
+		);
+		expect(
+			classifyCdpCommandError("Frame with the given id was not found"),
+		).toBe("FRAME_NOT_FOUND");
+		expect(classifyCdpCommandError("Frame not found")).toBe("FRAME_NOT_FOUND");
+		expect(
+			classifyCdpCommandError("Inspected target navigated or closed"),
+		).toBe("TARGET_NAVIGATED");
+		expect(classifyCdpCommandError("Not allowed")).toBe("NOT_ALLOWED");
+		expect(classifyCdpCommandError("Operation not allowed")).toBe(
+			"NOT_ALLOWED",
+		);
+		expect(classifyCdpCommandError("Internal error")).toBe("INTERNAL_ERROR");
+	});
+
+	test("classifies fixed CDP error codes ahead of the message", () => {
+		expect(classifyCdpCommandError("Invalid parameters", -32602)).toBe(
+			"INVALID_PARAMS",
+		);
+		expect(classifyCdpCommandError(undefined, -32602)).toBe("INVALID_PARAMS");
+		expect(classifyCdpCommandError("Method not found", -32601)).toBe(
+			"METHOD_NOT_FOUND",
+		);
+		// An unmapped code falls back to classifying the message.
+		expect(classifyCdpCommandError("Not allowed", -32000)).toBe("NOT_ALLOWED");
 	});
 
 	test("falls back to OTHER for an unknown or absent message", () => {
-		expect(classifyCdpCommandError("Internal error")).toBe("OTHER");
+		expect(classifyCdpCommandError("some unmapped failure")).toBe("OTHER");
 		expect(classifyCdpCommandError("   ")).toBe("OTHER");
 		expect(classifyCdpCommandError(undefined)).toBe("OTHER");
 		expect(classifyCdpCommandError({ message: "Could not find node" })).toBe(
@@ -2383,6 +2413,9 @@ describe("CDP command error classification", () => {
 			"NODE_NOT_FOUND",
 			"NODE_DETACHED",
 			"NO_EXECUTION_CONTEXT",
+			"CONTEXT_NOT_FOUND",
+			"CONTEXT_DESTROYED",
+			"NO_NODE_AT_LOCATION",
 		] as const;
 		for (const kind of retryable) {
 			expect(
