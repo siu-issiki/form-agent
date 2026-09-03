@@ -252,6 +252,7 @@ export type CdpCommandErrorKind =
 	| "NO_BOX_MODEL"
 	| "NOT_FOCUSABLE"
 	| "NO_EXECUTION_CONTEXT"
+	| "NO_NODE_AT_LOCATION"
 	| "OTHER";
 
 /**
@@ -273,6 +274,12 @@ const COMMAND_ERROR_KIND_PATTERNS: ReadonlyArray<
 	["NO_BOX_MODEL", ["box model", "layout object", "could not compute"]],
 	["NOT_FOCUSABLE", ["not focusable"]],
 	["NO_EXECUTION_CONTEXT", ["execution context", "cannot find context"]],
+	// DOM.getNodeForLocation when the computed point is outside the viewport or
+	// the layout has not settled after scrolling.
+	[
+		"NO_NODE_AT_LOCATION",
+		["no node found at given location", "no node at given location"],
+	],
 ];
 
 export function classifyCdpCommandError(message: unknown): CdpCommandErrorKind {

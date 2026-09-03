@@ -2104,6 +2104,7 @@ const RETRYABLE_CLICK_PREPARATION_KINDS: ReadonlySet<CdpCommandErrorKind> =
 		"NODE_NOT_FOUND",
 		"NODE_DETACHED",
 		"NO_EXECUTION_CONTEXT",
+		"NO_NODE_AT_LOCATION",
 	]);
 
 export type ClickPreparationRetryKind = CdpCommandErrorKind | "HIT_TEST";
