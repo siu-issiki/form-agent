@@ -2610,17 +2610,19 @@ const CHOICE_CANDIDATE_HELPERS = `
   const normalizeText = (text) => String(text ?? "").trim().toLowerCase();
   const labelTexts = (element) => {
     const root = element.getRootNode();
-    const labels = Array.from(element.labels ?? []).map((label) => normalizeText(label.textContent)).filter(Boolean);
+    // observe reports several labels, and several aria-labelledby targets, as
+    // one joined string each. Only those joined forms are compared, so a
+    // candidate can never match a fragment the model was never shown; a
+    // question label shared by a whole radio group is one such fragment.
+    const labels = Array.from(element.labels ?? []).map((label) => normalizeText(label.textContent)).filter(Boolean).join(" ");
     const labelledBy = (element.getAttribute("aria-labelledby") ?? "").split(/\\s+/).filter(Boolean)
-      .map((id) => normalizeText(root.getElementById?.(id)?.textContent)).filter(Boolean);
-    const texts = [...labels, ...labelledBy];
-    // observe joins several labels into one string, so the joined form has to
-    // match a candidate as well as each part does.
-    if (labels.length > 1) texts.push(labels.join(" "));
-    if (labelledBy.length > 1) texts.push(labelledBy.join(" "));
-    texts.push(normalizeText(element.getAttribute("aria-label")));
-    texts.push(normalizeText(element.closest("label")?.textContent));
-    return texts.filter(Boolean);
+      .map((id) => normalizeText(root.getElementById?.(id)?.textContent)).filter(Boolean).join(" ");
+    return [
+      labels,
+      labelledBy,
+      normalizeText(element.getAttribute("aria-label")),
+      normalizeText(element.closest("label")?.textContent),
+    ].filter(Boolean);
   };
   const candidateRank = (element, candidates) => {
     const texts = labelTexts(element);

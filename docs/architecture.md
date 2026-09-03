@@ -188,8 +188,9 @@ driver が submit control と識別した要素は通常の `click` で操作で
 `payload.formValues`の値には、単一文字列に加えて「登録者が事前に許可した値の順序付き集合」である候補リストを指定できる。モデルは従来どおり`payloadKey`を指すだけで、どの候補が使われるかは信頼済み handler が決める。候補文字列はログ、診断イベント、tool の戻り値、エラーメッセージのいずれにも出さない。
 
 - `select`要素: 候補リストの順に、option の`value`との完全一致、または option の text（`observe`が返す label と同じ。trim・大文字小文字無視）との完全一致を探し、最初に一致した候補の option を選ぶ。`value`が空の placeholder option は候補に一致しても選ばない。ページ側関数の戻り値は boolean だけで、Worker は`=== true`のときだけ成功とみなす。
-- radio: 対象 radio の`value`、または関連ラベル（`labels`、`aria-label`、祖先の`label`）が候補のいずれかに一致すれば対象とする。さらに同じ form owner・同じ`name`の radio 群を走査し、対象より前の候補に一致する別の（disabled でない）radio があれば選ばず、`ELEMENT_UNAVAILABLE`を返す。DOM 順ではなく候補順を優先させるためである。ページ側関数の戻り値は`selected` / `not_candidate` / `higher_priority_exists`の 3 値だけで、それ以外が返った場合は要素エラーにする。
-- checkbox: 候補リストの順に見て、最初に現れた`checked` / `true`で check、`unchecked` / `false`で uncheck する。状態を表す候補が無い場合は、対象の`value`またはラベルが候補に一致したときだけ check する。いずれにも当てはまらなければ要素エラーとする（任意の文字列を uncheck として扱う旧挙動は廃止した。破壊的変更である）。
+- radio: 対象 radio の`value`、または関連ラベルが候補のいずれかに一致すれば対象とする。さらに同じ form owner・同じ`name`の radio 群を走査し、対象より前の候補に一致する別の（disabled でない）radio があれば選ばず、`ELEMENT_UNAVAILABLE`を返す。DOM 順ではなく候補順を優先させるためである。ページ側関数の戻り値は`selected` / `not_candidate` / `higher_priority_exists`の 3 値だけで、それ以外が返った場合は要素エラーにする。
+- 関連ラベルの照合対象は`observe`がモデルへ報告する形と揃える。`observe`は複数の`labels`を空白 1 つで連結した 1 本の文字列として、`aria-labelledby`の複数 id も同様に連結した 1 本として報告するため、候補と比較するのもその連結形だけであり、個々の断片は比較しない。断片一致を許すと、radio 群が共有する設問文言のような「モデルが見ていない部分文字列」で誤選択が起こりうるためである。`aria-label`と祖先`label`はそれぞれ 1 本の文字列としてそのまま比較する。
+- checkbox: 候補リストの順に見て、最初に現れた`checked` / `true`で check、`unchecked` / `false`で uncheck する。状態を表す候補が無い場合は、対象の`value`またはラベル（radio と同じ照合対象）が候補に一致したときだけ check する。いずれにも当てはまらなければ要素エラーとする（任意の文字列を uncheck として扱う旧挙動は廃止した。破壊的変更である）。
 - 曖昧一致（部分一致・類義語）は行わない。完全一致だけを認める。
 
 候補一致は必ずページ側の関数で行い、Worker はページから固定 token 以外を受け取らない。ページが任意の文字列を返しても、それが値として使われることはない。

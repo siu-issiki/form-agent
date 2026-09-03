@@ -3833,7 +3833,8 @@ function fakeSelectOf(
 function fakeRadioGroup(
 	members: Array<{
 		value: string;
-		label?: string;
+		/** An array becomes several associated labels, as element.labels holds. */
+		label?: string | string[];
 		ariaLabel?: string;
 		/**
 		 * Text held by the elements this radio's aria-labelledby points at. An
@@ -3855,10 +3856,12 @@ function fakeRadioGroup(
 				: Array.isArray(member.labelledBy)
 					? member.labelledBy
 					: [member.labelledBy];
-		// The ids carry an "s" on purpose, so a split on a broken whitespace
+		// The id is derived from the text, so two radios naming the same text
+		// really share one id, as a group sharing a question label does. The
+		// ids carry an "s" on purpose, so a split on a broken whitespace
 		// pattern loses them instead of quietly passing.
 		const labelledByIds = labelledByTexts.map(
-			(_, index) => `labels-${member.value}-${index}`,
+			(text) => `labels-${text.replace(/\s+/g, "-")}`,
 		);
 		const radio: FakeRadio = {
 			tagName: "INPUT",
@@ -3868,7 +3871,12 @@ function fakeRadioGroup(
 			form: member.ownForm === false ? null : form,
 			disabled: member.disabled === true,
 			checked: false,
-			labels: member.label === undefined ? [] : [{ textContent: member.label }],
+			labels: (member.label === undefined
+				? []
+				: Array.isArray(member.label)
+					? member.label
+					: [member.label]
+			).map((textContent) => ({ textContent })),
 			ariaLabel: member.ariaLabel ?? null,
 			ariaLabelledBy:
 				labelledByIds.length === 0 ? null : labelledByIds.join(" "),
@@ -4100,19 +4108,62 @@ describe("choice candidate matching in the page", () => {
 		expect(byLabelledBy?.checked).toBe(true);
 	});
 
-	test("resolves every id of a multi-target aria-labelledby", () => {
+	test("matches only the joined form of several associated labels", () => {
 		const setRadio = selectRadioByCandidate();
-		const [byParts] = fakeRadioGroup([
-			{ value: "e", labelledBy: ["ご希望の", "連絡方法"] },
-		]);
 		const [byJoined] = fakeRadioGroup([
-			{ value: "p", labelledBy: ["ご希望の", "連絡方法"], name: "joined" },
+			{ value: "e", label: ["ご希望の連絡方法", "メール"] },
+		]);
+		const [byFragment] = fakeRadioGroup([
+			{ value: "p", label: ["ご希望の連絡方法", "メール"], name: "fragment" },
 		]);
 
-		expect(setRadio.call(byParts as object, ["連絡方法"])).toBe("selected");
-		expect(setRadio.call(byJoined as object, ["ご希望の 連絡方法"])).toBe(
+		expect(setRadio.call(byJoined as object, ["ご希望の連絡方法 メール"])).toBe(
 			"selected",
 		);
+		expect(setRadio.call(byFragment as object, ["メール"])).toBe(
+			"not_candidate",
+		);
+	});
+
+	test("matches only the joined form of a multi-target aria-labelledby", () => {
+		const setRadio = selectRadioByCandidate();
+		const [byJoined] = fakeRadioGroup([
+			{ value: "e", labelledBy: ["ご希望の連絡方法", "メール"] },
+		]);
+		const [byFragment] = fakeRadioGroup([
+			{
+				value: "p",
+				labelledBy: ["ご希望の連絡方法", "メール"],
+				name: "fragment",
+			},
+		]);
+
+		// observe reports the two targets as one string, so only that string is
+		// a candidate's counterpart.
+		expect(setRadio.call(byJoined as object, ["ご希望の連絡方法 メール"])).toBe(
+			"selected",
+		);
+		expect(setRadio.call(byFragment as object, ["メール"])).toBe(
+			"not_candidate",
+		);
+		expect(byFragment?.checked).toBe(false);
+	});
+
+	test("keeps a question label shared by a radio group from matching", () => {
+		const setRadio = selectRadioByCandidate();
+		const [email, phone] = fakeRadioGroup([
+			{ value: "email", labelledBy: ["ご希望の連絡方法", "メール"] },
+			{ value: "phone", labelledBy: ["ご希望の連絡方法", "電話"] },
+		]);
+
+		expect(setRadio.call(email as object, ["ご希望の連絡方法"])).toBe(
+			"not_candidate",
+		);
+		expect(setRadio.call(phone as object, ["ご希望の連絡方法"])).toBe(
+			"not_candidate",
+		);
+		expect(email?.checked).toBe(false);
+		expect(phone?.checked).toBe(false);
 	});
 
 	test("matches a checkbox labelled only through aria-labelledby", () => {
