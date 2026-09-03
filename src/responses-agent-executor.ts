@@ -273,6 +273,9 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 
 		let maxTurns = MAX_TURNS;
 		let correctionTurnsGranted = false;
+		let observations = 0;
+		let toolCalls = 0;
+		let toolErrors = 0;
 		for (let turn = 0; turn < maxTurns; turn += 1) {
 			throwIfAborted(signal);
 			counters.turns += 1;
@@ -329,6 +332,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 			}
 
 			history.push(...output);
+			toolCalls += 1;
 			const execution = await executeToolCall(
 				call,
 				tools.map((tool) => tool.name),
@@ -341,6 +345,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 				turn + 1,
 			);
 			if (execution.errorCode) {
+				toolErrors += 1;
 				// Fixed values only: the tool name and the error code come from
 				// closed sets, so no elementId, payloadKey, value, or URL is logged.
 				console.log(
@@ -359,7 +364,10 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 				correctionTurnsGranted = true;
 				maxTurns += CORRECTION_TURNS;
 			}
-			if (execution.successfulTool === "observe") hasObservedPage = true;
+			if (execution.successfulTool === "observe") {
+				hasObservedPage = true;
+				observations += 1;
+			}
 			history.push({
 				type: "function_call_output",
 				call_id: call.call_id,
@@ -367,6 +375,16 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 			});
 		}
 
+		// Counts only, so the line says how the budget was spent without
+		// revealing any input value, page text, or URL.
+		console.log(
+			JSON.stringify({
+				event: "agent_turn_limit_reached",
+				observations,
+				toolCalls,
+				toolErrors,
+			}),
+		);
 		return failed("AGENT_TURN_LIMIT", false);
 	}
 

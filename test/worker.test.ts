@@ -3623,7 +3623,7 @@ describe("ResponsesAgentExecutor", () => {
 
 	test("grants extra turns for the correction the review allows", () => {
 		expect(MAX_PROVIDER_REQUESTS).toBe(MAX_TURNS + CORRECTION_TURNS + 2);
-		expect(MAX_PROVIDER_REQUESTS).toBe(21);
+		expect(MAX_PROVIDER_REQUESTS).toBe(45);
 	});
 
 	test("keeps a reviewer provider failure classified instead of a browser failure", async () => {
@@ -4029,6 +4029,65 @@ describe("ResponsesAgentExecutor", () => {
 			code: "NAVIGATION_NOT_ALLOWED",
 			turn: 2,
 		});
+	});
+
+	test("logs how the turn budget was spent when the limit is reached", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		// Every turn observes, so the agent never finishes and burns the budget.
+		let call = 0;
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () => {
+				call += 1;
+				if (call > MAX_TURNS) throw new Error("Unexpected provider request");
+				return Response.json(
+					functionResponse(`call-observe-${call}`, "observe", {}),
+				);
+			}) as typeof fetch,
+			createBrowserDriver: async () => new WorkerFakeBrowserDriver(),
+		});
+		const logs: string[] = [];
+		const spy = vi.spyOn(console, "log").mockImplementation((message) => {
+			logs.push(String(message));
+		});
+
+		let result: Awaited<ReturnType<typeof executor.execute>> | undefined;
+		try {
+			result = await executor.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				new AbortController().signal,
+			);
+		} finally {
+			spy.mockRestore();
+		}
+
+		expect(result).toMatchObject({
+			outcome: "failed",
+			reasonCode: "AGENT_TURN_LIMIT",
+		});
+		const limits = logs
+			.filter((entry) => entry.includes('"agent_turn_limit_reached"'))
+			.map((entry) => JSON.parse(entry) as Record<string, unknown>);
+		// Counts only: no job ID, URL, or page text.
+		expect(limits).toEqual([
+			{
+				event: "agent_turn_limit_reached",
+				observations: MAX_TURNS,
+				toolCalls: MAX_TURNS,
+				toolErrors: 0,
+			},
+		]);
 	});
 });
 

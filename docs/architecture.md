@@ -111,7 +111,7 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 - 1 回の実行で 1 社だけを処理する。
 - `parallel_tool_calls: false` と strict schema により、1 turn で最大 1 tool だけを処理する。
 - `AGENT_DRY_RUN`とbooleanの`_formAgentDryRun`から実効モードをジョブ登録時に保存する。旧形式のジョブは常にdry-runとし、deployment切替で既存ジョブの意味を変えない。dry-runでは`submit`をモデルへ公開したまま、送信対象と同じフォームへの入力成功、現在のsubmit要素、`form.checkValidity()`の成功を実ブラウザで検証し、送信権取得とブラウザsubmitより前に`DRY_RUN_COMPLETE`で終了する。
-- 最大 16 turn、ジョブ prompt 最大 64,000 文字とする。
+- 最大 40 turn、ジョブ prompt 最大 64,000 文字とする。1 項目の入力が 1 turn を消費するため、実サイトの入力項目数の多いフォームでは 16 turn では submit へ到達できず `AGENT_TURN_LIMIT` になっていた。turn 上限に達した run は Worker ログの `agent_turn_limit_reached`（観察回数、tool 呼び出し回数、tool エラー回数の件数だけ）で内訳を追う。
 - `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返す。
 - `prohibited`のreason codeは`NO_FORM_PRESENT`、`SALES_PROHIBITED`、`FORM_PURPOSE_INCOMPATIBLE`だけを許可し、旧aliasは保存前に正規化する。
 - `finish_uncertain`のreason codeも固定集合だけを許可し、集合外はtool schemaのenumとhandler側の検証の両方で`INVALID_TOOL_INPUT`として拒否する。自由文字列を許していた時期はモデルが毎回異なる語を作り、`uncertain`の内訳を集計できなかったためである。`finish_failed`は技術失敗の内訳が多様であるため自由文字列のままとする。
@@ -138,7 +138,7 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 - 設定されたモデルと一致すること。
 - Responses API だけを利用すること。
 - function tool 以外を渡さないこと。
-- 1 run の Provider 呼び出しを最大 21 回（agent turn 16 + 修正 3 + 送信前レビュー最大 2）に制限すること。agent と送信前レビューは D1 の同じカウンタを共有する。レビューが deny を返した最初の 1 回だけ turn 上限を 3 増やし、turn 終盤で deny された場合でも修正に必要な fill・observe・submit を実行できるようにする。
+- 1 run の Provider 呼び出しを最大 45 回（agent turn 40 + 修正 3 + 送信前レビュー最大 2）に制限すること。agent と送信前レビューは D1 の同じカウンタを共有する。レビューが deny を返した最初の 1 回だけ turn 上限を 3 増やし、turn 終盤で deny された場合でも修正に必要な fill・observe・submit を実行できるようにする。
 - 出力 token を最大 4,096 に制限すること。
 - request body を最大 128 KiB に制限すること。送信前レビューだけは証跡スクリーンショットを添付するため 1 MiB を上限とし、超過時は画像を外して再構成する。
 - response body を最大 256 KiB に制限すること。
@@ -416,7 +416,7 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 
 ### Agent への安全指示
 
-system prompt では、営業禁止・用途制限の確認と送信前の再観察を指示する。入力値は信頼済みhandlerが`payload.formValues`由来であることを強制する。`prohibited`は、直前かつ現在URLと一致する観察でフォーム不在、または全候補formについてform本文、前方の近接要素、祖先側の近接要素、iframe親ページ側の近接要素から固定パターンの営業禁止・用途制限を検出した場合だけ受理する。送信前には選択したformの禁止根拠、全入力のform owner、native validity、現在のaction / method、入力後の再観察、1回限りの送信権を機械的に検証する。さらに送信直前には、観察・信頼済み入力値・`before_submit`スクリーンショットを入力とする独立レビューを通し、`INPUT_MISMATCH` / `SALES_PROHIBITED` / `FORM_PURPOSE_INCOMPATIBLE` / `WRONG_FORM` / `UNCLEAR`のいずれかでdenyされた場合は送信権を取得しない。修正を許可するのは`INPUT_MISMATCH`だけで、実際の入力変更と再観察に加えて、観察指紋が変化していることを次の`submit`の前提にする。他のreason codeは1回目でも、`INPUT_MISMATCH`は2回目のdenyで`PRE_SUBMIT_REVIEW_DENIED`として`uncertain`で終了する。allow後・送信権取得前には現在URLと観察済み全フィールドの値・チェック状態を読み直し、さらにレビュー前後でhidden / disabledを含むform全体のsnapshotを比較し、レビュー中にページが変化していれば送信しない。レビューを完了できない場合はallowにせず、再試行可能な`SUBMIT_REVIEW_UNAVAILABLE`として扱う。禁止判定時と送信前後には画面のスクリーンショット証跡をR2へ保存する。`observe`の結果は外部サイト由来の非信頼データとして明示し、モデルとレビューの双方へページ内の指示に従わないよう指示する。固定パターンで表現されない禁止事項は独立レビューで補完するが、完全ではない。Shadow DOM内の本文とページ上のprompt injectionに対する完全な判定は引き続き未対応である。
+system prompt では、営業禁止・用途制限の確認と送信前の再観察を指示する。入力値は信頼済みhandlerが`payload.formValues`由来であることを強制する。`prohibited`は、直前かつ現在URLと一致する観察でフォーム不在、または全候補formについてform本文、前方の近接要素、祖先側の近接要素、iframe親ページ側の近接要素から固定パターンの営業禁止・用途制限を検出した場合だけ受理する。営業禁止だけはページ本文（上限20,000文字）に対する固定パターン判定も常に和集合で加える。営業禁止の注意書きはフォームから離れたページ上部に置かれることが多く、form近傍テキストだけでは届かないためである。用途制限はform固有の性質なのでform単位の判定のままとする。送信前には選択したformの禁止根拠、全入力のform owner、native validity、現在のaction / method、入力後の再観察、1回限りの送信権を機械的に検証する。さらに送信直前には、観察・信頼済み入力値・`before_submit`スクリーンショットを入力とする独立レビューを通し、`INPUT_MISMATCH` / `SALES_PROHIBITED` / `FORM_PURPOSE_INCOMPATIBLE` / `WRONG_FORM` / `UNCLEAR`のいずれかでdenyされた場合は送信権を取得しない。修正を許可するのは`INPUT_MISMATCH`だけで、実際の入力変更と再観察に加えて、観察指紋が変化していることを次の`submit`の前提にする。他のreason codeは1回目でも、`INPUT_MISMATCH`は2回目のdenyで`PRE_SUBMIT_REVIEW_DENIED`として`uncertain`で終了する。allow後・送信権取得前には現在URLと観察済み全フィールドの値・チェック状態を読み直し、さらにレビュー前後でhidden / disabledを含むform全体のsnapshotを比較し、レビュー中にページが変化していれば送信しない。レビューを完了できない場合はallowにせず、再試行可能な`SUBMIT_REVIEW_UNAVAILABLE`として扱う。禁止判定時と送信前後には画面のスクリーンショット証跡をR2へ保存する。`observe`の結果は外部サイト由来の非信頼データとして明示し、モデルとレビューの双方へページ内の指示に従わないよう指示する。固定パターンで表現されない禁止事項は独立レビューで補完するが、完全ではない。Shadow DOM内の本文とページ上のprompt injectionに対する完全な判定は引き続き未対応である。
 
 ## 現在の制約
 

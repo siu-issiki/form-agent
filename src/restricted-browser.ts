@@ -934,6 +934,7 @@ export function detectProhibitedReasonCodes(
 ): ProhibitedReasonCode[] {
 	const codes: ProhibitedReasonCode[] = [];
 	if (observation.forms.length === 0) return ["NO_FORM_PRESENT"];
+	const pageCodes = detectProhibitedTextReasonCodes(observation.pageText ?? "");
 	if (observation.forms.every(hasTrustedFormProhibitionMetadata)) {
 		const formCodes = observation.forms.map(readProhibitedReasonCodes);
 		if (formCodes.every((formCode) => formCode.length > 0)) {
@@ -943,9 +944,23 @@ export function detectProhibitedReasonCodes(
 				}
 			}
 		}
-		return codes;
+	} else {
+		for (const code of pageCodes) {
+			if (!codes.includes(code)) codes.push(code);
+		}
 	}
-	return detectProhibitedTextReasonCodes(observation.pageText ?? "");
+	// A sales prohibition applies to the whole page, so the page text is
+	// consulted for it even when every form carries trusted metadata. The notice
+	// is often a site-wide line far from the form, out of reach of the
+	// form-local text the page function collects. `FORM_PURPOSE_INCOMPATIBLE`
+	// stays form-local because it describes who one specific form serves.
+	if (
+		pageCodes.includes("SALES_PROHIBITED") &&
+		!codes.includes("SALES_PROHIBITED")
+	) {
+		codes.push("SALES_PROHIBITED");
+	}
+	return codes;
 }
 
 /**
@@ -980,6 +995,23 @@ const FORM_PURPOSE_CONNECTORS =
 const FORM_PURPOSE_HEADING_FILLER =
 	"[\\s|｜/／・\\-‐−–—:：、。]|に関する|に関して|についての|について|関連|向け|専用|の|ご|お問い?合わ?せ|問い?合わ?せ|ご?相談|ご?依頼|受付|窓口|フォーム|ページ|情報|エントリー|応募|申込み?|申し込み|入力|送信|はこちら|専門";
 
+/**
+ * Words naming an unsolicited sales approach. Bare 「営業」 also starts ordinary
+ * business vocabulary ("営業時間", "営業日", "営業担当"), so it is guarded by a
+ * negative lookahead; the compound forms are listed ahead of it so they keep
+ * matching whatever the lookahead grows to exclude.
+ */
+const SALES_SUBJECTS =
+	"営業目的|営業活動|営業メール|営業(?:の)?ご?提案|勧誘目的|営業(?!時間|日|所|部|担当|中|カレンダー|マン|職|エリア|拠点|センター|本部|時|日程)|勧誘|セールス|売り込み|売込み|sales|solicitation";
+
+/**
+ * Ways a page refuses something. Softened refusals ("お控えください",
+ * "ご遠慮ください") carry the same meaning as an outright ban and appear far
+ * more often on Japanese contact pages.
+ */
+const SALES_REFUSALS =
+	"禁止|お断り|受け付け(?:て)?(?:おりません|いません|ません|ない)|ご遠慮|お?控え(?:ください|下さい|いただ|頂)|控えて|一切お断り|固くお断り|お断りして|お断りいたし|お断り致し|受け付けかね|対応(?:いた|致)しかね|ご対応(?:でき|出来)ません|返信(?:いた|致)しません|返答(?:いた|致)しません";
+
 export const PROHIBITION_TEXT_PATTERN_SOURCES = {
 	explicitAllowances: [
 		"(営業|勧誘|セールス).{0,40}(も|を)?受け付け(?:て)?(?:います|ております)",
@@ -987,8 +1019,8 @@ export const PROHIBITION_TEXT_PATTERN_SOURCES = {
 		"(sales|solicitation).{0,40}(?:is|are) not prohibited",
 	],
 	salesProhibited: [
-		"(営業|勧誘|セールス).{0,40}(禁止|お断り|受け付け(?:て)?(?:おりません|いません|ません|ない)|ご遠慮)",
-		"(禁止|お断り|受け付け(?:て)?(?:おりません|いません|ません|ない)|ご遠慮).{0,40}(営業|勧誘|セールス)",
+		`(?:${SALES_SUBJECTS}).{0,40}(?:${SALES_REFUSALS})`,
+		`(?:${SALES_REFUSALS}).{0,40}(?:${SALES_SUBJECTS})`,
 		"(sales|solicitation).{0,40}(prohibited|not accepted|do not use)",
 	],
 	formPurposeIncompatible: [

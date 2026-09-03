@@ -492,6 +492,50 @@ describe("RestrictedBrowserTools", () => {
 		).toEqual(["SALES_PROHIBITED", "FORM_PURPOSE_INCOMPATIBLE"]);
 	});
 
+	test("detects softened and emphatic sales refusals", () => {
+		for (const text of [
+			"営業を目的としたお問い合わせはご遠慮ください。",
+			"大変恐縮ですが営業目的のメールはお控えください。",
+			"営業・売り込み・勧誘目的でのご連絡は一切お断りいたします。",
+			"お問い合わせフォームからの営業メールやご提案に関するメールはご遠慮ください。",
+			"このフォームはお客様専用となります。営業メールはご遠慮ください。",
+		]) {
+			expect(detectProhibitedTextReasonCodes(text)).toContain(
+				"SALES_PROHIBITED",
+			);
+		}
+	});
+
+	test("does not read ordinary business-hours wording as a sales prohibition", () => {
+		expect(
+			detectProhibitedTextReasonCodes(
+				"営業時間外のお電話はお断りしております。",
+			),
+		).toEqual([]);
+		expect(
+			detectProhibitedTextReasonCodes("営業日以外は対応しておりません。"),
+		).toEqual([]);
+	});
+
+	test("takes a sales prohibition from the page text outside every form", () => {
+		expect(
+			detectProhibitedReasonCodes({
+				forms: [{ prohibitedReasonCodes: [] }, { prohibitedReasonCodes: [] }],
+				pageText:
+					"お問い合わせ窓口のご案内。営業目的のメールはお控えください。",
+			}),
+		).toEqual(["SALES_PROHIBITED"]);
+	});
+
+	test("keeps a form-only purpose restriction out of the page text detection", () => {
+		expect(
+			detectProhibitedReasonCodes({
+				forms: [{ prohibitedReasonCodes: ["FORM_PURPOSE_INCOMPATIBLE"] }],
+				pageText: "一般のお問い合わせはこちらのフォームからお願いします。",
+			}),
+		).toEqual(["FORM_PURPOSE_INCOMPATIBLE"]);
+	});
+
 	test("forgets successful inputs after navigation", async () => {
 		const driver = new FakeDriver();
 		const tools = await createTools(driver);

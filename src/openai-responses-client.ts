@@ -2,7 +2,7 @@ import { AgentExecutionError } from "./agent-executor";
 
 export const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 
-export const MAX_TURNS = 16;
+export const MAX_TURNS = 40;
 
 /**
  * Extra turns granted once, after a denied pre-submit review, so the agent can
