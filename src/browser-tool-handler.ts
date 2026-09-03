@@ -4,6 +4,7 @@ import {
 	type BrowserObservation,
 	PAYLOAD_KEY_PATTERN,
 	type ProhibitedReasonCode,
+	type ProhibitionVerification,
 	type RestrictedBrowserDriver,
 	RestrictedBrowserTools,
 	readTrustedFormValues,
@@ -131,11 +132,12 @@ export class BrowserToolCoordinator {
 		runToken: string,
 		reasonCode: ProhibitedReasonCode,
 		formUrl: string | null,
-	): Promise<void> {
+		evidence?: string | null,
+	): Promise<ProhibitionVerification> {
 		const operation = this.#operationTail.then(async () => {
 			if (this.#closed) throw new BrowserToolInputError();
 			const { tools } = await this.#getToolsAndJob(jobId, runToken);
-			await tools.validateProhibited(reasonCode, formUrl);
+			return tools.validateProhibited(reasonCode, formUrl, evidence);
 		});
 		this.#operationTail = operation.then(
 			() => undefined,

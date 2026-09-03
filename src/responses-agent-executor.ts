@@ -46,9 +46,12 @@ import {
 	type BrowserObservation,
 	CorrectionRequiredError,
 	FormStateChangedError,
+	MAX_PROHIBITION_EVIDENCE_LENGTH,
+	MIN_PROHIBITION_EVIDENCE_LENGTH,
 	NavigationPolicyError,
 	ObservationStaleError,
 	type ProhibitedReasonCode,
+	ProhibitionEvidenceError,
 	SubmissionEvidenceError,
 	SubmissionNotAuthorizedError,
 	SubmissionResultUncertainError,
@@ -519,13 +522,26 @@ async function executeToolCall(
 		}
 		if (parsed.result.outcome === "prohibited") {
 			try {
-				await coordinator.validateProhibited(
+				const verification = await coordinator.validateProhibited(
 					job.id,
 					runToken,
 					parsed.result.reasonCode,
 					parsed.result.formUrl,
+					parsed.evidence,
 				);
-			} catch {
+				if (verification === "PROHIBITION_EVIDENCE_VERIFIED") {
+					// Fixed code only: the quoted sentence is never recorded.
+					await recordToolDiagnostic(
+						db,
+						job,
+						runToken,
+						turn,
+						"finish",
+						"finish_validation",
+						verification,
+					);
+				}
+			} catch (error) {
 				await recordToolDiagnostic(
 					db,
 					job,
@@ -533,7 +549,9 @@ async function executeToolCall(
 					turn,
 					"finish",
 					"finish_validation",
-					"FINISH_PROHIBITION_NOT_VERIFIED",
+					error instanceof ProhibitionEvidenceError
+						? error.code
+						: "FINISH_PROHIBITION_NOT_VERIFIED",
 				);
 				return toolError("PROHIBITION_NOT_VERIFIED");
 			}
@@ -987,10 +1005,16 @@ type FinishParseResult =
 						reasonCode: ProhibitedReasonCode;
 						reason: string;
 				  };
+			/**
+			 * The sentence the model quoted from the page, kept out of `result`
+			 * so it never reaches the stored reason, an event, or a log.
+			 */
+			evidence?: string;
 			diagnosticCode: "OK";
 	  }
 	| {
 			result: null;
+			evidence?: undefined;
 			diagnosticCode:
 				| "FINISH_FIELDS_INVALID"
 				| "FINISH_FORM_URL_NOT_ALLOWED"
@@ -1030,7 +1054,16 @@ function parseFinishResult(
 	targetDomain: string,
 	allowedHosts: readonly string[],
 ): FinishParseResult {
-	const { outcome, formUrl, reasonCode, reason, retryable } = params;
+	const { outcome, formUrl, reasonCode, reason, retryable, evidence } = params;
+	if (
+		evidence !== undefined &&
+		evidence !== null &&
+		(typeof evidence !== "string" ||
+			evidence.length < MIN_PROHIBITION_EVIDENCE_LENGTH ||
+			evidence.length > MAX_PROHIBITION_EVIDENCE_LENGTH)
+	) {
+		return { result: null, diagnosticCode: "FINISH_FIELDS_INVALID" };
+	}
 	if (
 		typeof reasonCode !== "string" ||
 		!/^[A-Z][A-Z0-9_]{0,63}$/.test(reasonCode) ||
@@ -1063,6 +1096,7 @@ function parseFinishResult(
 		}
 		return {
 			result: { outcome, formUrl, reasonCode: prohibitedReasonCode, reason },
+			...(typeof evidence === "string" ? { evidence } : {}),
 			diagnosticCode: "OK",
 		};
 	}
@@ -1158,7 +1192,7 @@ export const TOOL_ERROR_GUIDANCE = {
 	SUBMIT_PROHIBITED:
 		"The trusted handler found a prohibition on the selected form. Do not submit it. If pageProhibited is true, call finish_prohibited with one of prohibitedReasonCodes. If pageProhibited is false, another form on the page may be the inquiry form: observe again and use it, and if no other inquiry form exists, call finish_uncertain with PROHIBITION_UNVERIFIED.",
 	PROHIBITION_NOT_VERIFIED:
-		"The trusted handler found no prohibition evidence in the latest observation for that reasonCode. Re-observe; if no evidence exists, continue the form or call finish_uncertain with FORM_PURPOSE_MISMATCH when the form serves another purpose, otherwise PROHIBITION_UNVERIFIED.",
+		"The trusted handler found no prohibition evidence in the latest observation for that reasonCode. Re-observe. Quote the exact sentence from the page in evidence, copied character for character from the observed page text. If no such sentence exists, continue the form or call finish_uncertain with FORM_PURPOSE_MISMATCH when the form serves another purpose, otherwise PROHIBITION_UNVERIFIED.",
 	JOB_STATE_CONFLICT:
 		"The job state no longer matches this run. Do not submit again and call finish_uncertain with SUBMIT_OUTCOME_UNKNOWN.",
 	SUBMIT_RESULT_NOT_PERSISTED:
@@ -1206,7 +1240,8 @@ function systemPrompt(dryRun: boolean): string {
 		"Read each observed page for sales, solicitation, or purpose restrictions in the page text and near the form, because sending to a site that prohibits outreach harms the sender.",
 		"When the current page has no inquiry form but observe returned navigationLinks that look like a contact or inquiry page, navigate there and observe again before deciding that no form exists.",
 		"When outreach is prohibited, no inquiry form exists, or the form's stated purpose excludes this inquiry, finish as prohibited instead of submitting.",
-		"For a purpose mismatch, finish_prohibited with FORM_PURPOSE_INCOMPATIBLE only when the latest observe lists that code in prohibitedReasonCodes; otherwise finish_uncertain with FORM_PURPOSE_MISMATCH.",
+		"prohibitedReasonCodes is a pattern match that misses wordings it does not know. When the page states a refusal plainly but the code is absent, still call finish_prohibited and put the exact sentence in evidence, quoted character for character from the observed page text. The handler verifies the quote against the page and rejects anything it cannot find there, so never paraphrase, translate, shorten, or invent a sentence.",
+		"For a purpose mismatch, finish_prohibited with FORM_PURPOSE_INCOMPATIBLE when the latest observe lists that code in prohibitedReasonCodes or the page states the restriction in a sentence you can quote in evidence; otherwise finish_uncertain with FORM_PURPOSE_MISMATCH.",
 		"Match each field to a payload.formValues key by meaning; the trusted handler supplies the value.",
 		"Some payload keys carry an ordered list of candidate labels for a choice control. For a select, radio, or checkbox, pick the payloadKey whose candidates match the control's options or label as shown in observe; the trusted handler selects the first matching candidate and rejects the call when none matches.",
 		"Before submit, re-observe and confirm every required field on the target form holds the intended payload key.",
@@ -1307,7 +1342,7 @@ const AGENT_TOOLS = [
 	),
 	functionTool(
 		"finish_prohibited",
-		"Finish without sending. Accepted only when the latest observe is current and its prohibitedReasonCodes contains reasonCode, and formUrl, when given, equals the observed page URL.",
+		"Finish without sending. Accepted when the latest observe is current, formUrl, when given, equals the observed page URL, and either its prohibitedReasonCodes contains reasonCode or evidence quotes a sentence the handler can find in the observed page text.",
 		{
 			formUrl: {
 				type: ["string", "null"],
@@ -1325,6 +1360,13 @@ const AGENT_TOOLS = [
 				description:
 					"NO_FORM_PRESENT: no inquiry form on the site. SALES_PROHIBITED: the site prohibits sales or outreach. FORM_PURPOSE_INCOMPATIBLE: the form exists but its stated purpose excludes this inquiry.",
 			},
+			evidence: {
+				type: ["string", "null"],
+				minLength: MIN_PROHIBITION_EVIDENCE_LENGTH,
+				maxLength: MAX_PROHIBITION_EVIDENCE_LENGTH,
+				description:
+					"The exact sentence quoted verbatim from the page that states the prohibition. Required when the latest observe's prohibitedReasonCodes does not already contain reasonCode. Copy it character for character from the observed page text; a sentence the handler cannot find there is rejected. Use null for NO_FORM_PRESENT or when prohibitedReasonCodes already contains reasonCode.",
+			},
 			reason: FINISH_REASON_PROPERTY,
 		},
 	),
@@ -1336,7 +1378,7 @@ const AGENT_TOOLS = [
 				type: "string",
 				enum: [...UNCERTAIN_REASON_CODES],
 				description:
-					"FORM_PURPOSE_MISMATCH: the form serves a specific purpose such as recruitment, booking, brochure requests, quotes, members, or product support rather than a general inquiry, and the trusted handler did not report it as prohibited. CONSENT_UNMAPPED: a consent checkbox has no matching payloadKey or its required value is unknown. FIELD_MAPPING_UNKNOWN: a required field other than consent has no matching payloadKey. CAPTCHA_REQUIRED: the form needs a CAPTCHA or another human check. CONTACT_FORM_UNREACHABLE: the inquiry form cannot be reached, for example a broken or dead-end link. PROHIBITION_UNVERIFIED: the page seems to restrict this inquiry but the trusted handler did not confirm it, including when the page text was truncated. SUBMIT_OUTCOME_UNKNOWN: the submission result cannot be confirmed. OTHER_UNCERTAINTY: none of the above fits.",
+					"FORM_PURPOSE_MISMATCH: the form serves a specific purpose such as recruitment, booking, brochure requests, quotes, members, or product support rather than a general inquiry, and the trusted handler did not report it as prohibited. CONSENT_UNMAPPED: a consent checkbox has no matching payloadKey or its required value is unknown. FIELD_MAPPING_UNKNOWN: a required field other than consent has no matching payloadKey. CAPTCHA_REQUIRED: the form needs a CAPTCHA or another human check. CONTACT_FORM_UNREACHABLE: the inquiry form cannot be reached, for example a broken or dead-end link. PROHIBITION_UNVERIFIED: the page seems to restrict this inquiry but the trusted handler could not confirm it, either because no quotable sentence states it or because the sentence you quoted in evidence could not be verified against the observed page text, including when that text was truncated. SUBMIT_OUTCOME_UNKNOWN: the submission result cannot be confirmed. OTHER_UNCERTAINTY: none of the above fits.",
 			},
 			reason: FINISH_REASON_PROPERTY,
 		},

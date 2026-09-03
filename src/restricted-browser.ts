@@ -330,6 +330,35 @@ export class FormStateChangedError extends BrowserElementError {
 	}
 }
 
+/** How a prohibition claim was verified, or why the quote was refused. */
+export type ProhibitionEvidenceOutcome =
+	| "PROHIBITION_EVIDENCE_VERIFIED"
+	| "PROHIBITION_EVIDENCE_NOT_FOUND"
+	| "PROHIBITION_EVIDENCE_WEAK";
+
+/** How `validateProhibited` accepted the claim. */
+export type ProhibitionVerification =
+	| "REASON_CODES"
+	| "PROHIBITION_EVIDENCE_VERIFIED";
+
+/**
+ * The model quoted a sentence for the prohibition but the handler could not
+ * confirm it against the observed page text. The code says which check failed
+ * so the diagnostic can distinguish a fabricated quote from a real sentence
+ * that does not state a refusal.
+ */
+export class ProhibitionEvidenceError extends BrowserElementError {
+	constructor(
+		readonly code: Exclude<
+			ProhibitionEvidenceOutcome,
+			"PROHIBITION_EVIDENCE_VERIFIED"
+		>,
+	) {
+		super();
+		this.name = "ProhibitionEvidenceError";
+	}
+}
+
 export class SubmissionNotAuthorizedError extends Error {
 	constructor() {
 		super("The job did not grant submission permission");
@@ -584,10 +613,18 @@ export class RestrictedBrowserTools {
 		await this.#assertCurrentUrlAllowed();
 	}
 
+	/**
+	 * Accepts a prohibition claim either from the handler's own pattern
+	 * detection or from a sentence the model quoted, when that sentence is
+	 * present verbatim in the observed page text. The quote is verified, never
+	 * trusted: the fixed patterns cannot cover every Japanese refusal, but the
+	 * model still cannot invent a prohibition the page does not state.
+	 */
 	async validateProhibited(
 		reasonCode: ProhibitedReasonCode,
 		formUrl: string | null,
-	): Promise<void> {
+		evidence?: string | null,
+	): Promise<ProhibitionVerification> {
 		const observation = this.#latestObservation;
 		// Observing after the last input stays the model's obligation, and a URL
 		// mismatch is not something a fresh observation can repair.
@@ -603,26 +640,56 @@ export class RestrictedBrowserTools {
 		) {
 			throw new BrowserElementError();
 		}
-		if (observation.prohibitedReasonCodes?.includes(reasonCode)) return;
+		if (observation.prohibitedReasonCodes?.includes(reasonCode)) {
+			return "REASON_CODES";
+		}
+		let evidenceOutcome = checkProhibitionEvidence(
+			reasonCode,
+			evidence,
+			observation.pageText,
+		);
+		if (evidenceOutcome === "PROHIBITION_EVIDENCE_VERIFIED") {
+			logProhibitionEvidence(evidenceOutcome);
+			return "PROHIBITION_EVIDENCE_VERIFIED";
+		}
 		// Whether the handler can read a prohibition depends on the page's own
 		// rendering, so one fresh observation is allowed for each input
-		// revision. It replaces the driver's element set, which the
+		// revision. It also gives a truncated page text a second chance to carry
+		// the quoted sentence. It replaces the driver's element set, which the
 		// PROHIBITION_NOT_VERIFIED guidance already tells the model to re-read.
 		if (this.#prohibitionReverifiedRevision === this.#inputRevision) {
-			throw new BrowserElementError();
+			if (evidenceOutcome) logProhibitionEvidence(evidenceOutcome);
+			throw evidenceOutcome
+				? new ProhibitionEvidenceError(evidenceOutcome)
+				: new BrowserElementError();
 		}
 		this.#prohibitionReverifiedRevision = this.#inputRevision;
 		const reobserved = await this.observe();
-		// The re-observation must describe the same page, otherwise the codes it
+		// The re-observation must describe the same page, otherwise anything it
 		// carries would corroborate a URL that was never checked.
-		const verified =
+		const samePage =
 			canonicalNavigationPermissionUrl(reobserved.url) ===
-				canonicalNavigationPermissionUrl(observation.url) &&
+			canonicalNavigationPermissionUrl(observation.url);
+		const verified =
+			samePage &&
 			reobserved.prohibitedReasonCodes?.includes(reasonCode) === true;
 		console.log(JSON.stringify({ event: "prohibition_reverified", verified }));
-		if (!verified) {
-			throw new BrowserElementError();
+		if (verified) return "REASON_CODES";
+		if (samePage) {
+			evidenceOutcome = checkProhibitionEvidence(
+				reasonCode,
+				evidence,
+				reobserved.pageText,
+			);
+			if (evidenceOutcome === "PROHIBITION_EVIDENCE_VERIFIED") {
+				logProhibitionEvidence(evidenceOutcome);
+				return "PROHIBITION_EVIDENCE_VERIFIED";
+			}
 		}
+		if (evidenceOutcome) logProhibitionEvidence(evidenceOutcome);
+		throw evidenceOutcome
+			? new ProhibitionEvidenceError(evidenceOutcome)
+			: new BrowserElementError();
 	}
 
 	/**
@@ -1001,10 +1068,13 @@ const FORM_PURPOSE_HEADING_FILLER =
  * guarded on both sides: a negative lookbehind for 「自営業」 and a negative
  * lookahead for the common compounds that describe a company's own operations.
  * The sales compounds are listed ahead of the bare word so they keep matching
- * whatever the lookahead grows to exclude.
+ * whatever the lookahead grows to exclude. The exclusions lean towards missing
+ * a prohibition rather than inventing one, because a miss is recovered by the
+ * quoted-evidence path in `validateProhibited` while a false positive silently
+ * drops a legitimate inquiry.
  */
 const SALES_SUBJECTS =
-	"営業(?:を|の)?目的(?:と)?|営業活動|営業メール|営業(?:の)?ご?提案|勧誘目的|(?<!自)営業(?!時間|日|所|部|担当|中|カレンダー|マン|職|エリア|拠点|センター|本部|時|日程|利益|成績|年度|許可|秘密|報告|支援|力|計画|戦略|会議|実績|収益|外|停止|終了|再開|開始|情報|方針|内容|範囲|活動報告)|勧誘|セールス|売り込み|売込み|sales|solicitation";
+	"営業(?:を|の)?目的(?:と)?|営業活動|営業メール|営業(?:の)?ご?提案|勧誘目的|(?<!自)営業(?!時間|日|所|部|担当|中|カレンダー|マン|職|エリア|拠点|センター|本部|時|日程|利益|成績|年度|許可|秘密|報告|力|会議|実績|収益|外|停止|終了|再開|開始|活動報告)|勧誘|セールス|売り込み|売込み|sales|solicitation";
 
 /**
  * Ways a page refuses something. Softened refusals ("お控えください",
@@ -1068,6 +1138,74 @@ export function detectProhibitedTextReasonCodes(
 		codes.push("FORM_PURPOSE_INCOMPATIBLE");
 	}
 	return codes;
+}
+
+/** Shortest and longest quote the evidence check will consider. */
+export const MIN_PROHIBITION_EVIDENCE_LENGTH = 8;
+export const MAX_PROHIBITION_EVIDENCE_LENGTH = 300;
+
+/**
+ * Words a quoted sentence must contain for each reason code. They are far
+ * looser than the detection patterns because the sentence itself is already
+ * proven to exist on the page; the check only rules out a quote that names
+ * something else entirely, such as a heading about the sales department.
+ */
+const PROHIBITION_EVIDENCE_VOCABULARY: Record<
+	Exclude<ProhibitedReasonCode, "NO_FORM_PRESENT">,
+	readonly [RegExp, RegExp]
+> = {
+	SALES_PROHIBITED: [
+		/営業|勧誘|セールス|売り込み|売込み|sales|solicitation|ソリシテーション/,
+		/お断り|断り|ご遠慮|遠慮|禁止|お控え|控え|受け付け|受付|承って|承り|対応|できません|かねます|しません|not accepted|prohibited|do not|refrain/,
+	],
+	FORM_PURPOSE_INCOMPATIBLE: [
+		new RegExp(FORM_PURPOSE_WORDS),
+		/専用|のみ|限定|に限|以外|お断り|ご遠慮|受け付け|できません/,
+	],
+};
+
+/**
+ * Normalizes a page or a quote for comparison. NFKC folds the full-width forms
+ * a page may use, and collapsing runs of whitespace absorbs the line breaks and
+ * ideographic spaces that layout adds between the words of one sentence.
+ */
+function normalizeForEvidence(value: string): string {
+	return value.normalize("NFKC").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+/**
+ * Returns how a quoted prohibition sentence fared against the page text, or
+ * null when there is no quote to check. `NO_FORM_PRESENT` is a structural claim
+ * about the page rather than a statement on it, so no quote can support it.
+ */
+function checkProhibitionEvidence(
+	reasonCode: ProhibitedReasonCode,
+	evidence: string | null | undefined,
+	pageText: string | undefined,
+): ProhibitionEvidenceOutcome | null {
+	if (reasonCode === "NO_FORM_PRESENT") return null;
+	if (typeof evidence !== "string") return null;
+	const quote = normalizeForEvidence(evidence);
+	if (
+		quote.length < MIN_PROHIBITION_EVIDENCE_LENGTH ||
+		evidence.length > MAX_PROHIBITION_EVIDENCE_LENGTH
+	) {
+		return "PROHIBITION_EVIDENCE_NOT_FOUND";
+	}
+	if (!normalizeForEvidence(pageText ?? "").includes(quote)) {
+		return "PROHIBITION_EVIDENCE_NOT_FOUND";
+	}
+	const [subject, refusal] = PROHIBITION_EVIDENCE_VOCABULARY[reasonCode];
+	return subject.test(quote) && refusal.test(quote)
+		? "PROHIBITION_EVIDENCE_VERIFIED"
+		: "PROHIBITION_EVIDENCE_WEAK";
+}
+
+/** Fixed outcome only: the quote itself never reaches the log. */
+function logProhibitionEvidence(outcome: ProhibitionEvidenceOutcome): void {
+	console.log(
+		JSON.stringify({ event: "browser_prohibition_evidence", outcome }),
+	);
 }
 
 function trustObservedForms(forms: unknown[]): unknown[] {
