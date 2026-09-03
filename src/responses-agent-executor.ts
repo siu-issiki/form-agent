@@ -1240,7 +1240,7 @@ function systemPrompt(dryRun: boolean): string {
 		"Read each observed page for sales, solicitation, or purpose restrictions in the page text and near the form, because sending to a site that prohibits outreach harms the sender.",
 		"When the current page has no inquiry form but observe returned navigationLinks that look like a contact or inquiry page, navigate there and observe again before deciding that no form exists.",
 		"When outreach is prohibited, no inquiry form exists, or the form's stated purpose excludes this inquiry, finish as prohibited instead of submitting.",
-		"prohibitedReasonCodes is a pattern match that misses wordings it does not know. When the page states a refusal plainly but the code is absent, still call finish_prohibited and put the exact sentence in evidence, quoted character for character from the observed page text. The handler verifies the quote against the page and rejects anything it cannot find there, so never paraphrase, translate, shorten, or invent a sentence.",
+		"prohibitedReasonCodes is a pattern match that misses wordings it does not know. When the page states a refusal plainly but the code is absent, still call finish_prohibited and put the exact sentence in evidence, quoted character for character from the observed page text. Quote only the sentence or clause that states the refusal: a passage that also states what the page does accept is rejected. The handler verifies the quote against the page and rejects anything it cannot find there, so never paraphrase, translate, shorten, or invent a sentence.",
 		"For a purpose mismatch, finish_prohibited with FORM_PURPOSE_INCOMPATIBLE when the latest observe lists that code in prohibitedReasonCodes or the page states the restriction in a sentence you can quote in evidence; otherwise finish_uncertain with FORM_PURPOSE_MISMATCH.",
 		"Match each field to a payload.formValues key by meaning; the trusted handler supplies the value.",
 		"Some payload keys carry an ordered list of candidate labels for a choice control. For a select, radio, or checkbox, pick the payloadKey whose candidates match the control's options or label as shown in observe; the trusted handler selects the first matching candidate and rejects the call when none matches.",
@@ -1285,7 +1285,14 @@ const FINISH_REASON_PROPERTY = {
 	minLength: 1,
 	maxLength: 1_000,
 	description:
-		"The observed condition that justifies reasonCode. Explain in your own words; do not paste page text, put the exact quote in evidence instead.",
+		"The observed condition that justifies reasonCode. Explain in your own words; do not paste page text.",
+} as const;
+
+/** Only `finish_prohibited` carries `evidence`, so only it points there. */
+const PROHIBITED_REASON_PROPERTY = {
+	...FINISH_REASON_PROPERTY,
+	description:
+		"The observed condition that justifies reasonCode. Explain in your own words; put the exact page quote in evidence, not here.",
 } as const;
 
 const AGENT_TOOLS = [
@@ -1368,7 +1375,7 @@ const AGENT_TOOLS = [
 				description:
 					"The exact sentence quoted verbatim from the page that states the prohibition. Required when the latest observe's prohibitedReasonCodes does not already contain reasonCode. Copy it character for character from the observed page text; a sentence the handler cannot find there is rejected. Use null for NO_FORM_PRESENT or when prohibitedReasonCodes already contains reasonCode.",
 			},
-			reason: FINISH_REASON_PROPERTY,
+			reason: PROHIBITED_REASON_PROPERTY,
 		},
 	),
 	functionTool(

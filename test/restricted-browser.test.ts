@@ -533,6 +533,36 @@ describe("RestrictedBrowserTools", () => {
 		}
 	});
 
+	test("accepts a quoted refusal phrased as かねます or 対象外", async () => {
+		const cases: Array<[ProhibitedReasonCode, string]> = [
+			// Too far apart for the fixed patterns, which bound the distance
+			// between the subject and the refusal.
+			[
+				"SALES_PROHIBITED",
+				"営業のご連絡につきましては、担当部署の体制および対応方針の都合により、誠に恐縮ながら対応しかねます。",
+			],
+			["FORM_PURPOSE_INCOMPATIBLE", "採用以外のお問い合わせは対象外です。"],
+		];
+		for (const [reasonCode, sentence] of cases) {
+			const driver = new FakeDriver();
+			driver.observationForms = defaultObservedForms(
+				"一般お問い合わせフォーム",
+			);
+			driver.pageText = `お問い合わせ窓口。${sentence}`;
+			const tools = await createTools(driver);
+			await tools.observe();
+			const logs = captureLogs();
+
+			try {
+				await expect(
+					tools.validateProhibited(reasonCode, input.targetUrl, sentence),
+				).resolves.toBe("PROHIBITION_EVIDENCE_VERIFIED");
+			} finally {
+				logs.restore();
+			}
+		}
+	});
+
 	test("matches a quote across full-width spaces and line breaks", async () => {
 		const driver = new FakeDriver();
 		driver.observationForms = defaultObservedForms("一般お問い合わせフォーム");
@@ -709,6 +739,7 @@ describe("RestrictedBrowserTools", () => {
 			"営業支援サービスのご案内はお断りしております。",
 			"営業部からのご提案はお断りしております。",
 			"営業担当者からのご案内はお断りしております。",
+			"営業目的のお問い合わせには対応しかねます。",
 		]) {
 			expect(detectProhibitedTextReasonCodes(text)).toContain(
 				"SALES_PROHIBITED",
@@ -725,6 +756,12 @@ describe("RestrictedBrowserTools", () => {
 		]) {
 			expect(detectProhibitedTextReasonCodes(text)).toEqual([]);
 		}
+	});
+
+	test("reads 対象外 as a purpose restriction", () => {
+		expect(
+			detectProhibitedTextReasonCodes("採用以外のお問い合わせは対象外です。"),
+		).toEqual(["FORM_PURPOSE_INCOMPATIBLE"]);
 	});
 
 	test("takes a sales prohibition from the page text outside every form", () => {
