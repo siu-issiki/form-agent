@@ -1,4 +1,5 @@
 import {
+	type AgentRunMetrics,
 	DuplicateJobError,
 	type EvidenceFailureCode,
 	type EvidenceStage,
@@ -250,6 +251,7 @@ export class D1JobStore implements JobStore {
 		reasonCode: string,
 		source: "consumer" | "exception" | "result",
 		durationMs: number,
+		delaySeconds: number,
 		now: string,
 	): Promise<boolean> {
 		const result = await this.db
@@ -261,6 +263,7 @@ export class D1JobStore implements JobStore {
           'reasonCode', ?,
           'source', ?,
           'durationMs', ?,
+          'delaySeconds', ?,
           'providerRequestCount', provider_request_count
         ), ?
         FROM jobs
@@ -272,6 +275,70 @@ export class D1JobStore implements JobStore {
 				reasonCode,
 				source,
 				durationMs,
+				delaySeconds,
+				now,
+				id,
+				runToken,
+			)
+			.run();
+
+		return result.meta.changes === 1;
+	}
+
+	/**
+	 * One row per agent run. Terminal states are accepted because the metrics
+	 * are written after the run finished, but the run token must still match.
+	 */
+	async recordAgentRunMetrics(
+		id: string,
+		runToken: string,
+		attempt: number,
+		metrics: AgentRunMetrics,
+		now: string,
+	): Promise<boolean> {
+		const result = await this.db
+			.prepare(
+				`INSERT INTO events (
+          id, job_id, attempt, type, data_json, created_at
+        )
+        SELECT ?, id, ?, 'agent.run_metrics', json_object(
+          'turns', ?,
+          'providerRequests', ?,
+          'reviewRequests', ?,
+          'inputTokens', ?,
+          'outputTokens', ?,
+          'reasoningTokens', ?,
+          'cachedTokens', ?,
+          'browserConnectMs', ?,
+          'browserSessionCreated', json(?),
+          'submitReviewAllow', ?,
+          'submitReviewDeny', ?,
+          'durationMs', ?,
+          'outcome', ?
+        ), ?
+        FROM jobs
+        WHERE id = ?
+          AND status IN (
+            'running', 'submitting', 'sent', 'uncertain', 'prohibited', 'failed'
+          )
+          AND run_token = ?`,
+			)
+			.bind(
+				crypto.randomUUID(),
+				attempt,
+				metrics.turns,
+				metrics.providerRequests,
+				metrics.reviewRequests,
+				metrics.inputTokens,
+				metrics.outputTokens,
+				metrics.reasoningTokens,
+				metrics.cachedTokens,
+				metrics.browserConnectMs,
+				metrics.browserSessionCreated ? "true" : "false",
+				metrics.submitReviewAllow,
+				metrics.submitReviewDeny,
+				metrics.durationMs,
+				metrics.outcome,
 				now,
 				id,
 				runToken,
@@ -321,6 +388,41 @@ export class D1JobStore implements JobStore {
 		return result.meta.changes === 1;
 	}
 
+	/**
+	 * Written before the object reaches R2, so an interrupted run leaves a row
+	 * that names the orphan. The same `events.id` later becomes
+	 * `evidence.captured` or `evidence.capture_failed`.
+	 */
+	async recordEvidenceIntent(
+		id: string,
+		runToken: string,
+		attempt: number,
+		eventId: string,
+		stage: EvidenceStage,
+		objectKey: string,
+		now: string,
+	): Promise<boolean> {
+		const result = await this.db
+			.prepare(
+				`INSERT INTO events (
+          id, job_id, attempt, type, data_json, created_at
+        )
+		SELECT ?, id, ?, 'evidence.intent', json_object(
+          'stage', ?,
+          'objectKey', ?
+        ), ?
+		FROM jobs
+		WHERE id = ?
+		  AND status IN ('running', 'submitting')
+		  AND run_token = ?
+		  AND attempt_count = ?`,
+			)
+			.bind(eventId, attempt, stage, objectKey, now, id, runToken, attempt)
+			.run();
+
+		return result.meta.changes === 1;
+	}
+
 	async recordEvidenceCaptured(
 		id: string,
 		runToken: string,
@@ -334,32 +436,37 @@ export class D1JobStore implements JobStore {
 	): Promise<boolean> {
 		const result = await this.db
 			.prepare(
-				`INSERT INTO events (
-          id, job_id, attempt, type, data_json, created_at
-        )
-		        SELECT ?, id, ?, 'evidence.captured', json_object(
-          'stage', ?,
-          'objectKey', ?,
-          'sha256', ?,
-          'byteLength', ?,
-          'contentType', 'image/jpeg'
-        ), ?
-		FROM jobs
-		WHERE id = ?
-		  AND status IN ('running', 'submitting')
-		  AND run_token = ?
-		  AND attempt_count = ?
-		ON CONFLICT(id) DO NOTHING`,
+				`UPDATE events
+		 SET type = 'evidence.captured',
+		     data_json = json_object(
+		       'stage', ?,
+		       'objectKey', ?,
+		       'sha256', ?,
+		       'byteLength', ?,
+		       'contentType', 'image/jpeg'
+		     ),
+		     created_at = ?
+		 WHERE id = ?
+		   AND job_id = ?
+		   AND attempt = ?
+		   AND type = 'evidence.intent'
+		   AND EXISTS (
+		     SELECT 1 FROM jobs
+		     WHERE jobs.id = events.job_id
+		       AND jobs.status IN ('running', 'submitting')
+		       AND jobs.run_token = ?
+		       AND jobs.attempt_count = ?
+		   )`,
 			)
 			.bind(
-				eventId,
-				attempt,
 				stage,
 				objectKey,
 				sha256,
 				byteLength,
 				now,
+				eventId,
 				id,
+				attempt,
 				runToken,
 				attempt,
 			)
@@ -388,7 +495,7 @@ export class D1JobStore implements JobStore {
 					 WHERE id = ?
 					   AND job_id = ?
 					   AND attempt = ?
-					   AND type = 'evidence.captured'`,
+					   AND type IN ('evidence.intent', 'evidence.captured')`,
 				)
 				.bind(stage, failureCode, now, eventId, id, attempt),
 			session

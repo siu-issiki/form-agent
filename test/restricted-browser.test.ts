@@ -1585,6 +1585,141 @@ class FakeDriver implements RestrictedBrowserDriver {
 }
 
 describe("SubmissionEvidenceRecorder", () => {
+	test("records the object key before the upload and completes the same event", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const evidence = new EventsAtPutEvidenceObjectStore(store);
+		const recorder = new SubmissionEvidenceRecorder(
+			driver,
+			evidence,
+			store,
+			input.id,
+			"run-token-1",
+			1,
+			() => "2026-08-28T00:00:02.000Z",
+		);
+
+		const result = await recorder.capture("before_submit");
+
+		expect(result.captured).toBe(true);
+		// The intent already names the object while it is being written.
+		expect(evidence.eventsAtPut).toEqual([
+			[
+				"evidence.intent",
+				evidenceObjectKey(
+					input.id,
+					"before_submit",
+					store.events[0]?.data.eventId as string,
+				),
+			],
+		]);
+		expect(store.events.map((event) => [event.type, event.data.stage])).toEqual(
+			[["evidence.captured", "before_submit"]],
+		);
+	});
+
+	test("moves the intent to a failure when the upload fails", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const evidence = new PutFailingEvidenceObjectStore();
+		const recorder = new SubmissionEvidenceRecorder(
+			driver,
+			evidence,
+			store,
+			input.id,
+			"run-token-1",
+			1,
+			() => "2026-08-28T00:00:02.000Z",
+		);
+
+		const result = await recorder.capture("before_submit");
+
+		expect(result).toEqual({
+			captured: false,
+			failureCode: "OBJECT_STORE_FAILED",
+		});
+		expect(store.events).toEqual([
+			{
+				jobId: input.id,
+				attempt: 1,
+				type: "evidence.capture_failed",
+				data: { stage: "before_submit", failureCode: "OBJECT_STORE_FAILED" },
+			},
+		]);
+	});
+
+	test("does not upload when the intent cannot be recorded", async () => {
+		const driver = new FakeDriver();
+		const store = new RecordEvidenceIntentRejectingJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const evidence = new InMemoryEvidenceObjectStore();
+		const recorder = new SubmissionEvidenceRecorder(
+			driver,
+			evidence,
+			store,
+			input.id,
+			"run-token-1",
+			1,
+			() => "2026-08-28T00:00:02.000Z",
+		);
+
+		const result = await recorder.capture("before_submit");
+
+		expect(result).toEqual({
+			captured: false,
+			failureCode: "EVENT_NOT_RECORDED",
+		});
+		expect(evidence.objects.size).toBe(0);
+		expect(store.events.map((event) => event.type)).toEqual([
+			"evidence.capture_failed",
+		]);
+	});
+
+	test("moves the intent to a failure when the capture times out", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const evidence = new StalledPutEvidenceObjectStore();
+		const recorder = new SubmissionEvidenceRecorder(
+			driver,
+			evidence,
+			store,
+			input.id,
+			"run-token-1",
+			1,
+			() => "2026-08-28T00:00:02.000Z",
+			20,
+		);
+		const originalWarn = console.warn;
+		console.warn = () => undefined;
+
+		let result: Awaited<ReturnType<typeof recorder.capture>>;
+		try {
+			result = await recorder.capture("after_submit");
+		} finally {
+			console.warn = originalWarn;
+		}
+
+		expect(result).toEqual({
+			captured: false,
+			failureCode: "CAPTURE_TIMEOUT",
+		});
+		expect(store.events).toEqual([
+			{
+				jobId: input.id,
+				attempt: 1,
+				type: "evidence.capture_failed",
+				data: { stage: "after_submit", failureCode: "CAPTURE_TIMEOUT" },
+			},
+		]);
+	});
+
 	test("deletes the uploaded object when the D1 event cannot be recorded", async () => {
 		const driver = new FakeDriver();
 		const evidence = new InMemoryEvidenceObjectStore();
@@ -1782,6 +1917,42 @@ class UncertainOnceFailingJobStore extends InMemoryJobStore {
 class RecordEvidenceCapturedRejectingJobStore extends InMemoryJobStore {
 	async recordEvidenceCaptured(): Promise<boolean> {
 		return false;
+	}
+}
+
+class RecordEvidenceIntentRejectingJobStore extends InMemoryJobStore {
+	override async recordEvidenceIntent(): Promise<boolean> {
+		return false;
+	}
+}
+
+/** Remembers the recorded events as they stood while the object was written. */
+class EventsAtPutEvidenceObjectStore extends InMemoryEvidenceObjectStore {
+	readonly eventsAtPut: Array<[string, unknown]> = [];
+
+	constructor(private readonly store: InMemoryJobStore) {
+		super();
+	}
+
+	override async put(
+		...args: Parameters<InMemoryEvidenceObjectStore["put"]>
+	): Promise<void> {
+		for (const event of this.store.events) {
+			this.eventsAtPut.push([event.type, event.data.objectKey]);
+		}
+		return super.put(...args);
+	}
+}
+
+class PutFailingEvidenceObjectStore extends InMemoryEvidenceObjectStore {
+	override async put(): Promise<void> {
+		throw new Error("put failed");
+	}
+}
+
+class StalledPutEvidenceObjectStore extends InMemoryEvidenceObjectStore {
+	override put(): Promise<void> {
+		return new Promise<void>(() => {});
 	}
 }
 
