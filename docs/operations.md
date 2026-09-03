@@ -293,6 +293,8 @@ Worker側の記録は`browser_use_session_created`、`browser_use_session_stoppe
 
 attempt上限で終端したジョブは、Queue consumerが結果を保存する前に同じ`jobId`のsessionを回収する。`browser_use_session_reclaimed`の`matched`が0のまま`activeTagged`が同時session上限に達している場合は他ジョブのleakであり、自動では解放されないため、上記の`list`とD1のジョブ状態を照合して終端済みジョブのsessionを`stop`する。
 
+BrowserUse devプランの同時ブラウザ上限は25で、Queue consumerの`max_concurrency`は20である。上限25のうち5は、leakしたsessionが寿命まで枠を塞ぐ分の余裕として空けている。`list`のactiveが常時5件を超えて残る場合は余裕を食い潰しているため、`max_concurrency`を下げるかleakの原因を先に解消する。
+
 `outcome: exceededCpu`によるWorkerの強制終了は、Cloudflareダッシュボードの Workers Logs で`outcome = exceededCpu`を検索して調査する。ログの保持期間はPaidプランで7日であるため、7日以内に確認する。`cpuTime`と`wallTime`を併せて読み、CPU上限（既定30秒。Paidプランでは`limits.cpu_ms`で変更できるが未設定）に達していない強制終了であれば上限引き上げでは解消しない。
 
 ## 重複Queue配送の検証

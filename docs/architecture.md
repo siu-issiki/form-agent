@@ -23,7 +23,7 @@
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値（単一文字列または選択肢候補リスト）を検証。一覧・キャンセルは未実装 |
 | Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
 | 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ、値を含まないagent tool診断イベント、ジョブ単位の実行メトリクス（turn、Provider 呼び出し、token、送信前レビュー、browser 接続時間、実行時間）。送信前・送信後・禁止判定時のスクリーンショット証跡を Cloudflare R2 へ保存し、D1 の `events` へ sha256 付きで記録する |
-| 並列検証 | 部分実施 | 2026-09-03 の 5 並列 19 シナリオで、session 明示停止の前後とも 15 件合格。明示停止後は CDP 切断（1011 / `LIMIT`）と `exceededCpu` が 0 件になり、18 session すべてを停止できたが、session 作成 API が 429 を 15 回返し 2 件が失敗した。当時の同時 session 上限は 5 未満と判断し、consumer を `max_concurrency: 3` にした。3 並列の 19 シナリオでは 17 件合格、429 / CDP 切断 / `exceededCpu` はいずれも 0 件、19 session すべてを停止できた。その後 Cloudflare Workers を Paid、BrowserUse を dev（有料）プランへ移行し、consumer を `max_concurrency: 10` にした。10 並列での実測は未実施であり、上限は `browser_use_session_limit` で計測して調整する |
+| 並列検証 | 部分実施 | 2026-09-03 の 5 並列 19 シナリオで、session 明示停止の前後とも 15 件合格。明示停止後は CDP 切断（1011 / `LIMIT`）と `exceededCpu` が 0 件になり、18 session すべてを停止できたが、session 作成 API が 429 を 15 回返し 2 件が失敗した。当時の同時 session 上限は 5 未満と判断し、consumer を `max_concurrency: 3` にした。3 並列の 19 シナリオでは 17 件合格、429 / CDP 切断 / `exceededCpu` はいずれも 0 件、19 session すべてを停止できた。その後 Cloudflare Workers を Paid、BrowserUse を dev（有料）プランへ移行し、consumer を `max_concurrency: 20` にした。dev プランの同時ブラウザ上限 25 のうち 5 は leak した session の余裕として残している。20 並列での実測は未実施であり、上限は `browser_use_session_limit` で計測して調整する |
 
 本書では、実装済みの構成を現在形で記述し、未実装または未検証の内容は「現在の制約」「PoC 計画」「残タスク・未決事項」に明示する。
 
@@ -155,7 +155,7 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 - proxy country は `jp`、session timeout は 12 分とする。12 分は run deadline 10 分と termination grace 30 秒の外側に置いた backstop であり、明示停止が届かなかった場合にだけ効く。
 - session には `metadata.jobId` と `metadata.dryRun` を付ける。Queue retry（`attemptCount` が 2 以上）の初回試行と、接続再試行の 2 回目以降では、create の前に `GET /browsers?filterBy=active` から同じ `jobId` の session を stop して残骸を回収し、`matched` / `stopped` / `failed` の件数を `browser_use_session_reclaimed` に記録する。停止を確認できた session だけを `stopped` に数え、1 件でも失敗すれば `ok: false` とする。create の応答が失われた場合や `cdpUrl` を欠く場合でも、次の create までに前回の session を解放できる。同一 `jobId` の session は `claimRun` の排他により同時に 1 件しか存在しないため、回収対象は必ず終了済み attempt のものである。
 - attempt 上限に達したジョブは新しい driver を作らずに終端するため、回収する主体がいない。そこで Queue consumer が、`hasExceededAttemptLimit` で `JOB_ATTEMPT_LIMIT_REACHED` を保存する経路と、consumer の例外を attempt 上限で `QUEUE_CONSUMER_ERROR` として確定させる経路の 2 か所で、結果を保存する前に同じ回収を実行する。`BROWSER_USE_API_KEY` が未設定なら何もしない。回収は best-effort であり、10 秒の timeout を置き、失敗してもジョブの結果を変えない。これがない場合、`outcome: exceededCpu` で強制終了した最後の attempt の session が session timeout（12 分）まで枠を塞ぐ。
-- 回収は自分の `jobId` に一致する session だけを停止する。`browser_use_session_reclaimed` の `matched` が 0 でも `activeTagged` が同時 session 上限を占めている場合、それは他ジョブの session であるため停止しない。したがって、`exceededCpu` などで leak した他ジョブの session は寿命が尽きるまで枠を塞ぎ続けるリスクが残る。BrowserUse dev プラン（同時 10）では leak が 10 件そろうと以後のジョブが全件 429 となり `BROWSER_TOOL_UNAVAILABLE` へ落ちる。2026-09-03 の計測では `browser_use_session_limit` が activeTotal 3 / activeTagged 3、`browser_use_session_reclaimed` が matched 0 となる連鎖を実際に観測した。手動の復旧は runbook の「BrowserUse sessionの確認と停止」で行う。
+- 回収は自分の `jobId` に一致する session だけを停止する。`browser_use_session_reclaimed` の `matched` が 0 でも `activeTagged` が同時 session 上限を占めている場合、それは他ジョブの session であるため停止しない。したがって、`exceededCpu` などで leak した他ジョブの session は寿命が尽きるまで枠を塞ぎ続けるリスクが残る。BrowserUse dev プラン（同時 25）では leak が 25 件そろうと以後のジョブが全件 429 となり `BROWSER_TOOL_UNAVAILABLE` へ落ちる。2026-09-03 の計測では `browser_use_session_limit` が activeTotal 3 / activeTagged 3、`browser_use_session_reclaimed` が matched 0 となる連鎖を実際に観測した。手動の復旧は runbook の「BrowserUse sessionの確認と停止」で行う。
 - `cdpUrl` は接続前・API key 付与前に host を検証し、`browser-use.com` またはそのサブドメイン以外は `Invalid Browser Use CDP endpoint` として失敗させる。`wss:` はそのまま使い、`https:` の場合だけ `GET <cdpUrl>/json/version` で `webSocketDebuggerUrl` を取得する。取得した URL も同じ host 検証を通し、`ws:` は `cdpUrl` と同一 host のときだけ `wss:` へ昇格させる。
 - API key を付ける REST 呼び出しと `/json/version` 取得は `redirect: "manual"` とし、redirect を追わない。3xx 応答は再試行不可の API 失敗として扱い、cross-origin redirect 先へ `X-Browser-Use-API-Key` が転送されないようにする。
 - CDP WebSocket が自発的に閉じた場合、close code、reason の文字数、reason を固定分類した hint（`NONE` / `LIMIT` / `AUTH` / `TIMEOUT` / `OTHER`）、`wasClean`、未完了コマンド数を記録する。相手から渡された reason の自由文そのものはログに残さない。
@@ -408,7 +408,9 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 
 `tools/campaign-dry-run.ts` は CSV と登録値 JSON からジョブを組み立てる。選択肢が必要なサイト向けに `--choices <path>` を追加した。JSON は `Record<string, string[]>` で、キーは payload key の書式、値は候補リストの契約（1〜10 要素、各要素 1〜256 文字、合計 2,048 文字以下）で検証する。登録値・件名・本文とキーが衝突した場合は優先順位を設けずエラーにする。サンプルは `docs/examples/campaign-choices.example.json` にある。
 
-プライバシーポリシー同意などの必須 checkbox を agent に操作させるかは運用判断であり、サンプルには含めない。同意させる場合は `privacyConsent` のようなキーで `["checked"]` を渡す。
+選択肢候補は `src/campaign-import.ts` の `DEFAULT_CHOICE_CANDIDATES`（`inquiryType` / `contactMethod` / `privacyConsent`）として同梱し、既定で常に適用する。実サイトでは同じ形の選択肢が繰り返し現れ、毎回ファイルを渡すと運用ミスで欠落するためである。`--choices` を渡した場合はキー単位でファイル側が勝ち、ファイルに無いキーは既定が残る。`--no-default-choices` は既定セット全体を無効化する。マージ結果は `mergeChoiceCandidates` が `readChoiceCandidates` と同じ契約で検証し、登録値とのキー衝突は従来どおり `buildCampaignJob` がエラーにする。既定の `privacyConsent: ["checked"]` はプライバシーポリシー同意を自動でチェックするという運用判断であり、無効化するには `--no-default-choices` を使う。
+
+既定セットを同梱しても信頼境界は変わらない。候補は運用者が決めた値であり、モデルは `payloadKey` を指すだけで候補文字列を組み立てられず、信頼済み handler が対象コントロールとの完全一致を確認してから入力する。
 
 `--submit-dry-run` では全件を先に `POST /jobs` へ登録し、その後で登録済みジョブ全体を 2 秒間隔でポーリングする。1 件登録して完了を待つ直列実行では Queue consumer の `max_concurrency` が活きず、2026-09-02 の 20 件で約 15 分を要したためである。待ち時間の上限は「4 分 × ceil(件数 / `max_concurrency`)」とし、満杯のバッチの後ろに並んだジョブが枠の空きを待つ分を見込む。登録が途中で失敗した場合は以降の登録を止め、登録済みの分だけ結果を待って集計し、exit code 1 で終了する。ジョブ照会の一時的な失敗は次の周回で読み直し、`campaign_dry_run_summary` には `byReasonCode` として reason code 別の件数（未登録は `REGISTRATION_FAILED`、期限切れは `DRY_RUN_TIMED_OUT`）を出力する。`submitting` / `sent` を観測した場合は従来どおり即座に中断する。
 
@@ -456,7 +458,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 
 ## 並列・リトライ方針
 
-PoC はまず 1 並列の production で開始し、管理下テストサイトへの実送信結果を観測してから 5、20、50 へ段階的に引き上げる。設定値だけで並列対応済みとせず、Cloudflare 上での実測を完了条件とする。現在は Cloudflare Workers が Paid、BrowserUse が dev（有料）プランであり、consumer は `max_concurrency: 10` である。
+PoC はまず 1 並列の production で開始し、管理下テストサイトへの実送信結果を観測してから 5、20、50 へ段階的に引き上げる。設定値だけで並列対応済みとせず、Cloudflare 上での実測を完了条件とする。現在は Cloudflare Workers が Paid、BrowserUse が dev（有料）プランであり、consumer は `max_concurrency: 20` である。
 
 2026-09-03 に 5 並列で管理下テストシステムの 12 シナリオを実行し、8 件が合格した。残りのうち 3 件は Worker 診断が stage `driver_connect`、code `CDP_CONNECTION_CLOSED` で、10 秒間に連続して発生した。発生時点で BrowserUse 側に既存 session が 3〜4 件あり、直前 2 分 40 秒で 9 session を作成していた。前後の接続は成功しているため、BrowserUse の同時 session 上限（プラン上 10）または session 作成レートの上限に達したと推定するが、当時は WebSocket の close code / reason を記録していなかったため原因は未確定である。
 
@@ -464,7 +466,7 @@ PoC はまず 1 並列の production で開始し、管理下テストサイト�
 
 明示停止後の再計測では 15 件が合格し、18 session すべてを平均約 100 ms で停止できた。CDP 切断（1011 / `LIMIT`）と `exceededCpu` は 0 件になった。一方で session 作成 API が `429 Too many concurrent active sessions` を 15 回返し、10 / 20 / 30 秒の再試行で 3 件は回復したが、`sample-request-only` と `open-shadow-dom` の 2 件は 60 秒待っても回復せず失敗した。回収ログの一致件数は常に 0 で、残骸ではなく同時実行中の session が上限を消費していた。session を毎回停止しても 5 並列で上限に達することから、当時この account の実際の同時 session 上限は 5 未満（Free プランの 3 と推定）であった。残る不合格は、途中の CDP コマンド失敗で止まった `multi-step`（受信 0）と、禁止フォームの submit を信頼済み handler がブロックした後にモデルが `finish_prohibited` ではなく `finish_failed` を選んだ `external-iframe-secondary`（受信 0、3 回中 2 回再現）である。
 
-consumer は `max_concurrency: 10` とする。Cloudflare Workers を Paid、BrowserUse を dev（有料）プランへ移行し、同時 session 上限が 10 になったためである。移行前は 5 並列で session を毎回停止しても作成 API が 429 を返したため、当時の推定上限（3）に合わせて 3 としていた。3 並列で 19 シナリオを再計測した結果は 17 件合格で、作成 API の 429、CDP 切断、`exceededCpu` はいずれも 0 件、19 session すべてを停止できた。不合格 2 件は、並列時に毎回 turn 6 の `click` で CDP コマンドが失敗する `multi-step`（受信 0）と、iframe 側の禁止文言に対して信頼済み handler の禁止根拠検証が通らずモデルが `uncertain` を選んだ `external-iframe-tertiary`（受信 0、4 回中 1 回）である。接続再試行（10 / 20 / 30 秒、最大 3 回）は緩和策として維持する。再試行でも接続できない場合は再試行可能エラーとして Queue の retry / DLQ へ進む。deploy 後の再計測では `browser_use_connect_retry`、`browser_use_cdp_closed`、`browser_use_session_stopped`、`browser_use_session_reclaimed` の件数を確認する。作成 API が 429 を返した時点（backoff の待機前）と回収時に active session の全件数と `metadata.source = form-agent` 付きの件数を記録し、上限を消費しているのがこの client か外部かを切り分ける。同じ API キーを別の deployment やローカル実行と共有している場合は source タグでも区別できない。10 並列での実測は未実施であり、実際に使える同時 session 数は `browser_use_session_limit` の `activeTotal` / `activeTagged` と作成 API の 429 件数で計測して調整する。
+consumer は `max_concurrency: 20` とする。Cloudflare Workers を Paid、BrowserUse を dev（有料）プランへ移行し、同時ブラウザ上限が 25 になったためである。20 に留めるのは、`exceededCpu` などで leak した session が寿命まで枠を塞ぐため、上限 25 のうち 5 をその余裕として残すためである。移行前は 5 並列で session を毎回停止しても作成 API が 429 を返したため、当時の推定上限（3）に合わせて 3 としていた。3 並列で 19 シナリオを再計測した結果は 17 件合格で、作成 API の 429、CDP 切断、`exceededCpu` はいずれも 0 件、19 session すべてを停止できた。不合格 2 件は、並列時に毎回 turn 6 の `click` で CDP コマンドが失敗する `multi-step`（受信 0）と、iframe 側の禁止文言に対して信頼済み handler の禁止根拠検証が通らずモデルが `uncertain` を選んだ `external-iframe-tertiary`（受信 0、4 回中 1 回）である。接続再試行（10 / 20 / 30 秒、最大 3 回）は緩和策として維持する。再試行でも接続できない場合は再試行可能エラーとして Queue の retry / DLQ へ進む。deploy 後の再計測では `browser_use_connect_retry`、`browser_use_cdp_closed`、`browser_use_session_stopped`、`browser_use_session_reclaimed` の件数を確認する。作成 API が 429 を返した時点（backoff の待機前）と回収時に active session の全件数と `metadata.source = form-agent` 付きの件数を記録し、上限を消費しているのがこの client か外部かを切り分ける。同じ API キーを別の deployment やローカル実行と共有している場合は source タグでも区別できない。20 並列での実測は未実施であり、実際に使える同時 session 数は `browser_use_session_limit` の `activeTotal` / `activeTagged` と作成 API の 429 件数で計測して調整する。
 
 再接続は送信前の接続確立に限定するため、フォームへの副作用は発生しない。
 
@@ -528,7 +530,7 @@ consumer は `max_concurrency: 10` とする。Cloudflare Workers を Paid、Bro
 
 - [x] 5 並列で二重実行なし、BrowserUse session の明示停止、作成 API の 429 を確認した。3 並列で 429 が消えることを確認し、consumer を 3 とした。原価の計測は未実施。
 - [x] `max_concurrency`を観測結果に基づいて1から5へ引き上げ、429 の観測により 3 へ戻す。
-- [x] Cloudflare Workers を Paid、BrowserUse を dev プランへ移行し、`max_concurrency`を 10 とした。10 並列の実測は未実施。
+- [x] Cloudflare Workers を Paid、BrowserUse を dev プランへ移行し、`max_concurrency`を 20 とした。dev プランの同時ブラウザ上限 25 のうち 5 は leak した session の余裕として残す。20 並列の実測は未実施。
 
 ### フェーズ 3: 20 並列
 
@@ -566,7 +568,7 @@ consumer は `max_concurrency: 10` とする。Cloudflare Workers を Paid、Bro
 - 並列時に `multi-step` で毎回発生する turn 6 `click` の CDP コマンド失敗（3 並列でも再現、受信 0）。click / fill / select 中の CDP コマンド失敗を要素エラーへ変換する対応は実装済みであり、3 並列 3 回の実行で `multi-step` が続行して `sent` になることの確認が残る。`external-iframe` の送信後読み取り失敗は明示停止後の再計測では再現しなかった。
 - `external-iframe-tertiary` で、モデルが観察本文から禁止を読み取っているのに信頼済み handler の禁止根拠検証（iframe 親ページ側の近接要素）が通らず `FINISH_PROHIBITION_NOT_VERIFIED` になり、`uncertain` で終了した例が 1 件（4 回中）。`validateProhibited` の 1 回限りの再観察は実装済みであり、3 並列 3 回の実行で `FINISH_PROHIBITION_NOT_VERIFIED` が減ることの確認が残る。残る場合は診断とともに記録する。
 - 禁止フォームの submit を信頼済み handler がブロックした後、モデルが `finish_prohibited` ではなく `finish_failed` を選ぶ（`external-iframe-secondary`、3 回中 2 回）。`SUBMIT_PROHIBITED` への分離と guidance、system prompt への追記は実装済みであり、`external-iframe-secondary` が `prohibited` で終わることの確認が残る。
-- BrowserUse dev プラン（同時 10）で consumer を `max_concurrency: 10` へ引き上げた後の再計測。3 並列で 429 が消えることは 19 シナリオで確認済みだが、10 並列は未計測である。`browser_use_session_limit` の `activeTotal` / `activeTagged` と作成 API の 429 件数を見て、必要なら並列数を下げる。
+- BrowserUse dev プラン（同時 25）で consumer を `max_concurrency: 20` へ引き上げた後の再計測。3 並列で 429 が消えることは 19 シナリオで確認済みだが、20 並列は未計測である。`browser_use_session_limit` の `activeTotal` / `activeTagged` と作成 API の 429 件数を見て、必要なら並列数を下げる。
 - R2 アップロード前に `evidence.intent` を記録するため、Worker が途中で停止した孤児オブジェクトは `type = 'evidence.intent'` の残存行から特定できる。残存行の定期確認と削除は runbook の手作業であり、自動化と保存期間ポリシーは未決である。
 - 送信前レビューの残存リスク対応: `dom` activation で照合と `requestSubmit` を同一 JS 実行内で行い、`mouse` / `enter` は activation 直前に再照合する。snapshot に禁止文言・label・option・action / method を含める。修正の証明を変更したコントロールの value / checked 差分に限定する。form 再探索の切り詰めを検出して fail-closed にする。いずれも管理下テストシステムでの E2E と併せて実施する。
 - `agent.run_metrics` の `durationMs` と Workers Logs の `wallTime` を突き合わせられるようになったが、`outcome: exceededCpu` の原因特定自体は未着手である。

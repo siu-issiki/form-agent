@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test";
 import {
 	buildCampaignJob,
 	type CampaignCsvRow,
+	DEFAULT_CHOICE_CANDIDATES,
 	filterCampaignRows,
 	mapRegistrationValues,
+	mergeChoiceCandidates,
 	normalizeCompanyDomain,
 	type RegistrationEntry,
 	readChoiceCandidates,
@@ -256,10 +258,53 @@ describe("campaign import", () => {
 			"docs/examples/campaign-choices.example.json",
 		).json();
 
-		expect(Object.keys(readChoiceCandidates(example))).toEqual([
+		// The example file documents the shipped defaults, so it must stay equal
+		// to them as well as valid.
+		expect(readChoiceCandidates(example)).toEqual({
+			...DEFAULT_CHOICE_CANDIDATES,
+		});
+	});
+
+	test("applies the default candidates when no choices file is given", () => {
+		const merged = mergeChoiceCandidates(DEFAULT_CHOICE_CANDIDATES, {});
+
+		expect(Object.keys(merged)).toEqual([
 			"inquiryType",
 			"contactMethod",
+			"privacyConsent",
 		]);
+		expect(merged.inquiryType?.[0]).toBe("その他");
+		expect(merged.privacyConsent).toEqual(["checked"]);
+	});
+
+	test("lets a choices file override one default key and keep the rest", () => {
+		const merged = mergeChoiceCandidates(DEFAULT_CHOICE_CANDIDATES, {
+			inquiryType: ["営業以外"],
+			salutation: ["様"],
+		});
+
+		expect(merged.inquiryType).toEqual(["営業以外"]);
+		expect(merged.salutation).toEqual(["様"]);
+		expect(merged.contactMethod).toEqual(
+			DEFAULT_CHOICE_CANDIDATES.contactMethod,
+		);
+		expect(merged.privacyConsent).toEqual(["checked"]);
+	});
+
+	test("drops every default when the default set is disabled", () => {
+		expect(mergeChoiceCandidates({}, {})).toEqual({});
+		expect(mergeChoiceCandidates({}, { inquiryType: ["その他"] })).toEqual({
+			inquiryType: ["その他"],
+		});
+	});
+
+	test("validates the merged candidates against the same contract", () => {
+		expect(() =>
+			mergeChoiceCandidates(DEFAULT_CHOICE_CANDIDATES, { inquiryType: [] }),
+		).toThrow("invalid candidate list");
+		expect(() =>
+			mergeChoiceCandidates(DEFAULT_CHOICE_CANDIDATES, { "1bad": ["x"] }),
+		).toThrow("invalid payload key");
 	});
 });
 

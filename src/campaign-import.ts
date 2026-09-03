@@ -227,6 +227,50 @@ export function readChoiceCandidates(
 	return choices;
 }
 
+/**
+ * Candidate lists shipped with the tool so that a run without `--choices`
+ * still answers the choice controls most Japanese inquiry forms use. These are
+ * operator-decided values, exactly like a choices file: the model only ever
+ * names a payloadKey, and the trusted handler still requires an exact match
+ * against the control before entering anything.
+ *
+ * `privacyConsent` ticks a privacy-policy checkbox. It is included by the
+ * operator's decision; `--no-default-choices` drops the whole default set.
+ */
+export const DEFAULT_CHOICE_CANDIDATES: Record<string, readonly string[]> = {
+	inquiryType: [
+		"その他",
+		"その他のお問い合わせ",
+		"その他お問い合わせ",
+		"ご意見・ご要望",
+		"お問い合わせ",
+		"一般のお問い合わせ",
+		"その他のご相談",
+	],
+	contactMethod: [
+		"メール",
+		"Eメール",
+		"E-mail",
+		"Email",
+		"メールでのご連絡",
+		"メールで連絡",
+	],
+	privacyConsent: ["checked"],
+};
+
+/**
+ * Overlays a choices file on the defaults key by key, the file winning, and
+ * validates the merged result against the same contract a choices file passes.
+ * Merging per key keeps a file that only overrides `inquiryType` from silently
+ * dropping the other defaults.
+ */
+export function mergeChoiceCandidates(
+	defaults: Record<string, readonly string[]>,
+	overrides: Record<string, readonly string[]>,
+): Record<string, readonly string[]> {
+	return readChoiceCandidates({ ...defaults, ...overrides });
+}
+
 export async function buildCampaignJob(
 	candidate: CampaignCandidate,
 	registrationValues: Record<string, string>,

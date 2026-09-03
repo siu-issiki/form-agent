@@ -2,8 +2,10 @@ import { parse } from "csv-parse/sync";
 import {
 	buildCampaignJob,
 	type CampaignCsvRow,
+	DEFAULT_CHOICE_CANDIDATES,
 	filterCampaignRows,
 	mapRegistrationValues,
+	mergeChoiceCandidates,
 	type RedirectResolution,
 	type RegistrationEntry,
 	readChoiceCandidates,
@@ -26,9 +28,21 @@ const TERMINAL_STATUSES = [
 
 const options = parseOptions(Bun.argv.slice(2));
 const registration = await readRegistration(options.registrationPath);
-const choices = options.choicesPath
-	? readChoiceCandidates(await Bun.file(options.choicesPath).json())
-	: {};
+const choices = mergeChoiceCandidates(
+	options.defaultChoices ? DEFAULT_CHOICE_CANDIDATES : {},
+	options.choicesPath
+		? readChoiceCandidates(await Bun.file(options.choicesPath).json())
+		: {},
+);
+console.log(
+	JSON.stringify({
+		event: "campaign_choice_summary",
+		defaultChoices: options.defaultChoices,
+		overrideFile: options.choicesPath !== undefined,
+		// Only the keys are logged; the candidate labels are payload data.
+		choiceKeys: Object.keys(choices).sort(),
+	}),
+);
 const csvText = await Bun.file(options.csvPath).text();
 const rows = parse(csvText, {
 	columns: true,
@@ -133,16 +147,22 @@ interface Options {
 	offset: number;
 	limit: number;
 	submit: boolean;
+	defaultChoices: boolean;
 	apiToken: string;
 }
 
 function parseOptions(args: string[]): Options {
 	const values = new Map<string, string>();
 	let submit = false;
+	let defaultChoices = true;
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index];
 		if (arg === "--submit-dry-run") {
 			submit = true;
+			continue;
+		}
+		if (arg === "--no-default-choices") {
+			defaultChoices = false;
 			continue;
 		}
 		if (!arg?.startsWith("--")) throw new Error("Invalid argument");
@@ -188,6 +208,7 @@ function parseOptions(args: string[]): Options {
 		offset,
 		limit,
 		submit,
+		defaultChoices,
 		apiToken,
 	};
 }
