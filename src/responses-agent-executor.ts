@@ -859,6 +859,7 @@ function systemPrompt(dryRun: boolean): string {
 		"You operate one company's inquiry form using only the provided tools.",
 		"Stay on the persisted target domain. Never use another company or arbitrary URL.",
 		"Read each observed page for sales, solicitation, or purpose restrictions in the page text and near the form, because sending to a site that prohibits outreach harms the sender.",
+		"When the current page has no inquiry form but observe returned navigationLinks that look like a contact or inquiry page, navigate there and observe again before deciding that no form exists.",
 		"When outreach is prohibited, no inquiry form exists, or the form's stated purpose excludes this inquiry, finish as prohibited instead of submitting.",
 		"Match each field to a payload.formValues key by meaning; the trusted handler supplies the value.",
 		"Before submit, re-observe and confirm every required field on the target form holds the intended payload key.",
