@@ -12,6 +12,7 @@ import {
 } from "../src/browser-tool-handler";
 import {
 	BrowserUseCdpClosedError,
+	BrowserUseCdpCommandError,
 	BrowserUseCdpPayloadTooLargeError,
 	BrowserUseCdpUpgradeRejectedError,
 } from "../src/browser-use-cdp";
@@ -1693,6 +1694,65 @@ describe("ResponsesAgentExecutor", () => {
 				event: "browser_setup_failed",
 				code: "PAGE_NOT_READY",
 				stage: "driver_connect",
+			},
+		]);
+	});
+
+	test("includes the fixed CDP method and kind in the setup failure breakdown", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () =>
+				Response.json(
+					functionResponse("call-observe", "observe", {}),
+				)) as typeof fetch,
+			createBrowserDriver: async () => {
+				throw new BrowserUseCdpCommandError(
+					"DOM.getDocument",
+					-32000,
+					"NODE_NOT_FOUND",
+				);
+			},
+		});
+		const logs: string[] = [];
+		const spy = vi.spyOn(console, "log").mockImplementation((message) => {
+			logs.push(String(message));
+		});
+
+		const error = await executor
+			.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				new AbortController().signal,
+			)
+			.catch((caught) => caught)
+			.finally(() => spy.mockRestore());
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(error.reasonCode).toBe("BROWSER_TOOL_UNAVAILABLE");
+		expect(error.cdpMethod).toBe("DOM.getDocument");
+		expect(error.cdpKind).toBe("NODE_NOT_FOUND");
+		const setupFailures = logs
+			.filter((entry) => entry.includes('"browser_setup_failed"'))
+			.map((entry) => JSON.parse(entry) as Record<string, unknown>);
+		// Fixed values only: no URL, session id, or provider message.
+		expect(setupFailures).toEqual([
+			{
+				event: "browser_setup_failed",
+				code: "CDP_COMMAND_FAILED",
+				stage: "driver_connect",
+				method: "DOM.getDocument",
+				kind: "NODE_NOT_FOUND",
 			},
 		]);
 	});
