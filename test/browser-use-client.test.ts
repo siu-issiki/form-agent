@@ -411,3 +411,17 @@ describe("BrowserUseClient stop confirmation", () => {
 		expect((await client.stopBrowser("session-001")).status).toBe("stopped");
 	});
 });
+
+describe("BrowserUseClient fetcher invocation", () => {
+	test("never invokes the fetcher as a method of the client", async () => {
+		function strictFetcher(this: unknown, _url: string, _init?: RequestInit) {
+			if (this !== undefined && this !== globalThis) {
+				throw new TypeError("Illegal invocation");
+			}
+			return Promise.resolve(Response.json(activeSession, { status: 201 }));
+		}
+		const client = new BrowserUseClient("secret-key", strictFetcher);
+		const session = await client.createBrowser();
+		expect(session.id).toBe(activeSession.id);
+	});
+});

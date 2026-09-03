@@ -75,11 +75,16 @@ export class BrowserUseResponseError extends Error {
 export class BrowserUseClient {
 	readonly #baseUrl: string;
 
+	readonly #fetcher: BrowserUseFetch;
+
 	constructor(
 		private readonly apiKey: string,
-		private readonly fetcher: BrowserUseFetch = fetch,
+		fetcher: BrowserUseFetch = fetch,
 		baseUrl = "https://api.browser-use.com/api/v4",
 	) {
+		// A bare `fetch` reference must not be invoked as a method of this object:
+		// Workers throws "Illegal invocation" when `this` is not the global scope.
+		this.#fetcher = (url, init) => fetcher(url, init);
 		if (!apiKey) {
 			throw new Error("Browser Use API key is required");
 		}
@@ -170,6 +175,9 @@ export class BrowserUseClient {
 
 		const body = await readJson(response);
 		if (!isRecord(body) || !Array.isArray(body.items)) {
+			logApiDiagnostic("list", "INVALID_LIST", {
+				keys: isRecord(body) ? Object.keys(body).sort() : [],
+			});
 			throw new BrowserUseResponseError(
 				"Browser Use returned an invalid session list",
 			);
@@ -185,17 +193,21 @@ export class BrowserUseClient {
 	): Promise<Response> {
 		let response: Response;
 		try {
-			response = await this.fetcher(url, {
+			response = await this.#fetcher(url, {
 				...init,
 				redirect: "manual",
 				...(signal ? { signal } : {}),
 			});
-		} catch {
+		} catch (error) {
+			logApiDiagnostic(operation, "REQUEST_FAILED", {
+				errorName: error instanceof Error ? error.name : typeof error,
+			});
 			throw new BrowserUseRequestError();
 		}
 		assertNotRedirected(operation, response);
 		if (!response.ok) {
 			await response.body?.cancel().catch(() => undefined);
+			logApiDiagnostic(operation, "HTTP_ERROR", { status: response.status });
 			throw new BrowserUseApiError(operation, response.status);
 		}
 		return response;
@@ -314,12 +326,38 @@ async function readJson(response: Response): Promise<unknown> {
 	try {
 		return await response.json();
 	} catch {
+		logApiDiagnostic("parse", "INVALID_JSON", { status: response.status });
 		throw new BrowserUseResponseError("Browser Use returned invalid JSON");
 	}
 }
 
+/**
+ * Records only fixed classifications, HTTP status codes, error class names,
+ * and top-level field names. Values, URLs, and identifiers are never logged.
+ */
+function logApiDiagnostic(
+	operation: BrowserUseOperation | "parse",
+	kind:
+		| "REQUEST_FAILED"
+		| "HTTP_ERROR"
+		| "INVALID_JSON"
+		| "INVALID_SESSION"
+		| "INVALID_LIST",
+	detail: Record<string, unknown>,
+): void {
+	console.warn(
+		JSON.stringify({
+			event: "browser_use_api_error",
+			operation,
+			kind,
+			...detail,
+		}),
+	);
+}
+
 function parseSession(value: unknown): BrowserSession {
 	if (!isRecord(value)) {
+		logApiDiagnostic("parse", "INVALID_SESSION", { valueType: typeof value });
 		throw new BrowserUseResponseError(
 			"Browser Use returned an invalid session",
 		);
@@ -327,9 +365,31 @@ function parseSession(value: unknown): BrowserSession {
 
 	const status = value.status;
 	if (status !== "active" && status !== "stopped") {
+		logApiDiagnostic("parse", "INVALID_SESSION", {
+			keys: Object.keys(value).sort(),
+			statusType: typeof status,
+			statusValue: typeof status === "string" ? status.slice(0, 32) : null,
+		});
 		throw new BrowserUseResponseError("Browser Use returned an invalid status");
 	}
+	try {
+		return parseSessionFields(value, status);
+	} catch (error) {
+		logApiDiagnostic("parse", "INVALID_SESSION", {
+			keys: Object.keys(value).sort(),
+			field:
+				error instanceof BrowserUseResponseError
+					? error.message.replace(/^Browser Use returned an invalid /, "")
+					: "unknown",
+		});
+		throw error;
+	}
+}
 
+function parseSessionFields(
+	value: Record<string, unknown>,
+	status: "active" | "stopped",
+): BrowserSession {
 	return {
 		id: requireString(value.id, "id"),
 		status,
