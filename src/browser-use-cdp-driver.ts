@@ -21,6 +21,7 @@ import {
 	BrowserUseRequestError,
 	BrowserUseResponseError,
 	resolveCdpWebSocketUrl,
+	SESSION_STILL_ACTIVE_MESSAGE,
 } from "./browser-use-client";
 import type { Job } from "./job";
 import {
@@ -102,34 +103,46 @@ function isRetryableConnectError(error: unknown): boolean {
 	);
 }
 
+type StopFailureReason = "STILL_ACTIVE" | "API_ERROR" | "TIMEOUT";
+
 /**
  * Stopping is best effort: the provider keeps the session alive until its own
  * timeout when the stop fails, so the outcome is recorded and the caller keeps
- * its original error.
+ * its original error. A provider response that still reports an active session
+ * counts as a failure, because the concurrency slot is still held.
  */
 async function stopBrowserSession(
 	session: BrowserSessionHandle,
-): Promise<void> {
+): Promise<{ ok: boolean; reason?: StopFailureReason }> {
 	const startedAt = Date.now();
-	let ok = true;
+	const timeout = AbortSignal.timeout(SESSION_STOP_TIMEOUT_MS);
+	let reason: StopFailureReason | undefined;
 	let status: number | undefined;
 	try {
-		await session.client.stopBrowser(
-			session.id,
-			AbortSignal.timeout(SESSION_STOP_TIMEOUT_MS),
-		);
+		await session.client.stopBrowser(session.id, timeout);
 	} catch (error) {
-		ok = false;
-		if (error instanceof BrowserUseApiError) status = error.status;
+		if (
+			error instanceof BrowserUseResponseError &&
+			error.message === SESSION_STILL_ACTIVE_MESSAGE
+		) {
+			reason = "STILL_ACTIVE";
+		} else if (timeout.aborted) {
+			reason = "TIMEOUT";
+		} else {
+			reason = "API_ERROR";
+			if (error instanceof BrowserUseApiError) status = error.status;
+		}
 	}
 	console.log(
 		JSON.stringify({
 			event: "browser_use_session_stopped",
-			ok,
+			ok: reason === undefined,
+			...(reason === undefined ? {} : { reason }),
 			...(status === undefined ? {} : { status }),
 			durationMs: Date.now() - startedAt,
 		}),
 	);
+	return reason === undefined ? { ok: true } : { ok: false, reason };
 }
 
 /**
@@ -143,7 +156,9 @@ async function reclaimJobSessions(
 	jobId: string,
 	signal: AbortSignal | undefined,
 ): Promise<void> {
+	let matched = 0;
 	let stopped = 0;
+	let failed = 0;
 	let ok = true;
 	try {
 		const sessions = await client.listBrowsers(
@@ -153,14 +168,27 @@ async function reclaimJobSessions(
 		);
 		for (const session of sessions) {
 			if (session.metadata.jobId !== jobId) continue;
-			await stopBrowserSession({ client, id: session.id });
-			stopped += 1;
+			matched += 1;
+			// Only a confirmed stop is counted, so the record never claims to have
+			// released a slot the provider still holds.
+			if ((await stopBrowserSession({ client, id: session.id })).ok) {
+				stopped += 1;
+			} else {
+				failed += 1;
+				ok = false;
+			}
 		}
 	} catch {
 		ok = false;
 	}
 	console.log(
-		JSON.stringify({ event: "browser_use_session_reclaimed", ok, stopped }),
+		JSON.stringify({
+			event: "browser_use_session_reclaimed",
+			ok,
+			matched,
+			stopped,
+			failed,
+		}),
 	);
 }
 

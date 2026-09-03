@@ -23,6 +23,10 @@ export type BrowserUseFetch = (
 
 export type BrowserUseOperation = "create" | "stop" | "list" | "resolve";
 
+/** A stop the provider accepted without actually ending the session. */
+export const SESSION_STILL_ACTIVE_MESSAGE =
+	"Browser Use did not stop the session";
+
 export class BrowserUseApiError extends Error {
 	constructor(
 		readonly operation: BrowserUseOperation,
@@ -134,7 +138,16 @@ export class BrowserUseClient {
 			signal,
 		);
 
-		return parseSession(await readJson(response));
+		const session = parseSession(await readJson(response));
+		// An accepted request is not a stopped session, so the caller must be able
+		// to tell that the concurrency slot is still held.
+		if (session.status !== "stopped") {
+			throw new BrowserUseResponseError(
+				SESSION_STILL_ACTIVE_MESSAGE,
+				session.id,
+			);
+		}
+		return session;
 	}
 
 	async listBrowsers(

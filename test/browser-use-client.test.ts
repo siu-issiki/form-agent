@@ -5,6 +5,7 @@ import {
 	BrowserUseRequestError,
 	BrowserUseResponseError,
 	resolveCdpWebSocketUrl,
+	SESSION_STILL_ACTIVE_MESSAGE,
 } from "../src/browser-use-client";
 
 const activeSession = {
@@ -308,7 +309,7 @@ describe("BrowserUseClient redirect handling", () => {
 		});
 
 		await client.createBrowser();
-		await client.stopBrowser("session-001");
+		await client.stopBrowser("session-001").catch(() => undefined);
 		await client.listBrowsers("active").catch(() => undefined);
 
 		expect(inits.map((init) => init?.redirect)).toEqual([
@@ -379,5 +380,34 @@ describe("BrowserUseClient redirect handling", () => {
 		expect(error.retryable).toBe(false);
 		expect(inits).toHaveLength(1);
 		expect(inits[0]?.redirect).toBe("manual");
+	});
+});
+
+describe("BrowserUseClient stop confirmation", () => {
+	test("rejects a stop that leaves the session active", async () => {
+		const client = new BrowserUseClient("secret-key", async () =>
+			Response.json(activeSession),
+		);
+
+		const error = await client
+			.stopBrowser("session-001")
+			.catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(BrowserUseResponseError);
+		expect(error.message).toBe(SESSION_STILL_ACTIVE_MESSAGE);
+		expect(error.sessionId).toBe("session-001");
+	});
+
+	test("accepts a stop the provider confirmed", async () => {
+		const client = new BrowserUseClient("secret-key", async () =>
+			Response.json({
+				...activeSession,
+				status: "stopped",
+				cdpUrl: null,
+				finishedAt: "2026-08-28T00:01:00.000Z",
+			}),
+		);
+
+		expect((await client.stopBrowser("session-001")).status).toBe("stopped");
 	});
 });

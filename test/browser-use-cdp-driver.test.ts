@@ -58,6 +58,7 @@ import {
 	type BrowserUseClient,
 	BrowserUseRequestError,
 	BrowserUseResponseError,
+	SESSION_STILL_ACTIVE_MESSAGE,
 } from "../src/browser-use-client";
 import type { Job } from "../src/job";
 import {
@@ -1648,6 +1649,7 @@ interface FakeBrowserUseClientOptions {
 	createFailures?: ReadonlyArray<unknown>;
 	cdpUrl?: string;
 	stopError?: unknown;
+	stopErrorsById?: Readonly<Record<string, unknown>>;
 	activeSessions?: ReadonlyArray<{ id: string; jobId?: string }>;
 	listError?: unknown;
 	onCreate?: () => void;
@@ -1686,7 +1688,9 @@ class FakeBrowserUseClient {
 	async stopBrowser(sessionId: string, signal?: AbortSignal): Promise<unknown> {
 		this.stopped.push({ id: sessionId, hasSignal: Boolean(signal) });
 		this.calls.push(`stop:${sessionId}`);
-		if (this.options.stopError) throw this.options.stopError;
+		const failure =
+			this.options.stopErrorsById?.[sessionId] ?? this.options.stopError;
+		if (failure) throw failure;
 		return this.#session(sessionId, {});
 	}
 
@@ -2650,6 +2654,7 @@ describe("BrowserUseCdpDriver session lifecycle", () => {
 		expect(logEvents(captured.logs)[1]).toEqual({
 			event: "browser_use_session_stopped",
 			ok: false,
+			reason: "API_ERROR",
 			status: 500,
 			durationMs: expect.any(Number),
 		});
@@ -2779,7 +2784,13 @@ describe("BrowserUseCdpDriver session lifecycle", () => {
 				ok: true,
 				durationMs: expect.any(Number),
 			},
-			{ event: "browser_use_session_reclaimed", ok: true, stopped: 1 },
+			{
+				event: "browser_use_session_reclaimed",
+				ok: true,
+				matched: 1,
+				stopped: 1,
+				failed: 0,
+			},
 			{ event: "browser_use_session_created", cdpScheme: "wss", attempt: 0 },
 		]);
 	});
@@ -2993,5 +3004,83 @@ describe("BrowserUseCdpConnection upgrade abort", () => {
 		).catch((error: unknown) => error);
 
 		expect((caught as Error).message).toBe("Browser Use CDP connection failed");
+	});
+});
+
+describe("BrowserUseCdpDriver session stop accounting", () => {
+	test("records a stop that left the session active as a failure", async () => {
+		const client = new FakeBrowserUseClient({
+			stopError: new BrowserUseResponseError(
+				SESSION_STILL_ACTIVE_MESSAGE,
+				"session-1",
+			),
+		});
+		const captured = captureLogs();
+
+		try {
+			const driver = await BrowserUseCdpDriver.connect(
+				"api-key",
+				connectJob,
+				true,
+				{
+					client: asClient(client),
+					connectConnection: async () => asConnection(new FakeCdpConnection()),
+				},
+			);
+			await driver.close();
+		} finally {
+			captured.restore();
+		}
+
+		expect(logEvents(captured.logs)[1]).toEqual({
+			event: "browser_use_session_stopped",
+			ok: false,
+			reason: "STILL_ACTIVE",
+			durationMs: expect.any(Number),
+		});
+	});
+
+	test("counts only the confirmed stops when reclaiming a job", async () => {
+		const client = new FakeBrowserUseClient({
+			activeSessions: [
+				{ id: "stale-1", jobId: connectJob.id },
+				{ id: "stale-2", jobId: connectJob.id },
+				{ id: "other-1", jobId: "another-job" },
+			],
+			stopErrorsById: { "stale-2": new BrowserUseApiError("stop", 500) },
+		});
+		const captured = captureLogs();
+
+		try {
+			await BrowserUseCdpDriver.connect(
+				"api-key",
+				{ ...connectJob, attemptCount: 2 },
+				true,
+				{
+					client: asClient(client),
+					connectConnection: async () => asConnection(new FakeCdpConnection()),
+				},
+			);
+		} finally {
+			captured.restore();
+		}
+
+		expect(client.stopped.map((entry) => entry.id)).toEqual([
+			"stale-1",
+			"stale-2",
+		]);
+		expect(
+			logEvents(captured.logs).find(
+				(entry) =>
+					(entry as { event: string }).event ===
+					"browser_use_session_reclaimed",
+			),
+		).toEqual({
+			event: "browser_use_session_reclaimed",
+			ok: false,
+			matched: 2,
+			stopped: 1,
+			failed: 1,
+		});
 	});
 });
