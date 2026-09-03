@@ -391,7 +391,9 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 - 送信後に応答を取得できない場合は `uncertain` として自動 retry を止める。
 - driver が submit control と識別した要素は通常の `click` で操作させず、`submit` tool へ限定する。
 - HTTP(S) の通信先を対象企業の登録可能ドメインとサブドメイン、またはジョブごとに登録した完全一致の外部hostへ限定する。
+- 上記の例外として、既知の検証サービス（reCAPTCHA / hCaptcha / Turnstile）のhostだけをコード内の固定allowlist `VERIFICATION_PROVIDER_ALLOWLIST` として全ジョブで許可する。`www.google.com` / `www.gstatic.com` / `recaptcha.net` / `www.recaptcha.net` は `/recaptcha/` 配下のみ、`hcaptcha.com` はサブドメインを含めて全パス、`challenges.cloudflare.com` は全パスとする。scheme は https のみ、methodは `GET` / `POST` のみとする。reCAPTCHA v3 はtokenを `POST` するため `GET` だけでは足りない。widgetへの通信を遮断すると「reCAPTCHAに接続できません」と表示され、人手を必要としないreCAPTCHA v3やTurnstileまで `CAPTCHA_REQUIRED` になるためである。2026-09-02 の実サイトdry-run 50件では `CAPTCHA_REQUIRED` 7件のうち4件がこの表示によるものだった。
 - POST 等の非safe HTTP methodまたは期待済みGET Documentは、送信権取得後の最初の 1 回だけ許可する。
+- 固定allowlistは経路を広げない範囲に限定する。`Document`（ページ遷移）は対象外でsubresourceとXHR / fetchだけを通し、ジョブ単位の `allowedHosts` の仕組みは変更しない。送信requestのclaim判定は対象ドメインのフォームactionに一致する `Document` requestだけを対象とするため、allowlistのhostが送信先としてclaimされることはなく、1回限りの送信権も消費しない。残存リスクとして、検証サービスへ送られるtelemetry（ページURLやbrowser fingerprintを含み得る）は許容する。widgetの動作に必要であり、送信先が既知の検証サービスに限られるためである。allowlist経由で通したrequestの件数はrun終了時に `browser_verification_requests` として1行だけ出力し、URLや値は出さない。0件のときは出力しない。
 - popup、Worker、Service Worker、WebSocket、WebRTC 等の迂回経路を遮断する。
 - Provider / BrowserUse の認証情報と D1 の実行権をモデル入力・tool 出力へ渡さない。
 - Agent に返すジョブ情報から `runToken` を除外する。
@@ -423,7 +425,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 ### Browser / form 対応
 
 - top-level navigation は対象企業ドメインとそのサブドメイン、またはジョブごとに登録した完全一致の外部hostだけを許可する。
-- フォーム入力前に限り、公開HTTPS hostのread-only subresource（`GET` / `HEAD` / `OPTIONS`）を許可する。入力開始後は対象企業ドメインとジョブ固有の許可host以外への通信を遮断する。
+- フォーム入力前に限り、公開HTTPS hostのread-only subresource（`GET` / `HEAD` / `OPTIONS`）を許可する。入力開始後は対象企業ドメイン、ジョブ固有の許可host、固定の検証サービスallowlist以外への通信を遮断する。
 - CDP DOM tree から `form` と可視 `input` / `textarea` / `select` / `button` を観察し、`form` 属性による外部関連付けにも対応する。各フィールドは tag、type、name、role、label、placeholder、必須、現在値、選択肢を返し、checkbox / radio では `checked` も返す。password の値は常に空文字で返す。select の option と radio / checkbox の label は、候補一致の根拠としてモデルとレビューの双方が参照する。
 - 探索上限は最大 25 form candidate、200 field candidate、モデルへ返す観察結果は最大 10 form、合計 100 field、本文 20,000 文字までとする。
 - open / closed Shadow DOMは探索対象で、管理下テストでは送信まで検証済みである。ただし実サイトでの互換性検証は継続する。

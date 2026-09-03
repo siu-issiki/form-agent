@@ -270,6 +270,10 @@ DLQへ移動したジョブを確認する。
 
 `data_json`にはturn、固定のtool名、stage、result codeだけが入り、URL、会社名、フォーム値、モデルの自由文は保存されない。
 
+## 検証サービスhostの追加と削除
+
+reCAPTCHA / hCaptcha / Turnstileのhostは`src/browser-network-policy.ts`の`VERIFICATION_PROVIDER_ALLOWLIST`にコードとして固定されている。運用中に設定で変えることはできず、変更にはコード変更・レビュー・deployが必要である。追加する場合は、そのhostが検証widgetの配信・検証だけに使われることを確認し、可能な限り`pathPrefix`でパスを絞る（例: `/recaptcha/`）。パスを絞れないhostは全パスが開くため、検証サービス専用のhostに限る。サブドメインを開く`allowSubdomains`は、そのドメイン全体が検証サービスのものである場合だけに使う。追加後は`test/restricted-browser.test.ts`の`pins the verification provider allowlist to known hosts`が期待値を固定しているので併せて更新し、`bun run test`で全件を確認してからdeployする。削除する場合は、対象サービスを使うフォームで`CAPTCHA_REQUIRED`が増えないかをdry-runで確認する。deploy後は`browser_verification_requests`の件数を追い、想定外に増減していないかを見る。
+
 ## BrowserUse sessionの確認と停止
 
 通常はジョブ終了時にWorkerがsessionを`stop`する。Workerが強制終了した場合、DLQへ落ちた場合、`stop`が失敗した場合はsessionが残るため、`BROWSER_USE_API_KEY`を持つ環境から確認する。API keyはシェル履歴へ残さず、`--env-file`で渡す。
