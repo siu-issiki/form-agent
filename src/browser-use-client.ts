@@ -368,7 +368,6 @@ function parseSession(value: unknown): BrowserSession {
 		logApiDiagnostic("parse", "INVALID_SESSION", {
 			keys: Object.keys(value).sort(),
 			statusType: typeof status,
-			statusValue: typeof status === "string" ? status.slice(0, 32) : null,
 		});
 		throw new BrowserUseResponseError("Browser Use returned an invalid status");
 	}
