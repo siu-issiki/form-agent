@@ -53,6 +53,13 @@ import {
 	toObservedFieldState,
 	waitForSubmissionConfirmation,
 } from "../src/browser-use-cdp-driver";
+import {
+	BrowserUseApiError,
+	type BrowserUseClient,
+	BrowserUseRequestError,
+	BrowserUseResponseError,
+	SESSION_STILL_ACTIVE_MESSAGE,
+} from "../src/browser-use-client";
 import type { Job } from "../src/job";
 import {
 	BrowserElementError,
@@ -1638,6 +1645,103 @@ const connectJob: Job = {
 	updatedAt: "2026-09-03T00:00:00.000Z",
 };
 
+interface FakeBrowserUseClientOptions {
+	createFailures?: ReadonlyArray<unknown>;
+	cdpUrl?: string;
+	stopError?: unknown;
+	stopErrorsById?: Readonly<Record<string, unknown>>;
+	activeSessions?: ReadonlyArray<{ id: string; jobId?: string }>;
+	listError?: unknown;
+	onCreate?: () => void;
+}
+
+class FakeBrowserUseClient {
+	createCount = 0;
+	readonly createdMetadata: Array<Record<string, string>> = [];
+	readonly createdTimeouts: number[] = [];
+	readonly stopped: Array<{ id: string; hasSignal: boolean }> = [];
+	readonly listedFilters: Array<string | undefined> = [];
+	readonly calls: string[] = [];
+
+	constructor(private readonly options: FakeBrowserUseClientOptions = {}) {}
+
+	get onCreate(): (() => void) | undefined {
+		return this.options.onCreate;
+	}
+
+	async createBrowser(options: {
+		timeoutMinutes?: number;
+		metadata?: Record<string, string>;
+		signal?: AbortSignal;
+	}): Promise<unknown> {
+		const index = this.createCount;
+		this.createCount += 1;
+		this.calls.push("create");
+		this.createdMetadata.push(options.metadata ?? {});
+		this.createdTimeouts.push(options.timeoutMinutes ?? 0);
+		this.options.onCreate?.();
+		const failure = this.options.createFailures?.[index];
+		if (failure) throw failure;
+		return this.#session(`session-${index + 1}`, options.metadata ?? {});
+	}
+
+	async stopBrowser(sessionId: string, signal?: AbortSignal): Promise<unknown> {
+		this.stopped.push({ id: sessionId, hasSignal: Boolean(signal) });
+		this.calls.push(`stop:${sessionId}`);
+		const failure =
+			this.options.stopErrorsById?.[sessionId] ?? this.options.stopError;
+		if (failure) throw failure;
+		return this.#session(sessionId, {});
+	}
+
+	async listBrowsers(status?: "active" | "stopped"): Promise<unknown[]> {
+		this.listedFilters.push(status);
+		this.calls.push("list");
+		if (this.options.listError) throw this.options.listError;
+		return (this.options.activeSessions ?? []).map((session) =>
+			this.#session(
+				session.id,
+				session.jobId === undefined ? {} : { jobId: session.jobId },
+			),
+		);
+	}
+
+	#session(id: string, metadata: Record<string, string>): unknown {
+		return {
+			id,
+			status: "active",
+			cdpUrl: this.options.cdpUrl ?? "wss://connect.browser-use.com/session",
+			liveUrl: null,
+			timeoutAt: "2026-09-03T00:12:00.000Z",
+			startedAt: "2026-09-03T00:00:00.000Z",
+			finishedAt: null,
+			metadata,
+		};
+	}
+}
+
+function asClient(client: FakeBrowserUseClient): BrowserUseClient {
+	return client as unknown as BrowserUseClient;
+}
+
+function captureLogs(): { logs: string[]; restore: () => void } {
+	const logs: string[] = [];
+	const originalLog = console.log;
+	console.log = (message: unknown) => {
+		logs.push(String(message));
+	};
+	return {
+		logs,
+		restore: () => {
+			console.log = originalLog;
+		},
+	};
+}
+
+function logEvents(logs: readonly string[]): unknown[] {
+	return logs.map((entry) => JSON.parse(entry));
+}
+
 class FakeCdpConnection {
 	closeCount = 0;
 	readonly sent: string[] = [];
@@ -1708,27 +1812,22 @@ describe("BrowserUseCdpDriver.connect retries", () => {
 
 		let driver: BrowserUseCdpDriver;
 		try {
-			driver = await BrowserUseCdpDriver.connect(
-				"api-key",
-				connectJob,
-				true,
-				"wss://connect.browser-use.com",
-				{
-					retryDelaysMs: [10, 20, 30],
-					sleep: async (ms) => {
-						delays.push(ms);
-					},
-					connectConnection: async () => {
-						const connection = new FakeCdpConnection(
-							connections.length === 0
-								? new Error("Browser Use CDP connection closed")
-								: undefined,
-						);
-						connections.push(connection);
-						return asConnection(connection);
-					},
+			driver = await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(new FakeBrowserUseClient()),
+				retryDelaysMs: [10, 20, 30],
+				sleep: async (ms) => {
+					delays.push(ms);
 				},
-			);
+				connectConnection: async () => {
+					const connection = new FakeCdpConnection(
+						connections.length === 0
+							? new Error("Browser Use CDP connection closed")
+							: undefined,
+					);
+					connections.push(connection);
+					return asConnection(connection);
+				},
+			});
 		} finally {
 			captured.restore();
 		}
@@ -1755,23 +1854,18 @@ describe("BrowserUseCdpDriver.connect retries", () => {
 
 		let caught: unknown;
 		try {
-			await BrowserUseCdpDriver.connect(
-				"api-key",
-				connectJob,
-				true,
-				"wss://connect.browser-use.com",
-				{
-					retryDelaysMs: [10, 20, 30],
-					sleep: async (ms) => {
-						delays.push(ms);
-					},
-					connectConnection: async () => {
-						const connection = new FakeCdpConnection(failure);
-						connections.push(connection);
-						return asConnection(connection);
-					},
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(new FakeBrowserUseClient()),
+				retryDelaysMs: [10, 20, 30],
+				sleep: async (ms) => {
+					delays.push(ms);
 				},
-			);
+				connectConnection: async () => {
+					const connection = new FakeCdpConnection(failure);
+					connections.push(connection);
+					return asConnection(connection);
+				},
+			});
 		} catch (error) {
 			caught = error;
 		} finally {
@@ -1797,23 +1891,21 @@ describe("BrowserUseCdpDriver.connect retries", () => {
 	test("does not retry a rejected endpoint", async () => {
 		let connectAttempts = 0;
 		const captured = captureWarnings();
+		const client = new FakeBrowserUseClient({
+			cdpUrl: "wss://connect.example.com/session",
+		});
 
 		let caught: unknown;
 		try {
-			await BrowserUseCdpDriver.connect(
-				"api-key",
-				connectJob,
-				true,
-				"wss://connect.example.com",
-				{
-					retryDelaysMs: [10, 20, 30],
-					sleep: async () => {},
-					connectConnection: async () => {
-						connectAttempts += 1;
-						return asConnection(new FakeCdpConnection());
-					},
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(client),
+				retryDelaysMs: [10, 20, 30],
+				sleep: async () => {},
+				connectConnection: async () => {
+					connectAttempts += 1;
+					return asConnection(new FakeCdpConnection());
 				},
-			);
+			});
 		} catch (error) {
 			caught = error;
 		} finally {
@@ -1822,6 +1914,8 @@ describe("BrowserUseCdpDriver.connect retries", () => {
 
 		expect((caught as Error).message).toBe("Invalid Browser Use CDP endpoint");
 		expect(connectAttempts).toBe(0);
+		expect(client.createCount).toBe(1);
+		expect(client.stopped).toEqual([{ id: "session-1", hasSignal: true }]);
 		expect(captured.warnings).toEqual([]);
 	});
 
@@ -1831,23 +1925,18 @@ describe("BrowserUseCdpDriver.connect retries", () => {
 
 		let caught: unknown;
 		try {
-			await BrowserUseCdpDriver.connect(
-				"api-key",
-				connectJob,
-				true,
-				"wss://connect.browser-use.com",
-				{
-					retryDelaysMs: [10, 20, 30],
-					sleep: async () => {},
-					connectConnection: async () => {
-						const connection = new FakeCdpConnection(
-							new BrowserUseCdpPayloadTooLargeError(),
-						);
-						connections.push(connection);
-						return asConnection(connection);
-					},
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(new FakeBrowserUseClient()),
+				retryDelaysMs: [10, 20, 30],
+				sleep: async () => {},
+				connectConnection: async () => {
+					const connection = new FakeCdpConnection(
+						new BrowserUseCdpPayloadTooLargeError(),
+					);
+					connections.push(connection);
+					return asConnection(connection);
 				},
-			);
+			});
 		} catch (error) {
 			caught = error;
 		} finally {
@@ -1955,20 +2044,15 @@ describe("BrowserUseCdpDriver.connect upgrade classification", () => {
 
 		let caught: unknown;
 		try {
-			await BrowserUseCdpDriver.connect(
-				"api-key",
-				connectJob,
-				true,
-				"wss://connect.browser-use.com",
-				{
-					retryDelaysMs: [10, 20, 30],
-					sleep: async () => {},
-					connectConnection: async () => {
-						connectAttempts += 1;
-						throw new BrowserUseCdpUpgradeRejectedError(401);
-					},
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(new FakeBrowserUseClient()),
+				retryDelaysMs: [10, 20, 30],
+				sleep: async () => {},
+				connectConnection: async () => {
+					connectAttempts += 1;
+					throw new BrowserUseCdpUpgradeRejectedError(401);
 				},
-			);
+			});
 		} catch (error) {
 			caught = error;
 		} finally {
@@ -1987,20 +2071,15 @@ describe("BrowserUseCdpDriver.connect upgrade classification", () => {
 
 		let caught: unknown;
 		try {
-			await BrowserUseCdpDriver.connect(
-				"api-key",
-				connectJob,
-				true,
-				"wss://connect.browser-use.com",
-				{
-					retryDelaysMs: [10, 20, 30],
-					sleep: async () => {},
-					connectConnection: async () => {
-						connectAttempts += 1;
-						throw new BrowserUseCdpUpgradeRejectedError(503);
-					},
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(new FakeBrowserUseClient()),
+				retryDelaysMs: [10, 20, 30],
+				sleep: async () => {},
+				connectConnection: async () => {
+					connectAttempts += 1;
+					throw new BrowserUseCdpUpgradeRejectedError(503);
 				},
-			);
+			});
 		} catch (error) {
 			caught = error;
 		} finally {
@@ -2026,20 +2105,15 @@ describe("BrowserUseCdpDriver.connect upgrade classification", () => {
 
 		let caught: unknown;
 		try {
-			await BrowserUseCdpDriver.connect(
-				"api-key",
-				connectJob,
-				true,
-				"wss://connect.browser-use.com",
-				{
-					retryDelaysMs: [10, 20, 30],
-					sleep: async () => {},
-					connectConnection: async () => {
-						connectAttempts += 1;
-						throw failure;
-					},
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(new FakeBrowserUseClient()),
+				retryDelaysMs: [10, 20, 30],
+				sleep: async () => {},
+				connectConnection: async () => {
+					connectAttempts += 1;
+					throw failure;
 				},
-			);
+			});
 		} catch (error) {
 			caught = error;
 		} finally {
@@ -2194,22 +2268,17 @@ describe("BrowserUseCdpDriver.connect close classification", () => {
 		const captured = captureWarnings();
 		let caught: unknown;
 		try {
-			await BrowserUseCdpDriver.connect(
-				"api-key",
-				connectJob,
-				true,
-				"wss://connect.browser-use.com",
-				{
-					retryDelaysMs: options.retryDelaysMs ?? [10, 20, 30],
-					...(options.signal ? { signal: options.signal } : {}),
-					...(options.signal ? {} : { sleep: async () => {} }),
-					connectConnection: async () => {
-						const connection = new FakeCdpConnection(failure);
-						connections.push(connection);
-						return asConnection(connection);
-					},
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(new FakeBrowserUseClient()),
+				retryDelaysMs: options.retryDelaysMs ?? [10, 20, 30],
+				...(options.signal ? { signal: options.signal } : {}),
+				...(options.signal ? {} : { sleep: async () => {} }),
+				connectConnection: async () => {
+					const connection = new FakeCdpConnection(failure);
+					connections.push(connection);
+					return asConnection(connection);
 				},
-			);
+			});
 		} catch (error) {
 			caught = error;
 		} finally {
@@ -2322,34 +2391,29 @@ describe("BrowserUseCdpConnection error before close", () => {
 
 		let caught: unknown;
 		try {
-			await BrowserUseCdpDriver.connect(
-				"api-key",
-				connectJob,
-				true,
-				"wss://connect.browser-use.com",
-				{
-					retryDelaysMs: [10, 20, 30],
-					sleep: async () => {},
-					connectConnection: async () => {
-						const webSocket = new FakeWebSocket();
-						sockets.push(webSocket);
-						const connection = await BrowserUseCdpConnection.connect(
-							"wss://connect.browser-use.com/session",
-							stubUpgradeFetch(webSocket),
-							20,
-						);
-						setTimeout(() => {
-							webSocket.emit("error", {});
-							webSocket.emit("close", {
-								code: 1008,
-								reason: "policy violation",
-								wasClean: false,
-							});
-						}, 0);
-						return connection;
-					},
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(new FakeBrowserUseClient()),
+				retryDelaysMs: [10, 20, 30],
+				sleep: async () => {},
+				connectConnection: async () => {
+					const webSocket = new FakeWebSocket();
+					sockets.push(webSocket);
+					const connection = await BrowserUseCdpConnection.connect(
+						"wss://connect.browser-use.com/session",
+						stubUpgradeFetch(webSocket),
+						20,
+					);
+					setTimeout(() => {
+						webSocket.emit("error", {});
+						webSocket.emit("close", {
+							code: 1008,
+							reason: "policy violation",
+							wasClean: false,
+						});
+					}, 0);
+					return connection;
 				},
-			);
+			});
 		} catch (error) {
 			caught = error;
 		} finally {
@@ -2361,5 +2425,662 @@ describe("BrowserUseCdpConnection error before close", () => {
 		expect(sockets).toHaveLength(1);
 		// The remote already closed the socket, so the driver does not close it again.
 		expect(sockets[0]?.closeCalls).toEqual([]);
+	});
+});
+
+class HangingCdpConnection {
+	closeCount = 0;
+	#rejects: Array<(error: Error) => void> = [];
+
+	send<TResult>(method: string): Promise<TResult> {
+		if (method === "Target.getTargets" || method === "Target.attachToTarget") {
+			return Promise.resolve(fakeCdpResponse(method) as TResult);
+		}
+		return new Promise<TResult>((_, reject) => {
+			this.#rejects.push(reject);
+		});
+	}
+
+	on(): () => void {
+		return () => {};
+	}
+
+	close(): void {
+		this.closeCount += 1;
+		const rejects = this.#rejects;
+		this.#rejects = [];
+		for (const reject of rejects) {
+			reject(new Error("Browser Use CDP connection is closed"));
+		}
+	}
+}
+
+describe("BrowserUseCdpDriver session lifecycle", () => {
+	test("creates a session, resolves its debugger endpoint and stops it on close", async () => {
+		const client = new FakeBrowserUseClient({
+			cdpUrl: "https://cdp.browser-use.com/session-1/",
+		});
+		const versionRequests: string[] = [];
+		const connections: FakeCdpConnection[] = [];
+		const captured = captureLogs();
+
+		try {
+			const driver = await BrowserUseCdpDriver.connect(
+				"api-key",
+				connectJob,
+				true,
+				{
+					client: asClient(client),
+					fetcher: async (url) => {
+						versionRequests.push(url);
+						return Response.json({
+							webSocketDebuggerUrl:
+								"ws://cdp.browser-use.com/devtools/browser/abc",
+						});
+					},
+					connectConnection: async (webSocketUrl) => {
+						expect(webSocketUrl).toBe(
+							"wss://cdp.browser-use.com/devtools/browser/abc",
+						);
+						const connection = new FakeCdpConnection();
+						connections.push(connection);
+						return asConnection(connection);
+					},
+				},
+			);
+			await driver.close();
+		} finally {
+			captured.restore();
+		}
+
+		expect(versionRequests).toEqual([
+			"https://cdp.browser-use.com/session-1/json/version",
+		]);
+		expect(client.createdTimeouts).toEqual([12]);
+		expect(client.createdMetadata).toEqual([
+			{ jobId: connectJob.id, dryRun: "true" },
+		]);
+		expect(client.stopped).toEqual([{ id: "session-1", hasSignal: true }]);
+		expect(connections[0]?.closeCount).toBe(1);
+		expect(logEvents(captured.logs)).toEqual([
+			{ event: "browser_use_session_created", cdpScheme: "https", attempt: 0 },
+			{
+				event: "browser_use_session_stopped",
+				ok: true,
+				durationMs: expect.any(Number),
+			},
+		]);
+	});
+
+	test("stops the session of a failed attempt before creating the next one", async () => {
+		const client = new FakeBrowserUseClient();
+		const captured = captureWarnings();
+		let attempts = 0;
+
+		let driver: BrowserUseCdpDriver;
+		try {
+			driver = await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(client),
+				retryDelaysMs: [10, 20, 30],
+				sleep: async () => {},
+				connectConnection: async () => {
+					attempts += 1;
+					return asConnection(
+						new FakeCdpConnection(
+							attempts === 1
+								? new Error("Browser Use CDP connection closed")
+								: undefined,
+						),
+					);
+				},
+			});
+		} finally {
+			captured.restore();
+		}
+
+		expect(driver).toBeInstanceOf(BrowserUseCdpDriver);
+		expect(client.createCount).toBe(2);
+		expect(client.stopped).toEqual([{ id: "session-1", hasSignal: true }]);
+	});
+
+	test("retries a session limit and reports it without a provider message", async () => {
+		const client = new FakeBrowserUseClient({
+			createFailures: [
+				new BrowserUseApiError("create", 429),
+				new BrowserUseApiError("create", 429),
+			],
+		});
+		const captured = captureWarnings();
+
+		try {
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(client),
+				retryDelaysMs: [10, 20, 30],
+				sleep: async () => {},
+				connectConnection: async () => asConnection(new FakeCdpConnection()),
+			});
+		} finally {
+			captured.restore();
+		}
+
+		expect(client.createCount).toBe(3);
+		expect(client.stopped).toEqual([]);
+		expect(JSON.parse(captured.warnings[0] ?? "{}")).toEqual({
+			event: "browser_use_connect_retry",
+			attempt: 1,
+			delayMs: 10,
+			reason: "SESSION_LIMIT",
+			status: 429,
+		});
+	});
+
+	test("does not retry a rejected session request", async () => {
+		const client = new FakeBrowserUseClient({
+			createFailures: [new BrowserUseApiError("create", 401)],
+		});
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(client),
+				retryDelaysMs: [10, 20, 30],
+				sleep: async () => {},
+				connectConnection: async () => asConnection(new FakeCdpConnection()),
+			});
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect(caught).toBeInstanceOf(BrowserUseApiError);
+		expect((caught as BrowserUseApiError).status).toBe(401);
+		expect(client.createCount).toBe(1);
+		expect(client.stopped).toEqual([]);
+		expect(captured.warnings).toEqual([]);
+	});
+
+	test("stops the session once when close is called twice", async () => {
+		const client = new FakeBrowserUseClient();
+		const captured = captureLogs();
+
+		try {
+			const driver = await BrowserUseCdpDriver.connect(
+				"api-key",
+				connectJob,
+				true,
+				{
+					client: asClient(client),
+					connectConnection: async () => asConnection(new FakeCdpConnection()),
+				},
+			);
+			await Promise.all([driver.close(), driver.close()]);
+			await driver.close();
+		} finally {
+			captured.restore();
+		}
+
+		expect(client.stopped).toHaveLength(1);
+		expect(
+			logEvents(captured.logs).filter(
+				(entry) =>
+					(entry as { event: string }).event === "browser_use_session_stopped",
+			),
+		).toHaveLength(1);
+	});
+
+	test("records a failed stop without failing the close", async () => {
+		const client = new FakeBrowserUseClient({
+			stopError: new BrowserUseApiError("stop", 500),
+		});
+		const captured = captureLogs();
+
+		try {
+			const driver = await BrowserUseCdpDriver.connect(
+				"api-key",
+				connectJob,
+				true,
+				{
+					client: asClient(client),
+					connectConnection: async () => asConnection(new FakeCdpConnection()),
+				},
+			);
+			await driver.close();
+		} finally {
+			captured.restore();
+		}
+
+		expect(logEvents(captured.logs)[1]).toEqual({
+			event: "browser_use_session_stopped",
+			ok: false,
+			reason: "API_ERROR",
+			status: 500,
+			durationMs: expect.any(Number),
+		});
+	});
+
+	test("stops a created session when the run is aborted before the connection opens", async () => {
+		const controller = new AbortController();
+		const client = new FakeBrowserUseClient({
+			onCreate: () => controller.abort(),
+		});
+		let connectAttempts = 0;
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(client),
+				signal: controller.signal,
+				retryDelaysMs: [10],
+				connectConnection: async () => {
+					connectAttempts += 1;
+					return asConnection(new FakeCdpConnection());
+				},
+			});
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect((caught as Error).message).toBe(
+			"Browser Use CDP connection aborted",
+		);
+		expect(connectAttempts).toBe(0);
+		expect(client.stopped).toEqual([{ id: "session-1", hasSignal: true }]);
+	});
+
+	test("retries a transport failure while resolving the debugger endpoint", async () => {
+		const client = new FakeBrowserUseClient({
+			cdpUrl: "https://cdp.browser-use.com/session",
+		});
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(client),
+				retryDelaysMs: [10, 20, 30],
+				sleep: async () => {},
+				fetcher: async () => {
+					throw new TypeError("Network connection lost");
+				},
+				connectConnection: async () => asConnection(new FakeCdpConnection()),
+			});
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect(caught).toBeInstanceOf(BrowserUseRequestError);
+		expect(client.createCount).toBe(4);
+		expect(client.stopped).toHaveLength(4);
+		expect(JSON.parse(captured.warnings[0] ?? "{}")).toEqual({
+			event: "browser_use_connect_retry",
+			attempt: 1,
+			delayMs: 10,
+			reason: "SESSION_CREATE_FAILED",
+		});
+	});
+
+	test("retries an invalid debugger response as a transient provider failure", async () => {
+		const client = new FakeBrowserUseClient({
+			cdpUrl: "https://cdp.browser-use.com/session",
+		});
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(client),
+				retryDelaysMs: [10],
+				sleep: async () => {},
+				fetcher: async () => Response.json({}),
+				connectConnection: async () => asConnection(new FakeCdpConnection()),
+			});
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect(caught).toBeInstanceOf(BrowserUseResponseError);
+		expect(client.createCount).toBe(2);
+	});
+
+	test("reclaims the sessions left by an earlier attempt of the same job", async () => {
+		const client = new FakeBrowserUseClient({
+			activeSessions: [
+				{ id: "stale-1", jobId: connectJob.id },
+				{ id: "other-1", jobId: "another-job" },
+				{ id: "untagged-1" },
+			],
+		});
+		const captured = captureLogs();
+
+		try {
+			await BrowserUseCdpDriver.connect(
+				"api-key",
+				{ ...connectJob, attemptCount: 2 },
+				true,
+				{
+					client: asClient(client),
+					connectConnection: async () => asConnection(new FakeCdpConnection()),
+				},
+			);
+		} finally {
+			captured.restore();
+		}
+
+		expect(client.listedFilters).toEqual(["active"]);
+		expect(client.stopped).toEqual([{ id: "stale-1", hasSignal: true }]);
+		expect(client.createCount).toBe(1);
+		expect(logEvents(captured.logs)).toEqual([
+			{
+				event: "browser_use_session_stopped",
+				ok: true,
+				durationMs: expect.any(Number),
+			},
+			{
+				event: "browser_use_session_reclaimed",
+				ok: true,
+				matched: 1,
+				stopped: 1,
+				failed: 0,
+			},
+			{ event: "browser_use_session_created", cdpScheme: "wss", attempt: 0 },
+		]);
+	});
+
+	test("does not reclaim sessions on the first attempt of a job", async () => {
+		const client = new FakeBrowserUseClient({
+			activeSessions: [{ id: "stale-1", jobId: connectJob.id }],
+		});
+		const captured = captureLogs();
+
+		try {
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(client),
+				connectConnection: async () => asConnection(new FakeCdpConnection()),
+			});
+		} finally {
+			captured.restore();
+		}
+
+		expect(client.listedFilters).toEqual([]);
+		expect(client.stopped).toEqual([]);
+	});
+
+	test("closes the connection and stops the session when the run is aborted during setup", async () => {
+		const controller = new AbortController();
+		const client = new FakeBrowserUseClient();
+		const connections: HangingCdpConnection[] = [];
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(client),
+				signal: controller.signal,
+				retryDelaysMs: [5_000],
+				connectConnection: async () => {
+					const connection = new HangingCdpConnection();
+					connections.push(connection);
+					setTimeout(() => controller.abort(), 10);
+					return connection as unknown as BrowserUseCdpConnection;
+				},
+			});
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect((caught as Error).message).toBe(
+			"Browser Use CDP connection aborted",
+		);
+		expect(connections).toHaveLength(1);
+		expect(connections[0]?.closeCount).toBeGreaterThanOrEqual(1);
+		expect(client.stopped).toEqual([{ id: "session-1", hasSignal: true }]);
+	});
+});
+
+describe("BrowserUseCdpDriver session recovery", () => {
+	test("does not retry a redirected debugger endpoint", async () => {
+		const client = new FakeBrowserUseClient({
+			cdpUrl: "https://cdp.browser-use.com/session",
+		});
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(client),
+				retryDelaysMs: [10, 20, 30],
+				sleep: async () => {},
+				fetcher: async () =>
+					new Response(null, {
+						status: 302,
+						headers: { Location: "https://evil.example/json/version" },
+					}),
+				connectConnection: async () => asConnection(new FakeCdpConnection()),
+			});
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect(caught).toBeInstanceOf(BrowserUseApiError);
+		expect((caught as BrowserUseApiError).status).toBe(302);
+		expect(client.createCount).toBe(1);
+		expect(client.stopped).toEqual([{ id: "session-1", hasSignal: true }]);
+		expect(captured.warnings).toEqual([]);
+	});
+
+	test("stops an unusable created session and reclaims before the next attempt", async () => {
+		const client = new FakeBrowserUseClient({
+			createFailures: [
+				new BrowserUseResponseError(
+					"Browser Use did not return an active session with a CDP URL",
+					"session-lost",
+				),
+			],
+		});
+		const captured = captureWarnings();
+
+		let driver: BrowserUseCdpDriver;
+		try {
+			driver = await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(client),
+				retryDelaysMs: [10, 20, 30],
+				sleep: async () => {},
+				connectConnection: async () => asConnection(new FakeCdpConnection()),
+			});
+		} finally {
+			captured.restore();
+		}
+
+		expect(driver).toBeInstanceOf(BrowserUseCdpDriver);
+		expect(client.calls).toEqual([
+			"create",
+			"stop:session-lost",
+			"list",
+			"create",
+		]);
+		expect(client.listedFilters).toEqual(["active"]);
+	});
+
+	test("reclaims a session the provider kept from a failed attempt", async () => {
+		const client = new FakeBrowserUseClient({
+			createFailures: [new BrowserUseApiError("create", 503)],
+			activeSessions: [{ id: "orphan-1", jobId: connectJob.id }],
+		});
+		const captured = captureWarnings();
+
+		try {
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(client),
+				retryDelaysMs: [10],
+				sleep: async () => {},
+				connectConnection: async () => asConnection(new FakeCdpConnection()),
+			});
+		} finally {
+			captured.restore();
+		}
+
+		expect(client.calls).toEqual(["create", "list", "stop:orphan-1", "create"]);
+	});
+
+	test("ends the run without retrying when the upgrade is aborted", async () => {
+		const controller = new AbortController();
+		const client = new FakeBrowserUseClient();
+		const signals: Array<AbortSignal | undefined> = [];
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await BrowserUseCdpDriver.connect("api-key", connectJob, true, {
+				client: asClient(client),
+				signal: controller.signal,
+				retryDelaysMs: [5_000],
+				connectConnection: async (_webSocketUrl, connectSignal) => {
+					signals.push(connectSignal);
+					controller.abort();
+					throw new Error("Browser Use CDP connection aborted");
+				},
+			});
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect((caught as Error).message).toBe(
+			"Browser Use CDP connection aborted",
+		);
+		expect(signals).toEqual([controller.signal]);
+		expect(client.createCount).toBe(1);
+		expect(client.stopped).toEqual([{ id: "session-1", hasSignal: true }]);
+		expect(captured.warnings).toEqual([]);
+	});
+});
+
+describe("BrowserUseCdpConnection upgrade abort", () => {
+	test("reports an aborted upgrade instead of a connection failure", async () => {
+		const controller = new AbortController();
+		const inits: Array<RequestInit | undefined> = [];
+
+		const caught = await BrowserUseCdpConnection.connect(
+			"wss://connect.browser-use.com/session",
+			(async (_url: unknown, init: RequestInit | undefined) => {
+				inits.push(init);
+				controller.abort();
+				throw new Error("The operation was aborted");
+			}) as unknown as typeof fetch,
+			20,
+			controller.signal,
+		).catch((error: unknown) => error);
+
+		expect((caught as Error).message).toBe(
+			"Browser Use CDP connection aborted",
+		);
+		expect(inits[0]?.signal).toBe(controller.signal);
+	});
+
+	test("still reports a transport failure when the run is not aborted", async () => {
+		const controller = new AbortController();
+
+		const caught = await BrowserUseCdpConnection.connect(
+			"wss://connect.browser-use.com/session",
+			(async () => {
+				throw new TypeError("Network connection lost");
+			}) as unknown as typeof fetch,
+			20,
+			controller.signal,
+		).catch((error: unknown) => error);
+
+		expect((caught as Error).message).toBe("Browser Use CDP connection failed");
+	});
+});
+
+describe("BrowserUseCdpDriver session stop accounting", () => {
+	test("records a stop that left the session active as a failure", async () => {
+		const client = new FakeBrowserUseClient({
+			stopError: new BrowserUseResponseError(
+				SESSION_STILL_ACTIVE_MESSAGE,
+				"session-1",
+			),
+		});
+		const captured = captureLogs();
+
+		try {
+			const driver = await BrowserUseCdpDriver.connect(
+				"api-key",
+				connectJob,
+				true,
+				{
+					client: asClient(client),
+					connectConnection: async () => asConnection(new FakeCdpConnection()),
+				},
+			);
+			await driver.close();
+		} finally {
+			captured.restore();
+		}
+
+		expect(logEvents(captured.logs)[1]).toEqual({
+			event: "browser_use_session_stopped",
+			ok: false,
+			reason: "STILL_ACTIVE",
+			durationMs: expect.any(Number),
+		});
+	});
+
+	test("counts only the confirmed stops when reclaiming a job", async () => {
+		const client = new FakeBrowserUseClient({
+			activeSessions: [
+				{ id: "stale-1", jobId: connectJob.id },
+				{ id: "stale-2", jobId: connectJob.id },
+				{ id: "other-1", jobId: "another-job" },
+			],
+			stopErrorsById: { "stale-2": new BrowserUseApiError("stop", 500) },
+		});
+		const captured = captureLogs();
+
+		try {
+			await BrowserUseCdpDriver.connect(
+				"api-key",
+				{ ...connectJob, attemptCount: 2 },
+				true,
+				{
+					client: asClient(client),
+					connectConnection: async () => asConnection(new FakeCdpConnection()),
+				},
+			);
+		} finally {
+			captured.restore();
+		}
+
+		expect(client.stopped.map((entry) => entry.id)).toEqual([
+			"stale-1",
+			"stale-2",
+		]);
+		expect(
+			logEvents(captured.logs).find(
+				(entry) =>
+					(entry as { event: string }).event ===
+					"browser_use_session_reclaimed",
+			),
+		).toEqual({
+			event: "browser_use_session_reclaimed",
+			ok: false,
+			matched: 2,
+			stopped: 1,
+			failed: 1,
+		});
 	});
 });

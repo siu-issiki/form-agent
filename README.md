@@ -72,7 +72,7 @@ Queue Consumer は `AgentRuntime` の結果契約を使い、WorkerからOpenAI 
 
 Responses APIのfunction callingはstrict schema、1ターン1toolで処理します。Worker側でモデル、request/response本文サイズ、出力token、最大turn、1 runの呼び出し回数を固定し、D1の条件付き更新でProvider予算を原子的に消費します。
 
-Worker内の信頼済みhandlerがBrowserUseへCDP接続し、モデルには`navigate` / `observe` / `click` / `fill` / `select` / `submit` / `finish`の高レベルtool定義だけを渡します。`fill` / `select`ではモデルが生の値ではなく`payload.formValues`内の`payloadKey`だけを指定し、handlerがD1の保存値を解決します。BrowserUse認証情報とCDP URLはモデルへ渡さず、対象ドメイン外の通信とService Worker経由の迂回を遮断し、実行終了時に接続を閉じます。
+Worker内の信頼済みhandlerがBrowserUseへCDP接続し、モデルには`navigate` / `observe` / `click` / `fill` / `select` / `submit` / `finish`の高レベルtool定義だけを渡します。`fill` / `select`ではモデルが生の値ではなく`payload.formValues`内の`payloadKey`だけを指定し、handlerがD1の保存値を解決します。BrowserUse認証情報とCDP URLはモデルへ渡さず、対象ドメイン外の通信とService Worker経由の迂回を遮断します。browser sessionはREST API v4で明示的に作成し、実行終了時は接続を閉じたうえでsessionを`stop`します。CDPを切断してもmanaged browserは停止しないため、stopを省くと同時session枠を寿命まで占有します。
 
 production executorは`AGENT_EXECUTOR_ENABLED=true`、`AGENT_MODEL`、`OPENAI_API_KEY`、`BROWSER_USE_API_KEY`がすべて設定された場合だけ有効になります。いずれかが不足する場合は`EXECUTOR_NOT_CONFIGURED`でfail-closedに終了します。
 

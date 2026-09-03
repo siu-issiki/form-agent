@@ -15,6 +15,7 @@ import {
 	BrowserUseCdpPayloadTooLargeError,
 	BrowserUseCdpUpgradeRejectedError,
 } from "../src/browser-use-cdp";
+import { BrowserUseApiError } from "../src/browser-use-client";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobInput } from "../src/job";
 import {
@@ -1468,6 +1469,184 @@ describe("ResponsesAgentExecutor", () => {
 		expect(error.reasonCode).toBe("AGENT_TIMEOUT");
 		expect(driverAttempts).toBe(1);
 		expect(Date.now() - startedAt).toBeLessThan(1_000);
+	});
+
+	test("fails a job without retrying when the browser provider rejects the session request", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () =>
+				Response.json(
+					functionResponse("call-observe", "observe", {}),
+				)) as typeof fetch,
+			createBrowserDriver: async () => {
+				throw new BrowserUseApiError("create", 401);
+			},
+		});
+
+		const error = await executor
+			.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				new AbortController().signal,
+			)
+			.catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(error.reasonCode).toBe("BROWSER_SESSION_REJECTED");
+		expect(error.retryable).toBe(false);
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{
+				turn: 1,
+				toolName: "observe",
+				stage: "driver_connect",
+				resultCode: "BROWSER_SESSION_API_FAILED",
+			},
+		]);
+	});
+
+	test("retries a job when the browser provider is at its session limit", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () =>
+				Response.json(
+					functionResponse("call-observe", "observe", {}),
+				)) as typeof fetch,
+			createBrowserDriver: async () => {
+				throw new BrowserUseApiError("create", 429);
+			},
+		});
+
+		const error = await executor
+			.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				new AbortController().signal,
+			)
+			.catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(error.reasonCode).toBe("BROWSER_TOOL_UNAVAILABLE");
+		expect(error.retryable).toBe(true);
+		expect(await readAgentToolDiagnostics(input.id)).toEqual([
+			{
+				turn: 1,
+				toolName: "observe",
+				stage: "driver_connect",
+				resultCode: "BROWSER_SESSION_LIMIT",
+			},
+		]);
+	});
+
+	test("waits for the browser session to be released before the run returns", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const driver = new WorkerFakeBrowserDriver();
+		const releaseDriver = driver.close.bind(driver);
+		let released = false;
+		driver.close = async () => {
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			await releaseDriver();
+			released = true;
+		};
+		const controller = new AbortController();
+		let providerCalls = 0;
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () => {
+				providerCalls += 1;
+				if (providerCalls > 1) {
+					controller.abort();
+					await new Promise((resolve) => setTimeout(resolve, 20));
+				}
+				return Response.json(
+					functionResponse(`call-observe-${providerCalls}`, "observe", {}),
+				);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const error = await executor
+			.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				controller.signal,
+			)
+			.catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(released).toBe(true);
+		expect(driver.closed).toBe(true);
+	});
+
+	test("releases a session that finishes connecting after the run was aborted", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const driver = new WorkerFakeBrowserDriver();
+		const controller = new AbortController();
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () =>
+				Response.json(
+					functionResponse("call-observe", "observe", {}),
+				)) as typeof fetch,
+			createBrowserDriver: async () => {
+				controller.abort();
+				return driver;
+			},
+		});
+
+		const error = await executor
+			.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				controller.signal,
+			)
+			.catch((caught) => caught);
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(driver.closed).toBe(true);
+		expect(driver.restrictedDomain).toBeUndefined();
+		expect(driver.observed).toBe(false);
 	});
 
 	test("retries infrastructure failures instead of asking the model to classify them", async () => {

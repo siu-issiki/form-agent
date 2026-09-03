@@ -14,6 +14,11 @@ import {
 } from "./browser-use-cdp";
 import { BrowserUseCdpDriver } from "./browser-use-cdp-driver";
 import {
+	BrowserUseApiError,
+	BrowserUseRequestError,
+	BrowserUseResponseError,
+} from "./browser-use-client";
+import {
 	type AgentToolDiagnosticCode,
 	type AgentToolDiagnosticStage,
 	type AgentToolDiagnosticToolName,
@@ -131,7 +136,6 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 					apiKey,
 					job,
 					dryRun,
-					undefined,
 					signal ? { signal } : {},
 				));
 	}
@@ -593,6 +597,16 @@ async function executeToolCall(
 				false,
 			);
 		}
+		if (
+			originalError instanceof BrowserUseApiError &&
+			!originalError.retryable
+		) {
+			throw new AgentExecutionError(
+				"BROWSER_SESSION_REJECTED",
+				"The browser provider rejected the session request.",
+				false,
+			);
+		}
 		throw new AgentExecutionError(
 			"BROWSER_TOOL_UNAVAILABLE",
 			"The browser provider or tool became unavailable.",
@@ -692,6 +706,17 @@ export function classifyToolDiagnostic(
 	}
 	if (error instanceof BrowserUseCdpUpgradeRejectedError) {
 		return "CDP_UPGRADE_REJECTED";
+	}
+	if (error instanceof BrowserUseApiError) {
+		return error.status === 429
+			? "BROWSER_SESSION_LIMIT"
+			: "BROWSER_SESSION_API_FAILED";
+	}
+	if (
+		error instanceof BrowserUseRequestError ||
+		error instanceof BrowserUseResponseError
+	) {
+		return "BROWSER_SESSION_API_FAILED";
 	}
 	if (error instanceof BrowserToolInputError || error instanceof SyntaxError) {
 		return "TOOL_INPUT_INVALID";

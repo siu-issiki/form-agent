@@ -47,6 +47,7 @@ export class BrowserUseCdpConnection {
 		webSocketUrl: string,
 		fetchImpl: typeof fetch = fetch,
 		errorCloseFallbackMs = ERROR_CLOSE_FALLBACK_MS,
+		signal?: AbortSignal,
 	): Promise<BrowserUseCdpConnection> {
 		const url = new URL(webSocketUrl);
 		if (url.protocol !== "wss:") {
@@ -57,8 +58,14 @@ export class BrowserUseCdpConnection {
 		try {
 			response = await fetchImpl(url, {
 				headers: { Upgrade: "websocket" },
+				...(signal ? { signal } : {}),
 			});
 		} catch {
+			// An aborted upgrade is the run ending, not a provider failure, so it
+			// must not be reported as a retryable connection error.
+			if (signal?.aborted) {
+				throw new Error("Browser Use CDP connection aborted");
+			}
 			throw new Error("Browser Use CDP connection failed");
 		}
 		if (response.status !== 101 || !response.webSocket) {
