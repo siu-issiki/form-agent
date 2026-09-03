@@ -37,18 +37,12 @@ export const VERIFICATION_PROVIDER_ALLOWLIST: readonly VerificationProviderHost[
 const VERIFICATION_PROVIDER_METHODS = new Set(["GET", "POST"]);
 
 /**
- * Whether the request may be continued because it belongs to a known
- * verification widget. Only https subresources and XHR / fetch qualify: a
- * `Document` request would be a page navigation, and the run must never leave
- * the target domain.
+ * Whether the URL alone belongs to a known verification widget: https without
+ * credentials, an allowlisted host, and — where the entry names one — a path
+ * below its prefix. Method and resource type are not considered, so the same
+ * rule can be applied to a browser target's URL.
  */
-export function isVerificationProviderRequest(
-	rawUrl: string,
-	method: string,
-	resourceType?: string,
-): boolean {
-	if (resourceType === "Document") return false;
-	if (!VERIFICATION_PROVIDER_METHODS.has(method.toUpperCase())) return false;
+export function isVerificationProviderUrl(rawUrl: string): boolean {
 	let url: URL;
 	try {
 		url = new URL(rawUrl);
@@ -70,6 +64,25 @@ export function isVerificationProviderRequest(
 }
 
 /**
+ * Whether the request may be continued because it belongs to a known
+ * verification widget. Only https and XHR / fetch / subresources qualify in the
+ * top frame: a `Document` request there is a page navigation, and the run must
+ * never leave the target domain. Below the top frame a `Document` request is
+ * the widget's own iframe (`.../recaptcha/api2/anchor`), which has to load for
+ * the widget to work at all, so `subframe` allows exactly that case.
+ */
+export function isVerificationProviderRequest(
+	rawUrl: string,
+	method: string,
+	resourceType?: string,
+	subframe = false,
+): boolean {
+	if (resourceType === "Document" && !subframe) return false;
+	if (!VERIFICATION_PROVIDER_METHODS.has(method.toUpperCase())) return false;
+	return isVerificationProviderUrl(rawUrl);
+}
+
+/**
  * Throws unless the request may be continued. Returns whether it was allowed by
  * {@link VERIFICATION_PROVIDER_ALLOWLIST}, so the caller can count it.
  */
@@ -82,10 +95,13 @@ export function assertAllowedBrowserRequest(
 	blockRequest = false,
 	allowedHosts: readonly string[] = [],
 	resourceType?: string,
+	subframe = false,
 ): boolean {
 	// Checked before every other rule so a widget keeps working after the
 	// dry-run interaction lock and outside the safe-method window.
-	if (isVerificationProviderRequest(url, method, resourceType)) return true;
+	if (isVerificationProviderRequest(url, method, resourceType, subframe)) {
+		return true;
+	}
 	if (blockRequest) throw new NavigationPolicyError();
 	const safeMethod = SAFE_METHODS.has(method.toUpperCase());
 	if (allowExternalRead && safeMethod) {
