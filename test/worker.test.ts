@@ -3940,6 +3940,71 @@ function functionResponse(
 	};
 }
 
+/** A Browser Use session as the provider returns it, with only the fields the client reads. */
+function fakeBrowserUseSession(
+	id: string,
+	jobId: string | undefined,
+	status: "active" | "stopped",
+): Record<string, unknown> {
+	return {
+		id,
+		status,
+		cdpUrl: "wss://connect.browser-use.com/session",
+		liveUrl: null,
+		timeoutAt: "2026-08-28T00:15:00.000Z",
+		startedAt: "2026-08-28T00:00:00.000Z",
+		finishedAt: null,
+		metadata: jobId === undefined ? {} : { source: "form-agent", jobId },
+	};
+}
+
+/**
+ * Answers the Browser Use REST calls the session reclaim makes and passes every
+ * other request to the real fetch, so the Worker bindings keep working.
+ */
+function stubBrowserUseApi(options: {
+	sessions: readonly { id: string; jobId?: string }[];
+	listStatus?: number;
+	stopStatus?: number;
+}): { stopped: string[]; restore: () => void } {
+	const stopped: string[] = [];
+	const originalFetch = globalThis.fetch;
+	const json = (body: unknown, status = 200): Response =>
+		new Response(JSON.stringify(body), {
+			status,
+			headers: { "content-type": "application/json" },
+		});
+
+	vi.stubGlobal(
+		"fetch",
+		async (resource: RequestInfo | URL, init?: RequestInit) => {
+			const url =
+				typeof resource === "string"
+					? resource
+					: resource instanceof URL
+						? resource.toString()
+						: resource.url;
+			if (!url.startsWith("https://api.browser-use.com/")) {
+				return originalFetch(resource, init);
+			}
+			if (url.includes("/browsers?")) {
+				if (options.listStatus) return json({}, options.listStatus);
+				return json({
+					items: options.sessions.map((session) =>
+						fakeBrowserUseSession(session.id, session.jobId, "active"),
+					),
+				});
+			}
+			const id = decodeURIComponent(url.slice(url.lastIndexOf("/") + 1));
+			stopped.push(id);
+			if (options.stopStatus) return json({}, options.stopStatus);
+			return json(fakeBrowserUseSession(id, undefined, "stopped"));
+		},
+	);
+
+	return { stopped, restore: () => vi.unstubAllGlobals() };
+}
+
 describe("Queue orchestration", () => {
 	test("registers a pending job before enqueueing it", async () => {
 		const sent: JobMessage[] = [];
@@ -4195,6 +4260,191 @@ describe("Queue orchestration", () => {
 		expect(persisted?.status).toBe("failed");
 		expect(persisted?.attemptCount).toBe(2);
 		expect(persisted?.result?.reasonCode).toBe("JOB_ATTEMPT_LIMIT_REACHED");
+	});
+
+	test("stops the sessions of the previous attempt when a limited job is redelivered", async () => {
+		const limitedInput = {
+			...input,
+			payload: { ...input.payload, _formAgentMaxAttempts: 1 },
+		};
+		const store = new D1JobStore(env.DB);
+		await store.create(limitedInput, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(
+			limitedInput.id,
+			"message-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		await store.recordRunAttempt(
+			limitedInput.id,
+			"message-1",
+			1,
+			"2026-08-28T00:00:01.000Z",
+		);
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
+			{
+				id: "message-1",
+				timestamp: new Date("2026-08-28T00:00:02.000Z"),
+				body: { jobId: limitedInput.id },
+				attempts: 2,
+			},
+		]);
+		const ctx = createExecutionContext();
+		let executions = 0;
+		const executor: AgentExecutor = {
+			async execute() {
+				executions += 1;
+				return {
+					outcome: "failed",
+					reasonCode: "SHOULD_NOT_RUN",
+					reason: "The agent should not run.",
+					retryable: false,
+				};
+			},
+		};
+		const api = stubBrowserUseApi({
+			sessions: [
+				{ id: "session-1", jobId: limitedInput.id },
+				{ id: "session-2", jobId: "job-other" },
+				{ id: "session-3" },
+			],
+		});
+
+		try {
+			await consumeJobBatch(
+				batch,
+				{ ...env, BROWSER_USE_API_KEY: "test-key" },
+				executor,
+			);
+		} finally {
+			api.restore();
+		}
+		const result = await getQueueResult(batch, ctx);
+		const persisted = await store.find(limitedInput.id);
+
+		expect(executions).toBe(0);
+		// Only the sessions tagged with this job are released: the ones another
+		// job or another user of the API key owns are left alone.
+		expect(api.stopped).toEqual(["session-1"]);
+		expect(result.explicitAcks).toEqual(["message-1"]);
+		expect(result.retryMessages).toEqual([]);
+		expect(persisted?.status).toBe("failed");
+		expect(persisted?.result?.reasonCode).toBe("JOB_ATTEMPT_LIMIT_REACHED");
+	});
+
+	test("records the attempt limit result when the session reclaim fails", async () => {
+		const limitedInput = {
+			...input,
+			payload: { ...input.payload, _formAgentMaxAttempts: 1 },
+		};
+		const store = new D1JobStore(env.DB);
+		await store.create(limitedInput, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(
+			limitedInput.id,
+			"message-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		await store.recordRunAttempt(
+			limitedInput.id,
+			"message-1",
+			1,
+			"2026-08-28T00:00:01.000Z",
+		);
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
+			{
+				id: "message-1",
+				timestamp: new Date("2026-08-28T00:00:02.000Z"),
+				body: { jobId: limitedInput.id },
+				attempts: 2,
+			},
+		]);
+		const ctx = createExecutionContext();
+		const executor: AgentExecutor = {
+			async execute() {
+				return {
+					outcome: "failed",
+					reasonCode: "SHOULD_NOT_RUN",
+					reason: "The agent should not run.",
+					retryable: false,
+				};
+			},
+		};
+		const api = stubBrowserUseApi({
+			sessions: [{ id: "session-1", jobId: limitedInput.id }],
+			listStatus: 500,
+		});
+
+		try {
+			await consumeJobBatch(
+				batch,
+				{ ...env, BROWSER_USE_API_KEY: "test-key" },
+				executor,
+			);
+		} finally {
+			api.restore();
+		}
+		const result = await getQueueResult(batch, ctx);
+		const persisted = await store.find(limitedInput.id);
+
+		expect(api.stopped).toEqual([]);
+		expect(result.explicitAcks).toEqual(["message-1"]);
+		expect(result.retryMessages).toEqual([]);
+		expect(persisted?.status).toBe("failed");
+		expect(persisted?.result?.reasonCode).toBe("JOB_ATTEMPT_LIMIT_REACHED");
+	});
+
+	test("stops the sessions of a job whose consumer fails at the attempt limit", async () => {
+		const limitedInput = {
+			...input,
+			payload: { ...input.payload, _formAgentMaxAttempts: 1 },
+		};
+		const store = new D1JobStore(env.DB);
+		await store.create(limitedInput, "2026-08-28T00:00:00.000Z");
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
+			{
+				id: "message-1",
+				timestamp: new Date("2026-08-28T00:00:01.000Z"),
+				body: { jobId: limitedInput.id },
+				attempts: 1,
+			},
+		]);
+		const ctx = createExecutionContext();
+		const executor: AgentExecutor = {
+			async execute() {
+				return {
+					outcome: "prohibited",
+					formUrl: limitedInput.targetUrl,
+					reasonCode: "SALES_PROHIBITED",
+					reason: "Sales messages are prohibited.",
+				};
+			},
+		};
+		const recordProhibited = vi
+			.spyOn(D1JobStore.prototype, "recordProhibited")
+			.mockRejectedValueOnce(new Error("D1 write failed"));
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		const api = stubBrowserUseApi({
+			sessions: [{ id: "session-1", jobId: limitedInput.id }],
+		});
+
+		try {
+			await consumeJobBatch(
+				batch,
+				{ ...env, BROWSER_USE_API_KEY: "test-key" },
+				executor,
+			);
+		} finally {
+			api.restore();
+			recordProhibited.mockRestore();
+			warn.mockRestore();
+		}
+		const result = await getQueueResult(batch, ctx);
+		const persisted = await store.find(limitedInput.id);
+
+		expect(api.stopped).toEqual(["session-1"]);
+		expect(result.explicitAcks).toEqual(["message-1"]);
+		expect(result.retryMessages).toEqual([]);
+		expect(persisted?.status).toBe("failed");
+		expect(persisted?.result?.reasonCode).toBe("QUEUE_CONSUMER_ERROR");
 	});
 
 	test("persists the reason for a retryable agent exception", async () => {

@@ -4,6 +4,8 @@ import {
 	executeAgent,
 } from "./agent-executor";
 import type { AgentRunResult } from "./agent-runtime";
+import { BrowserUseClient } from "./browser-use-client";
+import { reclaimJobSessions } from "./browser-use-session";
 import { D1JobStore } from "./d1-job-store";
 import { DuplicateJobError, type Job, type JobInput } from "./job";
 import { ResponsesAgentExecutor } from "./responses-agent-executor";
@@ -48,6 +50,8 @@ const RETRY_JITTER_RATIO = 0.2;
 /** 2^10 already exceeds the cap, so the exponent never needs to grow. */
 const MAX_RETRY_EXPONENT = 10;
 const MAX_AGENT_DURATION_MS = 10 * 60 * 1000;
+/** The reclaim runs after the job is already lost, so it waits only briefly. */
+const SESSION_RECLAIM_TIMEOUT_MS = 10_000;
 const MAX_JOB_REQUEST_BYTES = 64 * 1024;
 const JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
@@ -415,6 +419,26 @@ export function computeRetryDelaySeconds(
 	);
 }
 
+/**
+ * A Worker killed mid-attempt, by the CPU limit for example, leaves the browser
+ * sessions of that attempt running until the provider timeout expires, and each
+ * one holds a concurrency slot. The attempt-limit paths end the job without
+ * building a driver, so nothing else would release them; the reclaim is best
+ * effort and never changes the recorded result.
+ */
+async function reclaimAttemptSessions(env: Env, jobId: string): Promise<void> {
+	if (!env.BROWSER_USE_API_KEY) return;
+	try {
+		await reclaimJobSessions(
+			new BrowserUseClient(env.BROWSER_USE_API_KEY, fetch),
+			jobId,
+			AbortSignal.timeout(SESSION_RECLAIM_TIMEOUT_MS),
+		);
+	} catch {
+		// The provider is unreachable; the sessions expire on their own timeout.
+	}
+}
+
 export async function consumeJobBatch(
 	batch: MessageBatch<JobMessage>,
 	env: Env,
@@ -471,6 +495,7 @@ export async function consumeJobBatch(
 				continue;
 			}
 			if (hasExceededAttemptLimit(attemptedJob)) {
+				await reclaimAttemptSessions(env, attemptedJob.id);
 				const failed = await store.recordFailed(
 					attemptedJob.id,
 					runToken,
@@ -507,6 +532,7 @@ export async function consumeJobBatch(
 				}),
 			);
 			if (attemptedJob && hasReachedAttemptLimit(attemptedJob)) {
+				await reclaimAttemptSessions(env, attemptedJob.id);
 				await store.recordFailed(
 					attemptedJob.id,
 					message.id,
