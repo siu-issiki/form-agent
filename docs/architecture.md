@@ -425,20 +425,20 @@ reCAPTCHA / hCaptcha / Turnstile の widget 本体は iframe で読み込まれ�
 **切り離しは停止ではない。** `waitForDebuggerOnStart` の一時停止は browser プロセス側が frame の navigation を保留しているものであり、Chrome は保留を持っていた session が消えると保留を解放する。したがって `Target.detachFromTarget` だけでは frame は「実行されないまま」にならず、制限なしで走り出す。そこで停止処理は次の順で行う。
 
 1. その iframe session へ `Page.navigate({ url: "about:blank" })` を送る。frame target の `Page.navigate` は browser プロセスが処理するため、当該 frame の一時停止した renderer を待たない。かつ保留中の navigation を置き換えるため、widget の document は commit されない。
-2. navigate が受理された場合だけ `Runtime.runIfWaitingForDebugger` を送る。順序が逆だと widget がそのまま走り、navigate が拒否された後に解除しても同じく走るためである。解除後に実行されるのは空ページだけである。
+2. navigate が受理された場合だけ `Runtime.runIfWaitingForDebugger` を送る。順序が逆だと widget がそのまま走り、navigate が拒否された後に解除しても同じく走るためである。解除後に実行されるのは空ページだけである。`Page.navigate` は失敗を例外ではなく結果の `errorText` で返すことがあるため、例外と `errorText` の両方を拒否として扱う。
 3. 最後に `Target.detachFromTarget({ sessionId })` を送る。成否は問わない。
 
-停止した session は以後 continue しない。停止マークを付けた session の `Fetch.requestPaused` は allowlist に一致しても `failRequest` する。停止処理中に飛んできた request で通信させないためである。停止は `browser_verification_frame_stopped` として1行出力し、`reason` は固定値 `RESTRICTION_FAILED` / `NOT_PAUSED` / `NOT_ALLOWLISTED` のみとする。
+停止した session は以後 continue しない。停止マークを付けた session の `Fetch.requestPaused` は allowlist に一致しても `failRequest` する。停止処理中に飛んできた request で通信させないためである。allowlist 外として停止した session も同じ扱いとし、`Fetch.enable` を掛けていなくても request が届けば `failRequest` する。停止は `browser_verification_frame_stopped` として1行出力し、`reason` は固定値 `RESTRICTION_FAILED` / `NOT_PAUSED` / `NOT_ALLOWLISTED` のみとする。
 
 停止処理を行うのは次の場合である。
 
 - 必須の制限が1つでも入らなかった allowlist の iframe（`RESTRICTION_FAILED`）。widget は従来と同じく接続に失敗する。
-- allowlist 外の iframe（`NOT_ALLOWLISTED`）。トップフレーム以外の `Document` を allowlist 外では通さないため本来到達しないが、防御的に停止する。
-- `waitingForDebugger` が false の iframe で、必須の制限が1つでも入らなかった場合（`NOT_PAUSED`）。既に走り出している iframe は、まず必須の制限を試み、3つすべて成功した場合は解除コマンドを送らずそのまま監視下に置く。いずれの場合も policy failure を記録するため、この run は失敗する。`Fetch.enable` が後から入っても既に発行された request には掛からないためである。
+- allowlist 外の iframe（`NOT_ALLOWLISTED`）。トップフレーム以外の `Document` を allowlist 外では通さないため本来到達しないが、防御的に停止する。allowlist 判定は `waitingForDebugger` の値と無関係に常に行う。既に走り出している frame を allowlist 外のまま監視下に置かないためである。
+- allowlist 内で `waitingForDebugger` が false の iframe のうち、必須の制限が1つでも入らなかったもの（`NOT_PAUSED`）。既に走り出している iframe は、まず必須の制限を試み、3つすべて成功した場合は解除コマンドを送らずそのまま監視下に置く。いずれの場合も policy failure を記録するため、この run は失敗する。`Fetch.enable` が後から入っても既に発行された request には掛からないためである。
 
 policy failure は driver の以降の全 CDP コマンドを reject させ run を落とす。`waitingForDebugger` が false の場合は従来どおり記録する。一方、paused な iframe に制限を掛けきれず停止した場合は policy failure にしない。frame を実行させずに済んでおり、run 全体を落とす必要がないためである。
 
-残存リスクは2つある。1つは `about:blank` への navigate 自体が拒否された場合で、その後の detach で元の document が走り得る。この経路では解除コマンドを送らないため、Chrome が保留を解放するかどうかに依存する。もう1つは `waitingForDebugger` が false の iframe で、制限適用前に発行された request と、現在の document に対して escape blocker が評価されない点である（`Page.addScriptToEvaluateOnNewDocument` は次の document から効く）。いずれも policy failure により run が失敗する経路である。上記の停止処理の順序は Chrome / CDP の構造から導いたもので、実 OOPIF での実測は未実施である。
+残存リスクは2つある。1つは `about:blank` への navigate 自体が拒否された場合（例外、または結果の `errorText`）で、その後の detach で元の document が走り得る。この経路では解除コマンドを送らないため、Chrome が保留を解放するかどうかに依存する。もう1つは `waitingForDebugger` が false の iframe で、制限適用前に発行された request と、現在の document に対して escape blocker が評価されない点である（`Page.addScriptToEvaluateOnNewDocument` は次の document から効く）。いずれも policy failure により run が失敗する経路である。上記の停止処理の順序は Chrome / CDP の構造から導いたもので、実 OOPIF での実測は未実施である。
 
 信頼境界は次のとおり維持される。iframe は cross-origin なので親ページの DOM を読めず、入力値も送信先も見えない。iframe 内の通信は固定allowlistに限定される。iframe が `window.top.location` で親フレームを遷移させようとしても、それはトップフレームの `Document` request なので既存の遮断で止まる。残存リスクは従来と同じく検証サービスへ送られる telemetry であり、widget の動作に必要なため許容する。
 

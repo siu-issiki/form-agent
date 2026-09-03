@@ -1553,6 +1553,141 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		expect(failures).toEqual([]);
 	});
 
+	test("keeps a refused emptying navigation from releasing the frame", async () => {
+		const harness = relatedTargetHarness(
+			failFrameCommand("Fetch.enable", "NOT_ALLOWED"),
+			(method) =>
+				method === "Page.navigate"
+					? { errorText: "net::ERR_ABORTED" }
+					: undefined,
+		);
+		const failures: Error[] = [];
+
+		await denyRelatedBrowserTargets(harness.connection, "primary", (error) =>
+			failures.push(error),
+		);
+		const captured = captureLogs();
+		try {
+			harness.emit(
+				"Target.attachedToTarget",
+				{
+					sessionId: "widget-session",
+					targetInfo: {
+						targetId: "widget-1",
+						type: "iframe",
+						url: "https://www.google.com/recaptcha/api2/anchor?k=key",
+					},
+					waitingForDebugger: true,
+				},
+				"primary",
+			);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		} finally {
+			captured.restore();
+		}
+
+		// `Page.navigate` reports the refusal in `errorText` rather than by
+		// rejecting, so the frame stays paused and is only detached.
+		expect(frameCommands(harness.calls, "widget-session")).toEqual([
+			"Fetch.enable",
+			"Page.navigate",
+			"Target.detachFromTarget",
+		]);
+		expect(
+			harness.calls.some(
+				(call) => call.method === "Runtime.runIfWaitingForDebugger",
+			),
+		).toBe(false);
+		expect(failures).toEqual([]);
+	});
+
+	test("stops an unpaused iframe target outside the verification allowlist", async () => {
+		const harness = relatedTargetHarness();
+		const failures: Error[] = [];
+		let frameCount = 0;
+		let requestCount = 0;
+
+		await denyRelatedBrowserTargets(
+			harness.connection,
+			"primary",
+			(error) => failures.push(error),
+			{
+				onVerificationFrame: () => {
+					frameCount += 1;
+				},
+				onVerificationRequest: () => {
+					requestCount += 1;
+				},
+			},
+		);
+		const captured = captureLogs();
+		try {
+			harness.emit(
+				"Target.attachedToTarget",
+				{
+					sessionId: "widget-session",
+					targetInfo: {
+						targetId: "widget-1",
+						type: "iframe",
+						url: "https://evil.example/recaptcha/api2/anchor",
+					},
+					waitingForDebugger: false,
+				},
+				"primary",
+			);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		} finally {
+			captured.restore();
+		}
+
+		// The allowlist decides on its own: a frame that started early gets no
+		// restrictions installed, only the stop.
+		expect(frameCommands(harness.calls, "widget-session")).toEqual([
+			"Page.navigate",
+			"Target.detachFromTarget",
+		]);
+		expect(logEvents(captured.logs)).toEqual([
+			{
+				event: "browser_verification_frame_stopped",
+				reason: "NOT_ALLOWLISTED",
+			},
+		]);
+		expect(failures.map((error) => error.message)).toEqual([
+			"A related browser target was not paused",
+		]);
+
+		// Its requests are failed even though the frame was never registered as a
+		// verification session.
+		harness.emit(
+			"Fetch.requestPaused",
+			{
+				requestId: "late-1",
+				resourceType: "Script",
+				request: {
+					url: "https://www.gstatic.com/recaptcha/x.js",
+					method: "GET",
+				},
+			},
+			"widget-session",
+		);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(
+			harness.calls.filter((call) => call.method === "Fetch.continueRequest"),
+		).toEqual([]);
+		expect(
+			harness.calls.filter((call) => call.method === "Fetch.failRequest"),
+		).toEqual([
+			{
+				method: "Fetch.failRequest",
+				params: { requestId: "late-1", errorReason: "BlockedByClient" },
+				sessionId: "widget-session",
+			},
+		]);
+		expect(requestCount).toBe(0);
+		expect(frameCount).toBe(0);
+	});
+
 	test("blocks page-realm socket, peer, worker, popup, and service worker escapes", async () => {
 		const context = {
 			WebSocket: class {},
@@ -2297,10 +2432,12 @@ function failFrameCommand(
 /**
  * A connection stub for the related-target policy that records the session each
  * command was sent on and keeps every listener the policy registers. `fail`
- * answers with an error for the commands that should not land.
+ * answers with an error for the commands that should not land, and `respond`
+ * replaces the result of a command that answers without rejecting.
  */
 function relatedTargetHarness(
 	fail: (method: string, sessionId?: string) => Error | null = () => null,
+	respond: (method: string, sessionId?: string) => unknown = () => undefined,
 ): {
 	calls: Array<{
 		method: string;
@@ -2351,7 +2488,7 @@ function relatedTargetHarness(
 				calls.push({ method, params, sessionId });
 				const failure = fail(method, sessionId);
 				if (failure) throw failure;
-				return { success: true } as TResult;
+				return (respond(method, sessionId) ?? { success: true }) as TResult;
 			},
 		},
 		emit(method: string, params: unknown, sessionId?: string): void {

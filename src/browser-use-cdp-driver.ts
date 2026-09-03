@@ -2468,7 +2468,12 @@ export async function denyRelatedBrowserTargets(
 	};
 
 	connection.on("Fetch.requestPaused", (params, sessionId) => {
-		if (sessionId === undefined || !verificationSessions.has(sessionId)) return;
+		if (
+			sessionId === undefined ||
+			!(verificationSessions.has(sessionId) || stoppedSessions.has(sessionId))
+		) {
+			return;
+		}
 		const paused = params as PausedRequest;
 		// Inside the widget's own frame a `Document` request is the widget, not a
 		// page navigation, so subframe `Document` requests may pass the allowlist.
@@ -2521,7 +2526,10 @@ export async function denyRelatedBrowserTargets(
 			// run is failed either way. The restrictions are still attempted, since
 			// a frame under them is better than one running loose until the run ends.
 			onPolicyFailure(new Error("A related browser target was not paused"));
-		} else if (!isVerificationProviderUrl(attached.targetInfo.url ?? "")) {
+		}
+		// The allowlist decides on its own, whether or not the frame was paused:
+		// a frame that started early is no more trusted than one that did not.
+		if (!isVerificationProviderUrl(attached.targetInfo.url ?? "")) {
 			// The page's own request policy blocks a subframe `Document` outside the
 			// allowlist, so no such target should appear. Stopped, not trusted.
 			stopFrame(attached.sessionId, "NOT_ALLOWLISTED", paused);
@@ -2645,11 +2653,13 @@ async function runVerificationProviderFrame(
  * paused renderer, and it supersedes the navigation the frame is held on, which
  * is why the widget document never gets to commit. Only then is the debugger
  * pause released, and only if the navigation was accepted: releasing first
- * would let the widget run, and releasing after a rejected navigation would let
- * it run too. The pause is a browser-side hold that Chrome frees when the
- * session owning it goes away, so detaching is the last step and never the
- * stop by itself. A frame whose `about:blank` navigation is refused is the one
- * case left where detaching may let the original document run.
+ * would let the widget run, and releasing after a refused navigation would let
+ * it run too. A refusal arrives as `errorText` on a resolved answer as often as
+ * it does as a rejection, so both count as refused. The pause is a browser-side
+ * hold that Chrome frees when the session owning it goes away, so detaching is
+ * the last step and never the stop by itself. A frame whose `about:blank`
+ * navigation is refused is the one case left where detaching may let the
+ * original document run.
  */
 async function stopVerificationProviderFrame(
 	connection: Pick<BrowserUseCdpConnection, "send">,
@@ -2660,11 +2670,9 @@ async function stopVerificationProviderFrame(
 	console.log(
 		JSON.stringify({ event: "browser_verification_frame_stopped", reason }),
 	);
-	const navigated = await sendVerificationFrameStopCommand(
+	const navigated = await navigateVerificationFrameToBlank(
 		connection,
 		sessionId,
-		"Page.navigate",
-		{ url: "about:blank" },
 	);
 	if (navigated && paused) {
 		await sendVerificationFrameStopCommand(
@@ -2678,6 +2686,27 @@ async function stopVerificationProviderFrame(
 	await connection
 		.send("Target.detachFromTarget", { sessionId })
 		.catch(() => undefined);
+}
+
+/**
+ * Sends the emptying navigation, reporting whether the frame took it.
+ * `Page.navigate` reports a refusal in `errorText` rather than by rejecting, so
+ * a resolved answer is not on its own proof that the widget document is gone.
+ */
+async function navigateVerificationFrameToBlank(
+	connection: Pick<BrowserUseCdpConnection, "send">,
+	sessionId: string,
+): Promise<boolean> {
+	try {
+		const result = await connection.send<{ errorText?: string }>(
+			"Page.navigate",
+			{ url: "about:blank" },
+			sessionId,
+		);
+		return !result?.errorText;
+	} catch {
+		return false;
+	}
 }
 
 /** Sends one stop command, reporting whether it landed and never throwing. */
