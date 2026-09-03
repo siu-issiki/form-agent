@@ -293,9 +293,9 @@ Worker側の記録は`browser_use_session_created`、`browser_use_session_stoppe
 
 attempt上限で終端したジョブは、Queue consumerが結果を保存する前に同じ`jobId`のsessionを回収する。`browser_use_session_reclaimed`の`matched`が0のまま`activeTagged`が同時session上限に達している場合は他ジョブのleakであり、自動では解放されないため、上記の`list`とD1のジョブ状態を照合して終端済みジョブのsessionを`stop`する。
 
-`outcome: exceededCpu`によるWorkerの強制終了は、Cloudflareダッシュボードの Workers Logs で`outcome = exceededCpu`を検索して調査する。ログの保持期間はPaidプランで7日であるため、7日以内に確認する。`cpuTime`と`wallTime`を併せて読み、CPU上限（既定30秒。Paidプランでは`limits.cpu_ms`で変更できるが未設定）に達していない強制終了であれば上限引き上げでは解消しない。
+`outcome: exceededCpu`によるWorkerの強制終了は、Cloudflareダッシュボードの Workers Logs で`outcome = exceededCpu`を検索して調査する。ログの保持期間はPaidプランで7日であるため、7日以内に確認する。`cpuTime`と`wallTime`を併せて読む。CPU上限は、Freeプランが公称10 ms/呼び出し（実測では数百 msまで通ることが多いが、負荷時にisolateごと強制終了される）、Paidプランが既定30秒で`limits.cpu_ms`により最大5分まで変更できる。現在はPaidプランで`limits.cpu_ms`は未設定である。
 
-既知事象（2026-09-03解決）: 選択肢候補リストのdeploy以降、`exceededCpu`の発生率が1%程度から30〜40%へ急増した。同時刻に複数呼び出しが揃って停止するクラスターが多く、停止時の`cpuTime`は正常完了時より小さい値だった。当日夕方にCloudflare WorkersをPaid、BrowserUseをdev（有料）プランへ移行し、同一コードを再deployしたところ`exceededCpu`が0件になったため、原因はFreeプランのCPU上限執行と判断した。再発する場合は、`job.redelivery_ignored`とセッションleakの有無（本節前段の「attempt上限で終端したジョブ」の記述を参照）を併せて確認する。
+既知事象（2026-09-03、原因は推定）: 選択肢候補リストのdeploy以降、`exceededCpu`の発生率が1%程度から30〜40%へ急増した。同時刻に複数呼び出しが揃って停止するクラスターが多く、停止時の`cpuTime`は正常完了時より小さい値だった。当日夕方にCloudflare WorkersをPaid、BrowserUseをdev（有料）プランへ移行し、同一コードを再deployしたところ、9呼び出しで`exceededCpu`が0件、6シナリオ6/6合格となった。CPU総量では説明できないため、原因はFreeプランの負荷時のisolate強制終了と推定する。確定ではなく、23シナリオ2巡で再発しないことの確認が残っている。再発する場合は、`job.redelivery_ignored`とセッションleakの有無（本節前段の「attempt上限で終端したジョブ」の記述を参照）を併せて確認する。
 
 ## 重複Queue配送の検証
 
