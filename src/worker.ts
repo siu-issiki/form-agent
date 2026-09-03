@@ -40,6 +40,11 @@ interface JobQueue {
 }
 
 const DEAD_LETTER_QUEUE = "form-agent-jobs-dlq";
+const BASE_RETRY_DELAY_SECONDS = 30;
+const MAX_RETRY_DELAY_SECONDS = 300;
+const RETRY_JITTER_RATIO = 0.2;
+/** 2^10 already exceeds the cap, so the exponent never needs to grow. */
+const MAX_RETRY_EXPONENT = 10;
 const MAX_AGENT_DURATION_MS = 10 * 60 * 1000;
 const MAX_JOB_REQUEST_BYTES = 64 * 1024;
 const JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -386,6 +391,28 @@ function hasSameJsonValue(left: unknown, right: unknown): boolean {
 	);
 }
 
+/**
+ * Exponential backoff with jitter for one Queue redelivery. The jitter is
+ * applied first and the cap last, so no delay ever exceeds the cap.
+ */
+export function computeRetryDelaySeconds(
+	attempt: number,
+	random: number = Math.random(),
+): number {
+	const safeAttempt =
+		Number.isFinite(attempt) && attempt >= 1 ? Math.floor(attempt) : 1;
+	const exponent = Math.min(safeAttempt - 1, MAX_RETRY_EXPONENT);
+	const base = BASE_RETRY_DELAY_SECONDS * 2 ** exponent;
+	const safeRandom = Number.isFinite(random)
+		? Math.min(Math.max(random, 0), 1)
+		: 0.5;
+	const jitter = 1 + (safeRandom * 2 - 1) * RETRY_JITTER_RATIO;
+	return Math.min(
+		MAX_RETRY_DELAY_SECONDS,
+		Math.max(1, Math.round(base * jitter)),
+	);
+}
+
 export async function consumeJobBatch(
 	batch: MessageBatch<JobMessage>,
 	env: Env,
@@ -401,6 +428,8 @@ export async function consumeJobBatch(
 
 		let attemptedJob: Job | null = null;
 		let executionStartedAt: number | null = null;
+		// Computed once so the recorded delay is the delay the Queue receives.
+		const retryDelaySeconds = computeRetryDelaySeconds(message.attempts);
 		try {
 			const now = new Date().toISOString();
 			if (batch.queue === DEAD_LETTER_QUEUE) {
@@ -461,9 +490,10 @@ export async function consumeJobBatch(
 				attemptedJob,
 				runToken,
 				now,
+				retryDelaySeconds,
 			);
 			if (disposition === "retry") {
-				message.retry({ delaySeconds: 30 });
+				message.retry({ delaySeconds: retryDelaySeconds });
 			} else {
 				message.ack();
 			}
@@ -493,9 +523,10 @@ export async function consumeJobBatch(
 					"QUEUE_CONSUMER_ERROR",
 					"consumer",
 					executionStartedAt ?? Date.now(),
+					retryDelaySeconds,
 				);
 			}
-			message.retry({ delaySeconds: 30 });
+			message.retry({ delaySeconds: retryDelaySeconds });
 		}
 	}
 }
@@ -506,6 +537,7 @@ async function executeClaimedJob(
 	job: Job,
 	runToken: string,
 	now: string,
+	retryDelaySeconds: number,
 ): Promise<"ack" | "retry"> {
 	const startedAt = Date.now();
 	let result: AgentRunResult;
@@ -563,6 +595,7 @@ async function executeClaimedJob(
 					: "UNEXPECTED_AGENT_ERROR",
 				"exception",
 				startedAt,
+				retryDelaySeconds,
 			);
 			return "retry";
 		}
@@ -648,6 +681,7 @@ async function executeClaimedJob(
 					result.reasonCode,
 					"result",
 					startedAt,
+					retryDelaySeconds,
 				);
 				return "retry";
 			}
@@ -693,6 +727,7 @@ async function recordRetryScheduled(
 	reasonCode: string,
 	source: "consumer" | "exception" | "result",
 	startedAt: number,
+	delaySeconds: number,
 ): Promise<void> {
 	try {
 		const recorded = await store.recordRetryScheduled(
@@ -702,6 +737,7 @@ async function recordRetryScheduled(
 			reasonCode,
 			source,
 			Math.max(0, Date.now() - startedAt),
+			delaySeconds,
 			new Date().toISOString(),
 		);
 		if (!recorded) {

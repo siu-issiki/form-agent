@@ -146,6 +146,8 @@ D1 migrationはWorker deployでは自動適用されない。新しい列を参�
 
 送信済みの可能性を否定できない場合は再投入しない。未送信と判断して再実行する場合も、既存IDは変更せず、承認記録と新しいジョブIDを使用する。
 
+該当runがどこまで進んだかは、後述「実行メトリクスの取得」の`agent.run_metrics`でも確認する。`outcome`が`error`のrunはexecutorが例外で終了しており、`browserConnected`が`false`ならCDP接続が確立していない。ただしREST APIでのsession作成後にCDP接続で失敗した場合も`false`になるため、session自体の有無は`browser_use_session_created` / `browser_use_session_stopped`のログで確認する。
+
 ## 証跡スクリーンショットの確認
 
 対象ジョブの証跡イベントをD1から取得する。
@@ -175,6 +177,24 @@ D1へのイベント記録に失敗した場合、または15秒のタイムア�
 ./node_modules/.bin/wrangler r2 object delete form-agent-evidence/<objectKey> --remote
 ```
 
+R2へアップロードする直前に`evidence.intent`イベントを記録するため、R2 put後・D1記録前にWorkerが停止した孤児オブジェクトは、残存する`evidence.intent`行から特定できる。撮影が完了すると同じ`events.id`が`evidence.captured`または`evidence.capture_failed`へ遷移し、失敗側へ遷移した場合も`objectKey`を保持する。したがって孤児候補は次の2種類である。
+
+1. `type='evidence.intent'`のまま残る行（put前後にWorkerが停止した可能性がある）
+2. `type='evidence.capture_failed'`で`objectKey`を持ち、`failureCode`が`CAPTURE_TIMEOUT` / `OBJECT_STORE_FAILED` / `EVENT_NOT_RECORDED`の行（補償削除が完了していない可能性がある）
+
+Cloudflare APIトークンは不要である。
+
+```bash
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT events.id,events.job_id,events.attempt,events.type,json_extract(events.data_json,'$.stage') AS stage,json_extract(events.data_json,'$.failureCode') AS failure_code,json_extract(events.data_json,'$.objectKey') AS object_key,events.created_at,jobs.status FROM events JOIN jobs ON jobs.id=events.job_id WHERE (events.type='evidence.intent' OR (events.type='evidence.capture_failed' AND json_extract(events.data_json,'$.objectKey') IS NOT NULL AND json_extract(events.data_json,'$.failureCode') IN ('CAPTURE_TIMEOUT','OBJECT_STORE_FAILED','EVENT_NOT_RECORDED'))) ORDER BY events.created_at;"
+```
+
+`status`が`running` / `submitting`の行は撮影中の可能性があるため削除しない。終端状態のジョブに残る行だけを孤児候補として扱い、`object_key`をR2から削除する。多くの候補はWorkerが補償削除に成功しておりR2上に存在しないが、`wrangler r2 object delete`は存在しないキーに対しても成功扱いで終了するため、候補すべてに対して実行してよい。削除後も元のイベント行はrunの記録として残す。
+
+```bash
+./node_modules/.bin/wrangler r2 object delete form-agent-evidence/<objectKey> --remote
+```
+
 `wrangler`にはR2オブジェクトを一覧するコマンドが無い（`get` / `put` / `delete`のみ）ため、孤児オブジェクトの網羅的な突き合わせにはCloudflare REST APIを使う。R2読み取り権限を持つAPIトークンとアカウントIDが必要。
 
 ```bash
@@ -194,7 +214,50 @@ DLQへ移動したジョブを確認する。
   "SELECT id,status,attempt_count,provider_request_count,updated_at FROM jobs WHERE status='dead_lettered' ORDER BY updated_at;"
 ```
 
-`dead_lettered`は自動再投入しない。原因を解消し、外部送信が発生していないことを照合し、人間が承認した場合だけ新しいジョブIDで登録する。
+`dead_lettered`は自動再投入しない。原因を解消し、外部送信が発生していないことを照合し、人間が承認した場合だけ新しいジョブIDで登録する。既存IDの再キュー、`pending`への差し戻し、Queueへの直接再投入はいずれも行わない。
+
+再登録は次の順序で実施する。
+
+1. 対象ジョブの`payload_json`と`target_url`を取得し、送信内容と送信先を確認する。出力にはフォーム値が含まれるため、対象IDを限定し、保存先と閲覧者を確認してから実行する。
+2. 「`submitting` / `uncertain`の照合」と同じ外部証跡で、受信側に送信が無いことを照合する。
+3. 再送信の承認者、日時、根拠を記録する。
+4. 承認後に、新しいジョブIDで`POST /jobs`へ登録する。
+
+```bash
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT target_url,payload_json FROM jobs WHERE id='<JOB_ID>';"
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT attempt,type,data_json,created_at FROM events WHERE job_id='<JOB_ID>' ORDER BY created_at;"
+```
+
+`job.retry_scheduled`の`delaySeconds`には、その配信試行で実際に指定したQueue retryの遅延秒数（30秒を基準にした指数backoffへ±20%のjitterを掛け、300秒で上限を設けた値）が入る。DLQ到達までに要した時間の確認に使う。
+
+## 実行メトリクスの取得
+
+1 runにつき1件の`agent.run_metrics`イベントを記録する。値は数値、boolean、固定コードだけであり、URL、会社名、フォーム値、モデルの自由文は含まない。`browserConnected`はCDP driverの確立に成功したかどうかだけを表すため、課金対象のsession作成・停止件数は`browser_use_session_created` / `browser_use_session_stopped`のログで追う。
+
+```bash
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT job_id,attempt,data_json,created_at FROM events WHERE type='agent.run_metrics' AND created_at >= '<ISO8601>' ORDER BY created_at;"
+```
+
+期間内のtokenと実行時間を集計する場合は次を使う。
+
+```bash
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT COUNT(*) AS runs, SUM(json_extract(data_json,'$.inputTokens')) AS input_tokens, SUM(json_extract(data_json,'$.cachedTokens')) AS cached_tokens, SUM(json_extract(data_json,'$.outputTokens')) AS output_tokens, SUM(json_extract(data_json,'$.durationMs')) AS duration_ms, SUM(json_extract(data_json,'$.browserConnectMs')) AS browser_connect_ms FROM events WHERE type='agent.run_metrics' AND created_at >= '<ISO8601>';"
+```
+
+1件原価は、上記の集計とProvider側の単価から概算する。単価はこのリポジトリに保存せず、算出時にOpenAIの料金表を参照する。
+
+```text
+1件原価 ≒ ((input_tokens - cached_tokens) × input単価
+        + cached_tokens × cached input単価
+        + output_tokens × output単価) ÷ 対象run数
+        + BrowserUse session費用 + Cloudflare費用
+```
+
+`outputTokens`には`reasoningTokens`が含まれる。分母は目的に応じて全run数と`outcome='sent'`のrun数の両方で計算する。BrowserUseとCloudflareの費用はD1に記録していないため、各サービスの請求から按分する。
 
 ## エージェントツールの診断
 
@@ -218,6 +281,13 @@ bun --env-file=.env.production run tools/browser-use-sessions.ts stop-all
 ```
 
 `list`はactive sessionのid、開始時刻、寿命、`metadata.jobId`だけを出力する。live viewとCDPのURLはsessionの操作権を与えるため出力しない。停止対象は、対応するジョブがD1上で終端状態になっているsessionに限る。`stop-all`は実行中ジョブがない保守時間にだけ使う。
+
+週次で`list`を実行し、activeが0件でない場合は各`metadata.jobId`をD1で確認する。対応するジョブが終端状態（`sent` / `prohibited` / `uncertain` / `failed` / `dead_lettered`）であれば`stop`し、`running` / `submitting`のままであれば停止せず、「`submitting` / `uncertain`の照合」を先に実施する。
+
+```bash
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT id,status,updated_at FROM jobs WHERE id='<JOB_ID>';"
+```
 
 Worker側の記録は`browser_use_session_created`、`browser_use_session_stopped`、`browser_use_session_reclaimed`である。`browser_use_session_stopped`の`ok`が`false`の場合は`stop`が届いていないため、上記の`list`で残骸を確認する。
 

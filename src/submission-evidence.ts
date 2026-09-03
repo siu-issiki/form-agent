@@ -152,7 +152,25 @@ export class SubmissionEvidenceRecorder {
 		let sha256: string;
 		try {
 			sha256 = await sha256Hex(bytes);
-			if (expired()) return timeoutResult();
+		} catch {
+			if (!expired()) {
+				return this.#failed(eventId, stage, "OBJECT_STORE_FAILED");
+			}
+			await this.#failed(eventId, stage, "CAPTURE_TIMEOUT", false);
+			return timeoutResult();
+		}
+		if (expired()) return timeoutResult();
+
+		// The intent names the object before it exists, so a Worker that stops
+		// between the upload and the result still leaves the key in D1. Nothing
+		// is written to the object store without it.
+		const intentRecorded = await this.#recordIntent(eventId, stage, objectKey);
+		if (expired()) return timeoutResult();
+		if (!intentRecorded) {
+			return this.#failed(eventId, stage, "EVENT_NOT_RECORDED");
+		}
+
+		try {
 			await this.objectStore.put(
 				objectKey,
 				bytes,
@@ -201,6 +219,30 @@ export class SubmissionEvidenceRecorder {
 
 		logSubmissionEvidence(stage, true);
 		return { captured: true, objectKey, body: bytes };
+	}
+
+	/**
+	 * A primary key conflict with a failure event that a timeout already wrote
+	 * is a rejected intent, not a run failure, so the exception stays here.
+	 */
+	async #recordIntent(
+		eventId: string,
+		stage: EvidenceStage,
+		objectKey: string,
+	): Promise<boolean> {
+		try {
+			return await this.jobs.recordEvidenceIntent(
+				this.jobId,
+				this.runToken,
+				this.attempt,
+				eventId,
+				stage,
+				objectKey,
+				this.now(),
+			);
+		} catch {
+			return false;
+		}
 	}
 
 	async #discardObject(stage: EvidenceStage, objectKey: string): Promise<void> {

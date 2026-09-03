@@ -49,6 +49,34 @@ export type EvidenceFailureCode =
 	| "NO_BROWSER_SESSION"
 	| "CAPTURE_TIMEOUT";
 
+/** Fixed end state of one agent run, recorded with the run metrics. */
+export type AgentRunOutcome =
+	| "sent"
+	| "prohibited"
+	| "uncertain"
+	| "failed"
+	| "error";
+
+/**
+ * Per-run counters of one agent execution. Every field is a number, a boolean,
+ * or a fixed code, so the event carries no page content, value, or URL.
+ */
+export interface AgentRunMetrics {
+	turns: number;
+	providerRequests: number;
+	reviewRequests: number;
+	inputTokens: number;
+	outputTokens: number;
+	reasoningTokens: number;
+	cachedTokens: number;
+	browserConnectMs: number | null;
+	browserConnected: boolean;
+	submitReviewAllow: number;
+	submitReviewDeny: number;
+	durationMs: number;
+	outcome: AgentRunOutcome;
+}
+
 export interface JobEvent {
 	jobId: string;
 	attempt: number;
@@ -108,6 +136,20 @@ export interface JobStore {
 		reason: string,
 		now: string,
 	): Promise<Job | null>;
+	/**
+	 * Declares the object key before the screenshot reaches the object store.
+	 * The same event id later becomes `captured` or `capture_failed`, so a row
+	 * that stays `intent` names an orphan object.
+	 */
+	recordEvidenceIntent(
+		id: string,
+		runToken: string,
+		attempt: number,
+		eventId: string,
+		stage: EvidenceStage,
+		objectKey: string,
+		now: string,
+	): Promise<boolean>;
 	recordEvidenceCaptured(
 		id: string,
 		runToken: string,
@@ -301,9 +343,55 @@ export class InMemoryJobStore implements JobStore {
 		});
 	}
 
-	async recordEvidenceCaptured(
+	/** Mirrors `D1JobStore.recordAgentRunMetrics`: one row per finished run. */
+	async recordAgentRunMetrics(
 		id: string,
 		runToken: string,
+		attempt: number,
+		metrics: AgentRunMetrics,
+		_now: string,
+	): Promise<boolean> {
+		const job = this.#jobs.get(id);
+		if (
+			!job ||
+			job.status === "pending" ||
+			job.status === "dead_lettered" ||
+			job.runToken !== runToken
+		) {
+			return false;
+		}
+
+		this.events.push({
+			jobId: id,
+			attempt,
+			type: "agent.run_metrics",
+			data: { ...metrics },
+		});
+		return true;
+	}
+
+	async recordEvidenceIntent(
+		id: string,
+		runToken: string,
+		attempt: number,
+		eventId: string,
+		stage: EvidenceStage,
+		objectKey: string,
+		_now: string,
+	): Promise<boolean> {
+		return this.#recordEvidenceEvent(
+			id,
+			runToken,
+			attempt,
+			eventId,
+			"evidence.intent",
+			{ eventId, stage, objectKey },
+		);
+	}
+
+	async recordEvidenceCaptured(
+		id: string,
+		_runToken: string,
 		attempt: number,
 		eventId: string,
 		stage: EvidenceStage,
@@ -312,11 +400,11 @@ export class InMemoryJobStore implements JobStore {
 		byteLength: number,
 		_now: string,
 	): Promise<boolean> {
-		return this.#recordEvidenceEvent(
+		return this.#transitionEvidenceEvent(
 			id,
-			runToken,
 			attempt,
 			eventId,
+			["evidence.intent"],
 			"evidence.captured",
 			{
 				eventId,
@@ -338,24 +426,23 @@ export class InMemoryJobStore implements JobStore {
 		failureCode: EvidenceFailureCode,
 		_now: string,
 	): Promise<boolean> {
-		const existingIndex = this.#evidenceEventIndexes.get(eventId);
-		if (existingIndex !== undefined) {
-			const existing = this.events[existingIndex];
-			if (
-				!existing ||
-				existing.jobId !== id ||
-				existing.attempt !== attempt ||
-				existing.type !== "evidence.captured"
-			) {
-				return false;
-			}
-			this.events[existingIndex] = {
-				jobId: id,
+		const index = this.#evidenceEventIndexes.get(eventId);
+		if (index !== undefined) {
+			// The object key survives the failure so an upload that was already
+			// started stays traceable.
+			const objectKey = this.events[index]?.data.objectKey;
+			return this.#transitionEvidenceEvent(
+				id,
 				attempt,
-				type: "evidence.capture_failed",
-				data: { stage, failureCode },
-			};
-			return true;
+				eventId,
+				["evidence.intent", "evidence.captured"],
+				"evidence.capture_failed",
+				{
+					stage,
+					failureCode,
+					...(objectKey === undefined ? {} : { objectKey }),
+				},
+			);
 		}
 
 		return this.#recordEvidenceEvent(
@@ -369,6 +456,30 @@ export class InMemoryJobStore implements JobStore {
 				failureCode,
 			},
 		);
+	}
+
+	#transitionEvidenceEvent(
+		id: string,
+		attempt: number,
+		eventId: string,
+		fromTypes: readonly string[],
+		type: string,
+		data: Record<string, unknown>,
+	): boolean {
+		const index = this.#evidenceEventIndexes.get(eventId);
+		if (index === undefined) return false;
+		const existing = this.events[index];
+		if (
+			!existing ||
+			existing.jobId !== id ||
+			existing.attempt !== attempt ||
+			!fromTypes.includes(existing.type)
+		) {
+			return false;
+		}
+
+		this.events[index] = { jobId: id, attempt, type, data };
+		return true;
 	}
 
 	#recordEvidenceEvent(

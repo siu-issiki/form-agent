@@ -24,7 +24,7 @@ import {
 	type AgentToolDiagnosticToolName,
 	D1JobStore,
 } from "./d1-job-store";
-import type { Job } from "./job";
+import type { AgentRunMetrics, AgentRunOutcome, Job } from "./job";
 import {
 	CORRECTION_TURNS,
 	invalidProviderResponse,
@@ -32,7 +32,9 @@ import {
 	type JsonObject,
 	MAX_PROVIDER_REQUESTS,
 	MAX_TURNS,
+	type ProviderUsage,
 	providerRequestByteLength,
+	readProviderUsage,
 	requestResponses,
 	throwIfAborted,
 } from "./openai-responses-client";
@@ -58,6 +60,7 @@ import {
 import type { EvidenceObjectStore } from "./submission-evidence";
 import { ResponsesSubmitReviewer } from "./submit-reviewer";
 
+const RUN_METRICS_WRITE_TIMEOUT_MS = 2_000;
 const MAX_PROVIDER_OUTPUT_TOKENS = 4_096;
 const MAX_PROVIDER_REQUEST_BYTES = 128 * 1_024;
 const MAX_JOB_PROMPT_LENGTH = 64_000;
@@ -84,6 +87,19 @@ interface ResponsesAgentExecutorOptions {
 		dryRun: boolean,
 		signal?: AbortSignal,
 	) => ReturnType<BrowserDriverFactory>;
+}
+
+/** Counters collected while one run executes. Numbers and fixed codes only. */
+interface RunCounters {
+	turns: number;
+	providerRequests: number;
+	reviewRequests: number;
+	inputTokens: number;
+	outputTokens: number;
+	reasoningTokens: number;
+	cachedTokens: number;
+	submitReviewAllow: number;
+	submitReviewDeny: number;
 }
 
 interface ToolExecution {
@@ -147,23 +163,87 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 		signal: AbortSignal,
 	): Promise<AgentRunResult> {
 		const dryRun = isJobDryRun(input.job.payload, this.#dryRun);
+		const counters = newRunCounters();
+		const startedAt = Date.now();
 		const coordinator = new BrowserToolCoordinator(
 			this.#db,
 			(job) =>
 				this.#createBrowserDriver(this.#browserUseApiKey, job, dryRun, signal),
 			this.#evidenceStore,
-			(job) => this.#createReviewer(job, input.runToken, signal),
+			(job) => this.#createReviewer(job, input.runToken, signal, counters),
 		);
 		const abort = () => {
 			void coordinator.close().catch(() => undefined);
 		};
 		signal.addEventListener("abort", abort, { once: true });
 
+		// Every exit path is measured: the loop result, the early returns of
+		// #run, and the AgentExecutionError it throws.
+		let outcome: AgentRunOutcome = "error";
 		try {
-			return await this.#run(input, coordinator, signal, dryRun);
+			const result = await this.#run(
+				input,
+				coordinator,
+				signal,
+				dryRun,
+				counters,
+			);
+			outcome = result.outcome;
+			return result;
 		} finally {
 			signal.removeEventListener("abort", abort);
 			await coordinator.close().catch(() => undefined);
+			await this.#recordRunMetrics(input, {
+				...counters,
+				browserConnectMs: coordinator.connectDurationMs,
+				browserConnected: coordinator.browserConnected,
+				durationMs: Math.max(0, Date.now() - startedAt),
+				outcome,
+			});
+		}
+	}
+
+	/**
+	 * Best-effort and bounded: the write runs inside the executor's deadline
+	 * race, so a slow D1 must not let the timeout win over a run result that
+	 * #run already settled. A write cut off by the bound is reported, not
+	 * awaited.
+	 */
+	async #recordRunMetrics(
+		input: AgentRunInput,
+		metrics: AgentRunMetrics,
+	): Promise<void> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timedOut = new Promise<"TIMEOUT">((resolve) => {
+			timer = setTimeout(
+				() => resolve("TIMEOUT"),
+				RUN_METRICS_WRITE_TIMEOUT_MS,
+			);
+		});
+		try {
+			const write = new D1JobStore(this.#db)
+				.recordAgentRunMetrics(
+					input.job.id,
+					input.runToken,
+					input.job.attemptCount,
+					metrics,
+					new Date().toISOString(),
+				)
+				.then(
+					() => "OK" as const,
+					() => "WRITE_FAILED" as const,
+				);
+			const result = await Promise.race([write, timedOut]);
+			if (result !== "OK") {
+				console.warn(
+					JSON.stringify({
+						event: "agent_run_metrics_not_recorded",
+						reason: result,
+					}),
+				);
+			}
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
 		}
 	}
 
@@ -172,6 +252,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 		coordinator: BrowserToolCoordinator,
 		signal: AbortSignal,
 		dryRun: boolean,
+		counters: RunCounters,
 	): Promise<AgentRunResult> {
 		const safeJob = withoutRunToken(input.job);
 		const jobJson = JSON.stringify(safeJob);
@@ -192,6 +273,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 		let correctionTurnsGranted = false;
 		for (let turn = 0; turn < maxTurns; turn += 1) {
 			throwIfAborted(signal);
+			counters.turns += 1;
 			const tools = hasObservedPage ? AGENT_TOOLS : INITIAL_AGENT_TOOLS;
 			const body = JSON.stringify({
 				model: this.#model,
@@ -225,6 +307,8 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 				body,
 				signal,
 			);
+			counters.providerRequests += 1;
+			addUsage(counters, readProviderUsage(response));
 			if (isRecord(response.usage)) {
 				console.log(
 					JSON.stringify({
@@ -272,12 +356,17 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 		return failed("AGENT_TURN_LIMIT", false);
 	}
 
+	/**
+	 * The reviewer keeps its own interface; the wrapper only counts what the
+	 * run metrics need.
+	 */
 	#createReviewer(
 		job: Job,
 		runToken: string,
 		signal: AbortSignal,
+		counters: RunCounters,
 	): SubmitReviewer {
-		return new ResponsesSubmitReviewer({
+		const reviewer = new ResponsesSubmitReviewer({
 			db: this.#db,
 			jobId: job.id,
 			runToken,
@@ -285,8 +374,41 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 			openAiApiKey: this.#openAiApiKey,
 			fetcher: this.#fetcher,
 			signal,
+			onUsage: (usage) => {
+				counters.reviewRequests += 1;
+				addUsage(counters, usage);
+			},
 		});
+		return {
+			async review(input) {
+				const decision = await reviewer.review(input);
+				if (decision.decision === "allow") counters.submitReviewAllow += 1;
+				else counters.submitReviewDeny += 1;
+				return decision;
+			},
+		};
 	}
+}
+
+function newRunCounters(): RunCounters {
+	return {
+		turns: 0,
+		providerRequests: 0,
+		reviewRequests: 0,
+		inputTokens: 0,
+		outputTokens: 0,
+		reasoningTokens: 0,
+		cachedTokens: 0,
+		submitReviewAllow: 0,
+		submitReviewDeny: 0,
+	};
+}
+
+function addUsage(counters: RunCounters, usage: ProviderUsage): void {
+	counters.inputTokens += usage.inputTokens;
+	counters.outputTokens += usage.outputTokens;
+	counters.reasoningTokens += usage.reasoningTokens;
+	counters.cachedTokens += usage.cachedTokens;
 }
 
 export function isJobDryRun(

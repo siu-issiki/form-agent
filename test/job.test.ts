@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { DuplicateJobError, InMemoryJobStore, type JobInput } from "../src/job";
+import {
+	type AgentRunMetrics,
+	DuplicateJobError,
+	InMemoryJobStore,
+	type JobInput,
+} from "../src/job";
 
 const input: JobInput = {
 	id: "job-001",
@@ -168,6 +173,53 @@ describe("job submission guard", () => {
 
 		expect(uncertain?.status).toBe("uncertain");
 		expect(retried).toBeNull();
+	});
+
+	test("records the run metrics only for the current run token", async () => {
+		const store = new InMemoryJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const metrics: AgentRunMetrics = {
+			turns: 2,
+			providerRequests: 2,
+			reviewRequests: 1,
+			inputTokens: 1_000,
+			outputTokens: 200,
+			reasoningTokens: 64,
+			cachedTokens: 32,
+			browserConnectMs: 900,
+			browserConnected: true,
+			submitReviewAllow: 1,
+			submitReviewDeny: 0,
+			durationMs: 5_000,
+			outcome: "sent",
+		};
+
+		const recorded = await store.recordAgentRunMetrics(
+			input.id,
+			"run-token-1",
+			1,
+			metrics,
+			"2026-08-28T00:00:02.000Z",
+		);
+		const otherRun = await store.recordAgentRunMetrics(
+			input.id,
+			"run-token-2",
+			1,
+			metrics,
+			"2026-08-28T00:00:03.000Z",
+		);
+
+		expect(recorded).toBe(true);
+		expect(otherRun).toBe(false);
+		expect(store.events).toEqual([
+			{
+				jobId: input.id,
+				attempt: 1,
+				type: "agent.run_metrics",
+				data: { ...metrics },
+			},
+		]);
 	});
 
 	test("tracks redelivery attempts for the current run token", async () => {

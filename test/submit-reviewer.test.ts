@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, test } from "vitest";
 import { AgentExecutionError } from "../src/agent-executor";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobInput } from "../src/job";
+import type { ProviderUsage } from "../src/openai-responses-client";
 import type {
 	SubmitReviewInput,
 	SubmitReviewReasonCode,
@@ -147,6 +148,70 @@ describe("ResponsesSubmitReviewer", () => {
 		expect(error.reasonCode).toBe("PROVIDER_REQUEST_LIMIT_REACHED");
 		expect(error.retryable).toBe(false);
 		expect(requestCount).toBe(1);
+	});
+
+	test("reports the token usage of the review response", async () => {
+		const usages: ProviderUsage[] = [];
+		const reviewer = new ResponsesSubmitReviewer({
+			db: env.DB,
+			jobId: input.id,
+			runToken: "run-token-1",
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			fetcher: (async () =>
+				Response.json({
+					...reviewResponse("allow", "INPUTS_MATCH"),
+					usage: {
+						input_tokens: 900,
+						output_tokens: 40,
+						input_tokens_details: { cached_tokens: 128 },
+						output_tokens_details: { reasoning_tokens: 16 },
+					},
+				})) as typeof fetch,
+			signal: new AbortController().signal,
+			onUsage: (usage) => {
+				usages.push(usage);
+			},
+		});
+
+		await reviewer.review(reviewInput());
+
+		expect(usages).toEqual([
+			{
+				inputTokens: 900,
+				outputTokens: 40,
+				reasoningTokens: 16,
+				cachedTokens: 128,
+			},
+		]);
+	});
+
+	test("reports zero usage when the provider omits the counts", async () => {
+		const usages: ProviderUsage[] = [];
+		const reviewer = new ResponsesSubmitReviewer({
+			db: env.DB,
+			jobId: input.id,
+			runToken: "run-token-1",
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			fetcher: (async () =>
+				Response.json(reviewResponse("allow", "INPUTS_MATCH"))) as typeof fetch,
+			signal: new AbortController().signal,
+			onUsage: (usage) => {
+				usages.push(usage);
+			},
+		});
+
+		await reviewer.review(reviewInput());
+
+		expect(usages).toEqual([
+			{
+				inputTokens: 0,
+				outputTokens: 0,
+				reasoningTokens: 0,
+				cachedTokens: 0,
+			},
+		]);
 	});
 
 	test("keeps a rate limited provider failure classified", async () => {

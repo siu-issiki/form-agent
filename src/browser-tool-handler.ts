@@ -54,6 +54,9 @@ export class BrowserToolCoordinator {
 	#operationTail: Promise<void> = Promise.resolve();
 	#closed = false;
 	#closePromise: Promise<void> | undefined;
+	// Kept past close() so the run metrics can still read the connection cost.
+	#connectDurationMs: number | null = null;
+	#browserConnected = false;
 
 	constructor(
 		private readonly db: D1Database,
@@ -61,6 +64,20 @@ export class BrowserToolCoordinator {
 		private readonly evidenceStore: EvidenceObjectStore,
 		private readonly createReviewer: (job: Job) => SubmitReviewer,
 	) {}
+
+	/** Time spent establishing the browser driver, including a failed attempt. */
+	get connectDurationMs(): number | null {
+		return this.#connectDurationMs;
+	}
+
+	/**
+	 * Whether the browser driver was established. A failed attempt can still
+	 * have created a provider session, so the session count itself is followed
+	 * through the driver's own session logs.
+	 */
+	get browserConnected(): boolean {
+		return this.#browserConnected;
+	}
 
 	async execute(
 		jobId: string,
@@ -247,11 +264,15 @@ export class BrowserToolCoordinator {
 		}
 
 		let driver: RestrictedBrowserDriver;
+		const connectStartedAt = Date.now();
 		try {
 			driver = await this.createDriver(job);
 		} catch (error) {
+			this.#connectDurationMs = Math.max(0, Date.now() - connectStartedAt);
 			throw new BrowserToolSetupError("driver_connect", error);
 		}
+		this.#connectDurationMs = Math.max(0, Date.now() - connectStartedAt);
+		this.#browserConnected = true;
 		// The run may have been aborted while the session was being created. The
 		// provider session is released here because close() already ran and no
 		// longer holds this driver.

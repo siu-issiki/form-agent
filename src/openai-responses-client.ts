@@ -22,8 +22,38 @@ export const MAX_PROVIDER_RESPONSE_BYTES = 256 * 1_024;
 
 export type JsonObject = Record<string, unknown>;
 
+/** Token counts of one provider response. Missing fields count as zero. */
+export interface ProviderUsage {
+	inputTokens: number;
+	outputTokens: number;
+	reasoningTokens: number;
+	cachedTokens: number;
+}
+
 export function providerRequestByteLength(body: string): number {
 	return new TextEncoder().encode(body).byteLength;
+}
+
+export function readProviderUsage(response: JsonObject): ProviderUsage {
+	const usage = isRecord(response.usage) ? response.usage : {};
+	const inputDetails = isRecord(usage.input_tokens_details)
+		? usage.input_tokens_details
+		: {};
+	const outputDetails = isRecord(usage.output_tokens_details)
+		? usage.output_tokens_details
+		: {};
+	return {
+		inputTokens: tokenCount(usage.input_tokens),
+		outputTokens: tokenCount(usage.output_tokens),
+		reasoningTokens: tokenCount(outputDetails.reasoning_tokens),
+		cachedTokens: tokenCount(inputDetails.cached_tokens),
+	};
+}
+
+function tokenCount(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0
+		? Math.trunc(value)
+		: 0;
 }
 
 export async function requestResponses(

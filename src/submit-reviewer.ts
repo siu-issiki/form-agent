@@ -5,7 +5,9 @@ import {
 	isRecord,
 	type JsonObject,
 	MAX_PROVIDER_REQUESTS,
+	type ProviderUsage,
 	providerRequestByteLength,
+	readProviderUsage,
 	requestResponses,
 	throwIfAborted,
 } from "./openai-responses-client";
@@ -72,6 +74,11 @@ export interface ResponsesSubmitReviewerOptions {
 	openAiApiKey: string;
 	fetcher: typeof fetch;
 	signal: AbortSignal;
+	/**
+	 * Reports the token usage of every review response so the run metrics can
+	 * account for the reviewer without changing the `SubmitReviewer` contract.
+	 */
+	onUsage?: (usage: ProviderUsage) => void;
 }
 
 /**
@@ -87,6 +94,7 @@ export class ResponsesSubmitReviewer implements SubmitReviewer {
 	readonly #openAiApiKey: string;
 	readonly #fetcher: typeof fetch;
 	readonly #signal: AbortSignal;
+	readonly #onUsage: ((usage: ProviderUsage) => void) | undefined;
 
 	constructor(options: ResponsesSubmitReviewerOptions) {
 		this.#db = options.db;
@@ -96,6 +104,7 @@ export class ResponsesSubmitReviewer implements SubmitReviewer {
 		this.#openAiApiKey = options.openAiApiKey;
 		this.#fetcher = options.fetcher;
 		this.#signal = options.signal;
+		this.#onUsage = options.onUsage;
 	}
 
 	async review(input: SubmitReviewInput): Promise<SubmitReviewDecision> {
@@ -124,6 +133,8 @@ export class ResponsesSubmitReviewer implements SubmitReviewer {
 				this.#signal,
 				{ maxResponseBytes: MAX_REVIEW_RESPONSE_BYTES },
 			);
+			// The tokens are spent whether or not the answer parses.
+			this.#onUsage?.(readProviderUsage(response));
 			return readReviewDecision(response);
 		} catch (error) {
 			// Provider, limit, and response errors keep their classification.

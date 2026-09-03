@@ -22,7 +22,7 @@
 | E2E | 管理下範囲を実装済み | 常設テストシステムの13シナリオ、重複配送、送信後`uncertain`をproductionで検証済み。外部の実サイト送信は未実施 |
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値を検証。一覧・キャンセルは未実装 |
 | Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
-| 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ、値を含まないagent tool診断イベント。送信前・送信後・禁止判定時のスクリーンショット証跡を Cloudflare R2 へ保存し、D1 の `events` へ sha256 付きで記録する |
+| 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ、値を含まないagent tool診断イベント、ジョブ単位の実行メトリクス（turn、Provider 呼び出し、token、送信前レビュー、browser 接続時間、実行時間）。送信前・送信後・禁止判定時のスクリーンショット証跡を Cloudflare R2 へ保存し、D1 の `events` へ sha256 付きで記録する |
 | 並列検証 | 部分実施 | 2026-09-03 の 5 並列 19 シナリオで、session 明示停止の前後とも 15 件合格。明示停止後は CDP 切断（1011 / `LIMIT`）と `exceededCpu` が 0 件になり、18 session すべてを停止できたが、session 作成 API が 429 を 15 回返し 2 件が失敗した。実際の同時 session 上限は 5 未満と判断し、consumer を `max_concurrency: 3` にした。3 並列の 19 シナリオでは 17 件合格、429 / CDP 切断 / `exceededCpu` はいずれも 0 件、19 session すべてを停止できた |
 
 本書では、実装済みの構成を現在形で記述し、未実装または未検証の内容は「現在の制約」「PoC 計画」「残タスク・未決事項」に明示する。
@@ -101,7 +101,7 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 | --- | --- |
 | batch size | 1 |
 | max retries | 3 |
-| retry delay | 30 秒固定（Worker 実装） |
+| retry delay | 30 秒を基準に配信試行ごとに 2 倍へ増やし、±20% の jitter を掛けたうえで 300 秒を上限とする（Worker 実装） |
 | dead letter queue | `form-agent-jobs-dlq` |
 | max concurrency | 1（ローカル Wrangler では再現されない） |
 
@@ -225,7 +225,7 @@ driver が submit control と識別した要素は通常の `click` で操作で
 - Provider 呼び出し回数を D1 の条件付き更新で制限する。
 - DLQ 到達をイベントとして記録する。
 
-状態遷移と結果保存は D1 session / batch と条件付き `UPDATE` を使う。retry / DLQとagent tool診断はイベントへ保存するが、全状態遷移、token、全体処理時間、BrowserUse待ち時間、費用の記録は未実装である。
+状態遷移と結果保存は D1 session / batch と条件付き `UPDATE` を使う。retry / DLQ、agent tool診断、ジョブ単位の実行メトリクス（token、全体処理時間、BrowserUse接続待ち時間を含む）はイベントへ保存する。全状態遷移の記録と費用そのものの保存は未実装であり、費用は token 数と外部の単価から算出する。
 
 ### Cloudflare R2（証跡）
 
@@ -324,11 +324,13 @@ Provider、model、input / output token、処理時間、BrowserUse 待ち時間
 | `data_json` | TEXT | 秘密情報を除いたイベント詳細 |
 | `created_at` | TEXT | 発生日時 |
 
-現在保存するイベントは `job.retry_scheduled`、`job.dead_lettered`、`job.redelivery_ignored`、`agent.tool_diagnostic`、`evidence.captured`、`evidence.capture_failed` である。retry イベントにはreason code、発生元、attempt、実行時間、retry時点のProvider呼び出し累計を保存する。tool diagnosticにはturn、固定のtool名、処理stage、固定のresult codeだけを保存する。
+現在保存するイベントは `job.retry_scheduled`、`job.dead_lettered`、`job.redelivery_ignored`、`agent.tool_diagnostic`、`agent.run_metrics`、`evidence.intent`、`evidence.captured`、`evidence.capture_failed` である。retry イベントにはreason code、発生元、attempt、実行時間、次回配信までの遅延秒数、retry時点のProvider呼び出し累計を保存する。tool diagnosticにはturn、固定のtool名、処理stage、固定のresult codeだけを保存する。
 
 `job.redelivery_ignored` は、Queue の再配信を実行せずに ack した場合に best-effort で記録し、`data_json` はジョブの `status` だけを保存する。Worker が `submitting` 中に停止したジョブは再配信されても状態が `submitting` のまま残るため、`updated_at` 以外の手掛かりで見つけられるようにするためである。記録に失敗しても ack は変わらない。
 
-`evidence.captured` の `data_json` は `{ stage, objectKey, sha256, byteLength, contentType: "image/jpeg" }` を保存する。`stage` は `before_submit` / `after_submit` / `prohibited` の固定値であり、`objectKey` は `jobId` / `stage` / `eventId` から機械的に組み立てた R2 オブジェクトキーである。`evidence.capture_failed` の `data_json` は `{ stage, failureCode }` を保存する。`failureCode` は `SCREENSHOT_FAILED` / `OBJECT_STORE_FAILED` / `EVENT_NOT_RECORDED` / `NO_BROWSER_SESSION` / `CAPTURE_TIMEOUT` の固定値である。
+`agent.run_metrics` は 1 run に 1 件記録し、`data_json` は `{ turns, providerRequests, reviewRequests, inputTokens, outputTokens, reasoningTokens, cachedTokens, browserConnectMs, browserConnected, submitReviewAllow, submitReviewDeny, durationMs, outcome }` を保存する。数値、boolean、固定の `outcome`（`sent` / `prohibited` / `uncertain` / `failed` / `error`）だけであり、`error` は executor が `AgentExecutionError` を投げて終了した run を表す。`providerRequests` と `reviewRequests` は応答を受け取った Provider 呼び出しの件数、token は応答の `usage` の合計、`browserConnectMs` は browser driver の確立に要した時間（失敗した場合も記録し、確立を試みなかった run では `null`）である。`browserConnected` は CDP driver の確立に成功したかどうかだけを表す。REST API で session を作成した後に CDP 接続で失敗した場合も `false` になるため、課金対象となる session の作成・停止件数は Worker ログの `browser_use_session_created` / `browser_use_session_stopped` で追う。記録は executor の終了時に best-effort で行い、失敗しても run の結果を変えない。書き込みは 2 秒で打ち切り、打ち切りや失敗は Worker ログの `agent_run_metrics_not_recorded`（`reason` は `TIMEOUT` / `WRITE_FAILED`）で検知する。executor の deadline race の内側で走るため、遅い D1 が確定済みの run 結果を `AGENT_TERMINATION_UNCONFIRMED` へ上書きしないようにするためである。
+
+`evidence.captured` の `data_json` は `{ stage, objectKey, sha256, byteLength, contentType: "image/jpeg" }` を保存する。`stage` は `before_submit` / `after_submit` / `prohibited` の固定値であり、`objectKey` は `jobId` / `stage` / `eventId` から機械的に組み立てた R2 オブジェクトキーである。`evidence.intent` の `data_json` は `{ stage, objectKey }` を保存する。`evidence.capture_failed` の `data_json` は `{ stage, failureCode }` に加え、`evidence.intent` / `evidence.captured` から遷移した場合は `objectKey` も保持する。R2 へ書き始めた後に失敗・timeout したオブジェクトを D1 から辿れるようにするためであり、intent を記録する前に失敗した場合（`SCREENSHOT_FAILED` など）は `objectKey` を持たない。`failureCode` は `SCREENSHOT_FAILED` / `OBJECT_STORE_FAILED` / `EVENT_NOT_RECORDED` / `NO_BROWSER_SESSION` / `CAPTURE_TIMEOUT` の固定値である。
 
 どのイベントにも秘密情報、URL、フォーム値、自由記述のエラー本文を含めない。証跡イベントの `objectKey` も `jobId` / `stage` / `eventId` の組み合わせだけで構成されており、この方針を維持している。
 
@@ -391,9 +393,9 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 ### Provider / observability
 
 - Provider は OpenAI 固定である。
-- Provider 呼び出し回数以外のtoken、rate limit、費用を保存しない。retryイベント以外の全体処理時間とBrowserUse待ち時間も保存しない。
+- token、全体処理時間、BrowserUse接続待ち時間は `agent.run_metrics` として1 run に1件保存する。rate limitの詳細と費用そのものは保存せず、費用はtoken数と外部の単価から算出する。
 - agent tool診断はbrowser tool、`finish`、unknown tool dispatchを対象とする。`data_json`にはturn、固定tool名、stage、固定result codeだけを保存し、イベント共通列にはjob ID、attempt、記録時刻を保存する。送信前レビューはstage `submit_review`、result code `SUBMIT_REVIEW_ALLOWED` / `SUBMIT_REVIEW_DENIED` / `SUBMIT_REVIEW_UNAVAILABLE`として記録する。入力値、URL、自由記述エラー、全状態遷移は保存しない。
-- retry delay は 30 秒固定で、指数 backoff と jitter は未実装である。
+- retry delay は配信試行に応じた指数 backoff（30 / 60 / 120 秒）に ±20% の jitter を掛け、300 秒で上限を設ける。実際に使う遅延秒数は `job.retry_scheduled` の `delaySeconds` に保存する。
 - Workers Logs を有効にし、invocation ごとの `outcome`、`cpuTime`、`wallTime`、`console` 出力を head sampling 100% で記録する。保持期間は Free プランで 3 日であり、`outcome = exceededCpu` の調査は Cloudflare ダッシュボードの Workers Logs で 3 日以内に行う。ログに値、URL、自由文、session id を出さない方針は変わらない。
 - Worker の CPU 上限は既定の 30 秒のままである。`limits.cpu_ms` は Workers Free プランでは deploy が拒否される（code 100328）ため設定していない。2026-09-03 の `exceededCpu` は報告 `cpuTime` が 165 ms、`wallTime` が 91 秒であり、上限引き上げでは解消しない可能性が高いため、原因は Workers Logs で追跡する。
 
@@ -413,12 +415,12 @@ consumer は `max_concurrency: 3` とする。5 並列では session を毎回�
 
 | 分類 | 例 | 現在の方針 |
 | --- | --- | --- |
-| 再試行可能 | Provider / BrowserUse の一時障害、timeout | `running` を維持し、30 秒後に Queue retry |
+| 再試行可能 | Provider / BrowserUse の一時障害、timeout | `running` を維持し、jitter 付きの指数 backoff（30 / 60 / 120 秒、上限 300 秒）で Queue retry |
 | 再試行不可 | 営業禁止、対象フォームなし、入力不足 | 終端結果として保存し、ack |
 | 結果不明 | submit 後の timeout、完了確認不能 | `uncertain` として保存し、ack |
 | retry 上限超過 | 一時障害の継続 | DLQ へ移動し、`dead_lettered` とイベントを保存 |
 
-将来は一時障害を分類し、指数 backoff と jitter、設定可能な retry 回数、DLQ の人手確認・再投入を実装する。
+指数 backoff と jitter は実装済みであり、`dead_lettered` は人手で確認し、承認のうえ新しいジョブ ID で再登録する（手順は runbook）。一時障害の細分類と設定可能な retry 回数は未実装である。
 
 ## コスト / ボトルネック
 
@@ -428,7 +430,7 @@ consumer は `max_concurrency: 3` とする。5 並列では session を毎回�
 2. BrowserUse Cloud Browser の session 時間、並列数、待ち時間
 3. Cloudflare Worker、Queue、D1、ログ・イベント保存
 
-現時点で記録しているのは Provider 呼び出し回数だけであり、1 件原価は算出できない。今後は、全投入件数と `sent` 件数の両方を分母にして原価を計測する。
+`agent.run_metrics` に 1 run あたりの token 数、Provider 呼び出し回数、BrowserUse 接続時間、実行時間を保存するため、外部の token 単価と組み合わせて 1 件原価を概算できる。今後は、全投入件数と `sent` 件数の両方を分母にして原価を計測する。
 
 ## PoC 計画と進捗
 
@@ -474,7 +476,7 @@ consumer は `max_concurrency: 3` とする。5 並列では session を毎回�
 
 - [ ] Queue の backpressure と retry を検証する。
 - [ ] OpenAI / BrowserUse の 429、503、timeout を観測する。
-- [ ] 指数 backoff、jitter、DLQ 再投入を実装・検証する。
+- [ ] 20 並列で指数 backoff、jitter、DLQ 再登録を検証する（実装と runbook 手順は完了）。
 - [ ] 実 form の互換性と未対応パターンを分類する。
 - [ ] メトリクスの欠損とイベント量を確認する。
 
@@ -494,7 +496,7 @@ consumer は `max_concurrency: 3` とする。5 並列では session を毎回�
 - 実Workerを`submitting`中に停止した場合の検証。Workers テストで「再配信は ack され、状態は `submitting` のまま、`job.redelivery_ignored` が記録される」経路は固定済みであり、実機での強制停止確認だけが残る。
 - 禁止判定の固定パターンを実サイトの表現へ合わせて拡張し、誤検出と未検出を監査する仕組み。
 - 観察済みリンク自体がGET型副作用を持つサイトの識別またはサイト単位の許可方式。
-- 状態遷移、tool、token、時間、費用の observability。
+- 全状態遷移の observability（tool、token、時間は `agent.tool_diagnostic` と `agent.run_metrics` で記録済み）。
 - `submitting` / `uncertain` の照合を支援する専用 API / UI。
 - 実 form のcross-origin iframe、確認画面、複数ページ、Shadow DOM互換性検証と、添付・CAPTCHAの対応方針。
 - Shadow DOM 内の禁止文言を含む可視テキストの収集。
@@ -507,8 +509,9 @@ consumer は `max_concurrency: 3` とする。5 並列では session を毎回�
 - `external-iframe-tertiary` で、モデルが観察本文から禁止を読み取っているのに信頼済み handler の禁止根拠検証（iframe 親ページ側の近接要素）が通らず `FINISH_PROHIBITION_NOT_VERIFIED` になり、`uncertain` で終了した例が 1 件（4 回中）。`validateProhibited` の 1 回限りの再観察は実装済みであり、3 並列 3 回の実行で `FINISH_PROHIBITION_NOT_VERIFIED` が減ることの確認が残る。残る場合は診断とともに記録する。
 - 禁止フォームの submit を信頼済み handler がブロックした後、モデルが `finish_prohibited` ではなく `finish_failed` を選ぶ（`external-iframe-secondary`、3 回中 2 回）。`SUBMIT_PROHIBITED` への分離と guidance、system prompt への追記は実装済みであり、`external-iframe-secondary` が `prohibited` で終わることの確認が残る。
 - BrowserUse のプランと同時 session 上限をダッシュボードで確認する。3 並列で 429 が消えることは 19 シナリオで確認済み。並列数を上げる場合は Pay as you go（同時 10）へ変更してから再計測する。
-- R2 アップロード後・D1 記録前に Worker が停止した場合の孤児オブジェクトは検出できない。intent イベントの先行記録または R2 ライフサイクルルールで対処する。
+- R2 アップロード前に `evidence.intent` を記録するため、Worker が途中で停止した孤児オブジェクトは `type = 'evidence.intent'` の残存行から特定できる。残存行の定期確認と削除は runbook の手作業であり、自動化と保存期間ポリシーは未決である。
 - 送信前レビューの残存リスク対応: `dom` activation で照合と `requestSubmit` を同一 JS 実行内で行い、`mouse` / `enter` は activation 直前に再照合する。snapshot に禁止文言・label・option・action / method を含める。修正の証明を変更したコントロールの value / checked 差分に限定する。form 再探索の切り詰めを検出して fail-closed にする。いずれも管理下テストシステムでの E2E と併せて実施する。
+- `agent.run_metrics` の `durationMs` と Workers Logs の `wallTime` を突き合わせられるようになったが、`outcome: exceededCpu` の原因特定自体は未着手である。
 
 ### 運用・ポリシー
 
