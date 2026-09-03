@@ -51,7 +51,7 @@
 				"max_batch_timeout": 5,
 				"max_retries": 3,
 				"dead_letter_queue": "form-agent-jobs-dlq",
-				"max_concurrency": 10
+				"max_concurrency": 20
 			},
 			{
 				"queue": "form-agent-jobs-dlq",

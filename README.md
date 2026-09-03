@@ -70,11 +70,15 @@ bun run campaign:dry-run \
 
 `--limit`を5より大きくしても、生成ジョブが`_formAgentDryRun: true`固定であることと、実送信経路を持たないことは変わりません。増えるのは1回の実行で検証する件数だけです。
 
-`--choices`は省略できます。指定する場合のJSONは`Record<string, string[]>`で、値は「登録者が事前に許可した選択肢の順序付き集合」です。信頼済みhandlerが対象コントロールのoption値・option text・ラベルと完全一致する最初の候補を選び、一致しなければ入力せずエラーにします。候補は1〜10要素、各要素1〜256文字、合計2,048文字以下で、キーが登録情報・件名・本文と衝突した場合はエラーになります。書式は`docs/examples/campaign-choices.example.json`を参照してください。
+選択肢候補は既定でツールに同梱されており、`--choices`なしでも`inquiryType` / `contactMethod` / `privacyConsent`が適用されます。内容は`src/campaign-import.ts`の`DEFAULT_CHOICE_CANDIDATES`にあり、同じものを`docs/examples/campaign-choices.example.json`に置いています。
 
-プライバシーポリシー同意などの必須checkboxをagentに操作させるかは運用判断です。サンプルには含めていません。同意させる場合だけ、`privacyConsent`のようなキーへ`["checked"]`を指定します。
+`--choices`を指定すると、そのファイルがキー単位で既定を上書きします（ファイル側が勝ち、ファイルに無いキーは既定のまま残ります）。JSONは`Record<string, string[]>`で、値は「登録者が事前に許可した選択肢の順序付き集合」です。信頼済みhandlerが対象コントロールのoption値・option text・ラベルと完全一致する最初の候補を選び、一致しなければ入力せずエラーにします。候補は1〜10要素、各要素1〜256文字、合計2,048文字以下で、キーが登録情報・件名・本文と衝突した場合はエラーになります。既定とファイルをマージした結果も同じ契約で検証します。
+
+既定の`privacyConsent: ["checked"]`は、プライバシーポリシー同意チェックボックスを自動でチェックするという運用判断です。同意を自動化したくない場合は`--no-default-choices`を付けて既定セット全体を無効化し、必要なキーだけを`--choices`のファイルで渡してください。`--no-default-choices`と`--choices`を併用した場合は、ファイルの内容だけが適用されます。
 
 productionへ登録する場合だけ`JOB_API_TOKEN`を環境変数へ設定し、同じコマンドへ`--submit-dry-run`を追加します。生成ジョブは必ず`_formAgentDryRun: true`と`_formAgentMaxAttempts: 1`を持ち、再試行と`submitting` / `sent`を防ぎます。成功条件は各ジョブが1 attemptで`prohibited / DRY_RUN_COMPLETE`になることです。
+
+同じ`--campaign`名で登録値・件名・本文・選択肢を変えて再実行しないでください。ジョブIDはcampaign名・企業ドメイン・フォームURLから決まるため、内容を変えても同じIDになります。登録レスポンスが失われた際の存在確認は入力の一致まで検証するので、不一致は`REGISTRATION_UNKNOWN`として扱われexit 1になります。入力を変える場合はcampaign名も変えてください。
 
 ## エージェント実行境界
 

@@ -227,6 +227,222 @@ export function readChoiceCandidates(
 	return choices;
 }
 
+/**
+ * Narrower than `typeof fetch` so a test can supply a plain function; `fetch`
+ * itself is assignable to it.
+ */
+export type CampaignFetcher = (
+	input: string,
+	init?: RequestInit,
+) => Promise<Response>;
+
+export interface CampaignRegistrationOptions {
+	baseUrl: string;
+	apiToken: string;
+	fetcher?: CampaignFetcher;
+	/** Receives fixed-field log entries; the default writes them as JSON lines. */
+	log?: (entry: Record<string, unknown>) => void;
+}
+
+export interface CampaignRegistrationResult {
+	registered: JobInput[];
+	/** Jobs the API is known not to hold: rejected, 404, or never attempted. */
+	notRegistered: number;
+	/** Jobs whose registration could neither be confirmed nor ruled out. */
+	unknown: number;
+}
+
+export function campaignApiHeaders(apiToken: string): Record<string, string> {
+	return {
+		authorization: `Bearer ${apiToken}`,
+		"content-type": "application/json",
+	};
+}
+
+/**
+ * Digest of the inputs a dry-run actually sends: the form URL and every
+ * `formValues` entry, with candidate lists compared in order. Only the digest
+ * is compared or logged, so no registrant value leaves this function. The
+ * stored payload also carries `_formAgentEffectiveDryRun`, which the API adds,
+ * so the whole payload cannot be compared.
+ */
+export async function jobInputFingerprint(
+	targetUrl: unknown,
+	payload: unknown,
+): Promise<string> {
+	const values =
+		isPlainRecord(payload) && isPlainRecord(payload.formValues)
+			? payload.formValues
+			: {};
+	return sha256(
+		JSON.stringify({
+			targetUrl,
+			subject: values.subject ?? null,
+			message: values.message ?? null,
+			formValues: Object.keys(values)
+				.sort()
+				.map((key) => [key, values[key]]),
+		}),
+	);
+}
+
+/**
+ * Confirms whether the API already holds this exact job. Job ids are derived
+ * from the campaign, company domain, and form URL, so a registration whose
+ * response was lost can be resolved by asking for the id rather than posting
+ * again, which would risk a second queued run of the same company.
+ *
+ * A stored job under the same id whose inputs differ is treated as unconfirmed
+ * rather than as this registration: it means the same campaign name was reused
+ * with different values, and the queued run would send content this invocation
+ * never built.
+ */
+export async function confirmJobRegistration(
+	job: JobInput,
+	options: CampaignRegistrationOptions,
+): Promise<"registered" | "mismatched" | "not_found" | "unknown"> {
+	const fetcher = options.fetcher ?? fetch;
+	let body: unknown;
+	try {
+		const response = await fetcher(`${options.baseUrl}/jobs/${job.id}`, {
+			headers: campaignApiHeaders(options.apiToken),
+			redirect: "manual",
+		});
+		if (!response.ok) {
+			await response.body?.cancel();
+			return response.status === 404 ? "not_found" : "unknown";
+		}
+		body = await response.json();
+	} catch {
+		return "unknown";
+	}
+	if (!isPlainRecord(body) || !isPlainRecord(body.job)) return "unknown";
+	const stored = body.job;
+	const [expected, actual] = await Promise.all([
+		jobInputFingerprint(job.targetUrl, job.payload),
+		jobInputFingerprint(stored.targetUrl, stored.payload),
+	]);
+	return expected === actual ? "registered" : "mismatched";
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Registers every job without waiting for it to finish, so the Queue consumer
+ * runs up to its own max_concurrency instead of one job at a time. Registering
+ * is the last step before the dry-run boundary, so any failure stops further
+ * registrations while the jobs already accepted are still followed.
+ *
+ * A `fetch` that throws leaves the outcome unknown rather than failed: the
+ * request may have reached the API. That job is looked up by its deterministic
+ * id and counted as registered, not registered, or unconfirmed accordingly.
+ */
+export async function registerCampaignJobs(
+	jobs: readonly JobInput[],
+	options: CampaignRegistrationOptions,
+): Promise<CampaignRegistrationResult> {
+	const fetcher = options.fetcher ?? fetch;
+	const log =
+		options.log ??
+		((entry: Record<string, unknown>) => console.log(JSON.stringify(entry)));
+	const registered: JobInput[] = [];
+	let unknown = 0;
+	for (const job of jobs) {
+		if (job.payload._formAgentDryRun !== true) {
+			throw new Error("Job-level dry-run guard is missing");
+		}
+		let created: Response;
+		try {
+			created = await fetcher(`${options.baseUrl}/jobs`, {
+				method: "POST",
+				headers: campaignApiHeaders(options.apiToken),
+				body: JSON.stringify(job),
+				redirect: "manual",
+			});
+		} catch {
+			// Fixed values only: the failure reason may carry a URL or a host.
+			log({
+				event: "campaign_job_registration_unconfirmed",
+				jobId: job.id,
+				reason: "REQUEST_FAILED",
+			});
+			const outcome = await confirmJobRegistration(job, options);
+			log({
+				event: "campaign_job_registration_checked",
+				jobId: job.id,
+				outcome,
+			});
+			if (outcome === "registered") registered.push(job);
+			// A stored job whose inputs differ is not this registration, and it
+			// cannot be ruled out either, so it stays unconfirmed.
+			if (outcome === "unknown" || outcome === "mismatched") unknown += 1;
+			break;
+		}
+		await created.body?.cancel();
+		if (created.status !== 200 && created.status !== 201) {
+			log({
+				event: "campaign_job_registration_failed",
+				jobId: job.id,
+				status: created.status,
+			});
+			break;
+		}
+		registered.push(job);
+		log({ event: "campaign_job_registered", jobId: job.id });
+	}
+	return {
+		registered,
+		notRegistered: jobs.length - registered.length - unknown,
+		unknown,
+	};
+}
+
+/**
+ * Candidate lists shipped with the tool so that a run without `--choices`
+ * still answers the choice controls most Japanese inquiry forms use. These are
+ * operator-decided values, exactly like a choices file: the model only ever
+ * names a payloadKey, and the trusted handler still requires an exact match
+ * against the control before entering anything.
+ *
+ * `privacyConsent` ticks a privacy-policy checkbox. It is included by the
+ * operator's decision; `--no-default-choices` drops the whole default set.
+ */
+export const DEFAULT_CHOICE_CANDIDATES: Record<string, readonly string[]> = {
+	inquiryType: [
+		"その他",
+		"その他のお問い合わせ",
+		"その他お問い合わせ",
+		"ご意見・ご要望",
+		"お問い合わせ",
+		"一般のお問い合わせ",
+		"その他のご相談",
+	],
+	contactMethod: [
+		"メール",
+		"Eメール",
+		"E-mail",
+		"Email",
+		"メールでのご連絡",
+		"メールで連絡",
+	],
+	privacyConsent: ["checked"],
+};
+
+/**
+ * Overlays a choices file on the defaults key by key, the file winning, and
+ * validates the merged result against the same contract a choices file passes.
+ * Merging per key keeps a file that only overrides `inquiryType` from silently
+ * dropping the other defaults.
+ */
+export function mergeChoiceCandidates(
+	defaults: Record<string, readonly string[]>,
+	overrides: Record<string, readonly string[]>,
+): Record<string, readonly string[]> {
+	return readChoiceCandidates({ ...defaults, ...overrides });
+}
+
 export async function buildCampaignJob(
 	candidate: CampaignCandidate,
 	registrationValues: Record<string, string>,
