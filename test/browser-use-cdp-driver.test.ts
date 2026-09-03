@@ -2014,6 +2014,9 @@ describe("CDP command error classification", () => {
 		expect(
 			classifyCdpCommandError("Cannot find context with specified id"),
 		).toBe("NO_EXECUTION_CONTEXT");
+		expect(classifyCdpCommandError("No node found at given location")).toBe(
+			"NO_NODE_AT_LOCATION",
+		);
 		expect(classifyCdpCommandError("Execution context was destroyed.")).toBe(
 			"NO_EXECUTION_CONTEXT",
 		);

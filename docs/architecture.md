@@ -177,14 +177,14 @@ driver が submit control と識別した要素は通常の `click` で操作で
 
 `click` / `fill` / `select` の実行中に CDP が error 応答（`Browser Use CDP command failed`）を返した場合は、run 全体の再試行可能エラーにせず要素エラーとして扱い、モデルへ `ELEMENT_UNAVAILABLE` と再観察の guidance を返す。並列実行時は layout 確定前の `DOM.getBoxModel` / `DOM.scrollIntoViewIfNeeded` がこの失敗を返しやすく、ページが動いただけの失敗で run を終わらせないためである。診断イベントには `ELEMENT_OPERATION_CDP_FAILED` を記録し、通常の要素エラーと区別する。
 
-CDP の error 応答は、失敗した CDP メソッド名、error code、および error message を固定分類した kind（`NODE_NOT_FOUND` / `NODE_DETACHED` / `NO_BOX_MODEL` / `NOT_FOCUSABLE` / `NO_EXECUTION_CONTEXT` / `OTHER`）を保持する。`browser_element_operation_failed` にはこの 3 つを併記し、どのコマンドがどの理由で失敗したかを後から追えるようにする。error message の自由文はページ由来の文字列を含み得るため記録しない。
+CDP の error 応答は、失敗した CDP メソッド名、error code、および error message を固定分類した kind（`NODE_NOT_FOUND` / `NODE_DETACHED` / `NO_BOX_MODEL` / `NOT_FOCUSABLE` / `NO_EXECUTION_CONTEXT` / `NO_NODE_AT_LOCATION` / `OTHER`）を保持する。`browser_element_operation_failed` にはこの 3 つを併記し、どのコマンドがどの理由で失敗したかを後から追えるようにする。error message の自由文はページ由来の文字列を含み得るため記録しない。
 
 変換する範囲は次のとおりである。
 
 - `click`: 要素の検査から mouse の `mousePressed` 送信まで。`mouseReleased` の失敗は変換しない。press を送った時点で click がページへ届いた可能性があり、要素エラーを返すと再観察後の再 click で二重 click になり得るためである。
 - `fill` / `select`: 要素解決後の操作全体。どちらも冪等（select-all して置換、値の setter）であり、再実行しても入力が重複しない。
 
-非 submit の `click` では、要素エラーへ変換する前に準備段階（`DOM.scrollIntoViewIfNeeded` から hit test まで）を 1 animation frame ごとに最大 3 回やり直す。やり直す対象は hit test 不一致と、kind が `NO_BOX_MODEL` / `NODE_NOT_FOUND` / `NODE_DETACHED` / `NO_EXECUTION_CONTEXT` の CDP 失敗に限る。いずれも layout が確定していないだけで、次の frame では解消し得るためである。`NOT_FOCUSABLE` と `OTHER` は要素そのものの状態を表すので再試行しない。再試行のたびに `browser_click_preparation_retry` を `attempt` と `kind`（hit test 不一致は `HIT_TEST`）付きで記録する。`mousePressed` / `mouseReleased` は再試行しない。press を送った時点で click がページへ届いた可能性があるためである。並列実行の `multi-step` で「確認画面へ」の click が再観察後も 3 回連続で CDP error になった事象への対策である。
+非 submit の `click` では、要素エラーへ変換する前に準備段階（`DOM.scrollIntoViewIfNeeded` から hit test まで）を 1 animation frame ごとに最大 3 回やり直す。やり直す対象は hit test 不一致と、kind が `NO_BOX_MODEL` / `NODE_NOT_FOUND` / `NODE_DETACHED` / `NO_EXECUTION_CONTEXT` / `NO_NODE_AT_LOCATION` の CDP 失敗に限る。いずれも layout が確定していないだけで、次の frame では解消し得るためである。`NO_NODE_AT_LOCATION` は 2026-09-03 の 3 並列計測で `multi-step` の「確認画面へ」click が `DOM.getNodeForLocation`（code -32000）で失敗した実測から追加した。`NOT_FOCUSABLE` と `OTHER` は要素そのものの状態を表すので再試行しない。再試行のたびに `browser_click_preparation_retry` を `attempt` と `kind`（hit test 不一致は `HIT_TEST`）付きで記録する。`mousePressed` / `mouseReleased` は再試行しない。press を送った時点で click がページへ届いた可能性があるためである。並列実行の `multi-step` で「確認画面へ」の click が再観察後も 3 回連続で CDP error になった事象への対策である。
 
 接続断（`Browser Use CDP connection closed`）、timeout、送信失敗、payload 上限超過は変換せず、従来どおり run の失敗として扱う。後続の tool 呼び出しでも回復しないためである。`submit` 経路は変換対象外であり、送信権取得後の失敗を `uncertain` に倒す既存の契約を維持する。
 
