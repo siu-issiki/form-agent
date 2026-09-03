@@ -55,6 +55,8 @@ const CONNECT_RETRY_DELAYS_MS = [10_000, 20_000, 30_000];
  * never reaches the provider.
  */
 const SESSION_TIMEOUT_MINUTES = 12;
+/** Marks sessions created by this client so provider counts can separate them from other API-key users. */
+export const SESSION_SOURCE_TAG = "form-agent";
 const SESSION_STOP_TIMEOUT_MS = 10_000;
 
 const RETRYABLE_CONNECT_ERROR_MESSAGES = new Set([
@@ -151,6 +153,35 @@ async function stopBrowserSession(
  * because claimRun serialises attempts, so every active session tagged with it
  * belongs to an attempt that already ended.
  */
+/** Best-effort provider snapshot at the moment of a concurrency rejection. Counts only. */
+async function sampleActiveSessions(
+	client: BrowserUseClient,
+	signal: AbortSignal | undefined,
+): Promise<void> {
+	let activeTotal: number | null = null;
+	let activeTagged: number | null = null;
+	try {
+		const sessions = await client.listBrowsers(
+			"active",
+			100,
+			signal ?? AbortSignal.timeout(SESSION_STOP_TIMEOUT_MS),
+		);
+		activeTotal = sessions.length;
+		activeTagged = sessions.filter(
+			(session) => session.metadata.source === SESSION_SOURCE_TAG,
+		).length;
+	} catch {
+		// The sample is diagnostic only; the retry proceeds either way.
+	}
+	console.warn(
+		JSON.stringify({
+			event: "browser_use_session_limit",
+			activeTotal,
+			activeTagged,
+		}),
+	);
+}
+
 async function reclaimJobSessions(
 	client: BrowserUseClient,
 	jobId: string,
@@ -171,7 +202,9 @@ async function reclaimJobSessions(
 		// Counts only: they show whether the provider limit is consumed by this
 		// deployment (tagged with a jobId) or by sessions created elsewhere.
 		activeTotal = sessions.length;
-		activeTagged = sessions.filter((session) => session.metadata.jobId).length;
+		activeTagged = sessions.filter(
+			(session) => session.metadata.source === SESSION_SOURCE_TAG,
+		).length;
 		for (const session of sessions) {
 			if (session.metadata.jobId !== jobId) continue;
 			matched += 1;
@@ -458,6 +491,14 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 						...connectFailureDetail(lastError),
 					}),
 				);
+				if (
+					lastError instanceof BrowserUseApiError &&
+					lastError.status === 429
+				) {
+					// Sampled before the backoff so the counts describe the sessions
+					// that were active when the provider rejected the request.
+					await sampleActiveSessions(client, signal);
+				}
 				await sleep(delayMs);
 			}
 			assertConnectNotAborted(signal);
@@ -505,7 +546,11 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			session = await client.createBrowser({
 				timeoutMinutes: SESSION_TIMEOUT_MINUTES,
 				proxyCountryCode: "jp",
-				metadata: { jobId: job.id, dryRun: String(dryRun) },
+				metadata: {
+					source: SESSION_SOURCE_TAG,
+					jobId: job.id,
+					dryRun: String(dryRun),
+				},
 				...(signal ? { signal } : {}),
 			});
 		} catch (error) {
