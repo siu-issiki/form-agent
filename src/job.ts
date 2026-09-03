@@ -70,7 +70,7 @@ export interface AgentRunMetrics {
 	reasoningTokens: number;
 	cachedTokens: number;
 	browserConnectMs: number | null;
-	browserSessionCreated: boolean;
+	browserConnected: boolean;
 	submitReviewAllow: number;
 	submitReviewDeny: number;
 	durationMs: number;
@@ -426,14 +426,22 @@ export class InMemoryJobStore implements JobStore {
 		failureCode: EvidenceFailureCode,
 		_now: string,
 	): Promise<boolean> {
-		if (this.#evidenceEventIndexes.has(eventId)) {
+		const index = this.#evidenceEventIndexes.get(eventId);
+		if (index !== undefined) {
+			// The object key survives the failure so an upload that was already
+			// started stays traceable.
+			const objectKey = this.events[index]?.data.objectKey;
 			return this.#transitionEvidenceEvent(
 				id,
 				attempt,
 				eventId,
 				["evidence.intent", "evidence.captured"],
 				"evidence.capture_failed",
-				{ stage, failureCode },
+				{
+					stage,
+					failureCode,
+					...(objectKey === undefined ? {} : { objectKey }),
+				},
 			);
 		}
 

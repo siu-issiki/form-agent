@@ -195,7 +195,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 			await this.#recordRunMetrics(input, {
 				...counters,
 				browserConnectMs: coordinator.connectDurationMs,
-				browserSessionCreated: coordinator.browserSessionCreated,
+				browserConnected: coordinator.browserConnected,
 				durationMs: Math.max(0, Date.now() - startedAt),
 				outcome,
 			});

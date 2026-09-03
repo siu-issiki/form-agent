@@ -146,7 +146,7 @@ D1 migrationはWorker deployでは自動適用されない。新しい列を参�
 
 送信済みの可能性を否定できない場合は再投入しない。未送信と判断して再実行する場合も、既存IDは変更せず、承認記録と新しいジョブIDを使用する。
 
-該当runがどこまで進んだかは、後述「実行メトリクスの取得」の`agent.run_metrics`でも確認する。`outcome`が`error`のrunはexecutorが例外で終了しており、`browserSessionCreated`が`false`ならbrowser sessionを作る前に終わっている。
+該当runがどこまで進んだかは、後述「実行メトリクスの取得」の`agent.run_metrics`でも確認する。`outcome`が`error`のrunはexecutorが例外で終了しており、`browserConnected`が`false`ならCDP接続が確立していない。ただしREST APIでのsession作成後にCDP接続で失敗した場合も`false`になるため、session自体の有無は`browser_use_session_created` / `browser_use_session_stopped`のログで確認する。
 
 ## 証跡スクリーンショットの確認
 
@@ -177,14 +177,19 @@ D1へのイベント記録に失敗した場合、または15秒のタイムア�
 ./node_modules/.bin/wrangler r2 object delete form-agent-evidence/<objectKey> --remote
 ```
 
-R2へアップロードする直前に`evidence.intent`イベントを記録するため、R2 put後・D1記録前にWorkerが停止した孤児オブジェクトは、残存する`evidence.intent`行から特定できる。撮影が完了すると同じ`events.id`が`evidence.captured`または`evidence.capture_failed`へ遷移するため、`evidence.intent`のまま残る行は孤児の候補である。Cloudflare APIトークンは不要である。
+R2へアップロードする直前に`evidence.intent`イベントを記録するため、R2 put後・D1記録前にWorkerが停止した孤児オブジェクトは、残存する`evidence.intent`行から特定できる。撮影が完了すると同じ`events.id`が`evidence.captured`または`evidence.capture_failed`へ遷移し、失敗側へ遷移した場合も`objectKey`を保持する。したがって孤児候補は次の2種類である。
+
+1. `type='evidence.intent'`のまま残る行（put前後にWorkerが停止した可能性がある）
+2. `type='evidence.capture_failed'`で`objectKey`を持ち、`failureCode`が`CAPTURE_TIMEOUT` / `OBJECT_STORE_FAILED` / `EVENT_NOT_RECORDED`の行（補償削除が完了していない可能性がある）
+
+Cloudflare APIトークンは不要である。
 
 ```bash
 ./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
-  "SELECT events.id,events.job_id,events.attempt,json_extract(events.data_json,'$.stage') AS stage,json_extract(events.data_json,'$.objectKey') AS object_key,events.created_at,jobs.status FROM events JOIN jobs ON jobs.id=events.job_id WHERE events.type='evidence.intent' ORDER BY events.created_at;"
+  "SELECT events.id,events.job_id,events.attempt,events.type,json_extract(events.data_json,'$.stage') AS stage,json_extract(events.data_json,'$.failureCode') AS failure_code,json_extract(events.data_json,'$.objectKey') AS object_key,events.created_at,jobs.status FROM events JOIN jobs ON jobs.id=events.job_id WHERE (events.type='evidence.intent' OR (events.type='evidence.capture_failed' AND json_extract(events.data_json,'$.objectKey') IS NOT NULL AND json_extract(events.data_json,'$.failureCode') IN ('CAPTURE_TIMEOUT','OBJECT_STORE_FAILED','EVENT_NOT_RECORDED'))) ORDER BY events.created_at;"
 ```
 
-`status`が`running` / `submitting`の行は撮影中の可能性があるため削除しない。終端状態のジョブに残る行だけを孤児候補として扱い、`object_key`をR2から削除する。削除後も`evidence.intent`行はrunの記録として残す。
+`status`が`running` / `submitting`の行は撮影中の可能性があるため削除しない。終端状態のジョブに残る行だけを孤児候補として扱い、`object_key`をR2から削除する。多くの候補はWorkerが補償削除に成功しておりR2上に存在しないが、`wrangler r2 object delete`は存在しないキーに対しても成功扱いで終了するため、候補すべてに対して実行してよい。削除後も元のイベント行はrunの記録として残す。
 
 ```bash
 ./node_modules/.bin/wrangler r2 object delete form-agent-evidence/<objectKey> --remote
@@ -229,7 +234,7 @@ DLQへ移動したジョブを確認する。
 
 ## 実行メトリクスの取得
 
-1 runにつき1件の`agent.run_metrics`イベントを記録する。値は数値、boolean、固定コードだけであり、URL、会社名、フォーム値、モデルの自由文は含まない。
+1 runにつき1件の`agent.run_metrics`イベントを記録する。値は数値、boolean、固定コードだけであり、URL、会社名、フォーム値、モデルの自由文は含まない。`browserConnected`はCDP driverの確立に成功したかどうかだけを表すため、課金対象のsession作成・停止件数は`browser_use_session_created` / `browser_use_session_stopped`のログで追う。
 
 ```bash
 ./node_modules/.bin/wrangler d1 execute form-agent --remote --command \

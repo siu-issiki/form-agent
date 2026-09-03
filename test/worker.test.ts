@@ -377,7 +377,11 @@ describe("D1JobStore", () => {
 			{
 				type: "evidence.capture_failed",
 				attempt: 1,
-				data: { stage: "before_submit", failureCode: "CAPTURE_TIMEOUT" },
+				data: {
+					stage: "before_submit",
+					failureCode: "CAPTURE_TIMEOUT",
+					objectKey: "jobs/job-001/before_submit/event-timeout.jpg",
+				},
 			},
 		]);
 	});
@@ -435,11 +439,16 @@ describe("D1JobStore", () => {
 		);
 
 		expect(failed).toBe(true);
+		// The key stays on the failure event so a partial upload is traceable.
 		expect(await readEvidenceEvents(input.id)).toEqual([
 			{
 				type: "evidence.capture_failed",
 				attempt: 1,
-				data: { stage: "before_submit", failureCode: "OBJECT_STORE_FAILED" },
+				data: {
+					stage: "before_submit",
+					failureCode: "OBJECT_STORE_FAILED",
+					objectKey: "jobs/job-001/before_submit/event-failed.jpg",
+				},
 			},
 		]);
 	});
@@ -1322,7 +1331,7 @@ describe("ResponsesAgentExecutor", () => {
 			reviewRequests: 1,
 			submitReviewAllow: 1,
 			submitReviewDeny: 0,
-			browserSessionCreated: true,
+			browserConnected: true,
 			outcome: "prohibited",
 		});
 		const diagnostics = await readAgentToolDiagnostics(input.id);
@@ -2129,7 +2138,7 @@ describe("ResponsesAgentExecutor", () => {
 			outputTokens: 320,
 			reasoningTokens: 64,
 			cachedTokens: 400,
-			browserSessionCreated: true,
+			browserConnected: true,
 			submitReviewAllow: 0,
 			submitReviewDeny: 0,
 			outcome: "prohibited",
@@ -2175,7 +2184,7 @@ describe("ResponsesAgentExecutor", () => {
 		expect(metrics[0]?.data).toMatchObject({
 			turns: 1,
 			providerRequests: 1,
-			browserSessionCreated: false,
+			browserConnected: false,
 			outcome: "error",
 		});
 		// A failed connection still costs time and is measured.
@@ -2225,7 +2234,7 @@ describe("ResponsesAgentExecutor", () => {
 			reviewRequests: 0,
 			inputTokens: 0,
 			browserConnectMs: null,
-			browserSessionCreated: false,
+			browserConnected: false,
 			outcome: "failed",
 		});
 	});
@@ -3589,7 +3598,7 @@ function runMetrics(overrides: Partial<AgentRunMetrics> = {}): AgentRunMetrics {
 		reasoningTokens: 128,
 		cachedTokens: 64,
 		browserConnectMs: 850,
-		browserSessionCreated: true,
+		browserConnected: true,
 		submitReviewAllow: 1,
 		submitReviewDeny: 0,
 		durationMs: 12_000,

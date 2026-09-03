@@ -188,7 +188,7 @@ describe("job submission guard", () => {
 			reasoningTokens: 64,
 			cachedTokens: 32,
 			browserConnectMs: 900,
-			browserSessionCreated: true,
+			browserConnected: true,
 			submitReviewAllow: 1,
 			submitReviewDeny: 0,
 			durationMs: 5_000,

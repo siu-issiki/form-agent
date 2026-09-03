@@ -1740,12 +1740,17 @@ describe("SubmissionEvidenceRecorder", () => {
 			captured: false,
 			failureCode: "OBJECT_STORE_FAILED",
 		});
+		// The key stays on the failure event so a partial upload is traceable.
 		expect(store.events).toEqual([
 			{
 				jobId: input.id,
 				attempt: 1,
 				type: "evidence.capture_failed",
-				data: { stage: "before_submit", failureCode: "OBJECT_STORE_FAILED" },
+				data: {
+					stage: "before_submit",
+					failureCode: "OBJECT_STORE_FAILED",
+					objectKey: evidenceObjectKeyPattern("before_submit"),
+				},
 			},
 		]);
 	});
@@ -1813,7 +1818,11 @@ describe("SubmissionEvidenceRecorder", () => {
 				jobId: input.id,
 				attempt: 1,
 				type: "evidence.capture_failed",
-				data: { stage: "after_submit", failureCode: "CAPTURE_TIMEOUT" },
+				data: {
+					stage: "after_submit",
+					failureCode: "CAPTURE_TIMEOUT",
+					objectKey: evidenceObjectKeyPattern("after_submit"),
+				},
 			},
 		]);
 	});
@@ -1846,7 +1855,11 @@ describe("SubmissionEvidenceRecorder", () => {
 				jobId: input.id,
 				attempt: 1,
 				type: "evidence.capture_failed",
-				data: { stage: "before_submit", failureCode: "EVENT_NOT_RECORDED" },
+				data: {
+					stage: "before_submit",
+					failureCode: "EVENT_NOT_RECORDED",
+					objectKey: evidenceObjectKeyPattern("before_submit"),
+				},
 			},
 		]);
 	});
@@ -1987,7 +2000,11 @@ describe("SubmissionEvidenceRecorder", () => {
 				jobId: input.id,
 				attempt: 1,
 				type: "evidence.capture_failed",
-				data: { stage: "before_submit", failureCode: "CAPTURE_TIMEOUT" },
+				data: {
+					stage: "before_submit",
+					failureCode: "CAPTURE_TIMEOUT",
+					objectKey: evidenceObjectKeyPattern("before_submit"),
+				},
 			},
 		]);
 	});
@@ -2016,6 +2033,13 @@ class RecordEvidenceCapturedRejectingJobStore extends InMemoryJobStore {
 	async recordEvidenceCaptured(): Promise<boolean> {
 		return false;
 	}
+}
+
+/** Matches the object key the recorder builds for one capture. */
+function evidenceObjectKeyPattern(stage: EvidenceStage) {
+	return expect.stringMatching(
+		new RegExp(`^jobs/${input.id}/${stage}/[0-9a-f-]{36}\\.jpg$`),
+	);
 }
 
 class RecordEvidenceIntentRejectingJobStore extends InMemoryJobStore {

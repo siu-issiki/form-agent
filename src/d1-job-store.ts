@@ -312,7 +312,7 @@ export class D1JobStore implements JobStore {
           'reasoningTokens', ?,
           'cachedTokens', ?,
           'browserConnectMs', ?,
-          'browserSessionCreated', json(?),
+          'browserConnected', json(?),
           'submitReviewAllow', ?,
           'submitReviewDeny', ?,
           'durationMs', ?,
@@ -336,7 +336,7 @@ export class D1JobStore implements JobStore {
 				metrics.reasoningTokens,
 				metrics.cachedTokens,
 				metrics.browserConnectMs,
-				metrics.browserSessionCreated ? "true" : "false",
+				metrics.browserConnected ? "true" : "false",
 				metrics.submitReviewAllow,
 				metrics.submitReviewDeny,
 				metrics.durationMs,
@@ -518,9 +518,15 @@ export class D1JobStore implements JobStore {
 		const [updated, inserted] = await session.batch([
 			session
 				.prepare(
+					// The object key survives the failure so an upload that was
+					// already started stays traceable from D1.
 					`UPDATE events
 					 SET type = 'evidence.capture_failed',
-					     data_json = json_object('stage', ?, 'failureCode', ?),
+					     data_json = json_object(
+					       'stage', ?,
+					       'failureCode', ?,
+					       'objectKey', json_extract(data_json, '$.objectKey')
+					     ),
 					     created_at = ?
 					 WHERE id = ?
 					   AND job_id = ?
