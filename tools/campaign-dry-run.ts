@@ -2,6 +2,7 @@ import { parse } from "csv-parse/sync";
 import {
 	buildCampaignJob,
 	type CampaignCsvRow,
+	campaignApiHeaders,
 	DEFAULT_CHOICE_CANDIDATES,
 	filterCampaignRows,
 	mapRegistrationValues,
@@ -9,6 +10,7 @@ import {
 	type RedirectResolution,
 	type RegistrationEntry,
 	readChoiceCandidates,
+	registerCampaignJobs,
 	resolveRedirectHosts,
 	selectCampaignCandidates,
 } from "../src/campaign-import";
@@ -17,7 +19,7 @@ import type { TrustedFormValue } from "../src/restricted-browser";
 
 const PRODUCTION_BASE_URL = "https://form-agent.form-agent.workers.dev";
 /** Mirrors the Queue consumer max_concurrency in wrangler.jsonc. */
-const QUEUE_MAX_CONCURRENCY = 10;
+const QUEUE_MAX_CONCURRENCY = 20;
 const POLL_INTERVAL_MS = 2_000;
 const TERMINAL_STATUSES = [
 	"prohibited",
@@ -115,10 +117,16 @@ if (jobs.length !== options.limit) {
 }
 
 if (options.submit) {
-	const submitted = await registerAll(jobs, options.apiToken);
+	const submitted = await registerCampaignJobs(jobs, {
+		baseUrl: PRODUCTION_BASE_URL,
+		apiToken: options.apiToken,
+	});
 	const byReasonCode: Record<string, number> = {};
 	if (submitted.notRegistered > 0) {
 		byReasonCode.REGISTRATION_FAILED = submitted.notRegistered;
+	}
+	if (submitted.unknown > 0) {
+		byReasonCode.REGISTRATION_UNKNOWN = submitted.unknown;
 	}
 	const completed = await waitForAll(
 		submitted.registered,
@@ -231,47 +239,6 @@ async function readRegistration(path: string): Promise<RegistrationEntry[]> {
 }
 
 /**
- * Registration is sequential but does not wait for completion, so the Queue
- * consumer runs up to its own max_concurrency instead of one job at a time.
- * Registering a job is the last step before the dry-run boundary, so a failure
- * stops further registrations while the jobs already accepted are still
- * followed to their result.
- */
-async function registerAll(
-	jobs: readonly JobInput[],
-	apiToken: string,
-): Promise<{ registered: JobInput[]; notRegistered: number }> {
-	const registered: JobInput[] = [];
-	for (const job of jobs) {
-		if (job.payload._formAgentDryRun !== true) {
-			throw new Error("Job-level dry-run guard is missing");
-		}
-		const created = await fetch(`${PRODUCTION_BASE_URL}/jobs`, {
-			method: "POST",
-			headers: apiHeaders(apiToken),
-			body: JSON.stringify(job),
-			redirect: "manual",
-		});
-		await created.body?.cancel();
-		if (created.status !== 200 && created.status !== 201) {
-			console.log(
-				JSON.stringify({
-					event: "campaign_job_registration_failed",
-					jobId: job.id,
-					status: created.status,
-				}),
-			);
-			break;
-		}
-		registered.push(job);
-		console.log(
-			JSON.stringify({ event: "campaign_job_registered", jobId: job.id }),
-		);
-	}
-	return { registered, notRegistered: jobs.length - registered.length };
-}
-
-/**
  * Polls every registered job each round instead of draining them one by one.
  * The budget keeps the original four minutes per concurrent batch, because a
  * job queued behind a full batch only starts once one of those finishes.
@@ -355,30 +322,38 @@ async function readJobState(
 	jobId: string,
 	apiToken: string,
 ): Promise<JobState | null> {
-	const response = await fetch(`${PRODUCTION_BASE_URL}/jobs/${jobId}`, {
-		headers: apiHeaders(apiToken),
-		redirect: "manual",
-	});
-	if (!response.ok) {
-		await response.body?.cancel();
+	try {
+		const response = await fetch(`${PRODUCTION_BASE_URL}/jobs/${jobId}`, {
+			headers: campaignApiHeaders(apiToken),
+			redirect: "manual",
+		});
+		if (!response.ok) {
+			await response.body?.cancel();
+			console.log(
+				JSON.stringify({
+					event: "campaign_job_lookup_failed",
+					jobId,
+					status: response.status,
+				}),
+			);
+			return null;
+		}
+		const body = (await response.json()) as { job: JobState };
+		return body.job;
+	} catch {
+		// A lookup failure here — including a fetch that throws or a response
+		// body that fails to parse — is transient; the job stays pending and is
+		// read again next round. Fixed values only: the failure reason may carry
+		// a URL or a host.
 		console.log(
 			JSON.stringify({
 				event: "campaign_job_lookup_failed",
 				jobId,
-				status: response.status,
+				reason: "REQUEST_FAILED",
 			}),
 		);
 		return null;
 	}
-	const body = (await response.json()) as { job: JobState };
-	return body.job;
-}
-
-function apiHeaders(apiToken: string): Record<string, string> {
-	return {
-		authorization: `Bearer ${apiToken}`,
-		"content-type": "application/json",
-	};
 }
 
 function requiredOption(values: Map<string, string>, name: string): string {

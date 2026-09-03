@@ -228,6 +228,130 @@ export function readChoiceCandidates(
 }
 
 /**
+ * Narrower than `typeof fetch` so a test can supply a plain function; `fetch`
+ * itself is assignable to it.
+ */
+export type CampaignFetcher = (
+	input: string,
+	init?: RequestInit,
+) => Promise<Response>;
+
+export interface CampaignRegistrationOptions {
+	baseUrl: string;
+	apiToken: string;
+	fetcher?: CampaignFetcher;
+	/** Receives fixed-field log entries; the default writes them as JSON lines. */
+	log?: (entry: Record<string, unknown>) => void;
+}
+
+export interface CampaignRegistrationResult {
+	registered: JobInput[];
+	/** Jobs the API is known not to hold: rejected, 404, or never attempted. */
+	notRegistered: number;
+	/** Jobs whose registration could neither be confirmed nor ruled out. */
+	unknown: number;
+}
+
+export function campaignApiHeaders(apiToken: string): Record<string, string> {
+	return {
+		authorization: `Bearer ${apiToken}`,
+		"content-type": "application/json",
+	};
+}
+
+/**
+ * Confirms whether the API already holds a job. Job ids are derived from the
+ * campaign, company domain, and form URL, so a registration whose response was
+ * lost can be resolved by asking for the id rather than posting again, which
+ * would risk a second queued run of the same company.
+ */
+export async function confirmJobRegistration(
+	jobId: string,
+	options: CampaignRegistrationOptions,
+): Promise<"registered" | "not_found" | "unknown"> {
+	const fetcher = options.fetcher ?? fetch;
+	try {
+		const response = await fetcher(`${options.baseUrl}/jobs/${jobId}`, {
+			headers: campaignApiHeaders(options.apiToken),
+			redirect: "manual",
+		});
+		await response.body?.cancel();
+		if (response.ok) return "registered";
+		return response.status === 404 ? "not_found" : "unknown";
+	} catch {
+		return "unknown";
+	}
+}
+
+/**
+ * Registers every job without waiting for it to finish, so the Queue consumer
+ * runs up to its own max_concurrency instead of one job at a time. Registering
+ * is the last step before the dry-run boundary, so any failure stops further
+ * registrations while the jobs already accepted are still followed.
+ *
+ * A `fetch` that throws leaves the outcome unknown rather than failed: the
+ * request may have reached the API. That job is looked up by its deterministic
+ * id and counted as registered, not registered, or unconfirmed accordingly.
+ */
+export async function registerCampaignJobs(
+	jobs: readonly JobInput[],
+	options: CampaignRegistrationOptions,
+): Promise<CampaignRegistrationResult> {
+	const fetcher = options.fetcher ?? fetch;
+	const log =
+		options.log ??
+		((entry: Record<string, unknown>) => console.log(JSON.stringify(entry)));
+	const registered: JobInput[] = [];
+	let unknown = 0;
+	for (const job of jobs) {
+		if (job.payload._formAgentDryRun !== true) {
+			throw new Error("Job-level dry-run guard is missing");
+		}
+		let created: Response;
+		try {
+			created = await fetcher(`${options.baseUrl}/jobs`, {
+				method: "POST",
+				headers: campaignApiHeaders(options.apiToken),
+				body: JSON.stringify(job),
+				redirect: "manual",
+			});
+		} catch {
+			// Fixed values only: the failure reason may carry a URL or a host.
+			log({
+				event: "campaign_job_registration_unconfirmed",
+				jobId: job.id,
+				reason: "REQUEST_FAILED",
+			});
+			const outcome = await confirmJobRegistration(job.id, options);
+			log({
+				event: "campaign_job_registration_checked",
+				jobId: job.id,
+				outcome,
+			});
+			if (outcome === "registered") registered.push(job);
+			if (outcome === "unknown") unknown += 1;
+			break;
+		}
+		await created.body?.cancel();
+		if (created.status !== 200 && created.status !== 201) {
+			log({
+				event: "campaign_job_registration_failed",
+				jobId: job.id,
+				status: created.status,
+			});
+			break;
+		}
+		registered.push(job);
+		log({ event: "campaign_job_registered", jobId: job.id });
+	}
+	return {
+		registered,
+		notRegistered: jobs.length - registered.length - unknown,
+		unknown,
+	};
+}
+
+/**
  * Candidate lists shipped with the tool so that a run without `--choices`
  * still answers the choice controls most Japanese inquiry forms use. These are
  * operator-decided values, exactly like a choices file: the model only ever

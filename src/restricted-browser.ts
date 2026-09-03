@@ -958,8 +958,15 @@ const FORM_PURPOSE_WORDS =
 	"採用|求人|エントリー|応募|新卒|中途|アルバイト|インターン|予約|資料請求|お見積り|お見積|見積|会員|ログイン|マイページ|サポート|不具合|修理受付|報道|取材|サンプル";
 
 /** Words that turn a purpose word into a restriction on who may use the form. */
-const FORM_PURPOSE_LIMITERS =
-	"専用|のみ|以外は|以外の|限定|に限ります|に限らせて";
+const FORM_PURPOSE_LIMITERS = "専用|のみ|限定|に限ります|に限らせて";
+
+/**
+ * 「以外」 alone usually introduces a general inquiry form rather than excluding
+ * one ("採用以外のお問い合わせはこちら"), so it counts as a restriction only when
+ * a refusal follows it closely.
+ */
+const FORM_PURPOSE_REFUSALS =
+	"受け付けて(?:おりません|いません|ません)|受け付けません|受付(?:して)?(?:おりません|いません|ません)|お断り|ご遠慮|承って(?:おりません|いません|ません)|承りません|承れません|(?:いた|致)しかねます|対応して(?:おりません|いません)|お受けして(?:おりません|いません)|ご利用(?:いただけません|になれません)|できません";
 
 /**
  * Generic connectors allowed between a purpose word and a limiter. Requiring
@@ -988,6 +995,7 @@ export const PROHIBITION_TEXT_PATTERN_SOURCES = {
 		"(採用|サポート|報道|サンプル|資料請求).{0,30}(専用|のみ)",
 		"(専用|のみ).{0,30}(採用|サポート|報道|サンプル|資料請求)",
 		`(?:${FORM_PURPOSE_WORDS})${FORM_PURPOSE_CONNECTORS}(?:${FORM_PURPOSE_LIMITERS})`,
+		`(?:${FORM_PURPOSE_WORDS})${FORM_PURPOSE_CONNECTORS}以外(?:は|の).{0,20}(?:${FORM_PURPOSE_REFUSALS})`,
 	],
 	/**
 	 * Matched only against a heading, legend, or document title whose whole text

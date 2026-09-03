@@ -9,9 +9,11 @@ import {
 	normalizeCompanyDomain,
 	type RegistrationEntry,
 	readChoiceCandidates,
+	registerCampaignJobs,
 	resolveRedirectHosts,
 	selectCampaignCandidates,
 } from "../src/campaign-import";
+import type { JobInput } from "../src/job";
 
 const registrationPairs: Array<[string, string]> = [
 	["苗字", "last"],
@@ -298,6 +300,133 @@ describe("campaign import", () => {
 		});
 	});
 
+	test("registers every job before waiting for any of them", async () => {
+		const jobs = [dryRunJob("job-1"), dryRunJob("job-2")];
+		const posted: string[] = [];
+		const logs: Array<Record<string, unknown>> = [];
+
+		const result = await registerCampaignJobs(jobs, {
+			baseUrl: "https://api.test",
+			apiToken: "token",
+			log: (entry) => logs.push(entry),
+			fetcher: async (resource, init) => {
+				posted.push(String(init?.method ?? "GET"));
+				void resource;
+				return new Response(null, { status: 201 });
+			},
+		});
+
+		expect(result).toMatchObject({ notRegistered: 0, unknown: 0 });
+		expect(result.registered.map((job) => job.id)).toEqual(["job-1", "job-2"]);
+		expect(posted).toEqual(["POST", "POST"]);
+		expect(logs.map((entry) => entry.event)).toEqual([
+			"campaign_job_registered",
+			"campaign_job_registered",
+		]);
+	});
+
+	test("keeps a job whose registration response was lost but which exists", async () => {
+		const jobs = [dryRunJob("job-1"), dryRunJob("job-2")];
+		const logs: Array<Record<string, unknown>> = [];
+
+		const result = await registerCampaignJobs(jobs, {
+			baseUrl: "https://api.test",
+			apiToken: "token",
+			log: (entry) => logs.push(entry),
+			fetcher: async (_resource, init) => {
+				if (init?.method === "POST") throw new TypeError("network error");
+				return new Response(null, { status: 200 });
+			},
+		});
+
+		expect(result.registered.map((job) => job.id)).toEqual(["job-1"]);
+		// job-2 was never attempted after the stop, so it is a known non-entry.
+		expect(result).toMatchObject({ notRegistered: 1, unknown: 0 });
+		expect(logs.at(-1)).toEqual({
+			event: "campaign_job_registration_checked",
+			jobId: "job-1",
+			outcome: "registered",
+		});
+		// Fixed values only: no URL, host, or provider message.
+		expect(logs[0]).toEqual({
+			event: "campaign_job_registration_unconfirmed",
+			jobId: "job-1",
+			reason: "REQUEST_FAILED",
+		});
+	});
+
+	test("counts a lost registration the API does not hold as failed", async () => {
+		const result = await registerCampaignJobs([dryRunJob("job-1")], {
+			baseUrl: "https://api.test",
+			apiToken: "token",
+			log: () => undefined,
+			fetcher: async (_resource, init) => {
+				if (init?.method === "POST") throw new TypeError("network error");
+				return new Response(null, { status: 404 });
+			},
+		});
+
+		expect(result).toMatchObject({
+			registered: [],
+			notRegistered: 1,
+			unknown: 0,
+		});
+	});
+
+	test("counts a registration it cannot confirm either way as unknown", async () => {
+		const result = await registerCampaignJobs([dryRunJob("job-1")], {
+			baseUrl: "https://api.test",
+			apiToken: "token",
+			log: () => undefined,
+			fetcher: async () => {
+				throw new TypeError("network error");
+			},
+		});
+
+		expect(result).toMatchObject({
+			registered: [],
+			notRegistered: 0,
+			unknown: 1,
+		});
+	});
+
+	test("stops registering when the API rejects a job outright", async () => {
+		const jobs = [dryRunJob("job-1"), dryRunJob("job-2")];
+		let posts = 0;
+
+		const result = await registerCampaignJobs(jobs, {
+			baseUrl: "https://api.test",
+			apiToken: "token",
+			log: () => undefined,
+			fetcher: async () => {
+				posts += 1;
+				return new Response(null, { status: 500 });
+			},
+		});
+
+		expect(posts).toBe(1);
+		expect(result).toMatchObject({
+			registered: [],
+			notRegistered: 2,
+			unknown: 0,
+		});
+	});
+
+	test("refuses to register a job without the dry-run guard", async () => {
+		const job = dryRunJob("job-1");
+		const unguarded = { ...job, payload: { ...job.payload } };
+		delete unguarded.payload._formAgentDryRun;
+
+		await expect(
+			registerCampaignJobs([unguarded], {
+				baseUrl: "https://api.test",
+				apiToken: "token",
+				log: () => undefined,
+				fetcher: async () => new Response(null, { status: 201 }),
+			}),
+		).rejects.toThrow("dry-run guard");
+	});
+
 	test("validates the merged candidates against the same contract", () => {
 		expect(() =>
 			mergeChoiceCandidates(DEFAULT_CHOICE_CANDIDATES, { inquiryType: [] }),
@@ -307,6 +436,18 @@ describe("campaign import", () => {
 		).toThrow("invalid payload key");
 	});
 });
+
+function dryRunJob(id: string): JobInput {
+	return {
+		id,
+		companyId: "company-1",
+		companyName: "Target Company",
+		targetUrl: "https://acme.co.jp/contact",
+		targetDomain: "acme.co.jp",
+		allowedHosts: ["acme.co.jp"],
+		payload: { _formAgentDryRun: true, _formAgentMaxAttempts: 1 },
+	};
+}
 
 function row(overrides: CampaignCsvRow = {}): CampaignCsvRow {
 	return {
