@@ -59,10 +59,15 @@ production Workerを使う送信なしE2Eは、productionの`JOB_API_TOKEN`と�
 ```bash
 bun run campaign:dry-run \
   --registration /path/to/registration.json \
+  --choices /path/to/choices.json \
   --csv /path/to/targets.csv \
   --campaign agb-shaken-2026-09-dryrun-v1 \
   --limit 5
 ```
+
+`--choices`は省略できます。指定する場合のJSONは`Record<string, string[]>`で、値は「登録者が事前に許可した選択肢の順序付き集合」です。信頼済みhandlerが対象コントロールのoption値・option text・ラベルと完全一致する最初の候補を選び、一致しなければ入力せずエラーにします。候補は1〜10要素、各要素1〜256文字、合計2,048文字以下で、キーが登録情報・件名・本文と衝突した場合はエラーになります。書式は`docs/examples/campaign-choices.example.json`を参照してください。
+
+プライバシーポリシー同意などの必須checkboxをagentに操作させるかは運用判断です。サンプルには含めていません。同意させる場合だけ、`privacyConsent`のようなキーへ`["checked"]`を指定します。
 
 productionへ登録する場合だけ`JOB_API_TOKEN`を環境変数へ設定し、同じコマンドへ`--submit-dry-run`を追加します。生成ジョブは必ず`_formAgentDryRun: true`と`_formAgentMaxAttempts: 1`を持ち、再試行と`submitting` / `sent`を防ぎます。成功条件は各ジョブが1 attemptで`prohibited / DRY_RUN_COMPLETE`になることです。
 
@@ -72,7 +77,7 @@ Queue Consumer は `AgentRuntime` の結果契約を使い、WorkerからOpenAI 
 
 Responses APIのfunction callingはstrict schema、1ターン1toolで処理します。Worker側でモデル、request/response本文サイズ、出力token、最大turn、1 runの呼び出し回数を固定し、D1の条件付き更新でProvider予算を原子的に消費します。
 
-Worker内の信頼済みhandlerがBrowserUseへCDP接続し、モデルには`navigate` / `observe` / `click` / `fill` / `select` / `submit` / `finish`の高レベルtool定義だけを渡します。`fill` / `select`ではモデルが生の値ではなく`payload.formValues`内の`payloadKey`だけを指定し、handlerがD1の保存値を解決します。BrowserUse認証情報とCDP URLはモデルへ渡さず、対象ドメイン外の通信とService Worker経由の迂回を遮断します。browser sessionはREST API v4で明示的に作成し、実行終了時は接続を閉じたうえでsessionを`stop`します。CDPを切断してもmanaged browserは停止しないため、stopを省くと同時session枠を寿命まで占有します。
+Worker内の信頼済みhandlerがBrowserUseへCDP接続し、モデルには`navigate` / `observe` / `click` / `fill` / `select` / `submit` / `finish`の高レベルtool定義だけを渡します。`fill` / `select`ではモデルが生の値ではなく`payload.formValues`内の`payloadKey`だけを指定し、handlerがD1の保存値を解決します。`formValues`の値は単一文字列か選択肢候補リストのいずれかで、候補リストは`select`だけが受け取り、handlerがページ上の選択肢と完全一致する最初の候補を適用します。BrowserUse認証情報とCDP URLはモデルへ渡さず、対象ドメイン外の通信とService Worker経由の迂回を遮断します。browser sessionはREST API v4で明示的に作成し、実行終了時は接続を閉じたうえでsessionを`stop`します。CDPを切断してもmanaged browserは停止しないため、stopを省くと同時session枠を寿命まで占有します。
 
 production executorは`AGENT_EXECUTOR_ENABLED=true`、`AGENT_MODEL`、`OPENAI_API_KEY`、`BROWSER_USE_API_KEY`がすべて設定された場合だけ有効になります。いずれかが不足する場合は`EXECUTOR_NOT_CONFIGURED`でfail-closedに終了します。
 

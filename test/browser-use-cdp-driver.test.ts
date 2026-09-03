@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, test } from "bun:test";
 import { runInNewContext } from "node:vm";
 import { hasNewSubmissionConfirmation } from "../src/browser-submit-confirmation";
 import {
@@ -34,6 +34,7 @@ import {
 	createExpectedSubmissionRequest,
 	createSubmitActivationFailureLog,
 	denyRelatedBrowserTargets,
+	desiredCheckboxState,
 	ENTER_KEY_DOWN_EVENT,
 	getSubmissionRequestDisposition,
 	HAS_SAME_FORM_OWNER_FUNCTION,
@@ -45,11 +46,15 @@ import {
 	isExpectedNavigationDocumentRequest,
 	isPayloadIndependentClickTarget,
 	isRetryableClickPreparationError,
+	MATCHES_CHOICE_CANDIDATE_FUNCTION,
 	READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
 	readPageText,
+	readRadioSelectionOutcome,
 	readSubmissionConfirmation,
 	retrySubmitMousePreparation,
 	runSubmissionActivationWithinPermissionWindow,
+	SELECT_OPTION_BY_CANDIDATE_FUNCTION,
+	SELECT_RADIO_BY_CANDIDATE_FUNCTION,
 	SET_CHECKED_VALUE_FUNCTION,
 	shouldBlockNonSubmitRequest,
 	submitUncertainReasonCode,
@@ -3249,6 +3254,8 @@ const ELEMENT_PAGE_DOCUMENT = {
 				{ backendNodeId: 3, nodeName: "INPUT" },
 				{ backendNodeId: 4, nodeName: "SELECT" },
 				{ backendNodeId: 5, nodeName: "BUTTON" },
+				{ backendNodeId: 6, nodeName: "INPUT" },
+				{ backendNodeId: 7, nodeName: "INPUT" },
 			],
 		},
 	],
@@ -3258,6 +3265,8 @@ const ELEMENT_PAGE_DOCUMENT = {
 const TEXT_ELEMENT_ID = "fa-1-0";
 const SELECT_ELEMENT_ID = "fa-1-1";
 const BUTTON_ELEMENT_ID = "fa-1-2";
+const RADIO_ELEMENT_ID = "fa-1-3";
+const CHECKBOX_ELEMENT_ID = "fa-1-4";
 const BUTTON_BACKEND_NODE_ID = 5;
 
 function cdpCommandFailed(): Error {
@@ -3323,6 +3332,12 @@ function elementFixtureState(backendNodeId: number): Record<string, unknown> {
 			options: [{ value: "sales", label: "Sales" }],
 		};
 	}
+	if (backendNodeId === 6) {
+		return { ...base, tag: "input", type: "radio", value: "email" };
+	}
+	if (backendNodeId === 7) {
+		return { ...base, tag: "input", type: "checkbox", value: "checked" };
+	}
 	return { ...base, tag: "button", type: "button" };
 }
 
@@ -3332,6 +3347,7 @@ function elementFixtureState(backendNodeId: number): Record<string, unknown> {
  */
 class ScriptedCdpConnection {
 	closeCount = 0;
+	closed = false;
 	readonly sent: Array<{ method: string; params: Record<string, unknown> }> =
 		[];
 	fail:
@@ -3360,6 +3376,7 @@ class ScriptedCdpConnection {
 
 	close(): void {
 		this.closeCount += 1;
+		this.closed = true;
 	}
 }
 
@@ -3400,6 +3417,17 @@ function scriptedCdpResponse(
 			) {
 				return { result: { value: [] } };
 			}
+			// The choice page functions answer with fixed tokens only.
+			if (
+				params.functionDeclaration === SELECT_OPTION_BY_CANDIDATE_FUNCTION ||
+				params.functionDeclaration === MATCHES_CHOICE_CANDIDATE_FUNCTION ||
+				params.functionDeclaration === SET_CHECKED_VALUE_FUNCTION
+			) {
+				return { result: { value: true } };
+			}
+			if (params.functionDeclaration === SELECT_RADIO_BY_CANDIDATE_FUNCTION) {
+				return { result: { value: "selected" } };
+			}
 			const backendNodeId = Number(
 				String(params.objectId ?? "").replace("object-", ""),
 			);
@@ -3416,18 +3444,17 @@ function scriptedCdpResponse(
 	}
 }
 
-/** Connects a driver to the fixture page and takes the first observation. */
-async function observedElementDriver(): Promise<{
-	driver: BrowserUseCdpDriver;
-	connection: ScriptedCdpConnection;
-}> {
-	const connection = new ScriptedCdpConnection();
+/** Connects a driver to the fixture page without navigating or observing. */
+async function scriptedDriver(
+	connection: ScriptedCdpConnection,
+	dryRun = true,
+): Promise<BrowserUseCdpDriver> {
 	const captured = captureLogs();
 	try {
 		const driver = await BrowserUseCdpDriver.connect(
 			"api-key",
 			connectJob,
-			true,
+			dryRun,
 			{
 				client: asClient(new FakeBrowserUseClient()),
 				connectConnection: async () =>
@@ -3435,11 +3462,26 @@ async function observedElementDriver(): Promise<{
 			},
 		);
 		await driver.restrictToDomain("example.com", []);
-		await driver.observe();
-		return { driver, connection };
+		return driver;
 	} finally {
 		captured.restore();
 	}
+}
+
+/** Connects a driver to the fixture page and takes the first observation. */
+async function observedElementDriver(): Promise<{
+	driver: BrowserUseCdpDriver;
+	connection: ScriptedCdpConnection;
+}> {
+	const connection = new ScriptedCdpConnection();
+	const driver = await scriptedDriver(connection);
+	const captured = captureLogs();
+	try {
+		await driver.observe();
+	} finally {
+		captured.restore();
+	}
+	return { driver, connection };
 }
 
 describe("BrowserUseCdpDriver element operation failures", () => {
@@ -3544,7 +3586,7 @@ describe("BrowserUseCdpDriver element operation failures", () => {
 
 		let caught: unknown;
 		try {
-			await driver.select(SELECT_ELEMENT_ID, "sales");
+			await driver.select(SELECT_ELEMENT_ID, ["sales"]);
 		} catch (error) {
 			caught = error;
 		} finally {
@@ -3718,5 +3760,545 @@ describe("click preparation retries", () => {
 				},
 			]);
 		}
+	});
+});
+
+interface FakeOption {
+	value: string;
+	text: string;
+	selected: boolean;
+}
+
+interface FakeRadio {
+	tagName: string;
+	type: string;
+	name: string;
+	value: string;
+	form: object | null;
+	disabled: boolean;
+	checked: boolean;
+	labels: Array<{ textContent: string }>;
+	ariaLabel: string | null;
+	ancestorLabel: string | null;
+	getAttribute(name: string): string | null;
+	closest(selector: string): { textContent: string } | null;
+	getRootNode(): { querySelectorAll(selector: string): FakeRadio[] };
+	click(): void;
+}
+
+/** A minimal option list the select page function can walk. */
+function fakeSelect(options: Array<[value: string, text: string]>): {
+	tagName: string;
+	options: FakeOption[];
+	dispatchEvent(): boolean;
+} {
+	return {
+		tagName: "SELECT",
+		options: options.map(([value, text]) => ({
+			value,
+			text,
+			selected: false,
+		})),
+		dispatchEvent: () => true,
+	};
+}
+
+/**
+ * Builds one radio group whose members share a form owner, so the page
+ * function can be exercised against the DOM order as well as the candidate
+ * order.
+ */
+function fakeRadioGroup(
+	members: Array<{
+		value: string;
+		label?: string;
+		ariaLabel?: string;
+		name?: string;
+		disabled?: boolean;
+		ownForm?: boolean;
+	}>,
+): FakeRadio[] {
+	const form = {};
+	const group: FakeRadio[] = [];
+	for (const member of members) {
+		const radio: FakeRadio = {
+			tagName: "INPUT",
+			type: "radio",
+			name: member.name ?? "contactMethod",
+			value: member.value,
+			form: member.ownForm === false ? null : form,
+			disabled: member.disabled === true,
+			checked: false,
+			labels: member.label === undefined ? [] : [{ textContent: member.label }],
+			ariaLabel: member.ariaLabel ?? null,
+			ancestorLabel: null,
+			getAttribute: (name: string) =>
+				name === "aria-label" ? radio.ariaLabel : null,
+			closest: () =>
+				radio.ancestorLabel === null
+					? null
+					: { textContent: radio.ancestorLabel },
+			getRootNode: () => ({ querySelectorAll: () => group }),
+			click() {
+				for (const other of group) {
+					if (other.name === radio.name && other.form === radio.form) {
+						other.checked = false;
+					}
+				}
+				radio.checked = true;
+			},
+		};
+		group.push(radio);
+	}
+	return group;
+}
+
+function selectOptionByCandidate(): (
+	this: object,
+	candidates: readonly string[],
+) => unknown {
+	return runInNewContext(`(${SELECT_OPTION_BY_CANDIDATE_FUNCTION})`, {
+		Event: class {},
+	}) as (this: object, candidates: readonly string[]) => unknown;
+}
+
+function selectRadioByCandidate(): (
+	this: object,
+	candidates: readonly string[],
+) => unknown {
+	return runInNewContext(`(${SELECT_RADIO_BY_CANDIDATE_FUNCTION})`) as (
+		this: object,
+		candidates: readonly string[],
+	) => unknown;
+}
+
+function matchesChoiceCandidate(): (
+	this: object,
+	candidates: readonly string[],
+) => unknown {
+	return runInNewContext(`(${MATCHES_CHOICE_CANDIDATE_FUNCTION})`) as (
+		this: object,
+		candidates: readonly string[],
+	) => unknown;
+}
+
+describe("choice candidate matching in the page", () => {
+	test("takes the first candidate an option offers by value or by text", () => {
+		const setOption = selectOptionByCandidate();
+		const element = fakeSelect([
+			["", "選択してください"],
+			["shaken", "車検のご予約"],
+			["other", "その他"],
+		]);
+
+		expect(setOption.call(element, ["その他のお問い合わせ", "その他"])).toBe(
+			true,
+		);
+		expect(element.options.filter((option) => option.selected)).toEqual([
+			{ value: "other", text: "その他", selected: true },
+		]);
+	});
+
+	test("prefers the earlier candidate over the earlier option", () => {
+		const setOption = selectOptionByCandidate();
+		const element = fakeSelect([
+			["shaken", "車検のご予約"],
+			["other", "その他"],
+		]);
+
+		expect(setOption.call(element, ["その他", "車検のご予約"])).toBe(true);
+		expect(element.options[1]?.selected).toBe(true);
+	});
+
+	test("matches an option text case-insensitively after trimming", () => {
+		const setOption = selectOptionByCandidate();
+		const element = fakeSelect([["email", "  E-Mail  "]]);
+
+		expect(setOption.call(element, ["e-mail"])).toBe(true);
+		expect(element.options[0]?.selected).toBe(true);
+	});
+
+	test("never selects a placeholder option with an empty value", () => {
+		const setOption = selectOptionByCandidate();
+		const element = fakeSelect([
+			["", "選択してください"],
+			["other", "その他"],
+		]);
+
+		expect(setOption.call(element, ["選択してください"])).toBe(false);
+		expect(element.options.some((option) => option.selected)).toBe(false);
+	});
+
+	test("reports no match instead of guessing an option", () => {
+		const setOption = selectOptionByCandidate();
+		const element = fakeSelect([["shaken", "車検のご予約"]]);
+
+		expect(setOption.call(element, ["その他"])).toBe(false);
+		expect(element.options.some((option) => option.selected)).toBe(false);
+	});
+
+	test("checks the radio matching the earliest candidate regardless of DOM order", () => {
+		const setRadio = selectRadioByCandidate();
+		const [phone, email] = fakeRadioGroup([
+			{ value: "phone", label: "電話" },
+			{ value: "email", label: "メール" },
+		]);
+
+		expect(setRadio.call(email as object, ["メール", "Email"])).toBe(
+			"selected",
+		);
+		expect(email?.checked).toBe(true);
+		expect(phone?.checked).toBe(false);
+	});
+
+	test("refuses a radio when another radio matches an earlier candidate", () => {
+		const setRadio = selectRadioByCandidate();
+		const [phone, email] = fakeRadioGroup([
+			{ value: "phone", label: "電話" },
+			{ value: "email", label: "メール" },
+		]);
+
+		expect(setRadio.call(email as object, ["電話", "メール"])).toBe(
+			"higher_priority_exists",
+		);
+		expect(email?.checked).toBe(false);
+		expect(phone?.checked).toBe(false);
+	});
+
+	test("ignores a radio of another group, another form, or a disabled one", () => {
+		const setRadio = selectRadioByCandidate();
+		const [other, disabled, unowned, email] = fakeRadioGroup([
+			{ value: "phone", label: "電話", name: "otherGroup" },
+			{ value: "fax", label: "FAX", disabled: true },
+			{ value: "post", label: "郵送", ownForm: false },
+			{ value: "email", label: "メール" },
+		]);
+
+		expect(
+			setRadio.call(email as object, ["電話", "FAX", "郵送", "メール"]),
+		).toBe("selected");
+		expect(email?.checked).toBe(true);
+		expect(other?.checked).toBe(false);
+		expect(disabled?.checked).toBe(false);
+		expect(unowned?.checked).toBe(false);
+	});
+
+	test("matches a radio by its value and by its aria-label", () => {
+		const setRadio = selectRadioByCandidate();
+		const [byValue] = fakeRadioGroup([{ value: "email" }]);
+		const [byAria] = fakeRadioGroup([
+			{ value: "e", ariaLabel: "メール", name: "aria" },
+		]);
+
+		expect(setRadio.call(byValue as object, ["email"])).toBe("selected");
+		expect(setRadio.call(byAria as object, ["メール"])).toBe("selected");
+	});
+
+	test("answers not_candidate when no candidate matches the radio", () => {
+		const setRadio = selectRadioByCandidate();
+		const [email] = fakeRadioGroup([{ value: "email", label: "メール" }]);
+
+		expect(setRadio.call(email as object, ["郵送"])).toBe("not_candidate");
+		expect(email?.checked).toBe(false);
+	});
+
+	test("matches a checkbox by its own value or label only", () => {
+		const matches = matchesChoiceCandidate();
+		const [consent] = fakeRadioGroup([{ value: "agreed", label: "同意する" }]);
+
+		expect(matches.call(consent as object, ["同意する"])).toBe(true);
+		expect(matches.call(consent as object, ["agreed"])).toBe(true);
+		expect(matches.call(consent as object, ["同意"])).toBe(false);
+	});
+});
+
+describe("BrowserUseCdpDriver choice controls", () => {
+	test("hands the page the candidate list and keeps page text out of the call", async () => {
+		const { driver, connection } = await observedElementDriver();
+
+		await driver.select(SELECT_ELEMENT_ID, ["その他", "other"]);
+
+		const call = connection.sent.find(
+			(entry) =>
+				entry.method === "Runtime.callFunctionOn" &&
+				entry.params.functionDeclaration ===
+					SELECT_OPTION_BY_CANDIDATE_FUNCTION,
+		);
+		expect(call?.params.arguments).toEqual([{ value: ["その他", "other"] }]);
+	});
+
+	test("rejects a select the page reports as unmatched", async () => {
+		const { driver, connection } = await observedElementDriver();
+		connection.respond = (method, params) =>
+			method === "Runtime.callFunctionOn" &&
+			params.functionDeclaration === SELECT_OPTION_BY_CANDIDATE_FUNCTION
+				? { result: { value: false } }
+				: scriptedCdpResponse(method, params);
+
+		await expect(
+			driver.select(SELECT_ELEMENT_ID, ["その他"]),
+		).rejects.toBeInstanceOf(BrowserElementError);
+	});
+
+	test("rejects a select result that is not the page's fixed boolean", async () => {
+		const { driver, connection } = await observedElementDriver();
+		connection.respond = (method, params) =>
+			method === "Runtime.callFunctionOn" &&
+			params.functionDeclaration === SELECT_OPTION_BY_CANDIDATE_FUNCTION
+				? { result: { value: "その他" } }
+				: scriptedCdpResponse(method, params);
+
+		await expect(
+			driver.select(SELECT_ELEMENT_ID, ["その他"]),
+		).rejects.toBeInstanceOf(BrowserElementError);
+	});
+
+	test("checks a radio only when the page reports it selected", async () => {
+		for (const [outcome, selected] of [
+			["selected", true],
+			["not_candidate", false],
+			["higher_priority_exists", false],
+			["メール", false],
+		] as const) {
+			const { driver, connection } = await observedElementDriver();
+			connection.respond = (method, params) =>
+				method === "Runtime.callFunctionOn" &&
+				params.functionDeclaration === SELECT_RADIO_BY_CANDIDATE_FUNCTION
+					? { result: { value: outcome } }
+					: scriptedCdpResponse(method, params);
+
+			const caught = await driver
+				.select(RADIO_ELEMENT_ID, ["メール"])
+				.then(() => null)
+				.catch((error: unknown) => error);
+
+			expect(caught === null).toBe(selected);
+			if (!selected) expect(caught).toBeInstanceOf(BrowserElementError);
+		}
+	});
+
+	test("reads the checkbox state from the candidate list", async () => {
+		for (const [candidates, expected] of [
+			[["checked"], true],
+			[["true"], true],
+			[["unchecked"], false],
+			[["false"], false],
+		] as const) {
+			const { driver, connection } = await observedElementDriver();
+
+			await driver.select(CHECKBOX_ELEMENT_ID, candidates);
+
+			const call = connection.sent.find(
+				(entry) =>
+					entry.method === "Runtime.callFunctionOn" &&
+					entry.params.functionDeclaration === SET_CHECKED_VALUE_FUNCTION,
+			);
+			expect(call?.params.arguments).toEqual([{ value: expected }]);
+		}
+	});
+
+	test("checks a checkbox whose label matches a candidate", async () => {
+		const { driver, connection } = await observedElementDriver();
+		connection.respond = (method, params) =>
+			method === "Runtime.callFunctionOn" &&
+			params.functionDeclaration === MATCHES_CHOICE_CANDIDATE_FUNCTION
+				? { result: { value: true } }
+				: scriptedCdpResponse(method, params);
+
+		await driver.select(CHECKBOX_ELEMENT_ID, ["同意する"]);
+
+		const call = connection.sent.find(
+			(entry) =>
+				entry.method === "Runtime.callFunctionOn" &&
+				entry.params.functionDeclaration === SET_CHECKED_VALUE_FUNCTION,
+		);
+		expect(call?.params.arguments).toEqual([{ value: true }]);
+	});
+
+	test("never unchecks a checkbox for a candidate that names no state", async () => {
+		const { driver, connection } = await observedElementDriver();
+		connection.respond = (method, params) =>
+			method === "Runtime.callFunctionOn" &&
+			params.functionDeclaration === MATCHES_CHOICE_CANDIDATE_FUNCTION
+				? { result: { value: false } }
+				: scriptedCdpResponse(method, params);
+
+		await expect(
+			driver.select(CHECKBOX_ELEMENT_ID, ["いいえ"]),
+		).rejects.toBeInstanceOf(BrowserElementError);
+		expect(
+			connection.sent.some(
+				(entry) =>
+					entry.method === "Runtime.callFunctionOn" &&
+					entry.params.functionDeclaration === SET_CHECKED_VALUE_FUNCTION,
+			),
+		).toBe(false);
+	});
+
+	test("rejects an empty candidate list before it touches the page", async () => {
+		const { driver } = await observedElementDriver();
+
+		await expect(driver.select(SELECT_ELEMENT_ID, [])).rejects.toBeInstanceOf(
+			BrowserElementError,
+		);
+	});
+
+	test("accepts only the three radio outcomes the page may report", () => {
+		expect(readRadioSelectionOutcome("selected")).toBe("selected");
+		expect(readRadioSelectionOutcome("not_candidate")).toBe("not_candidate");
+		expect(readRadioSelectionOutcome("higher_priority_exists")).toBe(
+			"higher_priority_exists",
+		);
+		expect(() => readRadioSelectionOutcome("メール")).toThrow(
+			BrowserElementError,
+		);
+		expect(() => readRadioSelectionOutcome(true)).toThrow(BrowserElementError);
+	});
+
+	test("reads the intended checkbox state from the first candidate that names one", () => {
+		expect(desiredCheckboxState(["checked"])).toBe(true);
+		expect(desiredCheckboxState(["false"])).toBe(false);
+		expect(desiredCheckboxState(["unchecked", "checked"])).toBe(false);
+		expect(desiredCheckboxState(["同意する"])).toBeUndefined();
+	});
+});
+
+describe("bootstrap navigation readiness", () => {
+	/** Replies to `document.readyState` and lets a test spend the deadline. */
+	function readyStateConnection(
+		reply: (call: number) => string,
+	): ScriptedCdpConnection {
+		const connection = new ScriptedCdpConnection();
+		let calls = 0;
+		connection.respond = (method, params) => {
+			if (
+				method === "Runtime.evaluate" &&
+				params.expression === "document.readyState"
+			) {
+				calls += 1;
+				return { result: { value: reply(calls) } };
+			}
+			return scriptedCdpResponse(method, params);
+		};
+		return connection;
+	}
+
+	/** Spends the whole readyState deadline without waiting it out for real. */
+	function spendDeadline(): void {
+		setSystemTime(new Date(Date.now() + 60_000));
+	}
+
+	test("navigates again once when the first bootstrap attempt is not ready", async () => {
+		const connection = readyStateConnection((call) => {
+			if (call === 1) {
+				spendDeadline();
+				return "loading";
+			}
+			return "complete";
+		});
+		const driver = await scriptedDriver(connection);
+		const captured = captureLogs();
+
+		try {
+			await driver.navigate(ELEMENT_PAGE_URL);
+		} finally {
+			captured.restore();
+			setSystemTime();
+		}
+
+		expect(countSent(connection, "Page.navigate")).toBe(2);
+		expect(logEvents(captured.logs)).toEqual([
+			{ event: "browser_bootstrap_navigate_retried" },
+		]);
+		// The retry stays inside the single navigation a dry-run allows.
+		await expect(driver.navigate(ELEMENT_PAGE_URL)).rejects.toBeInstanceOf(
+			BrowserElementError,
+		);
+	});
+
+	test("reports PAGE_NOT_READY when both bootstrap attempts run out", async () => {
+		const connection = readyStateConnection(() => {
+			spendDeadline();
+			return "loading";
+		});
+		const driver = await scriptedDriver(connection);
+		const captured = captureLogs();
+
+		let caught: unknown;
+		try {
+			await driver.navigate(ELEMENT_PAGE_URL).catch((error: unknown) => {
+				caught = error;
+			});
+		} finally {
+			captured.restore();
+			setSystemTime();
+		}
+
+		expect((caught as Error).message).toBe("Browser page did not become ready");
+		expect(countSent(connection, "Page.navigate")).toBe(2);
+	});
+
+	test("does not retry a navigation the model asked for", async () => {
+		const connection = readyStateConnection((call) => {
+			if (call === 1) return "complete";
+			spendDeadline();
+			return "loading";
+		});
+		const driver = await scriptedDriver(connection, false);
+		const captured = captureLogs();
+
+		let caught: unknown;
+		try {
+			await driver.navigate(ELEMENT_PAGE_URL);
+			await driver.navigate(ELEMENT_PAGE_URL).catch((error: unknown) => {
+				caught = error;
+			});
+		} finally {
+			captured.restore();
+			setSystemTime();
+		}
+
+		expect((caught as Error).message).toBe("Browser page did not become ready");
+		expect(countSent(connection, "Page.navigate")).toBe(2);
+	});
+
+	test("leaves the readiness wait as soon as the connection is gone", async () => {
+		const connection = new ScriptedCdpConnection();
+		const driver = await scriptedDriver(connection);
+		connection.fail = (method, params) =>
+			method === "Runtime.evaluate" &&
+			params.expression === "document.readyState"
+				? new Error("Browser Use CDP connection is closed")
+				: null;
+
+		const caught = await driver
+			.navigate(ELEMENT_PAGE_URL)
+			.catch((error: unknown) => error);
+
+		expect((caught as Error).message).toBe(
+			"Browser Use CDP connection is closed",
+		);
+		expect(countSent(connection, "Page.navigate")).toBe(1);
+	});
+
+	test("does not navigate again over a connection that is already closed", async () => {
+		const connection = readyStateConnection(() => {
+			spendDeadline();
+			connection.closed = true;
+			return "loading";
+		});
+		const driver = await scriptedDriver(connection);
+
+		let caught: unknown;
+		try {
+			await driver.navigate(ELEMENT_PAGE_URL).catch((error: unknown) => {
+				caught = error;
+			});
+		} finally {
+			setSystemTime();
+		}
+
+		expect((caught as Error).message).toBe("Browser page did not become ready");
+		expect(countSent(connection, "Page.navigate")).toBe(1);
 	});
 });

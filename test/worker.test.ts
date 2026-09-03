@@ -742,6 +742,69 @@ describe("Job HTTP API", () => {
 		expect(await new D1JobStore(env.DB).find(input.id)).toMatchObject(input);
 	});
 
+	test("persists a candidate list and rejects one outside its contract", async () => {
+		const accepted = await handleHttpRequest(
+			jobRequest(
+				"POST",
+				"/jobs",
+				{
+					...input,
+					payload: {
+						formValues: {
+							message: "Hello",
+							inquiryType: ["その他のお問い合わせ", "その他"],
+						},
+					},
+				},
+				apiToken,
+			),
+			apiEnv,
+		);
+		const invalidLists: Array<[id: string, candidates: unknown]> = [
+			["job-101", []],
+			["job-102", Array.from({ length: 11 }, (_, index) => `c${index}`)],
+			["job-103", ["ok", ""]],
+			["job-104", ["x".repeat(257)]],
+			["job-105", Array.from({ length: 9 }, () => "x".repeat(256))],
+			["job-106", ["ok", 1]],
+			["job-107", [["ok"]]],
+		];
+		const rejected = [];
+		for (const [id, candidates] of invalidLists) {
+			rejected.push(
+				await handleHttpRequest(
+					jobRequest(
+						"POST",
+						"/jobs",
+						{
+							...input,
+							id,
+							payload: { formValues: { message: "Hello", choice: candidates } },
+						},
+						apiToken,
+					),
+					apiEnv,
+				),
+			);
+		}
+
+		expect(accepted.status).toBe(201);
+		expect(
+			(await new D1JobStore(env.DB).find(input.id))?.payload,
+		).toMatchObject({
+			formValues: {
+				message: "Hello",
+				inquiryType: ["その他のお問い合わせ", "その他"],
+			},
+		});
+		expect(rejected.map((response) => response.status)).toEqual(
+			invalidLists.map(() => 400),
+		);
+		for (const [id] of invalidLists) {
+			expect(await new D1JobStore(env.DB).find(id)).toBeNull();
+		}
+	});
+
 	test("rejects malformed jobs before persistence", async () => {
 		const mismatchedDomain = {
 			...input,
@@ -1001,6 +1064,39 @@ describe("BrowserToolCoordinator", () => {
 		await coordinator.close();
 	});
 
+	test("closes a driver that is still bootstrapping when the run is aborted", async () => {
+		const jobInput = { ...input, id: "job-bootstrap-abort" };
+		const store = new D1JobStore(env.DB);
+		await store.create(jobInput, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(
+			jobInput.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		const driver = new WorkerFakeBrowserDriver();
+		driver.blockNavigateUntilClose = true;
+		const coordinator = new BrowserToolCoordinator(
+			env.DB,
+			async () => driver,
+			new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			() => allowSubmitReviewer(),
+		);
+
+		const pending = coordinator.execute(
+			jobInput.id,
+			"run-token-1",
+			"observe",
+			{},
+		);
+		await driver.navigateEntered;
+		// close() has to reach the driver even though the bootstrap navigate has
+		// not returned it to the coordinator yet.
+		await coordinator.close();
+
+		await expect(pending).rejects.toBeInstanceOf(Error);
+		expect(driver.closed).toBe(true);
+	});
+
 	test("captures prohibited evidence for the active browser session", async () => {
 		const jobInput = { ...input, id: "job-evidence-session" };
 		const store = new D1JobStore(env.DB);
@@ -1098,6 +1194,9 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	/** Replayed per observe call when set; the last entry repeats. */
 	observationFormsSequence: unknown[][] | null = null;
 	fieldStates: ObservedFieldState[] = workerFieldStates();
+	/** Values each choice control offers, by elementId. */
+	selectOptions: Record<string, string[]> = {};
+	selectedCandidates: string[] = [];
 	/** Replayed in order; the last entry repeats. */
 	formSnapshots: string[] = ['["form"]'];
 	pageText: string | undefined;
@@ -1106,6 +1205,7 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 
 	async close(): Promise<void> {
 		this.closed = true;
+		this.#releaseNavigate?.();
 	}
 	async restrictToDomain(targetDomain: string): Promise<void> {
 		this.restrictedDomain = targetDomain;
@@ -1113,8 +1213,21 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	async currentUrl(): Promise<string> {
 		return this.url;
 	}
+	/** Blocks the bootstrap navigate until close(), like a page that never loads. */
+	blockNavigateUntilClose = false;
+	#enteredNavigate: (() => void) | undefined;
+	#releaseNavigate: (() => void) | undefined;
+	readonly navigateEntered = new Promise<void>((resolve) => {
+		this.#enteredNavigate = resolve;
+	});
 	async navigate(url: string): Promise<void> {
 		this.url = url;
+		if (!this.blockNavigateUntilClose) return;
+		this.#enteredNavigate?.();
+		await new Promise<void>((resolve) => {
+			this.#releaseNavigate = resolve;
+		});
+		throw new Error("Browser Use CDP connection is closed");
 	}
 	async observe() {
 		this.observed = true;
@@ -1141,8 +1254,17 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 		this.filledValues.push(value);
 		this.#applyValue(elementId, value);
 	}
-	async select(elementId: string, value: string): Promise<void> {
-		this.#applyValue(elementId, value);
+	async select(
+		elementId: string,
+		candidates: readonly string[],
+	): Promise<void> {
+		const offered = this.selectOptions[elementId];
+		const chosen = offered
+			? candidates.find((candidate) => offered.includes(candidate))
+			: candidates[0];
+		if (chosen === undefined) throw new BrowserElementError();
+		this.selectedCandidates.push(chosen);
+		this.#applyValue(elementId, chosen);
 	}
 	/** Mirrors what a real browser shows on the next observation. */
 	#applyValue(elementId: string, value: string): void {
@@ -2615,6 +2737,89 @@ describe("ResponsesAgentExecutor", () => {
 				}),
 			]),
 		});
+	});
+
+	test("sends a candidate list to select and refuses it for fill", async () => {
+		const store = new D1JobStore(env.DB);
+		const choiceInput = {
+			...input,
+			payload: {
+				formValues: {
+					message: "Hello",
+					contactMethod: ["メール", "Email"],
+				},
+			},
+		};
+		await store.create(choiceInput, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-fill-choice", "fill", {
+				elementId: "fa-0-0",
+				payloadKey: "contactMethod",
+			}),
+			functionResponse("call-select", "select", {
+				elementId: "fa-0-2",
+				payloadKey: "contactMethod",
+			}),
+			functionResponse("call-fill", "fill", {
+				elementId: "fa-0-0",
+				payloadKey: "message",
+			}),
+			functionResponse("call-confirm", "observe", {}),
+			functionResponse("call-submit", "submit", {
+				elementId: "fa-0-1",
+				activationStrategy: "mouse",
+			}),
+			reviewResponse("allow"),
+		];
+		const requests: unknown[] = [];
+		const driver = new WorkerFakeBrowserDriver();
+		// Only the second candidate is offered, so the first must be skipped.
+		driver.selectOptions = { "fa-0-2": ["Email"] };
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async (_resource, init) => {
+				requests.push(JSON.parse(String(init?.body)));
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => driver,
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toEqual({ outcome: "sent", formUrl: input.targetUrl });
+		expect(driver.selectedCandidates).toEqual(["Email"]);
+		expect(driver.filledValues).toEqual(["Hello"]);
+		expect(requests[2]).toMatchObject({
+			input: expect.arrayContaining([
+				expect.objectContaining({
+					type: "function_call_output",
+					call_id: "call-fill-choice",
+					output: JSON.stringify({
+						error: "INVALID_TOOL_INPUT",
+						guidance: TOOL_ERROR_GUIDANCE.INVALID_TOOL_INPUT,
+					}),
+				}),
+			]),
+		});
+		expect(
+			JSON.stringify(await readAgentToolDiagnostics(input.id)),
+		).not.toContain("メール");
 	});
 
 	test("reports sent only from the restricted browser persisted result", async () => {

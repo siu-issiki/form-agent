@@ -79,6 +79,11 @@ export class BrowserUseCdpConnection {
 		);
 	}
 
+	/** True once the socket is gone, so a caller can stop retrying. */
+	get closed(): boolean {
+		return this.#closed;
+	}
+
 	send<TResult>(
 		method: string,
 		params: Record<string, unknown> = {},
