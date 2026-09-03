@@ -1701,7 +1701,9 @@ class FakeBrowserUseClient {
 		return (this.options.activeSessions ?? []).map((session) =>
 			this.#session(
 				session.id,
-				session.jobId === undefined ? {} : { jobId: session.jobId },
+				session.jobId === undefined
+					? {}
+					: { source: "form-agent", jobId: session.jobId },
 			),
 		);
 	}
@@ -2498,7 +2500,7 @@ describe("BrowserUseCdpDriver session lifecycle", () => {
 		]);
 		expect(client.createdTimeouts).toEqual([12]);
 		expect(client.createdMetadata).toEqual([
-			{ jobId: connectJob.id, dryRun: "true" },
+			{ source: "form-agent", jobId: connectJob.id, dryRun: "true" },
 		]);
 		expect(client.stopped).toEqual([{ id: "session-1", hasSignal: true }]);
 		expect(connections[0]?.closeCount).toBe(1);
@@ -2572,6 +2574,14 @@ describe("BrowserUseCdpDriver session lifecycle", () => {
 			reason: "SESSION_LIMIT",
 			status: 429,
 		});
+		// The provider snapshot is taken before the backoff sleep, right after
+		// the rejection, so it describes the sessions that consumed the limit.
+		expect(JSON.parse(captured.warnings[1] ?? "{}")).toEqual({
+			event: "browser_use_session_limit",
+			activeTotal: 0,
+			activeTagged: 0,
+		});
+		expect(client.listedFilters.length).toBeGreaterThanOrEqual(2);
 	});
 
 	test("does not retry a rejected session request", async () => {
@@ -2787,6 +2797,8 @@ describe("BrowserUseCdpDriver session lifecycle", () => {
 			{
 				event: "browser_use_session_reclaimed",
 				ok: true,
+				activeTotal: 3,
+				activeTagged: 2,
 				matched: 1,
 				stopped: 1,
 				failed: 0,
@@ -3078,6 +3090,8 @@ describe("BrowserUseCdpDriver session stop accounting", () => {
 		).toEqual({
 			event: "browser_use_session_reclaimed",
 			ok: false,
+			activeTotal: 3,
+			activeTagged: 3,
 			matched: 2,
 			stopped: 1,
 			failed: 1,
