@@ -1228,12 +1228,16 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		]);
 		expect(requestCount).toBe(2);
 		expect(
-			harness.calls.some((call) => call.method === "Target.closeTarget"),
+			harness.calls.some(
+				(call) =>
+					call.method === "Target.closeTarget" ||
+					call.method === "Target.detachFromTarget",
+			),
 		).toBe(false);
 		expect(failures).toEqual([]);
 	});
 
-	test("closes an iframe target outside the verification allowlist", async () => {
+	test("detaches an iframe target outside the verification allowlist", async () => {
 		const harness = relatedTargetHarness();
 		const failures: Error[] = [];
 		let frameCount = 0;
@@ -1267,18 +1271,18 @@ describe("BrowserUseCdpDriver child target policy", () => {
 
 		expect(harness.calls.slice(1)).toEqual([
 			{
-				method: "Target.closeTarget",
-				params: { targetId: "frame-1" },
+				method: "Target.detachFromTarget",
+				params: { sessionId: "frame-1-session" },
 				sessionId: undefined,
 			},
 			{
-				method: "Target.closeTarget",
-				params: { targetId: "frame-2" },
+				method: "Target.detachFromTarget",
+				params: { sessionId: "frame-2-session" },
 				sessionId: undefined,
 			},
 			{
-				method: "Target.closeTarget",
-				params: { targetId: "frame-3" },
+				method: "Target.detachFromTarget",
+				params: { sessionId: "frame-3-session" },
 				sessionId: undefined,
 			},
 		]);
@@ -1286,7 +1290,7 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		expect(failures).toEqual([]);
 	});
 
-	test("closes an allowlisted iframe target that was not paused", async () => {
+	test("detaches an allowlisted iframe target that was not paused", async () => {
 		const harness = relatedTargetHarness();
 		const failures: Error[] = [];
 		let frameCount = 0;
@@ -1318,8 +1322,8 @@ describe("BrowserUseCdpDriver child target policy", () => {
 
 		expect(harness.calls.slice(1)).toEqual([
 			{
-				method: "Target.closeTarget",
-				params: { targetId: "widget-1" },
+				method: "Target.detachFromTarget",
+				params: { sessionId: "widget-session" },
 				sessionId: undefined,
 			},
 		]);
@@ -1327,6 +1331,133 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		expect(failures.map((error) => error.message)).toEqual([
 			"A related browser target was not paused",
 		]);
+	});
+
+	test("detaches the widget iframe when request interception cannot be installed", async () => {
+		const harness = relatedTargetHarness({
+			"Fetch.enable": new BrowserUseCdpCommandError(
+				"Fetch.enable",
+				-32000,
+				"NOT_ALLOWED",
+			),
+		});
+		const failures: Error[] = [];
+		let frameCount = 0;
+
+		await denyRelatedBrowserTargets(
+			harness.connection,
+			"primary",
+			(error) => failures.push(error),
+			{
+				onVerificationFrame: () => {
+					frameCount += 1;
+				},
+			},
+		);
+		const captured = captureLogs();
+		try {
+			harness.emit(
+				"Target.attachedToTarget",
+				{
+					sessionId: "widget-session",
+					targetInfo: {
+						targetId: "widget-1",
+						type: "iframe",
+						url: "https://www.google.com/recaptcha/api2/anchor?k=key",
+					},
+					waitingForDebugger: true,
+				},
+				"primary",
+			);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		} finally {
+			captured.restore();
+		}
+
+		expect(harness.calls.slice(1)).toEqual([
+			{
+				method: "Fetch.enable",
+				params: { patterns: [{ urlPattern: "*" }] },
+				sessionId: "widget-session",
+			},
+			{
+				method: "Target.detachFromTarget",
+				params: { sessionId: "widget-session" },
+				sessionId: undefined,
+			},
+		]);
+		expect(
+			harness.calls.some((call) => call.method === "Target.closeTarget"),
+		).toBe(false);
+		expect(logEvents(captured.logs)).toEqual([
+			{
+				event: "browser_verification_frame_restrict_failed",
+				method: "Fetch.enable",
+				kind: "NOT_ALLOWED",
+			},
+		]);
+		expect(frameCount).toBe(0);
+		expect(failures).toEqual([]);
+	});
+
+	test("keeps the widget iframe when only the escape blocker cannot be installed", async () => {
+		const harness = relatedTargetHarness({
+			"Page.addScriptToEvaluateOnNewDocument": new BrowserUseCdpCommandError(
+				"Page.addScriptToEvaluateOnNewDocument",
+				-32601,
+				"METHOD_NOT_FOUND",
+			),
+		});
+		const failures: Error[] = [];
+		let frameCount = 0;
+
+		await denyRelatedBrowserTargets(
+			harness.connection,
+			"primary",
+			(error) => failures.push(error),
+			{
+				onVerificationFrame: () => {
+					frameCount += 1;
+				},
+			},
+		);
+		const captured = captureLogs();
+		try {
+			harness.emit(
+				"Target.attachedToTarget",
+				{
+					sessionId: "widget-session",
+					targetInfo: {
+						targetId: "widget-1",
+						type: "iframe",
+						url: "https://challenges.cloudflare.com/turnstile/v0/widget",
+					},
+					waitingForDebugger: true,
+				},
+				"primary",
+			);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		} finally {
+			captured.restore();
+		}
+
+		expect(harness.calls.map((call) => call.method)).toEqual([
+			"Target.setAutoAttach",
+			"Fetch.enable",
+			"Target.setAutoAttach",
+			"Page.enable",
+			"Page.addScriptToEvaluateOnNewDocument",
+			"Runtime.runIfWaitingForDebugger",
+		]);
+		expect(logEvents(captured.logs)).toEqual([
+			{
+				event: "browser_verification_frame_restrict_failed",
+				method: "Page.addScriptToEvaluateOnNewDocument",
+				kind: "METHOD_NOT_FOUND",
+			},
+		]);
+		expect(frameCount).toBe(1);
+		expect(failures).toEqual([]);
 	});
 
 	test("blocks page-realm socket, peer, worker, popup, and service worker escapes", async () => {
@@ -2034,9 +2165,13 @@ function logEvents(logs: readonly string[]): unknown[] {
 
 /**
  * A connection stub for the related-target policy that records the session each
- * command was sent on and keeps every listener the policy registers.
+ * command was sent on and keeps every listener the policy registers. `fail`
+ * names the methods that answer with a CDP command error, the way an iframe
+ * session rejects a command it does not implement.
  */
-function relatedTargetHarness(): {
+function relatedTargetHarness(
+	fail: Readonly<Record<string, BrowserUseCdpCommandError>> = {},
+): {
 	calls: Array<{
 		method: string;
 		params: Record<string, unknown>;
@@ -2084,6 +2219,8 @@ function relatedTargetHarness(): {
 				sessionId?: string,
 			): Promise<TResult> {
 				calls.push({ method, params, sessionId });
+				const failure = fail[method];
+				if (failure) throw failure;
 				return { success: true } as TResult;
 			},
 		},

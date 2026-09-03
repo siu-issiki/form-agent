@@ -2415,6 +2415,13 @@ const AUTO_ATTACH_PARAMS = {
  * cross-origin, so it can neither read the page's DOM nor read back what it
  * posts to its own origin; a `window.top.location` navigation from inside it is
  * still a top-frame `Document` request and stays blocked by the request policy.
+ *
+ * An iframe target is never closed, only detached. `Target.closeTarget` on an
+ * out-of-process iframe closes the page that owns it, which took the run's own
+ * session with it: every following command answered "Session with given id not
+ * found". Detaching leaves the target paused on `waitForDebuggerOnStart`, so
+ * the frame never runs and the page stays alive. Only a target of another type
+ * (a popup page, a worker) is closed, since it owns no page the run needs.
  */
 export async function denyRelatedBrowserTargets(
 	connection: Pick<BrowserUseCdpConnection, "on" | "send">,
@@ -2440,6 +2447,14 @@ export async function denyRelatedBrowserTargets(
 					new Error("A related browser target could not be closed"),
 				);
 			});
+	};
+	// Detaching a target that is still paused is what denial means for an iframe.
+	// A failed detach leaves it attached and paused, which is the same standstill,
+	// so it costs the run nothing and is not treated as a policy failure.
+	const detachTarget = (sessionId: string) => {
+		void connection
+			.send("Target.detachFromTarget", { sessionId })
+			.catch(() => undefined);
 	};
 
 	connection.on("Fetch.requestPaused", (params, sessionId) => {
@@ -2479,36 +2494,40 @@ export async function denyRelatedBrowserTargets(
 			return;
 		}
 		const attached = params as AttachedTarget;
+		const isFrame = attached.targetInfo.type === "iframe";
+		const deny = () => {
+			if (isFrame) detachTarget(attached.sessionId);
+			else closeTarget(attached.targetInfo.targetId);
+		};
 		// Interception has to be installed before the target runs, so a target that
-		// is already running is closed even when its URL is on the allowlist.
+		// is already running is denied even when its URL is on the allowlist.
 		if (!attached.waitingForDebugger) {
 			onPolicyFailure(new Error("A related browser target was not paused"));
-			closeTarget(attached.targetInfo.targetId);
+			deny();
 			return;
 		}
-		if (
-			attached.targetInfo.type === "iframe" &&
-			isVerificationProviderUrl(attached.targetInfo.url ?? "")
-		) {
+		if (isFrame && isVerificationProviderUrl(attached.targetInfo.url ?? "")) {
 			verificationSessions.add(attached.sessionId);
 			void resumeVerificationProviderTarget(connection, attached.sessionId)
-				.then(() => {
-					// Counted only once the frame is actually left open under the
-					// restricted session, so the log matches what happened.
-					hooks.onVerificationFrame?.();
-				})
-				.catch(() => {
-					// Without the full setup the frame would run unpoliced, so it is
-					// closed and the widget fails the way it did before.
+				// Every command is judged on its own, so a rejection here is not
+				// expected; it is read as "not released" rather than left unhandled.
+				.catch(() => false)
+				.then((released) => {
+					if (released) {
+						// Counted only once the frame is actually left open under the
+						// restricted session, so the log matches what happened.
+						hooks.onVerificationFrame?.();
+						return;
+					}
+					// The frame was never released, so it runs nothing. It is detached
+					// rather than closed and the widget fails the way it did before,
+					// while the page the run drives keeps its session.
 					verificationSessions.delete(attached.sessionId);
-					onPolicyFailure(
-						new Error("A verification provider target could not be restricted"),
-					);
-					closeTarget(attached.targetInfo.targetId);
+					detachTarget(attached.sessionId);
 				});
 			return;
 		}
-		closeTarget(attached.targetInfo.targetId);
+		deny();
 	});
 	await connection.send(
 		"Target.setAutoAttach",
@@ -2519,26 +2538,73 @@ export async function denyRelatedBrowserTargets(
 
 /**
  * Applies the page's own restrictions to a verification widget target and then
- * releases it from the debugger pause. Every step has to land before the widget
- * runs, so a rejection leaves the caller to close the target.
+ * releases it from the debugger pause. Answers whether the frame was released.
+ *
+ * `Fetch.enable` carries the request allowlist, so it is the one command whose
+ * failure keeps the frame paused: releasing it without interception would let
+ * the widget talk to anything. The commands between it and the release are not
+ * all available on every iframe session, so each one is sent on its own and a
+ * failure is logged and stepped over instead of costing the widget its frame.
+ * `Runtime.runIfWaitingForDebugger` is always the last command sent.
  */
 async function resumeVerificationProviderTarget(
 	connection: Pick<BrowserUseCdpConnection, "send">,
 	sessionId: string,
-): Promise<void> {
-	await connection.send(
+): Promise<boolean> {
+	const intercepted = await sendVerificationFrameRestriction(
+		connection,
+		sessionId,
 		"Fetch.enable",
 		{ patterns: [{ urlPattern: "*" }] },
-		sessionId,
 	);
-	await connection.send("Target.setAutoAttach", AUTO_ATTACH_PARAMS, sessionId);
-	await connection.send("Page.enable", {}, sessionId);
-	await connection.send(
-		"Page.addScriptToEvaluateOnNewDocument",
-		{ source: BLOCK_BROWSER_ESCAPE_EXPRESSION },
+	if (!intercepted) return false;
+	for (const [method, params] of [
+		["Target.setAutoAttach", AUTO_ATTACH_PARAMS],
+		["Page.enable", {}],
+		[
+			"Page.addScriptToEvaluateOnNewDocument",
+			{ source: BLOCK_BROWSER_ESCAPE_EXPRESSION },
+		],
+	] as ReadonlyArray<readonly [string, Record<string, unknown>]>) {
+		await sendVerificationFrameRestriction(
+			connection,
+			sessionId,
+			method,
+			params,
+		);
+	}
+	return await sendVerificationFrameRestriction(
+		connection,
 		sessionId,
+		"Runtime.runIfWaitingForDebugger",
+		{},
 	);
-	await connection.send("Runtime.runIfWaitingForDebugger", {}, sessionId);
+}
+
+/**
+ * Sends one restriction command to a verification widget session and reports
+ * whether it landed. A failure is logged with the fixed method name and the
+ * fixed error kind only, so no page-derived text reaches the log.
+ */
+async function sendVerificationFrameRestriction(
+	connection: Pick<BrowserUseCdpConnection, "send">,
+	sessionId: string,
+	method: string,
+	params: Record<string, unknown>,
+): Promise<boolean> {
+	try {
+		await connection.send(method, params, sessionId);
+		return true;
+	} catch (error) {
+		console.log(
+			JSON.stringify({
+				event: "browser_verification_frame_restrict_failed",
+				method,
+				kind: error instanceof BrowserUseCdpCommandError ? error.kind : "OTHER",
+			}),
+		);
+		return false;
+	}
 }
 
 export const BLOCK_BROWSER_ESCAPE_EXPRESSION = `(() => {
