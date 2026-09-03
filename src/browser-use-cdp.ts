@@ -270,7 +270,7 @@ const COMMAND_ERROR_KIND_PATTERNS: ReadonlyArray<
 		],
 	],
 	["NODE_DETACHED", ["not attached", "detached"]],
-	["NO_BOX_MODEL", ["box model", "could not compute"]],
+	["NO_BOX_MODEL", ["box model", "layout object", "could not compute"]],
 	["NOT_FOCUSABLE", ["not focusable"]],
 	["NO_EXECUTION_CONTEXT", ["execution context", "cannot find context"]],
 ];

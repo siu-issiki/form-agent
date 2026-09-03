@@ -145,12 +145,12 @@ export class ResponsesSubmitReviewer implements SubmitReviewer {
 	}
 
 	/**
-	 * Base64 encoding the screenshot and serializing the request is the last
-	 * unmeasured stretch of CPU before the review call, so its cost is recorded
-	 * on every exit. Only sizes, a flag and a duration are logged.
+	 * Reports the size of the request the review call is about to send, on every
+	 * exit. No duration: the encoding and serialization are synchronous, and the
+	 * Workers clock only advances at an I/O boundary, so the CPU they spend has
+	 * to be read from the runtime's own `cpuTime` instead.
 	 */
 	#body(input: SubmitReviewInput): string {
-		const startedAt = monotonicNow();
 		const imageBytes = input.screenshot?.bytes.byteLength ?? 0;
 		const record = (bodyBytes: number, withImage: boolean): void => {
 			console.log(
@@ -159,7 +159,6 @@ export class ResponsesSubmitReviewer implements SubmitReviewer {
 					imageBytes,
 					bodyBytes,
 					withImage,
-					buildMs: Math.round(monotonicNow() - startedAt),
 				}),
 			);
 		};
@@ -315,12 +314,4 @@ export function toBase64(bytes: Uint8Array): string {
 	} catch {
 		throw new SubmitReviewUnavailableError();
 	}
-}
-
-/** Monotonic where the runtime offers it, so a clock step cannot skew a duration. */
-function monotonicNow(): number {
-	return typeof performance !== "undefined" &&
-		typeof performance.now === "function"
-		? performance.now()
-		: Date.now();
 }

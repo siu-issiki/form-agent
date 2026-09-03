@@ -1813,6 +1813,51 @@ describe("SubmissionEvidenceRecorder", () => {
 		expect(timings[0]?.bytes).toBe(0);
 	});
 
+	test("reports the record phase when the failure event write stalls", async () => {
+		const driver: Pick<RestrictedBrowserDriver, "captureScreenshot"> = {
+			captureScreenshot: () =>
+				Promise.reject(new Error("Browser screenshot failed")),
+		};
+		const store = new StalledFailureRecordJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const recorder = new SubmissionEvidenceRecorder(
+			driver,
+			new InMemoryEvidenceObjectStore(),
+			store,
+			input.id,
+			"run-token-1",
+			1,
+			() => "2026-08-28T00:00:02.000Z",
+			20,
+		);
+		const logs: string[] = [];
+		const originalLog = console.log;
+		const originalWarn = console.warn;
+		console.log = (message: unknown) => {
+			logs.push(String(message));
+		};
+		console.warn = () => undefined;
+
+		let result: Awaited<ReturnType<typeof recorder.capture>>;
+		try {
+			result = await recorder.capture("after_submit");
+		} finally {
+			console.warn = originalWarn;
+			console.log = originalLog;
+		}
+
+		expect(result).toEqual({
+			captured: false,
+			failureCode: "CAPTURE_TIMEOUT",
+		});
+		const timings = evidenceTimings(logs);
+		expect(timings).toHaveLength(1);
+		expect(timings[0]?.timedOut).toBe(true);
+		// The screenshot already failed; the capture is stuck writing that fact.
+		expect(timings[0]?.phase).toBe("record");
+	});
+
 	test("moves the intent to a failure when the upload fails", async () => {
 		const driver = new FakeDriver();
 		const store = new InMemoryJobStore();
@@ -2176,6 +2221,13 @@ class StalledPutEvidenceObjectStore extends InMemoryEvidenceObjectStore {
 class DeleteFailingEvidenceObjectStore extends InMemoryEvidenceObjectStore {
 	override async delete(): Promise<void> {
 		throw new Error("delete failed");
+	}
+}
+
+/** Never finishes the failure event write, so a capture stalls in `record`. */
+class StalledFailureRecordJobStore extends InMemoryJobStore {
+	override recordEvidenceCaptureFailed(): Promise<boolean> {
+		return new Promise<boolean>(() => {});
 	}
 }
 

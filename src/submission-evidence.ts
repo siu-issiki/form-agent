@@ -212,13 +212,13 @@ export class SubmissionEvidenceRecorder {
 			timing.screenshotMs = elapsedMs(screenshotStartedAt);
 			return expired()
 				? timeoutResult()
-				: this.#failed(eventId, stage, "SCREENSHOT_FAILED");
+				: this.#recordFailure(timing, eventId, stage, "SCREENSHOT_FAILED");
 		}
 		timing.screenshotMs = elapsedMs(screenshotStartedAt);
 		timing.bytes = bytes.byteLength;
 		if (expired()) return timeoutResult();
 		if (bytes.byteLength === 0) {
-			return this.#failed(eventId, stage, "SCREENSHOT_FAILED");
+			return this.#recordFailure(timing, eventId, stage, "SCREENSHOT_FAILED");
 		}
 
 		let sha256: string;
@@ -229,9 +229,20 @@ export class SubmissionEvidenceRecorder {
 		} catch {
 			timing.digestMs = elapsedMs(digestStartedAt);
 			if (!expired()) {
-				return this.#failed(eventId, stage, "OBJECT_STORE_FAILED");
+				return this.#recordFailure(
+					timing,
+					eventId,
+					stage,
+					"OBJECT_STORE_FAILED",
+				);
 			}
-			await this.#failed(eventId, stage, "CAPTURE_TIMEOUT", false);
+			await this.#recordFailure(
+				timing,
+				eventId,
+				stage,
+				"CAPTURE_TIMEOUT",
+				false,
+			);
 			return timeoutResult();
 		}
 		timing.digestMs = elapsedMs(digestStartedAt);
@@ -246,7 +257,7 @@ export class SubmissionEvidenceRecorder {
 		timing.recordMs = elapsedMs(intentStartedAt);
 		if (expired()) return timeoutResult();
 		if (!intentRecorded) {
-			return this.#failed(eventId, stage, "EVENT_NOT_RECORDED");
+			return this.#recordFailure(timing, eventId, stage, "EVENT_NOT_RECORDED");
 		}
 
 		timing.phase = "put";
@@ -261,10 +272,21 @@ export class SubmissionEvidenceRecorder {
 		} catch {
 			timing.putMs = elapsedMs(putStartedAt);
 			if (!expired()) {
-				return this.#failed(eventId, stage, "OBJECT_STORE_FAILED");
+				return this.#recordFailure(
+					timing,
+					eventId,
+					stage,
+					"OBJECT_STORE_FAILED",
+				);
 			}
 			await this.#discardObject(stage, objectKey);
-			await this.#failed(eventId, stage, "CAPTURE_TIMEOUT", false);
+			await this.#recordFailure(
+				timing,
+				eventId,
+				stage,
+				"CAPTURE_TIMEOUT",
+				false,
+			);
 			return timeoutResult();
 		}
 		timing.putMs = elapsedMs(putStartedAt);
@@ -295,13 +317,19 @@ export class SubmissionEvidenceRecorder {
 		// Both D1 writes of a capture are reported as one duration.
 		timing.recordMs += elapsedMs(recordStartedAt);
 		if (expired()) {
-			await this.#failed(eventId, stage, "CAPTURE_TIMEOUT", false);
+			await this.#recordFailure(
+				timing,
+				eventId,
+				stage,
+				"CAPTURE_TIMEOUT",
+				false,
+			);
 			await this.#discardObject(stage, objectKey);
 			return timeoutResult();
 		}
 		if (!recorded) {
 			await this.#discardObject(stage, objectKey);
-			return this.#failed(eventId, stage, "EVENT_NOT_RECORDED");
+			return this.#recordFailure(timing, eventId, stage, "EVENT_NOT_RECORDED");
 		}
 
 		logSubmissionEvidence(stage, true);
@@ -345,6 +373,26 @@ export class SubmissionEvidenceRecorder {
 					objectKey,
 				}),
 			);
+		}
+	}
+
+	/**
+	 * The failure event is a D1 write like any other, so a capture that stalls
+	 * writing it reports the record phase rather than the step that failed.
+	 */
+	async #recordFailure(
+		timing: EvidenceCaptureTiming,
+		eventId: string,
+		stage: EvidenceStage,
+		failureCode: EvidenceFailureCode,
+		shouldLog = true,
+	): Promise<EvidenceCaptureResult> {
+		timing.phase = "record";
+		const startedAt = monotonicNow();
+		try {
+			return await this.#failed(eventId, stage, failureCode, shouldLog);
+		} finally {
+			timing.recordMs += elapsedMs(startedAt);
 		}
 	}
 

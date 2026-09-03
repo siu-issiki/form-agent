@@ -123,7 +123,9 @@ describe("ResponsesSubmitReviewer", () => {
 		expect(entry.imageBytes).toBe(3);
 		expect(entry.withImage).toBe(true);
 		expect(typeof entry.bodyBytes).toBe("number");
-		expect(typeof entry.buildMs).toBe("number");
+		// No duration: the build is synchronous and the Workers clock does not
+		// advance across it.
+		expect(entry.buildMs).toBeUndefined();
 	});
 
 	test("omits a screenshot that would exceed the review request limit", async () => {

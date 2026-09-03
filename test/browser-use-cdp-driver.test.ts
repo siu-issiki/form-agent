@@ -2005,6 +2005,9 @@ describe("CDP command error classification", () => {
 		expect(classifyCdpCommandError("Could not compute box model.")).toBe(
 			"NO_BOX_MODEL",
 		);
+		expect(classifyCdpCommandError("Node does not have a layout object")).toBe(
+			"NO_BOX_MODEL",
+		);
 		expect(classifyCdpCommandError("Element is not focusable")).toBe(
 			"NOT_FOCUSABLE",
 		);
