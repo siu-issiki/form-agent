@@ -1646,6 +1646,57 @@ describe("ResponsesAgentExecutor", () => {
 		]);
 	});
 
+	test("logs the setup failure breakdown behind BROWSER_TOOL_UNAVAILABLE", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () =>
+				Response.json(
+					functionResponse("call-observe", "observe", {}),
+				)) as typeof fetch,
+			createBrowserDriver: async () => {
+				throw new Error("Browser page did not become ready");
+			},
+		});
+		const logs: string[] = [];
+		const spy = vi.spyOn(console, "log").mockImplementation((message) => {
+			logs.push(String(message));
+		});
+
+		const error = await executor
+			.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				new AbortController().signal,
+			)
+			.catch((caught) => caught)
+			.finally(() => spy.mockRestore());
+
+		expect(error).toBeInstanceOf(AgentExecutionError);
+		expect(error.reasonCode).toBe("BROWSER_TOOL_UNAVAILABLE");
+		const setupFailures = logs
+			.filter((entry) => entry.includes('"browser_setup_failed"'))
+			.map((entry) => JSON.parse(entry) as Record<string, unknown>);
+		// Fixed values only: no URL, session id, or provider message.
+		expect(setupFailures).toEqual([
+			{
+				event: "browser_setup_failed",
+				code: "PAGE_NOT_READY",
+				stage: "driver_connect",
+			},
+		]);
+	});
+
 	test("retries a job when the browser provider is temporarily overloaded", async () => {
 		const store = new D1JobStore(env.DB);
 		await store.create(input, "2026-08-28T00:00:00.000Z");
@@ -3526,7 +3577,7 @@ describe("ResponsesAgentExecutor", () => {
 			functionResponse("call-finish", "finish_uncertain", {
 				outcome: "uncertain",
 				formUrl: null,
-				reasonCode: "CORRECTION_NOT_APPLIED",
+				reasonCode: "OTHER_UNCERTAINTY",
 				reason: "The inputs were not corrected.",
 				retryable: null,
 			}),
@@ -3552,7 +3603,7 @@ describe("ResponsesAgentExecutor", () => {
 			new AbortController().signal,
 		);
 
-		expect(result).toMatchObject({ reasonCode: "CORRECTION_NOT_APPLIED" });
+		expect(result).toMatchObject({ reasonCode: "OTHER_UNCERTAINTY" });
 		expect(driver.submitCount).toBe(0);
 		const lastRequest = requests[requests.length - 1] as {
 			input: Array<{ type?: string; call_id?: string; output?: string }>;
@@ -3636,6 +3687,91 @@ describe("ResponsesAgentExecutor", () => {
 		});
 	});
 
+	test("rejects a finish_uncertain reason code outside the fixed set", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-invalid", "finish_uncertain", {
+				outcome: "uncertain",
+				formUrl: null,
+				reasonCode: "MISSING_CONSENT_MAPPING",
+				reason: "The consent checkbox has no payload key.",
+				retryable: null,
+			}),
+			functionResponse("call-finish", "finish_uncertain", {
+				outcome: "uncertain",
+				formUrl: null,
+				reasonCode: "CONSENT_UNMAPPED",
+				reason: "The consent checkbox has no payload key.",
+				retryable: null,
+			}),
+		];
+		const requests: unknown[] = [];
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async (_resource, init) => {
+				requests.push(JSON.parse(String(init?.body)));
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => new WorkerFakeBrowserDriver(),
+		});
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toMatchObject({
+			outcome: "uncertain",
+			reasonCode: "CONSENT_UNMAPPED",
+		});
+		const retry = requests[2] as {
+			input: Array<{ type?: string; call_id?: string; output?: string }>;
+		};
+		const rejection = retry.input.find(
+			(item) =>
+				item.type === "function_call_output" && item.call_id === "call-invalid",
+		)?.output;
+		expect(JSON.parse(String(rejection)).error).toBe("INVALID_TOOL_INPUT");
+		expect(await readAgentToolDiagnostics(input.id)).toContainEqual({
+			turn: 2,
+			toolName: "finish",
+			stage: "finish_validation",
+			resultCode: "FINISH_FIELDS_INVALID",
+		});
+		const uncertainTool = (
+			requests[1] as {
+				tools?: Array<{
+					name?: string;
+					parameters?: { properties: { reasonCode: { enum: string[] } } };
+				}>;
+			}
+		).tools?.find((tool) => tool.name === "finish_uncertain");
+		expect(uncertainTool?.parameters?.properties.reasonCode.enum).toEqual([
+			"FORM_PURPOSE_MISMATCH",
+			"CONSENT_UNMAPPED",
+			"FIELD_MAPPING_UNKNOWN",
+			"CAPTCHA_REQUIRED",
+			"CONTACT_FORM_UNREACHABLE",
+			"PROHIBITION_UNVERIFIED",
+			"SUBMIT_OUTCOME_UNKNOWN",
+			"OTHER_UNCERTAINTY",
+		]);
+	});
+
 	test("marks the observe result as untrusted page content", async () => {
 		const store = new D1JobStore(env.DB);
 		await store.create(input, "2026-08-28T00:00:00.000Z");
@@ -3653,7 +3789,7 @@ describe("ResponsesAgentExecutor", () => {
 			functionResponse("call-finish", "finish_uncertain", {
 				outcome: "uncertain",
 				formUrl: null,
-				reasonCode: "PAGE_TEXT_TRUNCATED",
+				reasonCode: "PROHIBITION_UNVERIFIED",
 				reason: "The page text was truncated.",
 				retryable: null,
 			}),

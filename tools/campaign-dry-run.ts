@@ -14,6 +14,15 @@ import type { JobInput } from "../src/job";
 import type { TrustedFormValue } from "../src/restricted-browser";
 
 const PRODUCTION_BASE_URL = "https://form-agent.form-agent.workers.dev";
+/** Mirrors the Queue consumer max_concurrency in wrangler.jsonc. */
+const QUEUE_MAX_CONCURRENCY = 10;
+const POLL_INTERVAL_MS = 2_000;
+const TERMINAL_STATUSES = [
+	"prohibited",
+	"uncertain",
+	"failed",
+	"dead_lettered",
+];
 
 const options = parseOptions(Bun.argv.slice(2));
 const registration = await readRegistration(options.registrationPath);
@@ -92,16 +101,23 @@ if (jobs.length !== options.limit) {
 }
 
 if (options.submit) {
-	let completed = 0;
-	for (const job of jobs) {
-		if (await submitAndWait(job, options.apiToken)) completed += 1;
+	const submitted = await registerAll(jobs, options.apiToken);
+	const byReasonCode: Record<string, number> = {};
+	if (submitted.notRegistered > 0) {
+		byReasonCode.REGISTRATION_FAILED = submitted.notRegistered;
 	}
+	const completed = await waitForAll(
+		submitted.registered,
+		options.apiToken,
+		byReasonCode,
+	);
 	console.log(
 		JSON.stringify({
 			event: "campaign_dry_run_summary",
 			selectedJobs: jobs.length,
 			completedJobs: completed,
 			safeFailures: jobs.length - completed,
+			byReasonCode,
 		}),
 	);
 	if (completed !== jobs.length) {
@@ -193,87 +209,155 @@ async function readRegistration(path: string): Promise<RegistrationEntry[]> {
 	return value as RegistrationEntry[];
 }
 
-async function submitAndWait(
-	job: JobInput,
+/**
+ * Registration is sequential but does not wait for completion, so the Queue
+ * consumer runs up to its own max_concurrency instead of one job at a time.
+ * Registering a job is the last step before the dry-run boundary, so a failure
+ * stops further registrations while the jobs already accepted are still
+ * followed to their result.
+ */
+async function registerAll(
+	jobs: readonly JobInput[],
 	apiToken: string,
-): Promise<boolean> {
-	if (job.payload._formAgentDryRun !== true) {
-		throw new Error("Job-level dry-run guard is missing");
-	}
-	const headers = {
-		authorization: `Bearer ${apiToken}`,
-		"content-type": "application/json",
-	};
-	const created = await fetch(`${PRODUCTION_BASE_URL}/jobs`, {
-		method: "POST",
-		headers,
-		body: JSON.stringify(job),
-		redirect: "manual",
-	});
-	await created.body?.cancel();
-	if (created.status !== 200 && created.status !== 201) {
-		throw new Error(`Job registration failed with status ${created.status}`);
-	}
-	console.log(
-		JSON.stringify({ event: "campaign_job_registered", jobId: job.id }),
-	);
-
-	const deadline = Date.now() + 4 * 60 * 1_000;
-	let lastStatus = "";
-	while (Date.now() < deadline) {
-		const response = await fetch(`${PRODUCTION_BASE_URL}/jobs/${job.id}`, {
-			headers,
+): Promise<{ registered: JobInput[]; notRegistered: number }> {
+	const registered: JobInput[] = [];
+	for (const job of jobs) {
+		if (job.payload._formAgentDryRun !== true) {
+			throw new Error("Job-level dry-run guard is missing");
+		}
+		const created = await fetch(`${PRODUCTION_BASE_URL}/jobs`, {
+			method: "POST",
+			headers: apiHeaders(apiToken),
+			body: JSON.stringify(job),
 			redirect: "manual",
 		});
-		if (!response.ok) {
-			await response.body?.cancel();
-			throw new Error(`Job lookup failed with status ${response.status}`);
-		}
-		const body = (await response.json()) as {
-			job: {
-				status: string;
-				attemptCount: number;
-				result: { reasonCode: string | null } | null;
-			};
-		};
-		if (body.job.status !== lastStatus) {
-			lastStatus = body.job.status;
+		await created.body?.cancel();
+		if (created.status !== 200 && created.status !== 201) {
 			console.log(
 				JSON.stringify({
-					event: "campaign_job_status",
+					event: "campaign_job_registration_failed",
 					jobId: job.id,
-					status: body.job.status,
-					attemptCount: body.job.attemptCount,
+					status: created.status,
 				}),
 			);
+			break;
 		}
-		if (body.job.status === "submitting" || body.job.status === "sent") {
-			throw new Error(`Dry-run entered unsafe status ${body.job.status}`);
-		}
-		if (
-			["prohibited", "uncertain", "failed", "dead_lettered"].includes(
-				body.job.status,
-			)
-		) {
-			const completed =
-				body.job.status === "prohibited" &&
-				body.job.result?.reasonCode === "DRY_RUN_COMPLETE" &&
-				body.job.attemptCount === 1;
+		registered.push(job);
+		console.log(
+			JSON.stringify({ event: "campaign_job_registered", jobId: job.id }),
+		);
+	}
+	return { registered, notRegistered: jobs.length - registered.length };
+}
+
+/**
+ * Polls every registered job each round instead of draining them one by one.
+ * The budget keeps the original four minutes per concurrent batch, because a
+ * job queued behind a full batch only starts once one of those finishes.
+ */
+async function waitForAll(
+	jobs: readonly JobInput[],
+	apiToken: string,
+	byReasonCode: Record<string, number>,
+): Promise<number> {
+	if (jobs.length === 0) return 0;
+	const pending = new Map(jobs.map((job) => [job.id, ""]));
+	const deadline =
+		Date.now() +
+		4 * 60 * 1_000 * Math.ceil(jobs.length / QUEUE_MAX_CONCURRENCY);
+	let completed = 0;
+	while (pending.size > 0 && Date.now() < deadline) {
+		for (const [jobId, lastStatus] of [...pending]) {
+			const state = await readJobState(jobId, apiToken);
+			// A lookup failure is transient here; the job stays pending and is read
+			// again next round, and the deadline still bounds the wait.
+			if (!state) continue;
+			if (state.status !== lastStatus) {
+				pending.set(jobId, state.status);
+				console.log(
+					JSON.stringify({
+						event: "campaign_job_status",
+						jobId,
+						status: state.status,
+						attemptCount: state.attemptCount,
+					}),
+				);
+			}
+			if (state.status === "submitting" || state.status === "sent") {
+				throw new Error(`Dry-run entered unsafe status ${state.status}`);
+			}
+			if (!TERMINAL_STATUSES.includes(state.status)) continue;
+			const reasonCode = state.result?.reasonCode ?? "NO_REASON";
+			const jobCompleted =
+				state.status === "prohibited" &&
+				reasonCode === "DRY_RUN_COMPLETE" &&
+				state.attemptCount === 1;
+			if (jobCompleted) completed += 1;
+			byReasonCode[reasonCode] = (byReasonCode[reasonCode] ?? 0) + 1;
+			pending.delete(jobId);
 			console.log(
 				JSON.stringify({
 					event: "campaign_job_result",
-					jobId: job.id,
-					completed,
-					status: body.job.status,
-					reasonCode: body.job.result?.reasonCode ?? "NO_REASON",
-					attemptCount: body.job.attemptCount,
+					jobId,
+					completed: jobCompleted,
+					status: state.status,
+					reasonCode,
+					attemptCount: state.attemptCount,
 				}),
 			);
-			return completed;
 		}
-		await Bun.sleep(2_000);
+		if (pending.size > 0) await Bun.sleep(POLL_INTERVAL_MS);
 	}
-	throw new Error(`Dry-run timed out with status ${lastStatus || "unknown"}`);
+	for (const [jobId, lastStatus] of pending) {
+		byReasonCode.DRY_RUN_TIMED_OUT = (byReasonCode.DRY_RUN_TIMED_OUT ?? 0) + 1;
+		console.log(
+			JSON.stringify({
+				event: "campaign_job_result",
+				jobId,
+				completed: false,
+				status: lastStatus || "unknown",
+				reasonCode: "DRY_RUN_TIMED_OUT",
+				attemptCount: 0,
+			}),
+		);
+	}
+	return completed;
+}
+
+interface JobState {
+	status: string;
+	attemptCount: number;
+	result: { reasonCode: string | null } | null;
+}
+
+async function readJobState(
+	jobId: string,
+	apiToken: string,
+): Promise<JobState | null> {
+	const response = await fetch(`${PRODUCTION_BASE_URL}/jobs/${jobId}`, {
+		headers: apiHeaders(apiToken),
+		redirect: "manual",
+	});
+	if (!response.ok) {
+		await response.body?.cancel();
+		console.log(
+			JSON.stringify({
+				event: "campaign_job_lookup_failed",
+				jobId,
+				status: response.status,
+			}),
+		);
+		return null;
+	}
+	const body = (await response.json()) as { job: JobState };
+	return body.job;
+}
+
+function apiHeaders(apiToken: string): Record<string, string> {
+	return {
+		authorization: `Bearer ${apiToken}`,
+		"content-type": "application/json",
+	};
 }
 
 function requiredOption(values: Map<string, string>, name: string): string {

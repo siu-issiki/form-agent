@@ -948,6 +948,31 @@ export function detectProhibitedReasonCodes(
 	return detectProhibitedTextReasonCodes(observation.pageText ?? "");
 }
 
+/**
+ * Purpose words that mark a form as serving a specific audience instead of a
+ * general inquiry. They are matched only next to a limiting expression or on
+ * their own inside a heading, because each word also appears in ordinary
+ * navigation on a general contact page.
+ */
+const FORM_PURPOSE_WORDS =
+	"採用|求人|エントリー|応募|新卒|中途|アルバイト|インターン|予約|資料請求|お見積り|お見積|見積|会員|ログイン|マイページ|サポート|不具合|修理受付|報道|取材|サンプル";
+
+/** Words that turn a purpose word into a restriction on who may use the form. */
+const FORM_PURPOSE_LIMITERS =
+	"専用|のみ|以外は|以外の|限定|に限ります|に限らせて";
+
+/**
+ * Generic connectors allowed between a purpose word and a limiter. Requiring
+ * one of these keeps "ご予約はお電話のみ" from reading as a purpose restriction
+ * while still matching "採用に関するお問い合わせ専用".
+ */
+const FORM_PURPOSE_CONNECTORS =
+	"(?:に関する|に関して|についての|について|関連|向け|の)?(?:お問い?合わ?せ|問い?合わ?せ|ご相談|相談|ご依頼|依頼|受付|窓口|フォーム|ページ|申込み?|申し込み)?(?:の)?";
+
+/** Filler a heading may contain around a purpose word and nothing else. */
+const FORM_PURPOSE_HEADING_FILLER =
+	"[\\s|｜/／・\\-‐−–—:：、。]|に関する|に関して|についての|について|関連|向け|専用|の|ご|お問い?合わ?せ|問い?合わ?せ|ご?相談|ご?依頼|受付|窓口|フォーム|ページ|情報|エントリー|応募|申込み?|申し込み|入力|送信|はこちら|専門";
+
 export const PROHIBITION_TEXT_PATTERN_SOURCES = {
 	explicitAllowances: [
 		"(営業|勧誘|セールス).{0,40}(も|を)?受け付け(?:て)?(?:います|ております)",
@@ -962,6 +987,15 @@ export const PROHIBITION_TEXT_PATTERN_SOURCES = {
 	formPurposeIncompatible: [
 		"(採用|サポート|報道|サンプル|資料請求).{0,30}(専用|のみ)",
 		"(専用|のみ).{0,30}(採用|サポート|報道|サンプル|資料請求)",
+		`(?:${FORM_PURPOSE_WORDS})${FORM_PURPOSE_CONNECTORS}(?:${FORM_PURPOSE_LIMITERS})`,
+	],
+	/**
+	 * Matched only against a heading, legend, or document title whose whole text
+	 * is a purpose word plus generic filler. A heading naming a company or any
+	 * other extra word is left alone.
+	 */
+	formPurposeHeading: [
+		`^[\\s|｜/／・\\-‐−–—]*[ごお]?(?:${FORM_PURPOSE_WORDS})(?:${FORM_PURPOSE_HEADING_FILLER})*$`,
 	],
 } as const;
 

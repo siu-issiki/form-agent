@@ -215,6 +215,57 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 		expect(JSON.stringify(result).length).toBeLessThan(100);
 	});
 
+	test("detects a purpose restriction stated next to a limiting word", () => {
+		const readContext = runInNewContext(
+			`(${READ_FORM_PROHIBITION_REASON_CODES_FUNCTION})`,
+		) as (this: object) => string[];
+
+		expect(
+			readContext.call({
+				tagName: "FORM",
+				innerText: "こちらは採用に関するお問い合わせ専用フォームです",
+				previousElementSibling: null,
+				parentElement: { tagName: "BODY" },
+			}),
+		).toEqual(["FORM_PURPOSE_INCOMPATIBLE"]);
+	});
+
+	test("detects a purpose restriction stated only in a heading", () => {
+		const readContext = runInNewContext(
+			`(${READ_FORM_PROHIBITION_REASON_CODES_FUNCTION})`,
+		) as (this: object) => string[];
+		const legend = { innerText: "ご予約フォーム" };
+
+		expect(
+			readContext.call({
+				tagName: "FORM",
+				innerText: "お名前 メールアドレス ご希望日",
+				previousElementSibling: null,
+				parentElement: { tagName: "BODY" },
+				querySelectorAll: () => ({ length: 1, 0: legend }),
+			}),
+		).toEqual(["FORM_PURPOSE_INCOMPATIBLE"]);
+	});
+
+	test("leaves a general inquiry form and its headings undetected", () => {
+		const readContext = runInNewContext(
+			`(${READ_FORM_PROHIBITION_REASON_CODES_FUNCTION})`,
+		) as (this: object) => string[];
+		const heading = { innerText: "お問い合わせフォーム" };
+
+		expect(
+			readContext.call({
+				tagName: "FORM",
+				innerText:
+					"お問い合わせ内容をご記入ください。ご予約はお電話のみで承ります。必須項目のみご入力ください。",
+				previousElementSibling: null,
+				parentElement: { tagName: "BODY" },
+				ownerDocument: { title: "お問い合わせ｜株式会社サンプル採用情報" },
+				querySelectorAll: () => ({ length: 1, 0: heading }),
+			}),
+		).toEqual([]);
+	});
+
 	test("finds the iframe element that owns a discovered form frame", () => {
 		expect(
 			findCdpFrameOwnerBackendNodeId(

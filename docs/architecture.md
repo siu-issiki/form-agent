@@ -114,6 +114,20 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 - 最大 16 turn、ジョブ prompt 最大 64,000 文字とする。
 - `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返す。
 - `prohibited`のreason codeは`NO_FORM_PRESENT`、`SALES_PROHIBITED`、`FORM_PURPOSE_INCOMPATIBLE`だけを許可し、旧aliasは保存前に正規化する。
+- `finish_uncertain`のreason codeも固定集合だけを許可し、集合外はtool schemaのenumとhandler側の検証の両方で`INVALID_TOOL_INPUT`として拒否する。自由文字列を許していた時期はモデルが毎回異なる語を作り、`uncertain`の内訳を集計できなかったためである。`finish_failed`は技術失敗の内訳が多様であるため自由文字列のままとする。
+
+| `uncertain` reason code | 意味 |
+| --- | --- |
+| `FORM_PURPOSE_MISMATCH` | フォームの用途が一般の問い合わせでない（採用・予約・資料請求・見積・会員・サポート専用など）が、信頼済みhandlerが禁止として検出していない |
+| `CONSENT_UNMAPPED` | 同意チェックに対応する`payloadKey`が無い、または必要な値が不明 |
+| `FIELD_MAPPING_UNKNOWN` | 同意以外の必須項目に対応する`payloadKey`が無い |
+| `CAPTCHA_REQUIRED` | CAPTCHAなど人間確認が必要 |
+| `CONTACT_FORM_UNREACHABLE` | 問い合わせフォームに到達できない（リンク切れ・行き止まり） |
+| `PROHIBITION_UNVERIFIED` | 禁止・用途制限がありそうだが信頼済みhandlerが検証できない（ページ本文の切り詰めを含む） |
+| `SUBMIT_OUTCOME_UNKNOWN` | 送信結果を確認できない |
+| `OTHER_UNCERTAINTY` | 上記のいずれにも当てはまらない |
+
+`submit`経路で信頼済みhandler自身が保存する`uncertain`（`SUBMIT_CONFIRMATION_NOT_OBSERVED`、`PRE_SUBMIT_REVIEW_DENIED`など）はモデルの申告ではないため、この集合とは別に扱う。
 - Agent 終了時または timeout 時に browser 接続を閉じる。
 - `fill` / `select`ではモデルに生の値を渡させず、`payload.formValues`内の`payloadKey`を指定させる。信頼済みhandlerがD1の保存値を解決し、存在しないキー、契約外の型、上限超過、空文字を拒否する。値は単一文字列（最大8,192文字）または選択肢候補リスト（1〜10要素、各要素1〜256文字、合計2,048文字以下）のいずれかであり、候補リストは`select`だけが受け取る。`fill`に候補リストのキーを渡した場合は`INVALID_TOOL_INPUT`とする。
 
@@ -354,6 +368,8 @@ Provider、model、input / output token、処理時間、BrowserUse 待ち時間
 
 現在保存するイベントは `job.retry_scheduled`、`job.dead_lettered`、`job.redelivery_ignored`、`agent.tool_diagnostic`、`agent.run_metrics`、`evidence.intent`、`evidence.captured`、`evidence.capture_failed` である。retry イベントにはreason code、発生元、attempt、実行時間、次回配信までの遅延秒数、retry時点のProvider呼び出し累計を保存する。tool diagnosticにはturn、固定のtool名、処理stage、固定のresult codeだけを保存する。
 
+executor が `BROWSER_TOOL_UNAVAILABLE` で run を終える際は、Worker ログへ `browser_setup_failed` を出力する。`code` は `PAGE_NOT_READY` / `NAVIGATION_FAILED` / `CDP_COMMAND_FAILED` などの固定の分類結果、`stage` は `driver_connect` / `scope_setup` / `bootstrap_navigate` またはtool名であり、値・URL・session idは出力しない。この reason code だけでは bootstrap 失敗の内訳が Workers Logs から分からず、D1 の `events` を引くまで切り分けられなかったためである。
+
 `job.redelivery_ignored` は、Queue の再配信を実行せずに ack した場合に best-effort で記録し、`data_json` はジョブの `status` だけを保存する。Worker が `submitting` 中に停止したジョブは再配信されても状態が `submitting` のまま残るため、`updated_at` 以外の手掛かりで見つけられるようにするためである。記録に失敗しても ack は変わらない。
 
 `agent.run_metrics` は 1 run に 1 件記録し、`data_json` は `{ turns, providerRequests, reviewRequests, inputTokens, outputTokens, reasoningTokens, cachedTokens, browserConnectMs, browserConnected, submitReviewAllow, submitReviewDeny, durationMs, outcome }` を保存する。数値、boolean、固定の `outcome`（`sent` / `prohibited` / `uncertain` / `failed` / `error`）だけであり、`error` は executor が `AgentExecutionError` を投げて終了した run を表す。`providerRequests` と `reviewRequests` は応答を受け取った Provider 呼び出しの件数、token は応答の `usage` の合計、`browserConnectMs` は browser driver の確立に要した時間（失敗した場合も記録し、確立を試みなかった run では `null`）である。`browserConnected` は CDP driver の確立に成功したかどうかだけを表す。REST API で session を作成した後に CDP 接続で失敗した場合も `false` になるため、課金対象となる session の作成・停止件数は Worker ログの `browser_use_session_created` / `browser_use_session_stopped` で追う。記録は executor の終了時に best-effort で行い、失敗しても run の結果を変えない。書き込みは 2 秒で打ち切り、打ち切りや失敗は Worker ログの `agent_run_metrics_not_recorded`（`reason` は `TIMEOUT` / `WRITE_FAILED`）で検知する。executor の deadline race の内側で走るため、遅い D1 が確定済みの run 結果を `AGENT_TERMINATION_UNCONFIRMED` へ上書きしないようにするためである。
@@ -394,6 +410,8 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 
 プライバシーポリシー同意などの必須 checkbox を agent に操作させるかは運用判断であり、サンプルには含めない。同意させる場合は `privacyConsent` のようなキーで `["checked"]` を渡す。
 
+`--submit-dry-run` では全件を先に `POST /jobs` へ登録し、その後で登録済みジョブ全体を 2 秒間隔でポーリングする。1 件登録して完了を待つ直列実行では Queue consumer の `max_concurrency` が活きず、2026-09-02 の 20 件で約 15 分を要したためである。待ち時間の上限は「4 分 × ceil(件数 / `max_concurrency`)」とし、満杯のバッチの後ろに並んだジョブが枠の空きを待つ分を見込む。登録が途中で失敗した場合は以降の登録を止め、登録済みの分だけ結果を待って集計し、exit code 1 で終了する。ジョブ照会の一時的な失敗は次の周回で読み直し、`campaign_dry_run_summary` には `byReasonCode` として reason code 別の件数（未登録は `REGISTRATION_FAILED`、期限切れは `DRY_RUN_TIMED_OUT`）を出力する。`submitting` / `sent` を観測した場合は従来どおり即座に中断する。
+
 ### Agent への安全指示
 
 system prompt では、営業禁止・用途制限の確認と送信前の再観察を指示する。入力値は信頼済みhandlerが`payload.formValues`由来であることを強制する。`prohibited`は、直前かつ現在URLと一致する観察でフォーム不在、または全候補formについてform本文、前方の近接要素、祖先側の近接要素、iframe親ページ側の近接要素から固定パターンの営業禁止・用途制限を検出した場合だけ受理する。送信前には選択したformの禁止根拠、全入力のform owner、native validity、現在のaction / method、入力後の再観察、1回限りの送信権を機械的に検証する。さらに送信直前には、観察・信頼済み入力値・`before_submit`スクリーンショットを入力とする独立レビューを通し、`INPUT_MISMATCH` / `SALES_PROHIBITED` / `FORM_PURPOSE_INCOMPATIBLE` / `WRONG_FORM` / `UNCLEAR`のいずれかでdenyされた場合は送信権を取得しない。修正を許可するのは`INPUT_MISMATCH`だけで、実際の入力変更と再観察に加えて、観察指紋が変化していることを次の`submit`の前提にする。他のreason codeは1回目でも、`INPUT_MISMATCH`は2回目のdenyで`PRE_SUBMIT_REVIEW_DENIED`として`uncertain`で終了する。allow後・送信権取得前には現在URLと観察済み全フィールドの値・チェック状態を読み直し、さらにレビュー前後でhidden / disabledを含むform全体のsnapshotを比較し、レビュー中にページが変化していれば送信しない。レビューを完了できない場合はallowにせず、再試行可能な`SUBMIT_REVIEW_UNAVAILABLE`として扱う。禁止判定時と送信前後には画面のスクリーンショット証跡をR2へ保存する。`observe`の結果は外部サイト由来の非信頼データとして明示し、モデルとレビューの双方へページ内の指示に従わないよう指示する。固定パターンで表現されない禁止事項は独立レビューで補完するが、完全ではない。Shadow DOM内の本文とページ上のprompt injectionに対する完全な判定は引き続き未対応である。
@@ -413,6 +431,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 - 送信完了は、許可したrequestを観測し、日本語の送信完了表現または`thank you`が5秒以内に新たに出現した場合に確定する。期待済みGET Documentは、送信対象frameの遷移と同じframe内の完了文言を必須にする。他frameの完了文言は判定に利用しない。
 - submit controlの期待済みGETは送信権で制御する。非submitの`click`、`fill`、`select`がDOMイベントを発火する直前から、その後および`submit`中のbrowser requestを遮断し、観察済みnavigateのtop-frame Document、期待済みsubmit request、またはそのrequest IDに直接連なるsafe redirectだけを許可する。`navigate`は直前の`observe.navigationLinks`で得たfragmentを含む完全一致URLまたは現在URLだけを許可する。観察済みリンク自体がGET型副作用を持つサイトは機械的に識別できないため、対象サイト側がGETをsafe methodとして扱うことは引き続き前提になる。
 - 営業禁止判定はフォーム不在と、候補form本文、前方・祖先側の近接要素、iframe親ページ側の近接要素に対する固定の日本語・英語パターンを使う。肯定表現と「禁止していない」は除外し、複数formがある場合のページ全体禁止は全formに何らかの禁止根拠がある場合だけ受理する。送信前確認は選択formの禁止根拠、form owner、native validity、action / method、入力後の再観察、1回限りの送信権を信頼済みhandlerで検証する。固定パターンに加えて送信直前の独立レビューが禁止表現と入力内容を再確認するが、レビューはモデル判断であり完全ではない。未知の禁止表現は`prohibited`として確定できず、追加パターンまたは人手確認が必要になる。
+- 用途不一致（`FORM_PURPOSE_INCOMPATIBLE`）の検出語彙は、採用・求人・エントリー・応募・予約・資料請求・見積・会員・マイページ・サポート・修理受付・報道・取材・サンプルなどを含む。誤検出を避けるため、用途語単独では検出せず、「専用」「のみ」「以外は」「限定」などの限定表現が用途語へ直接またはごく一般的な接続語（「に関する」「お問い合わせ」「フォーム」など）を挟んで続く場合に限る。加えて`h1`〜`h3`、`legend`、`title`の見出し本文が用途語と一般語だけで構成される場合も検出する。見出しは32文字までを対象とし、社名など余分な語を含む見出しは検出しない。「ご予約はお電話のみで承ります」のように限定表現が別の語に掛かる文は検出しない。用途不一致は信頼境界の対象であり、handlerが証跡を検出した場合だけ`prohibited`となる。検出できない場合、モデルは`finish_uncertain`の`FORM_PURPOSE_MISMATCH`で終了する。
 - dry-runではジョブURLへのbootstrap後の再navigateと、最初のclick / fill / select以降に発生するbrowser requestをすべて遮断し、座標click前にCDPのhit targetが検証済み要素またはそのcomposed descendantであることを確認する。
 - 送信前の独立レビューとレビュー後の再照合は、レビュー中のページ JS による値の書き換えを検出するが、最終照合から activation までの窓、禁止文言 / label / option / action の変化、200 field を超える form の再探索は対象外である。詳細は「送信前の独立レビュー」の残存リスクを参照する。
 

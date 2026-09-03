@@ -2626,12 +2626,27 @@ export const READ_FORM_PROHIBITION_REASON_CODES_FUNCTION = `function() {
     texts.push(String(value ?? ""));
   };
   appendText(this.innerText);
+	const headingTexts = [];
+	const appendHeadings = (element) => {
+		if (!element || headingTexts.length >= 20) return;
+		if (element.matches?.("h1, h2, h3, legend")) {
+			headingTexts.push(String(element.innerText ?? "").slice(0, 200));
+		}
+		const nodes = element.querySelectorAll?.("h1, h2, h3, legend");
+		const length = Math.min(Number(nodes?.length) || 0, 20);
+		for (let index = 0; index < length && headingTexts.length < 20; index += 1) {
+			headingTexts.push(String(nodes[index]?.innerText ?? "").slice(0, 200));
+		}
+	};
+	appendHeadings(this);
+	headingTexts.push(String(this.ownerDocument?.title ?? "").slice(0, 200));
 	const appendPrevious = (element, limit) => {
 		let sibling = element?.previousElementSibling;
 		for (let count = 0; count < limit && sibling; count += 1) {
 			if (sibling.matches?.("form") || sibling.querySelector?.("form")) break;
 			if (!["HEADER", "NAV", "FOOTER"].includes(sibling.tagName)) {
 				appendText(sibling.innerText);
+				appendHeadings(sibling);
 			}
 			sibling = sibling.previousElementSibling;
 		}
@@ -2672,6 +2687,16 @@ export const READ_FORM_PROHIBITION_REASON_CODES_FUNCTION = `function() {
       !codes.includes("FORM_PURPOSE_INCOMPATIBLE") &&
       patternSources.formPurposeIncompatible.some((source) => new RegExp(source).test(text))
     ) {
+      codes.push("FORM_PURPOSE_INCOMPATIBLE");
+    }
+  }
+  for (const rawHeading of headingTexts) {
+    if (codes.includes("FORM_PURPOSE_INCOMPATIBLE")) break;
+    const heading = rawHeading.replace(/\\s+/g, " ").trim().toLowerCase();
+    // A heading longer than this names something besides the form's purpose,
+    // and the bound also keeps the filler pattern from backtracking.
+    if (heading.length === 0 || heading.length > 32) continue;
+    if (patternSources.formPurposeHeading.some((source) => new RegExp(source).test(heading))) {
       codes.push("FORM_PURPOSE_INCOMPATIBLE");
     }
   }
