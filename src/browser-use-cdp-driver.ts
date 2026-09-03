@@ -2209,6 +2209,11 @@ const RETRYABLE_CLICK_PREPARATION_KINDS: ReadonlySet<CdpCommandErrorKind> =
 		"NODE_NOT_FOUND",
 		"NODE_DETACHED",
 		"NO_EXECUTION_CONTEXT",
+		// The exact provider messages that NO_EXECUTION_CONTEXT used to catch as
+		// a broad match are now classified into these two specific kinds; keep
+		// them retryable so the settling-layout behavior is unchanged.
+		"CONTEXT_NOT_FOUND",
+		"CONTEXT_DESTROYED",
 		"NO_NODE_AT_LOCATION",
 	]);
 

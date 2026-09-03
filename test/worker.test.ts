@@ -1753,6 +1753,7 @@ describe("ResponsesAgentExecutor", () => {
 				stage: "driver_connect",
 				method: "DOM.getDocument",
 				kind: "NODE_NOT_FOUND",
+				cdpCode: -32000,
 			},
 		]);
 	});
