@@ -992,9 +992,11 @@ export const PROHIBITION_TEXT_PATTERN_SOURCES = {
 		"(sales|solicitation).{0,40}(prohibited|not accepted|do not use)",
 	],
 	formPurposeIncompatible: [
-		"(採用|サポート|報道|サンプル|資料請求).{0,30}(専用|のみ)",
-		"(専用|のみ).{0,30}(採用|サポート|報道|サンプル|資料請求)",
 		`(?:${FORM_PURPOSE_WORDS})${FORM_PURPOSE_CONNECTORS}(?:${FORM_PURPOSE_LIMITERS})`,
+		// The reverse order ("専用の採用窓口") takes only the limiters that cannot
+		// attach to something else in between; "のみ" in this position matched
+		// unrelated sentences such as "お電話のみのご予約".
+		`(?:専用|限定)(?:の|は|:|：)?(?:${FORM_PURPOSE_WORDS})`,
 		`(?:${FORM_PURPOSE_WORDS})${FORM_PURPOSE_CONNECTORS}以外(?:は|の).{0,20}(?:${FORM_PURPOSE_REFUSALS})`,
 	],
 	/**

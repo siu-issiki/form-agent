@@ -78,6 +78,8 @@ bun run campaign:dry-run \
 
 productionへ登録する場合だけ`JOB_API_TOKEN`を環境変数へ設定し、同じコマンドへ`--submit-dry-run`を追加します。生成ジョブは必ず`_formAgentDryRun: true`と`_formAgentMaxAttempts: 1`を持ち、再試行と`submitting` / `sent`を防ぎます。成功条件は各ジョブが1 attemptで`prohibited / DRY_RUN_COMPLETE`になることです。
 
+同じ`--campaign`名で登録値・件名・本文・選択肢を変えて再実行しないでください。ジョブIDはcampaign名・企業ドメイン・フォームURLから決まるため、内容を変えても同じIDになります。登録レスポンスが失われた際の存在確認は入力の一致まで検証するので、不一致は`REGISTRATION_UNKNOWN`として扱われexit 1になります。入力を変える場合はcampaign名も変えてください。
+
 ## エージェント実行境界
 
 Queue Consumer は `AgentRuntime` の結果契約を使い、WorkerからOpenAI Responses APIを直接呼び出します。モデルへ渡すジョブ情報から`runToken`を除外し、OpenAIとBrowserUseの認証情報はWorkerの環境変数にだけ保持します。

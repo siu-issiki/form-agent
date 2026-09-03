@@ -266,6 +266,31 @@ describe("BrowserUse CDP payload and DOM discovery", () => {
 		).toEqual([]);
 	});
 
+	test("requires the limiter to attach to the purpose word", () => {
+		const readContext = runInNewContext(
+			`(${READ_FORM_PROHIBITION_REASON_CODES_FUNCTION})`,
+		) as (this: object) => string[];
+		const form = (innerText: string) => ({
+			tagName: "FORM",
+			innerText,
+			previousElementSibling: null,
+			parentElement: { tagName: "BODY" },
+		});
+
+		expect(readContext.call(form("採用専用フォーム"))).toEqual([
+			"FORM_PURPOSE_INCOMPATIBLE",
+		]);
+		expect(
+			readContext.call(form("採用に関するお問い合わせのみ受け付けます")),
+		).toEqual(["FORM_PURPOSE_INCOMPATIBLE"]);
+		// The purpose word and the limiter belong to different sentences here.
+		expect(
+			readContext.call(
+				form("採用以外のお問い合わせはこちら。必須項目のみご入力ください。"),
+			),
+		).toEqual([]);
+	});
+
 	test("detects an exclusion only when a refusal follows it", () => {
 		const readContext = runInNewContext(
 			`(${READ_FORM_PROHIBITION_REASON_CODES_FUNCTION})`,

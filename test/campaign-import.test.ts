@@ -4,6 +4,7 @@ import {
 	type CampaignCsvRow,
 	DEFAULT_CHOICE_CANDIDATES,
 	filterCampaignRows,
+	jobInputFingerprint,
 	mapRegistrationValues,
 	mergeChoiceCandidates,
 	normalizeCompanyDomain,
@@ -335,7 +336,7 @@ describe("campaign import", () => {
 			log: (entry) => logs.push(entry),
 			fetcher: async (_resource, init) => {
 				if (init?.method === "POST") throw new TypeError("network error");
-				return new Response(null, { status: 200 });
+				return storedJobResponse(jobs[0] as JobInput);
 			},
 		});
 
@@ -353,6 +354,62 @@ describe("campaign import", () => {
 			jobId: "job-1",
 			reason: "REQUEST_FAILED",
 		});
+	});
+
+	test("refuses a stored job under the same id whose inputs differ", async () => {
+		const logs: Array<Record<string, unknown>> = [];
+
+		const result = await registerCampaignJobs([dryRunJob("job-1", "Hello")], {
+			baseUrl: "https://api.test",
+			apiToken: "token",
+			log: (entry) => logs.push(entry),
+			fetcher: async (_resource, init) => {
+				if (init?.method === "POST") throw new TypeError("network error");
+				return storedJobResponse(dryRunJob("job-1", "A different message"));
+			},
+		});
+
+		expect(result).toMatchObject({
+			registered: [],
+			notRegistered: 0,
+			unknown: 1,
+		});
+		// The outcome is reported without any registrant value.
+		expect(logs.at(-1)).toEqual({
+			event: "campaign_job_registration_checked",
+			jobId: "job-1",
+			outcome: "mismatched",
+		});
+	});
+
+	test("compares the form URL and every form value in order", async () => {
+		const job = dryRunJob("job-1");
+		const base = await jobInputFingerprint(job.targetUrl, job.payload);
+		const values = (job.payload as { formValues: Record<string, unknown> })
+			.formValues;
+
+		// The API adds this key on registration, so it must not change the digest.
+		expect(
+			await jobInputFingerprint(job.targetUrl, {
+				...job.payload,
+				_formAgentEffectiveDryRun: true,
+			}),
+		).toBe(base);
+		expect(
+			await jobInputFingerprint("https://acme.co.jp/contact-us", job.payload),
+		).not.toBe(base);
+		expect(
+			await jobInputFingerprint(job.targetUrl, {
+				...job.payload,
+				formValues: { ...values, inquiryType: ["ご意見・ご要望", "その他"] },
+			}),
+		).not.toBe(base);
+		expect(
+			await jobInputFingerprint(job.targetUrl, {
+				...job.payload,
+				formValues: { ...values, extra: "x" },
+			}),
+		).not.toBe(base);
 	});
 
 	test("counts a lost registration the API does not hold as failed", async () => {
@@ -437,7 +494,7 @@ describe("campaign import", () => {
 	});
 });
 
-function dryRunJob(id: string): JobInput {
+function dryRunJob(id: string, message = "Hello"): JobInput {
 	return {
 		id,
 		companyId: "company-1",
@@ -445,8 +502,28 @@ function dryRunJob(id: string): JobInput {
 		targetUrl: "https://acme.co.jp/contact",
 		targetDomain: "acme.co.jp",
 		allowedHosts: ["acme.co.jp"],
-		payload: { _formAgentDryRun: true, _formAgentMaxAttempts: 1 },
+		payload: {
+			_formAgentDryRun: true,
+			_formAgentMaxAttempts: 1,
+			formValues: {
+				subject: "Inquiry",
+				message,
+				inquiryType: ["その他", "ご意見・ご要望"],
+			},
+		},
 	};
+}
+
+/** Mirrors `GET /jobs/:id`, including the key the API adds on registration. */
+function storedJobResponse(job: JobInput): Response {
+	return Response.json({
+		job: {
+			...job,
+			payload: { ...job.payload, _formAgentEffectiveDryRun: true },
+			status: "pending",
+			attemptCount: 0,
+		},
+	});
 }
 
 function row(overrides: CampaignCsvRow = {}): CampaignCsvRow {

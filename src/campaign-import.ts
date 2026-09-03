@@ -260,27 +260,73 @@ export function campaignApiHeaders(apiToken: string): Record<string, string> {
 }
 
 /**
- * Confirms whether the API already holds a job. Job ids are derived from the
- * campaign, company domain, and form URL, so a registration whose response was
- * lost can be resolved by asking for the id rather than posting again, which
- * would risk a second queued run of the same company.
+ * Digest of the inputs a dry-run actually sends: the form URL and every
+ * `formValues` entry, with candidate lists compared in order. Only the digest
+ * is compared or logged, so no registrant value leaves this function. The
+ * stored payload also carries `_formAgentEffectiveDryRun`, which the API adds,
+ * so the whole payload cannot be compared.
+ */
+export async function jobInputFingerprint(
+	targetUrl: unknown,
+	payload: unknown,
+): Promise<string> {
+	const values =
+		isPlainRecord(payload) && isPlainRecord(payload.formValues)
+			? payload.formValues
+			: {};
+	return sha256(
+		JSON.stringify({
+			targetUrl,
+			subject: values.subject ?? null,
+			message: values.message ?? null,
+			formValues: Object.keys(values)
+				.sort()
+				.map((key) => [key, values[key]]),
+		}),
+	);
+}
+
+/**
+ * Confirms whether the API already holds this exact job. Job ids are derived
+ * from the campaign, company domain, and form URL, so a registration whose
+ * response was lost can be resolved by asking for the id rather than posting
+ * again, which would risk a second queued run of the same company.
+ *
+ * A stored job under the same id whose inputs differ is treated as unconfirmed
+ * rather than as this registration: it means the same campaign name was reused
+ * with different values, and the queued run would send content this invocation
+ * never built.
  */
 export async function confirmJobRegistration(
-	jobId: string,
+	job: JobInput,
 	options: CampaignRegistrationOptions,
-): Promise<"registered" | "not_found" | "unknown"> {
+): Promise<"registered" | "mismatched" | "not_found" | "unknown"> {
 	const fetcher = options.fetcher ?? fetch;
+	let body: unknown;
 	try {
-		const response = await fetcher(`${options.baseUrl}/jobs/${jobId}`, {
+		const response = await fetcher(`${options.baseUrl}/jobs/${job.id}`, {
 			headers: campaignApiHeaders(options.apiToken),
 			redirect: "manual",
 		});
-		await response.body?.cancel();
-		if (response.ok) return "registered";
-		return response.status === 404 ? "not_found" : "unknown";
+		if (!response.ok) {
+			await response.body?.cancel();
+			return response.status === 404 ? "not_found" : "unknown";
+		}
+		body = await response.json();
 	} catch {
 		return "unknown";
 	}
+	if (!isPlainRecord(body) || !isPlainRecord(body.job)) return "unknown";
+	const stored = body.job;
+	const [expected, actual] = await Promise.all([
+		jobInputFingerprint(job.targetUrl, job.payload),
+		jobInputFingerprint(stored.targetUrl, stored.payload),
+	]);
+	return expected === actual ? "registered" : "mismatched";
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -322,14 +368,16 @@ export async function registerCampaignJobs(
 				jobId: job.id,
 				reason: "REQUEST_FAILED",
 			});
-			const outcome = await confirmJobRegistration(job.id, options);
+			const outcome = await confirmJobRegistration(job, options);
 			log({
 				event: "campaign_job_registration_checked",
 				jobId: job.id,
 				outcome,
 			});
 			if (outcome === "registered") registered.push(job);
-			if (outcome === "unknown") unknown += 1;
+			// A stored job whose inputs differ is not this registration, and it
+			// cannot be ruled out either, so it stays unconfirmed.
+			if (outcome === "unknown" || outcome === "mismatched") unknown += 1;
 			break;
 		}
 		await created.body?.cancel();
