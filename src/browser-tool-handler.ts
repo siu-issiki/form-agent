@@ -2,10 +2,14 @@ import { D1JobStore } from "./d1-job-store";
 import type { Job } from "./job";
 import {
 	type BrowserObservation,
+	PAYLOAD_KEY_PATTERN,
 	type ProhibitedReasonCode,
 	type RestrictedBrowserDriver,
 	RestrictedBrowserTools,
+	readTrustedFormValues,
 	type SubmitActivationStrategy,
+	type SubmitReviewDecision,
+	type SubmitReviewer,
 } from "./restricted-browser";
 import {
 	type EvidenceObjectStore,
@@ -49,11 +53,13 @@ export class BrowserToolCoordinator {
 	#scopeKey: string | undefined;
 	#operationTail: Promise<void> = Promise.resolve();
 	#closed = false;
+	#closePromise: Promise<void> | undefined;
 
 	constructor(
 		private readonly db: D1Database,
 		private readonly createDriver: BrowserDriverFactory,
 		private readonly evidenceStore: EvidenceObjectStore,
+		private readonly createReviewer: (job: Job) => SubmitReviewer,
 	) {}
 
 	async execute(
@@ -72,16 +78,23 @@ export class BrowserToolCoordinator {
 		return operation;
 	}
 
+	/**
+	 * Dry-run path: validates the submit control and runs the same independent
+	 * pre-submit review as a real submission, without a screenshot because the
+	 * dry-run never captures evidence.
+	 */
 	async validateSubmit(
 		jobId: string,
 		runToken: string,
 		params: BrowserToolParams,
-	): Promise<void> {
+	): Promise<SubmitReviewDecision> {
 		const operation = this.#operationTail.then(async () => {
 			if (this.#closed) throw new BrowserToolInputError();
 			const { tools } = await this.#getToolsAndJob(jobId, runToken);
 			readSubmitActivationStrategy(params);
-			await tools.validateSubmit(readElementId(params));
+			const elementId = readElementId(params);
+			await tools.validateSubmit(elementId);
+			return tools.reviewSubmit(elementId, null);
 		});
 		this.#operationTail = operation.then(
 			() => undefined,
@@ -198,8 +211,17 @@ export class BrowserToolCoordinator {
 		}
 	}
 
+	/**
+	 * The close releases the provider session, so the caller must be able to wait
+	 * for it. A second call joins the first instead of returning early.
+	 */
 	async close(): Promise<void> {
 		this.#closed = true;
+		this.#closePromise ??= this.#close();
+		return this.#closePromise;
+	}
+
+	async #close(): Promise<void> {
 		const driver = this.#driver;
 		this.#driver = undefined;
 		this.#tools = undefined;
@@ -230,6 +252,13 @@ export class BrowserToolCoordinator {
 		} catch (error) {
 			throw new BrowserToolSetupError("driver_connect", error);
 		}
+		// The run may have been aborted while the session was being created. The
+		// provider session is released here because close() already ran and no
+		// longer holds this driver.
+		if (this.#closed) {
+			await driver.close?.().catch(() => undefined);
+			throw new BrowserToolInputError();
+		}
 		try {
 			let tools: RestrictedBrowserTools;
 			try {
@@ -239,6 +268,7 @@ export class BrowserToolCoordinator {
 					jobId,
 					runToken,
 					this.evidenceStore,
+					this.createReviewer(job),
 				);
 			} catch (error) {
 				throw new BrowserToolSetupError("scope_setup", error);
@@ -280,19 +310,15 @@ function readPayloadValue(
 	maxLength: number,
 ): string {
 	const payloadKey = readString(params, "payloadKey", 64);
-	if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(payloadKey)) {
+	if (!PAYLOAD_KEY_PATTERN.test(payloadKey)) {
 		throw new BrowserToolInputError();
 	}
-	const formValues = job.payload.formValues;
-	if (!isRecord(formValues) || !Object.hasOwn(formValues, payloadKey)) {
+	const trusted = readTrustedFormValues(job.payload);
+	if (!Object.hasOwn(trusted, payloadKey)) {
 		throw new BrowserToolInputError();
 	}
-	const value = formValues[payloadKey];
-	if (
-		typeof value !== "string" ||
-		value.length === 0 ||
-		value.length > maxLength
-	) {
+	const value = trusted[payloadKey];
+	if (typeof value !== "string" || value.length > maxLength) {
 		throw new BrowserToolInputError();
 	}
 	return value;
@@ -321,10 +347,6 @@ function readString(
 		throw new BrowserToolInputError();
 	}
 	return value;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export type { BrowserObservation };

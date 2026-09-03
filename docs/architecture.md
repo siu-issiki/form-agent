@@ -1,7 +1,7 @@
 # フォーム営業自動化アーキテクチャ
 
 - ステータス: PoC 実装中（production実送信有効 / 管理下サイト13シナリオ検証済み）
-- 最終更新: 2026-09-02
+- 最終更新: 2026-09-03
 - 対象: `siu-issiki/form-agent`
 
 ## 目的
@@ -18,12 +18,12 @@
 | Queue / DLQ | 実装済み | production Queue、retry、DLQ、実POSTを伴う重複配信テスト |
 | Agent 実行 | 実装済み | Worker から OpenAI Responses API の function calling を直接実行 |
 | 推論 Provider | 部分実装 | OpenAI Responses API のみ。モデル、回数、本文、出力 token を Worker 側で制限 |
-| BrowserUse | 実装済み | standalone browser へ CDP 接続し、用途限定ツールだけを公開 |
+| BrowserUse | 実装済み | REST API v4 で standalone browser session を作成・停止し、CDP 接続では用途限定ツールだけを公開 |
 | E2E | 管理下範囲を実装済み | 常設テストシステムの13シナリオ、重複配送、送信後`uncertain`をproductionで検証済み。外部の実サイト送信は未実施 |
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値を検証。一覧・キャンセルは未実装 |
 | Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
 | 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ、値を含まないagent tool診断イベント。送信前・送信後・禁止判定時のスクリーンショット証跡を Cloudflare R2 へ保存し、D1 の `events` へ sha256 付きで記録する |
-| 並列検証 | 部分実施 | 安全確認中は `max_concurrency: 1`。Cloudflare 上の単一ジョブを検証済みで、5 並列以上は未検証 |
+| 並列検証 | 部分実施 | 2026-09-03 の 5 並列 19 シナリオで、session 明示停止の前後とも 15 件合格。明示停止後は CDP 切断（1011 / `LIMIT`）と `exceededCpu` が 0 件になり、18 session すべてを停止できたが、session 作成 API が 429 を 15 回返し 2 件が失敗した。実際の同時 session 上限は 5 未満と判断し、consumer を `max_concurrency: 3` にした。3 並列の 19 シナリオでは 17 件合格、429 / CDP 切断 / `exceededCpu` はいずれも 0 件、19 session すべてを停止できた |
 
 本書では、実装済みの構成を現在形で記述し、未実装または未検証の内容は「現在の制約」「PoC 計画」「残タスク・未決事項」に明示する。
 
@@ -124,9 +124,9 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 - 設定されたモデルと一致すること。
 - Responses API だけを利用すること。
 - function tool 以外を渡さないこと。
-- 1 run の Provider 呼び出しを最大 16 回に制限すること。
+- 1 run の Provider 呼び出しを最大 21 回（agent turn 16 + 修正 3 + 送信前レビュー最大 2）に制限すること。agent と送信前レビューは D1 の同じカウンタを共有する。レビューが deny を返した最初の 1 回だけ turn 上限を 3 増やし、turn 終盤で deny された場合でも修正に必要な fill・observe・submit を実行できるようにする。
 - 出力 token を最大 4,096 に制限すること。
-- request body を最大 128 KiB に制限すること。
+- request body を最大 128 KiB に制限すること。送信前レビューだけは証跡スクリーンショットを添付するため 1 MiB を上限とし、超過時は画像を外して再構成する。
 - response body を最大 256 KiB に制限すること。
 - OpenAI API key、BrowserUse API key、`runToken` をモデル入力へ含めないこと。
 
@@ -136,8 +136,21 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 
 - BrowserUse Agent ではなく、standalone browser へ CDP 接続する。
 - BrowserUse API key と CDP URL はモデルへ渡さない。
-- 1 試行につき最大 1 browser session とし、終了時に接続を閉じる。Queue retry では同じジョブに対して新しい Agent 実行と session を開始する。
-- proxy country は `jp`、session timeout は 15 分とする。
+- session は REST API v4（`https://api.browser-use.com/api/v4`）で明示的に作成し、応答の `cdpUrl` へ CDP 接続する。ジョブ終了時は正常・異常・deadline のいずれでも `PATCH /browsers/{id}` の `stop` を呼び、session を停止してから実行を終える。停止は best-effort であり、成否を `browser_use_session_stopped` に記録する。応答が 2xx でも `status` が `stopped` でなければ同時 session 枠は解放されていないため失敗として扱い、失敗理由は `STILL_ACTIVE` / `TIMEOUT` / `API_ERROR` の固定分類だけを記録する。
+- 明示停止を行う理由は、CDP 接続を閉じても managed browser が止まらないためである。BrowserUse の公式ドキュメントは「`browser.close()`, disconnecting CDP, or `client.close()` does not stop the managed browser. Use `client.browsers.stop(browser.id)`」と記載しており、2026-09-03 の 5 並列計測では CDP 切断後も session が寿命まで残り、同時 session 数を食いつぶして close code 1011 / `LIMIT` を招いた。
+- proxy country は `jp`、session timeout は 12 分とする。12 分は run deadline 10 分と termination grace 30 秒の外側に置いた backstop であり、明示停止が届かなかった場合にだけ効く。
+- session には `metadata.jobId` と `metadata.dryRun` を付ける。Queue retry（`attemptCount` が 2 以上）の初回試行と、接続再試行の 2 回目以降では、create の前に `GET /browsers?filterBy=active` から同じ `jobId` の session を stop して残骸を回収し、`matched` / `stopped` / `failed` の件数を `browser_use_session_reclaimed` に記録する。停止を確認できた session だけを `stopped` に数え、1 件でも失敗すれば `ok: false` とする。create の応答が失われた場合や `cdpUrl` を欠く場合でも、次の create までに前回の session を解放できる。同一 `jobId` の session は `claimRun` の排他により同時に 1 件しか存在しないため、回収対象は必ず終了済み attempt のものである。
+- `cdpUrl` は接続前・API key 付与前に host を検証し、`browser-use.com` またはそのサブドメイン以外は `Invalid Browser Use CDP endpoint` として失敗させる。`wss:` はそのまま使い、`https:` の場合だけ `GET <cdpUrl>/json/version` で `webSocketDebuggerUrl` を取得する。取得した URL も同じ host 検証を通し、`ws:` は `cdpUrl` と同一 host のときだけ `wss:` へ昇格させる。
+- API key を付ける REST 呼び出しと `/json/version` 取得は `redirect: "manual"` とし、redirect を追わない。3xx 応答は再試行不可の API 失敗として扱い、cross-origin redirect 先へ `X-Browser-Use-API-Key` が転送されないようにする。
+- CDP WebSocket が自発的に閉じた場合、close code、reason の文字数、reason を固定分類した hint（`NONE` / `LIMIT` / `AUTH` / `TIMEOUT` / `OTHER`）、`wasClean`、未完了コマンド数を記録する。相手から渡された reason の自由文そのものはログに残さない。
+- 接続確立（CDP 接続から初期化完了まで）が一過性の障害で失敗した場合だけ、10 秒 → 20 秒 → 30 秒の待機を挟んで最大 3 回再接続する。再試行は送信前の接続段階に限定し、フォームへの副作用はない。
+- 再試行の可否は失敗の種別で決める。WebSocket upgrade が拒否された場合は HTTP status が 408、429、5xx のときだけ再試行し、401 / 403 / 404 等の恒久的な拒否は即座に失敗させる。upgrade 要求自体が失敗したネットワーク障害、接続断、コマンド timeout は再試行する。endpoint 不正や API key 未設定は接続を試みずに失敗させる。
+- session の作成・`cdpUrl` の解決が失敗した場合も同じ基準で扱う。REST API の status が 408、429、5xx なら再試行し、それ以外は再試行しない。API へ到達しなかった通信障害と、不正な JSON や `cdpUrl` 欠落のような一過性の応答異常は再試行する。再試行ログ `browser_use_connect_retry` の `reason` には、429 で `SESSION_LIMIT`、その他の作成・解決失敗で `SESSION_CREATE_FAILED` を記録する。
+- session を作成した後の失敗（abort、`cdpUrl` 不正、CDP 接続・初期化の失敗）では、元のエラーを投げ直す前にその session を stop する。恒久的に拒否された session 要求は `BROWSER_SESSION_REJECTED` として再試行不可の failed にし、診断イベントには status に応じて `BROWSER_SESSION_LIMIT`（429）または `BROWSER_SESSION_API_FAILED` を記録する。再試行可能な失敗は従来どおり `BROWSER_TOOL_UNAVAILABLE` とする。
+- 恒久的な upgrade 拒否（401 / 403 / 404 等）は `BROWSER_UPGRADE_REJECTED` として再試行不可の failed にし、Queue の再配信を行わない。診断イベントには `CDP_UPGRADE_REJECTED` を記録する。
+- upgrade 成功後の close も、close code 1008（policy violation）または reason が認証を示す場合は再試行しない。`BROWSER_CONNECTION_REJECTED` として再試行不可の failed にする。
+- 再試行の待機は agent の deadline で中断される。実行が abort された時点で待機と接続試行を打ち切り、`AGENT_TIMEOUT` として終了するため、termination grace を待機で消費しない。abort は WebSocket upgrade の要求と接続確立中の CDP コマンドも打ち切り、作成済み session を stop してから終了する。abort 中の失敗は再試行として記録せず、`browser_use_connect_retry` を出さない。接続が abort より後に完了した場合は、scope 設定と bootstrap navigate へ進まずに session を停止する。
+- 実行は session の stop が完了するまで戻らない。stop には 10 秒の timeout を置き、termination grace 30 秒の内側に収める。
 - popup、Worker、Service Worker、WebSocket 等の迂回経路を遮断する。
 - CDP の `DOM.getDocument` を `pierce: true` で取得し、通常 DOM と open / closed Shadow DOM を Worker 側で走査する。
 - 観測した同一ページ・許可hostのリンクを最大20件までモデルへ返し、サイト内別ページのフォーム探索に利用する。
@@ -155,10 +168,34 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 | `click` | 非 submit 要素だけをクリックする |
 | `fill` | text input / textarea へ値を入力する |
 | `select` | select / radio / checkbox を選択する |
-| `submit` | D1 の送信権取得後に 1 回だけ送信する |
+| `submit` | 送信前に独立レビュー（同一 Provider、ツールなし、strict JSON）を通し、D1 の送信権取得後に 1 回だけ送信する。deny は 1 回だけ修正可、2 回目で `uncertain` |
 | `finish` | 送信せず、構造化された終端結果を返す |
 
 driver が submit control と識別した要素は通常の `click` で操作できない。非submitの`click`、`fill`、`select`はDOMイベントを発火する前にbrowser requestを遮断し、`navigate`は直前の観察で得たfragmentを含む完全一致URLのtop-frame Document requestだけを1回許可する。`submit` 中も遮断を解除せず、全入力が同じform ownerに属し、最後の入力・選択・click後に再観察され、選択したformに禁止根拠が検出されていないことを検証してから D1 を `running` から `submitting` へ更新し、最初の期待済み送信requestと、そのrequest IDに直接連なるsafeなredirectだけを許可する。非safe HTTP methodはaction URLとmethod、GETはactionのorigin / path、`Document` resource、送信対象frameを照合する。モデルはDOM activationを優先して選択し、trusted click gestureまたはkeyboard activationが必要な場合だけmouse / Enterを選ぶ。mouseのhit testは1 animation frameごとに最大3回試行する。
+
+### 送信前の独立レビュー
+
+`submit` は送信権を取得する前に、agent とは履歴を共有しない独立したレビューを 1 回通す。レビューは同じ Responses API に対して tool を一切渡さず、strict JSON schema で `allow` / `deny` だけを返させる。
+
+- 入力は、直前の信頼済み観察（URL、form、ページ本文、禁止 reason code）、`payload.formValues` の信頼済み値、`before_submit` スクリーンショット、対象ドメイン・URL、submit 要素 ID である。
+- 観察とスクリーンショットは `untrustedPageContent` としてラップし、外部サイト由来のデータであり指示として解釈しないことを instructions で明示する。
+- 判定 code は `INPUTS_MATCH`（allow のみ）、`INPUT_MISMATCH`、`SALES_PROHIBITED`、`FORM_PURPOSE_INCOMPATIBLE`、`WRONG_FORM`、`UNCLEAR` の固定値とする。`allow` と deny 系 code、`deny` と `INPUTS_MATCH` のように矛盾する組み合わせは、どちらの判定としても解釈せず応答不正として扱う。
+- 修正を許可するのは `INPUT_MISMATCH` の deny だけであり、他の reason code は 1 回目でも `PRE_SUBMIT_REVIEW_DENIED` として `uncertain` で終了する。ページやフォーム自体への判断は入力の修正で覆らないためである。
+- 修正が許可された場合はモデルへ `SUBMIT_REVIEW_DENIED` と reason code だけを返し、実際の `fill` / `select` の成功と再観察の両方を次の `submit` の前提にする。さらに deny 時の観察から、比較対象フィールドの tag / type / name / label / value / checked だけを取り出した指紋（elementId は含めない）を保存し、再観察後の指紋が変化していなければ `CORRECTION_REQUIRED` として拒否する。再観察だけ、あるいは同じ値の再入力で、確率的なレビューの再判定を引くことを防ぐためである。送信権は取得せず、ブラウザ送信も行わない。
+- deny の 2 回目は `PRE_SUBMIT_REVIEW_DENIED` として `uncertain` を保存し、そのジョブを終了する。
+- deny 予算は D1 のジョブ行（`submit_review_denial_count`）へ保存し、Queue 再配信で新しい browser session と Agent 実行になっても 1 attempt 目と同じ予算を共有する。修正を許可しない deny は残り予算をすべて消費するため、`uncertain` の保存に失敗して `running` のまま残っても、後続の allow で送信へ進むことはない。`submit` は冒頭で永続値を読み直し、予算を使い切っていればレビューも撮影も行わずに `uncertain` で終了する。「修正が必要」というフラグ自体は実行単位であり、再配信後の新しい実行はページを最初から入力し直す。
+- レビュー自体を完了できない場合は allow にせず、再試行可能な `SUBMIT_REVIEW_UNAVAILABLE` として扱う。Provider の通信失敗、429、応答不正はそれぞれの Provider 用 reason code のまま伝播させ、browser tool の障害へ丸めない。
+- モデルへ返すのは固定の code と guidance だけであり、レビューの自由記述はモデルへ渡さない。自由記述は 2 回目 deny 時の `uncertain` の reason にだけ、制御文字を空白へ置換し 500 文字へ切り詰めて保存する。
+- レビューが allow を返した直後、送信権を取得する前に、現在 URL と観察済み全フィールドの `value` / `checked` を読み直して観察時と一致することを確認する。1 件でも異なる、要素が消えている、要素が増えている場合は `FORM_STATE_CHANGED` として送信せず、再観察を強制する。レビュー中に非信頼ページの JS が値を書き換えても、レビューされていない内容が送信されないようにするためである。
+- あわせて、レビュー呼び出しの直前と allow 直後に、submit 要素が属する form 全体を DOM から再探索した snapshot を取得して比較する。snapshot には hidden と disabled を含む全コントロールの tag / type / name / value / checked / disabled を DOM 順で含め、password の値はマスクする。観察済み要素だけを再訪する照合では見えない、レビュー中の hidden input 追加、`name` の差し替え、disabled の変更もこれで検出する。
+- レビューは `running` 状態でのみ Provider 呼び出し回数を消費できるため、必ず `claimSubmission` より前に実行する。
+- 既知の残存リスク（2026-09-03 時点で受容し、未対応）:
+  - allow 後の最終照合から activation までの間（`claimSubmission` の待ち時間を含む数十 ms）は再照合しない。この窓で非信頼ページの JS がフォームを書き換えた場合、レビューされていない内容が送信され得る。送信先は対象ドメインと期待済み action / method に限定されるため、影響は対象サイト自身のフォームへの内容差異にとどまる。
+  - snapshot にはコントロールの基本属性だけを含め、禁止文言、label、select の option、form の action / method の変化は比較しない。レビュー中にこれらが変わった場合、変化後の action へ送信され得る（ドメインと method の制限は network policy が別途強制する）。
+  - 修正の証明は「`fill` / `select` の実施」と「観察指紋全体の変化」で判定するため、無関係な動的フィールドや label が変わると、同じ値の再入力でも修正済みと見なされる。
+  - form 全体の再探索は候補 200 field / 25 form で打ち切られるため、それを超えるページでは snapshot が form 全体を表さない。
+
+- レビューモデルは既定で `AGENT_MODEL` と同じであり、`AGENT_SUBMIT_REVIEW_MODEL` を設定した場合だけ上書きする。
 
 ### Cloudflare D1
 
@@ -214,7 +251,7 @@ pending / running / failed ── retry 上限超過 ──► dead_lettered
 
 | stage | 撮影位置 | ジョブ状態 | 失敗時の扱い |
 | --- | --- | --- | --- |
-| `before_submit` | `submit` tool内、送信前検証成功・送信試行フラグ設定の直後、送信権取得（`claimSubmission`）の前 | `running` | 必須。撮影に失敗した場合は送信権取得も driver への送信も行わず、何も送信しない。再試行可能なエラーとして扱う |
+| `before_submit` | `submit` tool内、送信前検証成功の直後、送信前レビューと送信権取得（`claimSubmission`）の前 | `running` | 必須。撮影に失敗した場合はレビューも送信権取得も driver への送信も行わず、何も送信しない。再試行可能なエラーとして扱う。レビュー deny 後の再 submit では再撮影するため、1 attempt に複数件になり得る |
 | `after_submit` | driver への送信が成功または例外で終わった直後、結果確定（`sent` / `uncertain`）の前 | `submitting` | ベストエフォート。失敗しても送信結果（`sent` / `uncertain` / 例外経路）は変えない |
 | `prohibited` | `finish` tool で禁止判定の結果を返す直前 | `running` | ベストエフォート。ブラウザセッションが未作成の場合は撮影せず、未撮影であることだけを記録する |
 
@@ -236,6 +273,7 @@ pending / running / failed ── retry 上限超過 ──► dead_lettered
 | `payload_json` | TEXT | 送信者情報、本文などの入力 |
 | `status` | TEXT | `pending` / `running` / `submitting` / `sent` / `prohibited` / `uncertain` / `failed` / `dead_lettered` |
 | `attempt_count` | INTEGER | 実行試行回数 |
+| `submit_review_denial_count` | INTEGER | 送信前レビューが消費した deny 予算。修正を許可しない deny は残り予算をすべて消費する。Queue 再配信をまたいで共有する |
 | `run_token` | TEXT NULL | 現在の実行権を識別する token |
 | `provider_request_count` | INTEGER | 現在の run が使用した Provider 呼び出し回数 |
 | `created_at` | TEXT | 作成日時 |
@@ -289,13 +327,17 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 - Provider / BrowserUse の認証情報と D1 の実行権をモデル入力・tool 出力へ渡さない。
 - Agent に返すジョブ情報から `runToken` を除外する。
 - モデルが`fill` / `select`で指定できるのは`payload.formValues`内のキーだけとし、実際の値は信頼済みhandlerがD1から取得する。
+- `observe`の結果を`untrusted_page_content`として明示し、ページ本文が信頼済みhandlerの上限（20,000文字）で切り詰められた場合は`pageTextTruncated`で通知する。
+- 送信直前に、直前の観察・`payload.formValues`・`before_submit`スクリーンショットを入力とする独立レビューを通し、`allow`以外では送信権を取得しない。
+- レビューのdenyで修正を許可するのは`INPUT_MISMATCH`だけとし、実際の`fill` / `select`と観察指紋の変化を次の`submit`の前提にする。deny予算はD1のジョブ行に保存し、実行と再配信をまたいで共有する。
+- レビューのallowから送信権取得までの間に、現在URLと観察済み全フィールドの値・チェック状態を読み直し、あわせてhidden / disabledを含むform全体のsnapshotをレビュー前後で比較し、1件でも異なれば送信しない。
 - ジョブ間で browser session、cookie、入力データを共有しない。
 
 `submitting` 中に Worker が停止し、結果保存まで到達しなかった場合は自動再送せず、人間の確認対象にする。人手照合、DLQ確認、緊急停止、安全な再開のrunbookは [operations.md](operations.md) に定義済みである。照合用の専用 API / UI は未実装である。
 
 ### Agent への安全指示
 
-system prompt では、営業禁止・用途制限の確認と送信前の再観察を指示する。入力値は信頼済みhandlerが`payload.formValues`由来であることを強制する。`prohibited`は、直前かつ現在URLと一致する観察でフォーム不在、または全候補formについてform本文、前方の近接要素、祖先側の近接要素、iframe親ページ側の近接要素から固定パターンの営業禁止・用途制限を検出した場合だけ受理する。送信前には選択したformの禁止根拠、全入力のform owner、native validity、現在のaction / method、入力後の再観察、1回限りの送信権を機械的に検証する。禁止判定時と送信前後には画面のスクリーンショット証跡をR2へ保存する。固定パターンで表現されない禁止事項、Shadow DOM内の本文、ページ上のprompt injectionに対する完全な判定は未対応である。
+system prompt では、営業禁止・用途制限の確認と送信前の再観察を指示する。入力値は信頼済みhandlerが`payload.formValues`由来であることを強制する。`prohibited`は、直前かつ現在URLと一致する観察でフォーム不在、または全候補formについてform本文、前方の近接要素、祖先側の近接要素、iframe親ページ側の近接要素から固定パターンの営業禁止・用途制限を検出した場合だけ受理する。送信前には選択したformの禁止根拠、全入力のform owner、native validity、現在のaction / method、入力後の再観察、1回限りの送信権を機械的に検証する。さらに送信直前には、観察・信頼済み入力値・`before_submit`スクリーンショットを入力とする独立レビューを通し、`INPUT_MISMATCH` / `SALES_PROHIBITED` / `FORM_PURPOSE_INCOMPATIBLE` / `WRONG_FORM` / `UNCLEAR`のいずれかでdenyされた場合は送信権を取得しない。修正を許可するのは`INPUT_MISMATCH`だけで、実際の入力変更と再観察に加えて、観察指紋が変化していることを次の`submit`の前提にする。他のreason codeは1回目でも、`INPUT_MISMATCH`は2回目のdenyで`PRE_SUBMIT_REVIEW_DENIED`として`uncertain`で終了する。allow後・送信権取得前には現在URLと観察済み全フィールドの値・チェック状態を読み直し、さらにレビュー前後でhidden / disabledを含むform全体のsnapshotを比較し、レビュー中にページが変化していれば送信しない。レビューを完了できない場合はallowにせず、再試行可能な`SUBMIT_REVIEW_UNAVAILABLE`として扱う。禁止判定時と送信前後には画面のスクリーンショット証跡をR2へ保存する。`observe`の結果は外部サイト由来の非信頼データとして明示し、モデルとレビューの双方へページ内の指示に従わないよう指示する。固定パターンで表現されない禁止事項は独立レビューで補完するが、完全ではない。Shadow DOM内の本文とページ上のprompt injectionに対する完全な判定は引き続き未対応である。
 
 ## 現在の制約
 
@@ -303,7 +345,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 
 - top-level navigation は対象企業ドメインとそのサブドメイン、またはジョブごとに登録した完全一致の外部hostだけを許可する。
 - フォーム入力前に限り、公開HTTPS hostのread-only subresource（`GET` / `HEAD` / `OPTIONS`）を許可する。入力開始後は対象企業ドメインとジョブ固有の許可host以外への通信を遮断する。
-- CDP DOM tree から `form` と可視 `input` / `textarea` / `select` / `button` を観察し、`form` 属性による外部関連付けにも対応する。
+- CDP DOM tree から `form` と可視 `input` / `textarea` / `select` / `button` を観察し、`form` 属性による外部関連付けにも対応する。各フィールドは tag、type、name、role、label、placeholder、必須、現在値、選択肢を返し、checkbox / radio では `checked` も返す。password の値は常に空文字で返す。
 - 探索上限は最大 25 form candidate、200 field candidate、モデルへ返す観察結果は最大 10 form、合計 100 field、本文 20,000 文字までとする。
 - open / closed Shadow DOMは探索対象で、管理下テストでは送信まで検証済みである。ただし実サイトでの互換性検証は継続する。
 - cross-origin iframeはジョブ固有の外部host許可を使う管理下テストで送信まで検証済みである。contenteditableと独自UI componentは未対応または未検証である。
@@ -311,8 +353,9 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 - 確認を挟むmulti-stepは管理下テストで検証済みである。ファイル添付とCAPTCHAは未対応である。
 - 送信完了は、許可したrequestを観測し、日本語の送信完了表現または`thank you`が5秒以内に新たに出現した場合に確定する。期待済みGET Documentは、送信対象frameの遷移と同じframe内の完了文言を必須にする。他frameの完了文言は判定に利用しない。
 - submit controlの期待済みGETは送信権で制御する。非submitの`click`、`fill`、`select`がDOMイベントを発火する直前から、その後および`submit`中のbrowser requestを遮断し、観察済みnavigateのtop-frame Document、期待済みsubmit request、またはそのrequest IDに直接連なるsafe redirectだけを許可する。`navigate`は直前の`observe.navigationLinks`で得たfragmentを含む完全一致URLまたは現在URLだけを許可する。観察済みリンク自体がGET型副作用を持つサイトは機械的に識別できないため、対象サイト側がGETをsafe methodとして扱うことは引き続き前提になる。
-- 営業禁止判定はフォーム不在と、候補form本文、前方・祖先側の近接要素、iframe親ページ側の近接要素に対する固定の日本語・英語パターンを使う。肯定表現と「禁止していない」は除外し、複数formがある場合のページ全体禁止は全formに何らかの禁止根拠がある場合だけ受理する。送信前確認は選択formの禁止根拠、form owner、native validity、action / method、入力後の再観察、1回限りの送信権を信頼済みhandlerで検証する。未知の禁止表現は`prohibited`として確定できず、追加パターンまたは人手確認が必要になる。
+- 営業禁止判定はフォーム不在と、候補form本文、前方・祖先側の近接要素、iframe親ページ側の近接要素に対する固定の日本語・英語パターンを使う。肯定表現と「禁止していない」は除外し、複数formがある場合のページ全体禁止は全formに何らかの禁止根拠がある場合だけ受理する。送信前確認は選択formの禁止根拠、form owner、native validity、action / method、入力後の再観察、1回限りの送信権を信頼済みhandlerで検証する。固定パターンに加えて送信直前の独立レビューが禁止表現と入力内容を再確認するが、レビューはモデル判断であり完全ではない。未知の禁止表現は`prohibited`として確定できず、追加パターンまたは人手確認が必要になる。
 - dry-runではジョブURLへのbootstrap後の再navigateと、最初のclick / fill / select以降に発生するbrowser requestをすべて遮断し、座標click前にCDPのhit targetが検証済み要素またはそのcomposed descendantであることを確認する。
+- 送信前の独立レビューとレビュー後の再照合は、レビュー中のページ JS による値の書き換えを検出するが、最終照合から activation までの窓、禁止文言 / label / option / action の変化、200 field を超える form の再探索は対象外である。詳細は「送信前の独立レビュー」の残存リスクを参照する。
 
 ### API / 運用
 
@@ -326,12 +369,24 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 
 - Provider は OpenAI 固定である。
 - Provider 呼び出し回数以外のtoken、rate limit、費用を保存しない。retryイベント以外の全体処理時間とBrowserUse待ち時間も保存しない。
-- agent tool診断はbrowser tool、`finish`、unknown tool dispatchを対象とする。`data_json`にはturn、固定tool名、stage、固定result codeだけを保存し、イベント共通列にはjob ID、attempt、記録時刻を保存する。入力値、URL、自由記述エラー、全状態遷移は保存しない。
+- agent tool診断はbrowser tool、`finish`、unknown tool dispatchを対象とする。`data_json`にはturn、固定tool名、stage、固定result codeだけを保存し、イベント共通列にはjob ID、attempt、記録時刻を保存する。送信前レビューはstage `submit_review`、result code `SUBMIT_REVIEW_ALLOWED` / `SUBMIT_REVIEW_DENIED` / `SUBMIT_REVIEW_UNAVAILABLE`として記録する。入力値、URL、自由記述エラー、全状態遷移は保存しない。
 - retry delay は 30 秒固定で、指数 backoff と jitter は未実装である。
+- Workers Logs を有効にし、invocation ごとの `outcome`、`cpuTime`、`wallTime`、`console` 出力を head sampling 100% で記録する。保持期間は 7 日であり、`outcome = exceededCpu` の調査は Cloudflare ダッシュボードの Workers Logs で 7 日以内に行う。ログに値、URL、自由文、session id を出さない方針は変わらない。
+- Worker の CPU 上限を 120 秒（既定 30 秒、Paid の最大 300 秒）に設定する。上限は Queue consumer にも適用される。ただし 2026-09-03 の `exceededCpu` は報告 `cpuTime` が 165 ms、`wallTime` が 91 秒であり、上限引き上げでは解消しない可能性が高いため、原因は Workers Logs で追跡する。
 
 ## 並列・リトライ方針
 
 PoC はまず 1 並列の production で開始し、管理下テストサイトへの実送信結果を観測してから 5、20、50 へ段階的に引き上げる。設定値だけで並列対応済みとせず、Cloudflare 上での実測を完了条件とする。
+
+2026-09-03 に 5 並列で管理下テストシステムの 12 シナリオを実行し、8 件が合格した。残りのうち 3 件は Worker 診断が stage `driver_connect`、code `CDP_CONNECTION_CLOSED` で、10 秒間に連続して発生した。発生時点で BrowserUse 側に既存 session が 3〜4 件あり、直前 2 分 40 秒で 9 session を作成していた。前後の接続は成功しているため、BrowserUse の同時 session 上限（プラン上 10）または session 作成レートの上限に達したと推定するが、当時は WebSocket の close code / reason を記録していなかったため原因は未確定である。
+
+同日に 19 シナリオを同時登録して 5 並列で再計測し、15 件が合格した。close code 1011、`wasClean`、reason 分類 `LIMIT` の切断が 16 件、接続再試行が 15 回発生し、`native-get` は 10 / 20 / 30 秒の再接続 3 回でも解けなかった。Worker 側では `outcome: exceededCpu` による強制終了が 1 件あった。原因はジョブ終了後に session を停止しておらず、CDP 切断後も session が 15 分の寿命まで残って同時 session 上限を食いつぶしていたことである。REST API v4 での明示的な作成・停止を入れて、同じ 19 シナリオを 5 並列で再計測した。
+
+明示停止後の再計測では 15 件が合格し、18 session すべてを平均約 100 ms で停止できた。CDP 切断（1011 / `LIMIT`）と `exceededCpu` は 0 件になった。一方で session 作成 API が `429 Too many concurrent active sessions` を 15 回返し、10 / 20 / 30 秒の再試行で 3 件は回復したが、`sample-request-only` と `open-shadow-dom` の 2 件は 60 秒待っても回復せず失敗した。回収ログの一致件数は常に 0 で、残骸ではなく同時実行中の session が上限を消費していた。session を毎回停止しても 5 並列で上限に達することから、この account の実際の同時 session 上限は 5 未満（Free プランの 3 と推定）である。残る不合格は、途中の CDP コマンド失敗で止まった `multi-step`（受信 0）と、禁止フォームの submit を信頼済み handler がブロックした後にモデルが `finish_prohibited` ではなく `finish_failed` を選んだ `external-iframe-secondary`（受信 0、3 回中 2 回再現）である。
+
+consumer は `max_concurrency: 3` とする。5 並列では session を毎回停止しても作成 API が 429 を返したため、推定される同時 session 上限（3）に合わせた。3 並列で 19 シナリオを再計測した結果は 17 件合格で、作成 API の 429、CDP 切断、`exceededCpu` はいずれも 0 件、19 session すべてを停止できた。不合格 2 件は、並列時に毎回 turn 6 の `click` で CDP コマンドが失敗する `multi-step`（受信 0）と、iframe 側の禁止文言に対して信頼済み handler の禁止根拠検証が通らずモデルが `uncertain` を選んだ `external-iframe-tertiary`（受信 0、4 回中 1 回）である。接続再試行（10 / 20 / 30 秒、最大 3 回）は緩和策として維持する。再試行でも接続できない場合は再試行可能エラーとして Queue の retry / DLQ へ進む。deploy 後の再計測では `browser_use_connect_retry`、`browser_use_cdp_closed`、`browser_use_session_stopped`、`browser_use_session_reclaimed` の件数を確認する。作成 API が 429 を返した時点（backoff の待機前）と回収時に active session の全件数と `metadata.source = form-agent` 付きの件数を記録し、上限を消費しているのがこの client か外部かを切り分ける。同じ API キーを別の deployment やローカル実行と共有している場合は source タグでも区別できない。並列数を引き上げるのは、BrowserUse のプランと同時 session 上限をダッシュボードで確認し、必要なら Pay as you go（同時 10）へ変更してからとする。
+
+再接続は送信前の接続確立に限定するため、フォームへの副作用は発生しない。
 
 | 分類 | 例 | 現在の方針 |
 | --- | --- | --- |
@@ -390,7 +445,7 @@ PoC はまず 1 並列の production で開始し、管理下テストサイト�
 ### フェーズ 2: 5 並列
 
 - [ ] 送信なし5並列で二重実行、rate limit、BrowserUse session、原価を計測する。
-- [ ] `max_concurrency`を観測結果に基づいて1から5へ引き上げる。
+- [x] `max_concurrency`を観測結果に基づいて1から5へ引き上げ、429 の観測により 3 へ戻す。
 
 ### フェーズ 3: 20 並列
 
@@ -424,7 +479,13 @@ PoC はまず 1 並列の production で開始し、管理下テストサイト�
 - CSVから抽出した外部form hostをジョブ単位の完全一致allowlistへ安全に反映する運用検証。
 - Provider abstraction と fallback。
 - 外部 API E2E は GitHub Actions の通常 CI に含めず、手動実行に限定する。
+- Worker の `outcome: exceededCpu` の原因特定。報告 `cpuTime` 165 ms に対して強制終了しているため、CPU 上限の引き上げでは説明できない。Workers Logs の保持期間が 7 日であるため、再発時は 7 日以内に調査する。
+- 並列時に `multi-step` で毎回発生する turn 6 `click` の CDP コマンド失敗（3 並列でも再現、受信 0）。逐次では合格する。click 中の CDP 失敗を run 全体の再試行可能エラーではなく要素エラーとしてモデルへ返し、再観察させる方式を検討する。`external-iframe` の送信後読み取り失敗は明示停止後の再計測では再現しなかった。
+- `external-iframe-tertiary` で、モデルが観察本文から禁止を読み取っているのに信頼済み handler の禁止根拠検証（iframe 親ページ側の近接要素）が通らず `FINISH_PROHIBITION_NOT_VERIFIED` になり、`uncertain` で終了した例が 1 件（4 回中）。iframe 内容の描画タイミングに依存する可能性があり、再観察後の再検証を含めて確認する。
+- 禁止フォームの submit を信頼済み handler がブロックした後、モデルが `finish_prohibited` ではなく `finish_failed` を選ぶ（`external-iframe-secondary`、3 回中 2 回）。ブロック時の tool エラーを `SUBMIT_PROHIBITED` として分け、observe の `prohibitedReasonCodes` で `finish_prohibited` を呼ぶ guidance を返す。
+- BrowserUse のプランと同時 session 上限をダッシュボードで確認する。3 並列で 429 が消えることは 19 シナリオで確認済み。並列数を上げる場合は Pay as you go（同時 10）へ変更してから再計測する。
 - R2 アップロード後・D1 記録前に Worker が停止した場合の孤児オブジェクトは検出できない。intent イベントの先行記録または R2 ライフサイクルルールで対処する。
+- 送信前レビューの残存リスク対応: `dom` activation で照合と `requestSubmit` を同一 JS 実行内で行い、`mouse` / `enter` は activation 直前に再照合する。snapshot に禁止文言・label・option・action / method を含める。修正の証明を変更したコントロールの value / checked 差分に限定する。form 再探索の切り詰めを検出して fail-closed にする。いずれも管理下テストシステムでの E2E と併せて実施する。
 
 ### 運用・ポリシー
 
@@ -443,6 +504,8 @@ PoC はまず 1 並列の production で開始し、管理下テストサイト�
 - 現在の推論 Provider は OpenAI とし、認証情報と制限は Worker 側で管理する。
 - BrowserUse Agent は使わず、standalone browser へ CDP 接続する。
 - Agent には用途限定 browser tool だけを公開し、`submit` を独立した制御対象にする。
+- `submit` の直前に、agent とは独立したレビューを 1 回通し、`allow` 以外では送信権を取得しない。修正を許可するのは `INPUT_MISMATCH` の 1 回目の deny だけとし、観察指紋が変わる実際の入力変更を必須にする。2 回目の deny と修正不能な deny は `uncertain` とする。
+- 送信前レビューの審査と証跡の設計は OpenAI Codex の `node_repl_policy.md` と `node_repl_review_evidence.rs` を参考にした。
 - exactly-once を仮定せず、`jobId`、`runToken`、D1 の条件付き状態遷移で二重送信を防ぐ。
 - 送信権取得後に結果を確定できない場合は `uncertain` とし、自動 retry しない。
 - 本番処理は Cloudflare 上へ置き、手元 PC は開発・検証にだけ使う。

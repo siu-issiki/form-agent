@@ -29,6 +29,11 @@ export interface JobResult {
 export interface Job extends JobInput {
 	status: JobStatus;
 	attemptCount: number;
+	/**
+	 * Pre-submit review denials for this job. It is persisted rather than held
+	 * in memory so that a Queue redelivery keeps the same correction budget.
+	 */
+	submitReviewDenialCount: number;
 	runToken: string | null;
 	result: JobResult | null;
 	createdAt: string;
@@ -87,6 +92,15 @@ export interface JobStore {
 		reason: string,
 		now: string,
 	): Promise<Job | null>;
+	/**
+	 * Counts one pre-submit review denial and returns the new total, or null
+	 * when the job is no longer running under this run token.
+	 */
+	recordSubmitReviewDenial(
+		id: string,
+		runToken: string,
+		now: string,
+	): Promise<number | null>;
 	recordFailed(
 		id: string,
 		runToken: string,
@@ -137,6 +151,7 @@ export class InMemoryJobStore implements JobStore {
 			...structuredClone(input),
 			status: "pending",
 			attemptCount: 0,
+			submitReviewDenialCount: 0,
 			runToken: null,
 			result: null,
 			createdAt: now,
@@ -253,6 +268,21 @@ export class InMemoryJobStore implements JobStore {
 			reason,
 			completedAt: now,
 		});
+	}
+
+	async recordSubmitReviewDenial(
+		id: string,
+		runToken: string,
+		now: string,
+	): Promise<number | null> {
+		const job = this.#jobs.get(id);
+		if (job?.status !== "running" || job.runToken !== runToken) {
+			return null;
+		}
+
+		const submitReviewDenialCount = job.submitReviewDenialCount + 1;
+		this.#jobs.set(id, { ...job, submitReviewDenialCount, updatedAt: now });
+		return submitReviewDenialCount;
 	}
 
 	async recordFailed(

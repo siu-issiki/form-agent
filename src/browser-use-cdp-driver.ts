@@ -1,6 +1,10 @@
 import { assertAllowedBrowserRequest } from "./browser-network-policy";
 import { SUBMISSION_CONFIRMATION_PATTERN } from "./browser-submit-confirmation";
-import { BrowserUseCdpConnection } from "./browser-use-cdp";
+import {
+	BrowserUseCdpClosedError,
+	BrowserUseCdpConnection,
+	BrowserUseCdpUpgradeRejectedError,
+} from "./browser-use-cdp";
 import {
 	type CdpDomNode,
 	type CdpFormDiscovery,
@@ -9,6 +13,16 @@ import {
 	discoverCdpNavigationLinks,
 	findCdpFrameOwnerBackendNodeId,
 } from "./browser-use-cdp-dom";
+import {
+	type BrowserSession,
+	BrowserUseApiError,
+	BrowserUseClient,
+	type BrowserUseFetch,
+	BrowserUseRequestError,
+	BrowserUseResponseError,
+	resolveCdpWebSocketUrl,
+	SESSION_STILL_ACTIVE_MESSAGE,
+} from "./browser-use-client";
 import type { Job } from "./job";
 import {
 	assertAllowedTargetUrl,
@@ -17,7 +31,9 @@ import {
 	type BrowserObservation,
 	type BrowserSubmitResult,
 	createBrowserSubmitDiagnosticError,
+	isReviewComparableField,
 	normalizeAllowedHosts,
+	type ObservedFieldState,
 	PROHIBITION_TEXT_PATTERN_SOURCES,
 	type RestrictedBrowserDriver,
 	type SubmitActivationStrategy,
@@ -32,6 +48,250 @@ const CONFIRMATION_POLL_INTERVAL_MS = 1_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MS = 15_000;
 const SUBMISSION_PERMISSION_WINDOW_MS = 2_000;
 const MAX_SUBMIT_MOUSE_PREPARATION_ATTEMPTS = 3;
+const CONNECT_RETRY_DELAYS_MS = [10_000, 20_000, 30_000];
+/**
+ * The run deadline is 10 minutes and the termination grace is 30 seconds, so a
+ * 12 minute provider timeout only acts as a backstop when the explicit stop
+ * never reaches the provider.
+ */
+const SESSION_TIMEOUT_MINUTES = 12;
+/** Marks sessions created by this client so provider counts can separate them from other API-key users. */
+export const SESSION_SOURCE_TAG = "form-agent";
+const SESSION_STOP_TIMEOUT_MS = 10_000;
+
+const RETRYABLE_CONNECT_ERROR_MESSAGES = new Set([
+	"Browser Use CDP connection failed",
+	"Browser Use CDP connection closed",
+	"Browser Use CDP connection is closed",
+	"Browser Use CDP command timed out",
+]);
+
+export interface BrowserUseConnectOptions {
+	retryDelaysMs?: readonly number[];
+	sleep?: (ms: number) => Promise<void>;
+	signal?: AbortSignal;
+	client?: BrowserUseClient;
+	fetcher?: BrowserUseFetch;
+	connectConnection?: (
+		webSocketUrl: string,
+		signal?: AbortSignal,
+	) => Promise<BrowserUseCdpConnection>;
+}
+
+interface BrowserSessionHandle {
+	client: BrowserUseClient;
+	id: string;
+}
+
+function isRetryableConnectError(error: unknown): boolean {
+	if (error instanceof BrowserUseCdpUpgradeRejectedError) {
+		return error.retryable;
+	}
+	if (error instanceof BrowserUseCdpClosedError) {
+		return error.retryable;
+	}
+	if (error instanceof BrowserUseApiError) {
+		return error.retryable;
+	}
+	if (
+		error instanceof BrowserUseRequestError ||
+		error instanceof BrowserUseResponseError
+	) {
+		return true;
+	}
+	return (
+		error instanceof Error &&
+		RETRYABLE_CONNECT_ERROR_MESSAGES.has(error.message)
+	);
+}
+
+type StopFailureReason = "STILL_ACTIVE" | "API_ERROR" | "TIMEOUT";
+
+/**
+ * Stopping is best effort: the provider keeps the session alive until its own
+ * timeout when the stop fails, so the outcome is recorded and the caller keeps
+ * its original error. A provider response that still reports an active session
+ * counts as a failure, because the concurrency slot is still held.
+ */
+async function stopBrowserSession(
+	session: BrowserSessionHandle,
+): Promise<{ ok: boolean; reason?: StopFailureReason }> {
+	const startedAt = Date.now();
+	const timeout = AbortSignal.timeout(SESSION_STOP_TIMEOUT_MS);
+	let reason: StopFailureReason | undefined;
+	let status: number | undefined;
+	try {
+		await session.client.stopBrowser(session.id, timeout);
+	} catch (error) {
+		if (
+			error instanceof BrowserUseResponseError &&
+			error.message === SESSION_STILL_ACTIVE_MESSAGE
+		) {
+			reason = "STILL_ACTIVE";
+		} else if (timeout.aborted) {
+			reason = "TIMEOUT";
+		} else {
+			reason = "API_ERROR";
+			if (error instanceof BrowserUseApiError) status = error.status;
+		}
+	}
+	console.log(
+		JSON.stringify({
+			event: "browser_use_session_stopped",
+			ok: reason === undefined,
+			...(reason === undefined ? {} : { reason }),
+			...(status === undefined ? {} : { status }),
+			durationMs: Date.now() - startedAt,
+		}),
+	);
+	return reason === undefined ? { ok: true } : { ok: false, reason };
+}
+
+/**
+ * A queue retry inherits the sessions of the previous attempt when the Worker
+ * was killed before it could stop them. The job identifier is unique per run
+ * because claimRun serialises attempts, so every active session tagged with it
+ * belongs to an attempt that already ended.
+ */
+/** Best-effort provider snapshot at the moment of a concurrency rejection. Counts only. */
+async function sampleActiveSessions(
+	client: BrowserUseClient,
+	signal: AbortSignal | undefined,
+): Promise<void> {
+	let activeTotal: number | null = null;
+	let activeTagged: number | null = null;
+	try {
+		const sessions = await client.listBrowsers(
+			"active",
+			100,
+			signal ?? AbortSignal.timeout(SESSION_STOP_TIMEOUT_MS),
+		);
+		activeTotal = sessions.length;
+		activeTagged = sessions.filter(
+			(session) => session.metadata.source === SESSION_SOURCE_TAG,
+		).length;
+	} catch {
+		// The sample is diagnostic only; the retry proceeds either way.
+	}
+	console.warn(
+		JSON.stringify({
+			event: "browser_use_session_limit",
+			activeTotal,
+			activeTagged,
+		}),
+	);
+}
+
+async function reclaimJobSessions(
+	client: BrowserUseClient,
+	jobId: string,
+	signal: AbortSignal | undefined,
+): Promise<void> {
+	let matched = 0;
+	let stopped = 0;
+	let failed = 0;
+	let activeTotal = 0;
+	let activeTagged = 0;
+	let ok = true;
+	try {
+		const sessions = await client.listBrowsers(
+			"active",
+			100,
+			signal ?? AbortSignal.timeout(SESSION_STOP_TIMEOUT_MS),
+		);
+		// Counts only: they show whether the provider limit is consumed by this
+		// deployment (tagged with a jobId) or by sessions created elsewhere.
+		activeTotal = sessions.length;
+		activeTagged = sessions.filter(
+			(session) => session.metadata.source === SESSION_SOURCE_TAG,
+		).length;
+		for (const session of sessions) {
+			if (session.metadata.jobId !== jobId) continue;
+			matched += 1;
+			// Only a confirmed stop is counted, so the record never claims to have
+			// released a slot the provider still holds.
+			if ((await stopBrowserSession({ client, id: session.id })).ok) {
+				stopped += 1;
+			} else {
+				failed += 1;
+				ok = false;
+			}
+		}
+	} catch {
+		ok = false;
+	}
+	console.log(
+		JSON.stringify({
+			event: "browser_use_session_reclaimed",
+			ok,
+			activeTotal,
+			activeTagged,
+			matched,
+			stopped,
+			failed,
+		}),
+	);
+}
+
+function connectAbortedError(): Error {
+	return new Error("Browser Use CDP connection aborted");
+}
+
+function assertConnectNotAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw connectAbortedError();
+}
+
+export function connectFailureDetail(error: unknown): {
+	reason: string;
+	status?: number;
+} {
+	if (error instanceof BrowserUseCdpUpgradeRejectedError) {
+		return { reason: "CDP_UPGRADE_REJECTED", status: error.status };
+	}
+	if (error instanceof BrowserUseApiError) {
+		return {
+			reason: error.status === 429 ? "SESSION_LIMIT" : "SESSION_CREATE_FAILED",
+			status: error.status,
+		};
+	}
+	if (
+		error instanceof BrowserUseRequestError ||
+		error instanceof BrowserUseResponseError
+	) {
+		return { reason: "SESSION_CREATE_FAILED" };
+	}
+	if (!(error instanceof Error)) return { reason: "UNKNOWN" };
+	switch (error.message) {
+		case "Browser Use CDP connection failed":
+			return { reason: "CDP_CONNECTION_FAILED" };
+		case "Browser Use CDP connection is closed":
+		case "Browser Use CDP connection closed":
+			return { reason: "CDP_CONNECTION_CLOSED" };
+		case "Browser Use CDP command timed out":
+			return { reason: "CDP_COMMAND_TIMEOUT" };
+		default:
+			return { reason: "UNKNOWN" };
+	}
+}
+
+function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) {
+			reject(connectAbortedError());
+			return;
+		}
+		let timeout: ReturnType<typeof setTimeout>;
+		const onAbort = () => {
+			clearTimeout(timeout);
+			reject(connectAbortedError());
+		};
+		timeout = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
 
 export const ENTER_KEY_DOWN_EVENT = {
 	type: "keyDown",
@@ -176,31 +436,185 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#formDataEntered = false;
 	#interactionStarted = false;
 	#navigationCount = 0;
+	#closePromise: Promise<void> | undefined;
 	readonly #successfulInputBackendNodeIds = new Set<number>();
 
 	private constructor(
 		private readonly connection: BrowserUseCdpConnection,
 		private readonly sessionId: string,
 		private readonly dryRun: boolean,
+		private readonly browserSession: BrowserSessionHandle | undefined,
 	) {}
 
+	/**
+	 * The provider keeps a managed browser running after the CDP socket is gone,
+	 * so every session is created through the REST API and stopped again on the
+	 * way out. Leaving that stop undone consumes a concurrency slot until the
+	 * provider timeout expires.
+	 */
 	static async connect(
 		apiKey: string,
-		_job: Job,
+		job: Job,
 		dryRun = false,
-		endpoint = "wss://connect.browser-use.com",
+		options: BrowserUseConnectOptions = {},
 	): Promise<BrowserUseCdpDriver> {
 		if (!apiKey) throw new Error("Browser Use API key is required");
-		const url = new URL(endpoint);
-		if (url.protocol !== "wss:" || url.hostname !== "connect.browser-use.com") {
-			throw new Error("Invalid Browser Use CDP endpoint");
-		}
-		url.searchParams.set("apiKey", apiKey);
-		url.searchParams.set("proxyCountryCode", "jp");
-		url.searchParams.set("timeout", "15");
+		const client = options.client ?? new BrowserUseClient(apiKey, fetch);
+		const fetcher = options.fetcher ?? fetch;
+		const retryDelaysMs = options.retryDelaysMs ?? CONNECT_RETRY_DELAYS_MS;
+		const signal = options.signal;
+		const sleep = options.sleep ?? ((ms: number) => sleepMs(ms, signal));
+		const openConnection =
+			options.connectConnection ??
+			((target: string, connectSignal?: AbortSignal) =>
+				BrowserUseCdpConnection.connect(
+					target,
+					fetch,
+					undefined,
+					connectSignal,
+				));
 
-		const connection = await BrowserUseCdpConnection.connect(url.toString());
+		assertConnectNotAborted(signal);
+		if (job.attemptCount > 1) {
+			await reclaimJobSessions(client, job.id, signal);
+		}
+
+		let lastError: unknown;
+		for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+			if (attempt > 0) {
+				const delayMs = retryDelaysMs[attempt - 1] ?? 0;
+				console.warn(
+					JSON.stringify({
+						event: "browser_use_connect_retry",
+						attempt,
+						delayMs,
+						...connectFailureDetail(lastError),
+					}),
+				);
+				if (
+					lastError instanceof BrowserUseApiError &&
+					lastError.status === 429
+				) {
+					// Sampled before the backoff so the counts describe the sessions
+					// that were active when the provider rejected the request.
+					await sampleActiveSessions(client, signal);
+				}
+				await sleep(delayMs);
+			}
+			assertConnectNotAborted(signal);
+			// A previous attempt may have created a session the provider kept but
+			// never handed back, so the leftovers are collected before retrying.
+			if (attempt > 0) {
+				await reclaimJobSessions(client, job.id, signal);
+			}
+			try {
+				return await BrowserUseCdpDriver.#connectOnce(
+					client,
+					fetcher,
+					apiKey,
+					job,
+					dryRun,
+					attempt,
+					openConnection,
+					signal,
+				);
+			} catch (error) {
+				// An abort ends the run, so it is never reported as a retry.
+				assertConnectNotAborted(signal);
+				if (!isRetryableConnectError(error)) throw error;
+				lastError = error;
+			}
+		}
+		throw lastError;
+	}
+
+	static async #connectOnce(
+		client: BrowserUseClient,
+		fetcher: BrowserUseFetch,
+		apiKey: string,
+		job: Job,
+		dryRun: boolean,
+		attempt: number,
+		openConnection: (
+			webSocketUrl: string,
+			signal?: AbortSignal,
+		) => Promise<BrowserUseCdpConnection>,
+		signal: AbortSignal | undefined,
+	): Promise<BrowserUseCdpDriver> {
+		let session: BrowserSession;
 		try {
+			session = await client.createBrowser({
+				timeoutMinutes: SESSION_TIMEOUT_MINUTES,
+				proxyCountryCode: "jp",
+				metadata: {
+					source: SESSION_SOURCE_TAG,
+					jobId: job.id,
+					dryRun: String(dryRun),
+				},
+				...(signal ? { signal } : {}),
+			});
+		} catch (error) {
+			// The provider may have started a session even though the response was
+			// unusable, so the identifier it reported is released here.
+			if (error instanceof BrowserUseResponseError && error.sessionId) {
+				await stopBrowserSession({ client, id: error.sessionId });
+			}
+			throw error;
+		}
+		const handle: BrowserSessionHandle = { client, id: session.id };
+		try {
+			assertConnectNotAborted(signal);
+			const cdpUrl = session.cdpUrl;
+			if (!cdpUrl) {
+				throw new BrowserUseResponseError(
+					"Browser Use did not return an active session with a CDP URL",
+				);
+			}
+			const cdpScheme = cdpUrl.startsWith("wss:") ? "wss" : "https";
+			const webSocketUrl = await resolveCdpWebSocketUrl(
+				cdpUrl,
+				fetcher,
+				apiKey,
+				signal,
+			);
+			const driver = await BrowserUseCdpDriver.#establish(
+				webSocketUrl,
+				dryRun,
+				openConnection,
+				signal,
+				handle,
+			);
+			console.log(
+				JSON.stringify({
+					event: "browser_use_session_created",
+					cdpScheme,
+					attempt,
+				}),
+			);
+			return driver;
+		} catch (error) {
+			await stopBrowserSession(handle);
+			throw error;
+		}
+	}
+
+	static async #establish(
+		webSocketUrl: string,
+		dryRun: boolean,
+		openConnection: (
+			webSocketUrl: string,
+			signal?: AbortSignal,
+		) => Promise<BrowserUseCdpConnection>,
+		signal: AbortSignal | undefined,
+		browserSession: BrowserSessionHandle | undefined,
+	): Promise<BrowserUseCdpDriver> {
+		const connection = await openConnection(webSocketUrl, signal);
+		// Closing the connection rejects every in-flight command, so an abort
+		// during setup fails fast instead of waiting out the CDP command timeout.
+		const onAbort = () => connection.close();
+		signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			assertConnectNotAborted(signal);
 			const { targetInfos } = await connection.send<{
 				targetInfos: TargetInfo[];
 			}>("Target.getTargets");
@@ -218,18 +632,33 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				"Target.attachToTarget",
 				{ targetId, flatten: true },
 			);
-			const driver = new BrowserUseCdpDriver(connection, sessionId, dryRun);
+			const driver = new BrowserUseCdpDriver(
+				connection,
+				sessionId,
+				dryRun,
+				browserSession,
+			);
 			await driver.#initialize();
 			return driver;
 		} catch (error) {
 			connection.close();
 			throw error;
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
 		}
 	}
 
 	async close(): Promise<void> {
+		this.#closePromise ??= this.#close();
+		return this.#closePromise;
+	}
+
+	async #close(): Promise<void> {
 		this.#notifyPageChanged();
 		this.connection.close();
+		if (this.browserSession) {
+			await stopBrowserSession(this.browserSession);
+		}
 	}
 
 	async restrictToDomain(
@@ -335,6 +764,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 					placeholder: state.placeholder,
 					required: state.required,
 					value: state.type === "password" ? "" : state.value,
+					...(state.type === "checkbox" || state.type === "radio"
+						? { checked: state.checked }
+						: {}),
 					options: state.options,
 				});
 			}
@@ -408,7 +840,57 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				durationMs: Date.now() - startedAt,
 			}),
 		);
-		return { url, forms, pageText, navigationLinks };
+		return {
+			url,
+			forms,
+			pageText: pageText.text,
+			...(pageText.truncated ? { pageTextTruncated: true } : {}),
+			navigationLinks,
+		};
+	}
+
+	/**
+	 * Re-reads every element the latest observation named, so the caller can
+	 * confirm the page still holds the reviewed content. Elements that no
+	 * longer resolve are omitted, which the caller sees as a set mismatch.
+	 */
+	async readObservedFieldStates(): Promise<ObservedFieldState[]> {
+		const states: ObservedFieldState[] = [];
+		for (const [elementId, reference] of this.#elements) {
+			const state = await this.#inspectElement(reference.backendNodeId).catch(
+				() => null,
+			);
+			const comparable = state && toObservedFieldState(elementId, state);
+			if (comparable) states.push(comparable);
+		}
+		return states;
+	}
+
+	/**
+	 * Rediscovers the form that owns the submit control and describes every
+	 * control it holds. Unlike `observe`, nothing is dropped for being hidden
+	 * or disabled, so a control the page adds during the review is visible in
+	 * the comparison.
+	 */
+	async readFormSnapshot(elementId: string): Promise<string> {
+		const reference = this.#element(elementId);
+		const { discovery } = await this.#discoverForms(await this.currentUrl());
+		const owner = discovery.forms.find(
+			(form) =>
+				(form.frameId ?? this.#topFrameId) ===
+					(reference.frameId ?? this.#topFrameId) &&
+				form.fields.some(
+					(field) => field.backendNodeId === reference.backendNodeId,
+				),
+		);
+		if (!owner) throw new BrowserElementError();
+		const states: Array<FormSnapshotElement | null> = [];
+		for (const field of owner.fields) {
+			states.push(
+				await this.#inspectElement(field.backendNodeId).catch(() => null),
+			);
+		}
+		return toFormSnapshot(states);
 	}
 
 	async clickNonSubmit(elementId: string): Promise<void> {
@@ -816,9 +1298,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		throw new Error("Browser page did not become ready");
 	}
 
-	#bodyText(): Promise<string> {
-		return this.#evaluate<string>(
-			`(document.body?.innerText ?? "").slice(0, ${MAX_PAGE_TEXT})`,
+	async #bodyText(): Promise<{ text: string; truncated: boolean }> {
+		// One extra character makes the truncation detectable in the Worker
+		// instead of trusting a value computed inside the page.
+		return readPageText(
+			await this.#evaluate<string>(
+				`(document.body?.innerText ?? "").slice(0, ${MAX_PAGE_TEXT + 1})`,
+			),
 		);
 	}
 
@@ -1709,6 +2195,79 @@ export function createExpectedSubmissionRequest(
 	}
 	url.hash = "";
 	return { url: url.toString(), method: formMethod.toUpperCase() };
+}
+
+/**
+ * Splits the raw body text into the value the model may see and a flag saying
+ * whether the page held more. Truncation is decided in the Worker so that an
+ * untrusted page cannot claim its text was complete.
+ */
+export interface FormSnapshotElement {
+	ok: boolean;
+	tag: string;
+	type: string;
+	name: string | null;
+	value: string;
+	checked: boolean;
+	disabled: boolean;
+}
+
+/**
+ * Canonical string for one form's controls, in DOM order. Password values are
+ * masked, and an element that no longer resolves becomes null so that its
+ * disappearance still changes the snapshot.
+ */
+export function toFormSnapshot(
+	states: ReadonlyArray<FormSnapshotElement | null>,
+): string {
+	return JSON.stringify(
+		states.map((state) =>
+			state?.ok
+				? [
+						state.tag,
+						state.type || "",
+						state.name ?? "",
+						state.type === "password" ? "" : state.value,
+						state.checked,
+						state.disabled,
+					]
+				: null,
+		),
+	);
+}
+
+/**
+ * Narrows one inspected element to the state the pre-submit comparison uses,
+ * or null when the element is not comparable (unusable, or a submit control
+ * whose activation is what `submit` does).
+ */
+export function toObservedFieldState(
+	elementId: string,
+	state: {
+		ok: boolean;
+		tag: string;
+		type: string;
+		value: string;
+		checked: boolean;
+		submitLike: boolean;
+	},
+): ObservedFieldState | null {
+	if (!state.ok || state.submitLike) return null;
+	if (!isReviewComparableField(state.tag, state.type || null)) return null;
+	return {
+		elementId,
+		value: state.type === "password" ? "" : state.value,
+		checked: state.checked,
+	};
+}
+
+export function readPageText(raw: string): {
+	text: string;
+	truncated: boolean;
+} {
+	return raw.length > MAX_PAGE_TEXT
+		? { text: raw.slice(0, MAX_PAGE_TEXT), truncated: true }
+		: { text: raw, truncated: false };
 }
 
 export function submitUncertainReasonCode(

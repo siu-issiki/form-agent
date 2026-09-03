@@ -20,6 +20,7 @@
     "test/apply-migrations.ts",
     "test/browser-use-smoke.test.ts",
     "test/e2e-worker.ts",
-    "test/worker.test.ts"
+    "test/worker.test.ts",
+    "test/submit-reviewer.test.ts"
   ]
 }

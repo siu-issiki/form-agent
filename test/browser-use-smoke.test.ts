@@ -19,6 +19,7 @@ const job: Job = {
 	payload: {},
 	status: "running",
 	attemptCount: 1,
+	submitReviewDenialCount: 0,
 	runToken: "browser-use-smoke",
 	result: null,
 	createdAt: "2026-08-28T00:00:00.000Z",
@@ -55,6 +56,15 @@ describe("BrowserUseCdpDriver real CDP smoke", () => {
 				job.id,
 				job.runToken ?? "",
 				new InMemoryEvidenceObjectStore(),
+				{
+					async review() {
+						return {
+							decision: "allow",
+							reasonCode: "INPUTS_MATCH",
+							reason: "The smoke test never submits.",
+						};
+					},
+				},
 			);
 			await tools.navigate(targetUrl);
 

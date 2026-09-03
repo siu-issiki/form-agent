@@ -1,17 +1,156 @@
 import { parse } from "tldts";
 import type { Job, JobStore } from "./job";
 import {
+	EVIDENCE_CONTENT_TYPE,
 	type EvidenceCaptureResult,
 	type EvidenceObjectStore,
 	SubmissionEvidenceRecorder,
 } from "./submission-evidence";
 
+/** A denial only allows one correction; the second denial ends the job. */
+const MAX_SUBMIT_REVIEW_DENIALS = 2;
+const MAX_SUBMIT_REVIEW_REASON_LENGTH = 500;
+const SUBMIT_REVIEW_BUDGET_EXHAUSTED_REASON =
+	"Pre-submit review denied the submission and its correction budget is exhausted.";
+// biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are flattened on purpose
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/g;
+
 export interface BrowserObservation {
 	url: string;
 	forms: unknown[];
 	pageText?: string;
+	pageTextTruncated?: boolean;
 	navigationLinks?: Array<{ url: string; text: string }>;
 	prohibitedReasonCodes?: ProhibitedReasonCode[];
+}
+
+export type SubmitReviewReasonCode =
+	| "INPUTS_MATCH"
+	| "INPUT_MISMATCH"
+	| "SALES_PROHIBITED"
+	| "FORM_PURPOSE_INCOMPATIBLE"
+	| "WRONG_FORM"
+	| "UNCLEAR";
+
+export interface SubmitReviewDecision {
+	decision: "allow" | "deny";
+	reasonCode: SubmitReviewReasonCode;
+	reason: string;
+}
+
+export interface SubmitReviewInput {
+	targetDomain: string;
+	targetUrl: string;
+	currentUrl: string;
+	formValues: Record<string, string>;
+	observation: BrowserObservation;
+	submitElementId: string;
+	screenshot: { contentType: "image/jpeg"; bytes: Uint8Array } | null;
+}
+
+export interface SubmitReviewer {
+	review(input: SubmitReviewInput): Promise<SubmitReviewDecision>;
+}
+
+export interface ObservedFieldState {
+	elementId: string;
+	value: string;
+	checked: boolean;
+}
+
+/**
+ * Mirrors the driver's own exclusion rule so that the observation and the live
+ * read-back always describe the same set of elements. Submit controls and
+ * buttons are excluded because activating them is what `submit` does.
+ */
+/**
+ * Canonical description of the values a reviewer judged, used to require that
+ * a correction actually changed something. Element ids are excluded so that a
+ * re-render which only renumbers elements does not read as a correction.
+ */
+export function observationFingerprint(
+	observation: BrowserObservation,
+): string {
+	const forms: unknown[] = [];
+	for (const form of observation.forms) {
+		if (!isRecord(form) || !Array.isArray(form.fields)) {
+			forms.push(null);
+			continue;
+		}
+		const fields: unknown[] = [];
+		for (const field of form.fields) {
+			if (!isRecord(field)) continue;
+			if (!isReviewComparableField(field.tag, field.type)) continue;
+			fields.push([
+				fingerprintValue(field.tag),
+				fingerprintValue(field.type),
+				fingerprintValue(field.name),
+				fingerprintValue(field.label),
+				fingerprintValue(field.value),
+				fingerprintValue(field.checked),
+			]);
+		}
+		forms.push(fields);
+	}
+	return JSON.stringify(forms);
+}
+
+/** Keeps the fingerprint canonical by reducing page data to scalars. */
+function fingerprintValue(value: unknown): string | boolean | null {
+	if (typeof value === "string") return value;
+	if (typeof value === "boolean") return value;
+	return null;
+}
+
+export function isReviewComparableField(tag: unknown, type: unknown): boolean {
+	if (tag === "button") return false;
+	if (tag === "input" && (type === "submit" || type === "image")) return false;
+	return true;
+}
+
+/** The pre-submit review rejected this submission. */
+export class SubmitReviewDeniedError extends Error {
+	constructor(readonly reasonCode: SubmitReviewReasonCode) {
+		super("The pre-submit review denied the submission");
+		this.name = "SubmitReviewDeniedError";
+	}
+}
+
+/** The pre-submit review could not produce a decision. */
+export class SubmitReviewUnavailableError extends Error {
+	constructor() {
+		super("The pre-submit review could not be completed");
+		this.name = "SubmitReviewUnavailableError";
+	}
+}
+
+export const PAYLOAD_KEY_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+export const MAX_PAYLOAD_VALUE_LENGTH = 8_192;
+
+/**
+ * Narrows `job.payload.formValues` to the entries the trusted handler is
+ * willing to enter into a form. It lives here so that the browser tool handler
+ * and the pre-submit review share exactly one definition of a trusted value.
+ */
+export function readTrustedFormValues(
+	payload: Record<string, unknown>,
+): Record<string, string> {
+	const formValues = payload.formValues;
+	// A null prototype keeps inherited members such as `constructor` out of the
+	// result, so a payloadKey can only ever resolve to a job-supplied value.
+	const trusted: Record<string, string> = Object.create(null);
+	if (!isRecord(formValues) || Array.isArray(formValues)) return trusted;
+	for (const [key, value] of Object.entries(formValues)) {
+		if (
+			PAYLOAD_KEY_PATTERN.test(key) &&
+			typeof value === "string" &&
+			value.length > 0 &&
+			value.length <= MAX_PAYLOAD_VALUE_LENGTH
+		) {
+			trusted[key] = value;
+		}
+	}
+	return trusted;
 }
 
 export type ProhibitedReasonCode =
@@ -42,6 +181,20 @@ export interface RestrictedBrowserDriver {
 	fill(elementId: string, value: string): Promise<void>;
 	select(elementId: string, value: string): Promise<void>;
 	validateSubmit(elementId: string): Promise<void>;
+	/**
+	 * Re-reads the live state of every element named by the latest observation,
+	 * excluding submit controls and buttons. It is used to detect a page that
+	 * changed itself between the review and the submission.
+	 */
+	readObservedFieldStates(): Promise<ObservedFieldState[]>;
+	/**
+	 * Rediscovers the form that owns the submit control and returns a canonical
+	 * string covering every control it holds, hidden and disabled included.
+	 * Comparing two snapshots detects elements added, removed, or altered
+	 * between the review and the submission, which a read-back limited to the
+	 * previously observed elements cannot see.
+	 */
+	readFormSnapshot(elementId: string): Promise<string>;
 	captureScreenshot(): Promise<Uint8Array>;
 	submit(
 		elementId: string,
@@ -67,6 +220,30 @@ export class BrowserFormInvalidError extends BrowserElementError {
 	constructor() {
 		super();
 		this.name = "BrowserFormInvalidError";
+	}
+}
+
+/** The latest observation is older than the latest trusted input. */
+export class ObservationStaleError extends BrowserElementError {
+	constructor() {
+		super();
+		this.name = "ObservationStaleError";
+	}
+}
+
+/** The review denied the inputs and no field has been changed since. */
+export class CorrectionRequiredError extends BrowserElementError {
+	constructor() {
+		super();
+		this.name = "CorrectionRequiredError";
+	}
+}
+
+/** The page changed between the review and the submission. */
+export class FormStateChangedError extends BrowserElementError {
+	constructor() {
+		super();
+		this.name = "FormStateChangedError";
 	}
 }
 
@@ -130,13 +307,17 @@ export function createBrowserSubmitDiagnosticError(
 
 export class RestrictedBrowserTools {
 	readonly #targetDomain: string;
+	readonly #targetUrl: string;
 	readonly #allowedHosts: string[];
+	readonly #formValues: Record<string, string>;
 	readonly #successfulInputElementIds = new Set<string>();
 	readonly #allowedNavigationUrls = new Set<string>();
 	#latestObservation: BrowserObservation | undefined;
 	#inputRevision = 0;
 	#observationRevision = -1;
 	#submitAttempted = false;
+	#deniedFingerprint: string | undefined;
+	#correctionInputApplied = false;
 
 	private constructor(
 		private readonly driver: RestrictedBrowserDriver,
@@ -144,13 +325,17 @@ export class RestrictedBrowserTools {
 		private readonly jobId: string,
 		private readonly runToken: string,
 		private readonly recorder: SubmissionEvidenceRecorder,
+		private readonly reviewer: SubmitReviewer,
 		targetDomain: string,
 		allowedHosts: readonly string[],
 		targetUrl: string,
+		formValues: Record<string, string>,
 		private readonly now: () => string = () => new Date().toISOString(),
 	) {
 		this.#targetDomain = normalizeTargetDomain(targetDomain);
 		this.#allowedHosts = normalizeAllowedHosts(allowedHosts);
+		this.#targetUrl = targetUrl;
+		this.#formValues = formValues;
 		this.#allowedNavigationUrls.add(canonicalNavigationUrl(targetUrl));
 	}
 
@@ -160,6 +345,7 @@ export class RestrictedBrowserTools {
 		jobId: string,
 		runToken: string,
 		evidenceStore: EvidenceObjectStore,
+		reviewer: SubmitReviewer,
 		now: () => string = () => new Date().toISOString(),
 	): Promise<RestrictedBrowserTools> {
 		const job = await jobs.find(jobId);
@@ -185,9 +371,11 @@ export class RestrictedBrowserTools {
 				job.attemptCount,
 				now,
 			),
+			reviewer,
 			targetDomain,
 			allowedHosts,
 			job.targetUrl,
+			readTrustedFormValues(job.payload),
 			now,
 		);
 	}
@@ -262,6 +450,9 @@ export class RestrictedBrowserTools {
 		await this.#assertCurrentUrlAllowed();
 		this.#successfulInputElementIds.add(elementId);
 		this.#inputRevision += 1;
+		// A denied review is only cleared once an input actually changed the
+		// observed values, which `validateSubmit` decides from the fingerprint.
+		this.#correctionInputApplied = true;
 	}
 
 	async select(elementId: string, value: string): Promise<void> {
@@ -269,14 +460,18 @@ export class RestrictedBrowserTools {
 		await this.#assertCurrentUrlAllowed();
 		this.#successfulInputElementIds.add(elementId);
 		this.#inputRevision += 1;
+		this.#correctionInputApplied = true;
 	}
 
 	async validateSubmit(elementId: string): Promise<void> {
 		if (this.#successfulInputElementIds.size < 1) {
 			throw new BrowserElementError();
 		}
+		if (this.#deniedFingerprint !== undefined && !this.#hasCorrectedInputs()) {
+			throw new CorrectionRequiredError();
+		}
 		if (this.#observationRevision !== this.#inputRevision) {
-			throw new BrowserElementError();
+			throw new ObservationStaleError();
 		}
 		if (
 			prohibitedReasonCodesForElement(this.#latestObservation, elementId)
@@ -307,6 +502,31 @@ export class RestrictedBrowserTools {
 		}
 	}
 
+	/**
+	 * Runs the independent pre-submit review over the latest trusted
+	 * observation. It must run before `claimSubmission`, because the reviewer
+	 * consumes a provider request that D1 only grants while the job is still
+	 * `running`.
+	 */
+	async reviewSubmit(
+		elementId: string,
+		screenshot: { contentType: "image/jpeg"; bytes: Uint8Array } | null,
+	): Promise<SubmitReviewDecision> {
+		const observation = this.#latestObservation;
+		if (!observation) {
+			throw new BrowserElementError();
+		}
+		return this.reviewer.review({
+			targetDomain: this.#targetDomain,
+			targetUrl: this.#targetUrl,
+			currentUrl: observation.url,
+			formValues: this.#formValues,
+			observation,
+			submitElementId: elementId,
+			screenshot,
+		});
+	}
+
 	async submit(
 		elementId: string,
 		activationStrategy: SubmitActivationStrategy = "mouse",
@@ -315,13 +535,68 @@ export class RestrictedBrowserTools {
 			throw new SubmissionNotAuthorizedError();
 		}
 		await this.validateSubmit(elementId);
-		this.#submitAttempted = true;
+
+		// The denial budget is read from D1 before anything else happens, so a
+		// failed uncertain write cannot leave a spent job open to another
+		// review that happens to allow.
+		const persisted = await this.jobs.find(this.jobId);
+		if (
+			persisted?.status !== "running" ||
+			persisted.runToken !== this.runToken
+		) {
+			throw new SubmissionNotAuthorizedError();
+		}
+		if (persisted.submitReviewDenialCount >= MAX_SUBMIT_REVIEW_DENIALS) {
+			await this.#recordUncertain(
+				"PRE_SUBMIT_REVIEW_DENIED",
+				SUBMIT_REVIEW_BUDGET_EXHAUSTED_REASON,
+			);
+			throw new SubmissionResultUncertainError();
+		}
 
 		// Nothing is submitted until the pre-submission evidence exists.
 		const before = await this.recorder.capture("before_submit");
 		if (!before.captured) {
 			throw new SubmissionEvidenceError();
 		}
+
+		// Taken before the review so that anything the page adds, removes, or
+		// alters while the review runs shows up as a different snapshot.
+		const snapshotBefore = await this.driver.readFormSnapshot(elementId);
+
+		const decision = await this.reviewSubmit(elementId, {
+			contentType: EVIDENCE_CONTENT_TYPE,
+			bytes: before.body,
+		});
+		if (decision.decision === "deny") {
+			// Only a mismatch between the entered values and the payload is
+			// correctable by the agent. Every other denial is a judgement about
+			// the page or the form itself, which a retry cannot change.
+			const correctable = decision.reasonCode === "INPUT_MISMATCH";
+			const denialCount = await this.#spendSubmitReviewDenial(correctable);
+			if (correctable && denialCount < MAX_SUBMIT_REVIEW_DENIALS) {
+				// Force both a real input change and a fresh observation so the
+				// next review sees corrected values instead of the denied ones.
+				// The fingerprint makes a re-entry of the same values visible as
+				// the non-correction it is.
+				this.#deniedFingerprint = observationFingerprint(
+					this.#latestObservation ?? { url: this.#targetUrl, forms: [] },
+				);
+				this.#correctionInputApplied = false;
+				this.#inputRevision += 1;
+				throw new SubmitReviewDeniedError(decision.reasonCode);
+			}
+			await this.#recordUncertain(
+				"PRE_SUBMIT_REVIEW_DENIED",
+				submitReviewDeniedReason(decision, denialCount),
+			);
+			throw new SubmissionResultUncertainError();
+		}
+
+		// The reviewed page is not the page that gets submitted unless nothing
+		// moved in between. Untrusted page scripts run during the review.
+		await this.#assertReviewedStateUnchanged(elementId, snapshotBefore);
+		this.#submitAttempted = true;
 
 		const authorized = await this.jobs.claimSubmission(
 			this.jobId,
@@ -431,8 +706,85 @@ export class RestrictedBrowserTools {
 		}
 	}
 
+	/**
+	 * Records this denial in D1 and returns its ordinal. A denial that offers
+	 * no correction consumes the whole remaining budget, so a failed uncertain
+	 * write cannot leave the job open to a later review that allows.
+	 */
+	async #spendSubmitReviewDenial(correctable: boolean): Promise<number> {
+		const denialCount = await this.jobs.recordSubmitReviewDenial(
+			this.jobId,
+			this.runToken,
+			this.now(),
+		);
+		if (denialCount === null) {
+			throw new SubmissionNotAuthorizedError();
+		}
+		if (correctable && denialCount < MAX_SUBMIT_REVIEW_DENIALS) {
+			return denialCount;
+		}
+		for (
+			let spent = denialCount;
+			spent < MAX_SUBMIT_REVIEW_DENIALS;
+			spent += 1
+		) {
+			if (
+				(await this.jobs.recordSubmitReviewDenial(
+					this.jobId,
+					this.runToken,
+					this.now(),
+				)) === null
+			) {
+				throw new SubmissionNotAuthorizedError();
+			}
+		}
+		return denialCount;
+	}
+
+	/** True once an input changed the values a denied review looked at. */
+	#hasCorrectedInputs(): boolean {
+		const observation = this.#latestObservation;
+		if (!observation || !this.#correctionInputApplied) return false;
+		return observationFingerprint(observation) !== this.#deniedFingerprint;
+	}
+
 	async #assertCurrentUrlAllowed(): Promise<void> {
 		this.#assertAllowedUrl(await this.driver.currentUrl());
+	}
+
+	/**
+	 * Confirms that the page still matches the observation the reviewer saw.
+	 * A mismatch forces a fresh observation instead of submitting content that
+	 * was never reviewed.
+	 */
+	async #assertReviewedStateUnchanged(
+		elementId: string,
+		snapshotBefore: string,
+	): Promise<void> {
+		const observation = this.#latestObservation;
+		if (!observation) throw new FormStateChangedError();
+		let unchanged: boolean;
+		try {
+			const currentUrl = await this.driver.currentUrl();
+			this.#assertAllowedUrl(currentUrl);
+			// The observed-field read-back ties the reviewed observation to the
+			// live values; the form snapshot covers everything the observation
+			// never showed, including hidden and disabled controls.
+			const states = await this.driver.readObservedFieldStates();
+			const snapshotAfter = await this.driver.readFormSnapshot(elementId);
+			unchanged =
+				canonicalNavigationPermissionUrl(currentUrl) ===
+					canonicalNavigationPermissionUrl(observation.url) &&
+				hasSameObservedFieldStates(observation, states) &&
+				snapshotAfter === snapshotBefore;
+		} catch (error) {
+			if (error instanceof NavigationPolicyError) throw error;
+			unchanged = false;
+		}
+		if (!unchanged) {
+			this.#inputRevision += 1;
+			throw new FormStateChangedError();
+		}
 	}
 
 	#assertAllowedUrl(rawUrl: string): void {
@@ -609,6 +961,54 @@ function canonicalNavigationUrl(rawUrl: string): string {
 
 function canonicalNavigationPermissionUrl(rawUrl: string): string {
 	return new URL(rawUrl).toString();
+}
+
+/**
+ * The reviewer's free-form reason is the only untrusted text this module
+ * persists. It is reachable through `GET /jobs/:id`, so control characters and
+ * line breaks are flattened and the text is truncated before storage. The model
+ * never sees it; only the fixed reason code is returned to the agent.
+ */
+function submitReviewDeniedReason(
+	decision: SubmitReviewDecision,
+	denialCount: number,
+): string {
+	const reason = decision.reason
+		.replace(CONTROL_CHARACTER_PATTERN, " ")
+		.slice(0, MAX_SUBMIT_REVIEW_REASON_LENGTH);
+	return `Pre-submit review denied the submission (reasonCode: ${decision.reasonCode}, denials: ${denialCount}). ${reason}`;
+}
+
+/**
+ * Compares the observation the reviewer saw with the live element states.
+ * Element sets must match exactly; values always, and checked state only where
+ * the observation reported one.
+ */
+function hasSameObservedFieldStates(
+	observation: BrowserObservation,
+	states: readonly ObservedFieldState[],
+): boolean {
+	const observed = new Map<string, Record<string, unknown>>();
+	for (const form of observation.forms) {
+		if (!isRecord(form) || !Array.isArray(form.fields)) continue;
+		for (const field of form.fields) {
+			if (!isRecord(field) || typeof field.elementId !== "string") continue;
+			if (!isReviewComparableField(field.tag, field.type)) continue;
+			observed.set(field.elementId, field);
+		}
+	}
+	if (states.length !== observed.size) return false;
+	for (const state of states) {
+		const field = observed.get(state.elementId);
+		if (!field) return false;
+		if (typeof field.value === "string" && field.value !== state.value) {
+			return false;
+		}
+		if (typeof field.checked === "boolean" && field.checked !== state.checked) {
+			return false;
+		}
+	}
+	return true;
 }
 
 function submitFailureReason(error: BrowserSubmitDiagnosticError): string {

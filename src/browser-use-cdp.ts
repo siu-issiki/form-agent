@@ -1,4 +1,5 @@
 const CDP_COMMAND_TIMEOUT_MS = 15_000;
+const ERROR_CLOSE_FALLBACK_MS = 1_000;
 export const MAX_CDP_MESSAGE_CHARACTERS = 4 * 1024 * 1024;
 
 interface CdpMessage {
@@ -28,28 +29,54 @@ export class BrowserUseCdpConnection {
 	#listeners = new Map<string, Set<CdpEventListener>>();
 	#lastResponseCharacters = new Map<string, number>();
 	#closed = false;
+	#closeRequested = false;
+	#closeLogged = false;
+	#pendingAtFailure: number | undefined;
+	#errorFallback: ReturnType<typeof setTimeout> | undefined;
 
-	private constructor(private readonly webSocket: WebSocket) {
+	private constructor(
+		private readonly webSocket: WebSocket,
+		private readonly errorCloseFallbackMs: number,
+	) {
 		webSocket.addEventListener("message", (event) => this.#onMessage(event));
-		webSocket.addEventListener("close", () => this.#onClose());
-		webSocket.addEventListener("error", () => this.#onClose());
+		webSocket.addEventListener("close", (event) => this.#onClose(event));
+		webSocket.addEventListener("error", () => this.#onError());
 	}
 
-	static async connect(webSocketUrl: string): Promise<BrowserUseCdpConnection> {
+	static async connect(
+		webSocketUrl: string,
+		fetchImpl: typeof fetch = fetch,
+		errorCloseFallbackMs = ERROR_CLOSE_FALLBACK_MS,
+		signal?: AbortSignal,
+	): Promise<BrowserUseCdpConnection> {
 		const url = new URL(webSocketUrl);
 		if (url.protocol !== "wss:") {
 			throw new Error("A secure CDP WebSocket endpoint is required");
 		}
 		url.protocol = "https:";
-		const response = await fetch(url, {
-			headers: { Upgrade: "websocket" },
-		});
-		if (response.status !== 101 || !response.webSocket) {
-			await response.body?.cancel();
+		let response: Response;
+		try {
+			response = await fetchImpl(url, {
+				headers: { Upgrade: "websocket" },
+				...(signal ? { signal } : {}),
+			});
+		} catch {
+			// An aborted upgrade is the run ending, not a provider failure, so it
+			// must not be reported as a retryable connection error.
+			if (signal?.aborted) {
+				throw new Error("Browser Use CDP connection aborted");
+			}
 			throw new Error("Browser Use CDP connection failed");
 		}
+		if (response.status !== 101 || !response.webSocket) {
+			await response.body?.cancel();
+			throw new BrowserUseCdpUpgradeRejectedError(response.status);
+		}
 		response.webSocket.accept();
-		return new BrowserUseCdpConnection(response.webSocket);
+		return new BrowserUseCdpConnection(
+			response.webSocket,
+			errorCloseFallbackMs,
+		);
 	}
 
 	send<TResult>(
@@ -100,6 +127,7 @@ export class BrowserUseCdpConnection {
 
 	close(): void {
 		if (this.#closed) return;
+		this.#closeRequested = true;
 		this.#closed = true;
 		this.webSocket.close(1000, "Form Agent run complete");
 		this.#rejectPending();
@@ -114,6 +142,7 @@ export class BrowserUseCdpConnection {
 				caught instanceof BrowserUseCdpPayloadTooLargeError
 					? caught
 					: new BrowserUseCdpPayloadTooLargeError();
+			this.#closeRequested = true;
 			this.#closed = true;
 			this.webSocket.close(1009, "CDP message is too large");
 			this.#rejectPending(error);
@@ -142,20 +171,107 @@ export class BrowserUseCdpConnection {
 		}
 	}
 
-	#onClose(): void {
-		if (this.#closed) return;
+	#onClose(event: CloseEvent): void {
+		const reason = event.reason ?? "";
+		const reasonHint = classifyCdpCloseReason(reason);
+		if (!this.#closeRequested && !this.#closeLogged) {
+			this.#closeLogged = true;
+			console.warn(
+				JSON.stringify({
+					event: "browser_use_cdp_closed",
+					code: event.code,
+					reasonLength: reason.length,
+					reasonHint,
+					wasClean: event.wasClean,
+					pending: this.#pendingAtFailure ?? this.#pending.size,
+				}),
+			);
+		}
+		if (this.#closeRequested) return;
 		this.#closed = true;
-		this.#rejectPending();
+		this.#rejectPending(new BrowserUseCdpClosedError(event.code, reasonHint));
+	}
+
+	/**
+	 * The close event carries the diagnosis, so an error only records what it
+	 * saw and waits for it. The timer only covers a close that never arrives.
+	 */
+	#onError(): void {
+		if (this.#closed) return;
+		this.#pendingAtFailure = this.#pending.size;
+		console.warn(JSON.stringify({ event: "browser_use_cdp_error" }));
+		this.#closed = true;
+		this.#errorFallback = setTimeout(() => {
+			this.#errorFallback = undefined;
+			this.#rejectPending();
+		}, this.errorCloseFallbackMs);
 	}
 
 	#rejectPending(
 		error: Error = new Error("Browser Use CDP connection closed"),
 	): void {
+		if (this.#errorFallback !== undefined) {
+			clearTimeout(this.#errorFallback);
+			this.#errorFallback = undefined;
+		}
 		for (const pending of this.#pending.values()) {
 			clearTimeout(pending.timeout);
 			pending.reject(error);
 		}
 		this.#pending.clear();
+	}
+}
+
+export type CdpCloseReasonHint =
+	| "NONE"
+	| "LIMIT"
+	| "AUTH"
+	| "TIMEOUT"
+	| "OTHER";
+
+const CLOSE_REASON_HINT_PATTERNS: ReadonlyArray<
+	readonly [CdpCloseReasonHint, readonly string[]]
+> = [
+	["LIMIT", ["limit", "concurren", "rate", "quota"]],
+	["AUTH", ["unauthori", "forbidden", "api key"]],
+	["TIMEOUT", ["timeout", "timed out"]],
+];
+
+export function classifyCdpCloseReason(reason: string): CdpCloseReasonHint {
+	const normalized = reason.trim().toLowerCase();
+	if (!normalized) return "NONE";
+	for (const [hint, needles] of CLOSE_REASON_HINT_PATTERNS) {
+		if (needles.some((needle) => normalized.includes(needle))) return hint;
+	}
+	return "OTHER";
+}
+
+export class BrowserUseCdpClosedError extends Error {
+	constructor(
+		readonly code: number,
+		readonly reasonHint: CdpCloseReasonHint,
+	) {
+		super("Browser Use CDP connection closed");
+		this.name = "BrowserUseCdpClosedError";
+	}
+
+	/**
+	 * A policy violation or an authentication reason will not succeed on a
+	 * second connection, so those closures end the run instead of retrying.
+	 */
+	get retryable(): boolean {
+		return this.code !== 1008 && this.reasonHint !== "AUTH";
+	}
+}
+
+export class BrowserUseCdpUpgradeRejectedError extends Error {
+	constructor(readonly status: number) {
+		super("Browser Use CDP connection failed");
+		this.name = "BrowserUseCdpUpgradeRejectedError";
+	}
+
+	get retryable(): boolean {
+		return this.status === 408 || this.status === 429 || this.status >= 500;
 	}
 }
 
