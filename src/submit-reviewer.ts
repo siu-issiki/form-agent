@@ -47,7 +47,7 @@ export const SUBMIT_REVIEW_INSTRUCTIONS = [
 	"Deny with WRONG_FORM when the submit element does not belong to the inquiry form that holds the filled values, or the form is a login, purchase, or account form.",
 	"Deny with UNCLEAR when you cannot verify the above from the provided evidence.",
 	"Allow with INPUTS_MATCH only when all checks pass. When in doubt, deny.",
-	"reason: one short sentence, no more than 500 characters, no page text quotation longer than 100 characters.",
+	"reason: one short sentence that names the field or the restriction behind the decision. Paraphrase page text instead of quoting it.",
 ].join(" ");
 
 const SUBMIT_REVIEW_FORMAT = {
