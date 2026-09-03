@@ -1231,13 +1231,14 @@ describe("BrowserUseCdpDriver child target policy", () => {
 			harness.calls.some(
 				(call) =>
 					call.method === "Target.closeTarget" ||
-					call.method === "Target.detachFromTarget",
+					call.method === "Target.detachFromTarget" ||
+					call.method === "Page.navigate",
 			),
 		).toBe(false);
 		expect(failures).toEqual([]);
 	});
 
-	test("detaches an iframe target outside the verification allowlist", async () => {
+	test("stops an iframe target outside the verification allowlist", async () => {
 		const harness = relatedTargetHarness();
 		const failures: Error[] = [];
 		let frameCount = 0;
@@ -1252,45 +1253,58 @@ describe("BrowserUseCdpDriver child target policy", () => {
 				},
 			},
 		);
-		for (const [targetId, url] of [
-			["frame-1", "https://evil.example/recaptcha/api2/anchor"],
-			["frame-2", "https://www.google.com.evil.example/recaptcha/api2/anchor"],
-			["frame-3", "https://www.google.com/search"],
-		] as const) {
-			harness.emit(
-				"Target.attachedToTarget",
-				{
-					sessionId: `${targetId}-session`,
-					targetInfo: { targetId, type: "iframe", url },
-					waitingForDebugger: true,
-				},
-				"primary",
-			);
+		const captured = captureLogs();
+		try {
+			for (const [targetId, url] of [
+				["frame-1", "https://evil.example/recaptcha/api2/anchor"],
+				[
+					"frame-2",
+					"https://www.google.com.evil.example/recaptcha/api2/anchor",
+				],
+				["frame-3", "https://www.google.com/search"],
+			] as const) {
+				harness.emit(
+					"Target.attachedToTarget",
+					{
+						sessionId: `${targetId}-session`,
+						targetInfo: { targetId, type: "iframe", url },
+						waitingForDebugger: true,
+					},
+					"primary",
+				);
+			}
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		} finally {
+			captured.restore();
 		}
-		await new Promise((resolve) => setTimeout(resolve, 0));
 
-		expect(harness.calls.slice(1)).toEqual([
-			{
-				method: "Target.detachFromTarget",
-				params: { sessionId: "frame-1-session" },
-				sessionId: undefined,
-			},
-			{
-				method: "Target.detachFromTarget",
-				params: { sessionId: "frame-2-session" },
-				sessionId: undefined,
-			},
-			{
-				method: "Target.detachFromTarget",
-				params: { sessionId: "frame-3-session" },
-				sessionId: undefined,
-			},
-		]);
+		expect(logEvents(captured.logs)).toEqual(
+			Array.from({ length: 3 }, () => ({
+				event: "browser_verification_frame_stopped",
+				reason: "NOT_ALLOWLISTED",
+			})),
+		);
+
+		// Every frame is emptied and released before its session is dropped, and
+		// none of them is closed.
+		for (const targetId of ["frame-1", "frame-2", "frame-3"]) {
+			expect(frameCommands(harness.calls, `${targetId}-session`)).toEqual([
+				"Page.navigate",
+				"Runtime.runIfWaitingForDebugger",
+				"Target.detachFromTarget",
+			]);
+		}
+		expect(
+			harness.calls.some((call) => call.method === "Target.closeTarget"),
+		).toBe(false);
+		expect(
+			harness.calls.find((call) => call.method === "Page.navigate")?.params,
+		).toEqual({ url: "about:blank" });
 		expect(frameCount).toBe(0);
 		expect(failures).toEqual([]);
 	});
 
-	test("detaches an allowlisted iframe target that was not paused", async () => {
+	test("keeps an unpaused allowlisted iframe under the restrictions", async () => {
 		const harness = relatedTargetHarness();
 		const failures: Error[] = [];
 		let frameCount = 0;
@@ -1320,12 +1334,13 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		);
 		await new Promise((resolve) => setTimeout(resolve, 0));
 
-		expect(harness.calls.slice(1)).toEqual([
-			{
-				method: "Target.detachFromTarget",
-				params: { sessionId: "widget-session" },
-				sessionId: undefined,
-			},
+		// The frame is already running, so it is put under the restrictions rather
+		// than released, and it is neither counted nor closed.
+		expect(frameCommands(harness.calls, "widget-session")).toEqual([
+			"Fetch.enable",
+			"Target.setAutoAttach",
+			"Page.enable",
+			"Page.addScriptToEvaluateOnNewDocument",
 		]);
 		expect(frameCount).toBe(0);
 		expect(failures.map((error) => error.message)).toEqual([
@@ -1333,26 +1348,14 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		]);
 	});
 
-	test("detaches the widget iframe when request interception cannot be installed", async () => {
-		const harness = relatedTargetHarness({
-			"Fetch.enable": new BrowserUseCdpCommandError(
-				"Fetch.enable",
-				-32000,
-				"NOT_ALLOWED",
-			),
-		});
+	test("stops an unpaused iframe target the restrictions do not cover", async () => {
+		const harness = relatedTargetHarness(
+			failFrameCommand("Target.setAutoAttach", "METHOD_NOT_FOUND"),
+		);
 		const failures: Error[] = [];
-		let frameCount = 0;
 
-		await denyRelatedBrowserTargets(
-			harness.connection,
-			"primary",
-			(error) => failures.push(error),
-			{
-				onVerificationFrame: () => {
-					frameCount += 1;
-				},
-			},
+		await denyRelatedBrowserTargets(harness.connection, "primary", (error) =>
+			failures.push(error),
 		);
 		const captured = captureLogs();
 		try {
@@ -1365,7 +1368,7 @@ describe("BrowserUseCdpDriver child target policy", () => {
 						type: "iframe",
 						url: "https://www.google.com/recaptcha/api2/anchor?k=key",
 					},
-					waitingForDebugger: true,
+					waitingForDebugger: false,
 				},
 				"primary",
 			);
@@ -1374,40 +1377,131 @@ describe("BrowserUseCdpDriver child target policy", () => {
 			captured.restore();
 		}
 
-		expect(harness.calls.slice(1)).toEqual([
-			{
-				method: "Fetch.enable",
-				params: { patterns: [{ urlPattern: "*" }] },
-				sessionId: "widget-session",
-			},
-			{
-				method: "Target.detachFromTarget",
-				params: { sessionId: "widget-session" },
-				sessionId: undefined,
-			},
+		// Nothing is released: the frame was never paused, so the stop is the
+		// empty navigation and the detach.
+		expect(frameCommands(harness.calls, "widget-session")).toEqual([
+			"Fetch.enable",
+			"Target.setAutoAttach",
+			"Page.navigate",
+			"Target.detachFromTarget",
 		]);
-		expect(
-			harness.calls.some((call) => call.method === "Target.closeTarget"),
-		).toBe(false);
 		expect(logEvents(captured.logs)).toEqual([
 			{
 				event: "browser_verification_frame_restrict_failed",
-				method: "Fetch.enable",
-				kind: "NOT_ALLOWED",
+				method: "Target.setAutoAttach",
+				kind: "METHOD_NOT_FOUND",
 			},
+			{ event: "browser_verification_frame_stopped", reason: "NOT_PAUSED" },
 		]);
-		expect(frameCount).toBe(0);
-		expect(failures).toEqual([]);
+		expect(failures.map((error) => error.message)).toEqual([
+			"A related browser target was not paused",
+		]);
 	});
 
-	test("keeps the widget iframe when only the escape blocker cannot be installed", async () => {
-		const harness = relatedTargetHarness({
-			"Page.addScriptToEvaluateOnNewDocument": new BrowserUseCdpCommandError(
-				"Page.addScriptToEvaluateOnNewDocument",
-				-32601,
-				"METHOD_NOT_FOUND",
-			),
-		});
+	test("stops the widget iframe when a required restriction cannot be installed", async () => {
+		for (const [method, kind] of [
+			["Fetch.enable", "NOT_ALLOWED"],
+			["Target.setAutoAttach", "METHOD_NOT_FOUND"],
+			["Page.addScriptToEvaluateOnNewDocument", "METHOD_NOT_FOUND"],
+		] as const) {
+			const harness = relatedTargetHarness(failFrameCommand(method, kind));
+			const failures: Error[] = [];
+			let frameCount = 0;
+			let requestCount = 0;
+
+			await denyRelatedBrowserTargets(
+				harness.connection,
+				"primary",
+				(error) => failures.push(error),
+				{
+					onVerificationFrame: () => {
+						frameCount += 1;
+					},
+					onVerificationRequest: () => {
+						requestCount += 1;
+					},
+				},
+			);
+			const captured = captureLogs();
+			try {
+				harness.emit(
+					"Target.attachedToTarget",
+					{
+						sessionId: "widget-session",
+						targetInfo: {
+							targetId: "widget-1",
+							type: "iframe",
+							url: "https://www.google.com/recaptcha/api2/anchor?k=key",
+						},
+						waitingForDebugger: true,
+					},
+					"primary",
+				);
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			} finally {
+				captured.restore();
+			}
+
+			// The empty navigation comes before the release, so the widget document
+			// is replaced rather than let go, and the detach is last.
+			const commands = frameCommands(harness.calls, "widget-session");
+			expect(commands.slice(-3)).toEqual([
+				"Page.navigate",
+				"Runtime.runIfWaitingForDebugger",
+				"Target.detachFromTarget",
+			]);
+			expect(commands).toContain(method);
+			expect(commands).not.toContain("Target.closeTarget");
+			expect(logEvents(captured.logs)).toEqual([
+				{
+					event: "browser_verification_frame_restrict_failed",
+					method,
+					kind,
+				},
+				{
+					event: "browser_verification_frame_stopped",
+					reason: "RESTRICTION_FAILED",
+				},
+			]);
+
+			// A request the stopped frame still makes is failed even though its URL
+			// is on the allowlist.
+			harness.emit(
+				"Fetch.requestPaused",
+				{
+					requestId: "late-1",
+					resourceType: "Script",
+					request: {
+						url: "https://www.gstatic.com/recaptcha/x.js",
+						method: "GET",
+					},
+				},
+				"widget-session",
+			);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			expect(
+				harness.calls.filter((call) => call.method === "Fetch.continueRequest"),
+			).toEqual([]);
+			expect(
+				harness.calls.filter((call) => call.method === "Fetch.failRequest"),
+			).toEqual([
+				{
+					method: "Fetch.failRequest",
+					params: { requestId: "late-1", errorReason: "BlockedByClient" },
+					sessionId: "widget-session",
+				},
+			]);
+			expect(requestCount).toBe(0);
+			expect(frameCount).toBe(0);
+			expect(failures).toEqual([]);
+		}
+	});
+
+	test("keeps the widget iframe when only Page.enable fails", async () => {
+		const harness = relatedTargetHarness(
+			failFrameCommand("Page.enable", "METHOD_NOT_FOUND"),
+		);
 		const failures: Error[] = [];
 		let frameCount = 0;
 
@@ -1441,8 +1535,7 @@ describe("BrowserUseCdpDriver child target policy", () => {
 			captured.restore();
 		}
 
-		expect(harness.calls.map((call) => call.method)).toEqual([
-			"Target.setAutoAttach",
+		expect(frameCommands(harness.calls, "widget-session")).toEqual([
 			"Fetch.enable",
 			"Target.setAutoAttach",
 			"Page.enable",
@@ -1452,7 +1545,7 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		expect(logEvents(captured.logs)).toEqual([
 			{
 				event: "browser_verification_frame_restrict_failed",
-				method: "Page.addScriptToEvaluateOnNewDocument",
+				method: "Page.enable",
 				kind: "METHOD_NOT_FOUND",
 			},
 		]);
@@ -2164,13 +2257,50 @@ function logEvents(logs: readonly string[]): unknown[] {
 }
 
 /**
+ * The commands one frame session received, in order. A detach is addressed to
+ * the browser session and names the frame in its params, so it is counted for
+ * the frame it detaches rather than for the session it was sent on.
+ */
+function frameCommands(
+	calls: ReadonlyArray<{
+		method: string;
+		params: Record<string, unknown>;
+		sessionId?: string;
+	}>,
+	sessionId: string,
+): string[] {
+	return calls
+		.filter(
+			(call) =>
+				call.sessionId === sessionId ||
+				(call.sessionId === undefined && call.params.sessionId === sessionId),
+		)
+		.map((call) => call.method);
+}
+
+/**
+ * Fails one method on one session with a CDP command error, the way an iframe
+ * session rejects a command it does not implement. Scoped to a session because
+ * the policy sends `Target.setAutoAttach` to the page's session as well.
+ */
+function failFrameCommand(
+	method: string,
+	kind: CdpCommandErrorKind,
+	sessionId = "widget-session",
+): (sentMethod: string, sentSessionId?: string) => Error | null {
+	return (sentMethod, sentSessionId) =>
+		sentMethod === method && sentSessionId === sessionId
+			? new BrowserUseCdpCommandError(method, -32000, kind)
+			: null;
+}
+
+/**
  * A connection stub for the related-target policy that records the session each
  * command was sent on and keeps every listener the policy registers. `fail`
- * names the methods that answer with a CDP command error, the way an iframe
- * session rejects a command it does not implement.
+ * answers with an error for the commands that should not land.
  */
 function relatedTargetHarness(
-	fail: Readonly<Record<string, BrowserUseCdpCommandError>> = {},
+	fail: (method: string, sessionId?: string) => Error | null = () => null,
 ): {
 	calls: Array<{
 		method: string;
@@ -2219,7 +2349,7 @@ function relatedTargetHarness(
 				sessionId?: string,
 			): Promise<TResult> {
 				calls.push({ method, params, sessionId });
-				const failure = fail[method];
+				const failure = fail(method, sessionId);
 				if (failure) throw failure;
 				return { success: true } as TResult;
 			},

@@ -177,7 +177,7 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 - モデルが呼ぶ通常の`navigate`は従来どおり 10 秒・再試行なしとする。サイトは既に暖まっており、そこで固まるのはモデルが判断すべき事象だからである。
 - 上限は bootstrap 全体で最大 110 秒である。1 回の試行は `Page.navigate`（CDP command timeout 15 秒）と readyState 待ちからなり、後者は締切の直前に開始した `document.readyState` の評価が同じ command timeout まで伸びうるため、25 秒ではなく最大 40 秒を見込む。これを 2 回行う。
 - readyState の評価が接続断（`Browser Use CDP connection is closed` / `... connection closed` / `... command could not be sent`）で失敗した場合は待ち続けず、その場で throw する。abort 時は coordinator の`close()`が bootstrap 中の driver（`#pendingDriver`）を閉じるため、待ちは即座に終わり、termination grace 30 秒の内側で session の stop が走る。
-- popup、Worker、Service Worker、WebSocket 等の迂回経路を遮断する。ただし固定allowlistのhostにある `iframe` target だけは、同じ制限を適用したうえで開いたままにする。iframe target の拒否は `Target.closeTarget` ではなく `Target.detachFromTarget` で行う（「検証サービスのiframe」を参照）。
+- popup、Worker、Service Worker、WebSocket 等の迂回経路を遮断する。ただし固定allowlistのhostにある `iframe` target だけは、同じ制限を適用したうえで開いたままにする。制限をすべて掛けられなかった iframe target は `Target.closeTarget` ではなく、`about:blank` への遷移と `Target.detachFromTarget` で中身を止める（「検証サービスのiframe」を参照）。
 - CDP の `DOM.getDocument` を `pierce: true` で取得し、通常 DOM と open / closed Shadow DOM を Worker 側で走査する。
 - 観測した同一ページ・許可hostのリンクを最大20件までモデルへ返し、サイト内別ページのフォーム探索に利用する。
 - top documentとiframe documentを同じDOM探索対象とし、送信完了文言も各document bodyで確認する。
@@ -412,24 +412,37 @@ reCAPTCHA / hCaptcha / Turnstile の widget 本体は iframe で読み込まれ�
 
 そこで、`type` が `iframe` で `targetInfo.url` が固定allowlist（scheme は https、host は完全一致、`hcaptcha.com` のみサブドメイン可、`/recaptcha/` 系はパス前方一致）に一致する target だけを閉じずに残す。残す target には、debugger の一時停止（`waitForDebuggerOnStart`）を解除する前に、ページ本体と同じ制限を適用する。
 
+ルールは「制限がすべて入った iframe だけを実行させる。入らなかった iframe は中身を止める」である。必須の制限は次の3つで、1つでも欠けると request policy を迂回する経路が残るため、3つ揃わない iframe は実行させない。
+
 - `Fetch.enable`（全パターン）を掛け、その session の `Fetch.requestPaused` は固定allowlistに一致するものだけ continue し、それ以外はすべて `failRequest` する。iframe 内の `Document` request も allowlist に一致する場合だけ通す。
-- `Target.setAutoAttach` を同じ設定で掛け、iframe から派生する target（Worker、popup、入れ子の iframe）も同じ判定を通す。
+- `Target.setAutoAttach` を同じ設定で掛け、iframe から派生する target（Worker、popup、入れ子の OOPIF）も同じ判定を通す。これが無いと入れ子の OOPIF が無制限で走る。
 - ページ本体と同じ escape blocker を `Page.addScriptToEvaluateOnNewDocument` で widget のスクリプトより先に評価し、`Fetch` で捕捉できない `WebSocket` / `WebTransport` / `RTCPeerConnection` / `Worker` / `window.open` を iframe 内でも塞ぐ。
-- 各コマンドは個別に送り、失敗しても致命的にしない。iframe の session では実装されていないコマンドがあり得るためである。ただし `Fetch.enable` の失敗だけは致命的とし、その場合は解除しない。allowlist 判定は `Fetch` の傍受に依存しており、傍受なしで走らせると iframe の通信が無制限になるためである。`Runtime.runIfWaitingForDebugger` は常に最後に送る。失敗したコマンドは `browser_verification_frame_restrict_failed` として1行出力し、固定のコマンド名と `kind` だけを出す。
 
-**iframe target は `Target.closeTarget` しない。** 別プロセス iframe（OOPIF）の target を閉じると Chrome は所有ページ（タブ）ごと閉じるため、run が使っているメインページの session まで失われる。2026-09-02 の実サイト dry-run では reCAPTCHA を使う9サイトすべてで `observe` 段階の `CDP_COMMAND_FAILED` が発生し、CDP エラーは -32001 `Session with given id not found`、`browser_verification_frames` は常に0件だった。制限付き再開が毎回失敗して `Target.closeTarget` に落ち、メインページを閉じていたためである。
+各コマンドは個別に送り、必須の3つはいずれの失敗も許容せず停止処理へ進む。`Page.enable` はイベントを有効化するだけで制限が依存していないため非致命とする（試みはする）。`Runtime.runIfWaitingForDebugger` は常に最後に送り、制限が揃う前に何も実行されないようにする。失敗したコマンドは `browser_verification_frame_restrict_failed` として1行出力し、固定のコマンド名と `kind` だけを出す。
 
-そのため iframe target の拒否は `Target.detachFromTarget({ sessionId })` で行う。`waitForDebuggerOnStart` で一時停止したままの target を切り離すと、そのフレームは実行されない（widget が描画されないだけ）でページは生き続ける。次の場合に切り離す。
+**iframe target は `Target.closeTarget` しない。** 別プロセス iframe（OOPIF）の target を閉じると Chrome は所有ページ（タブ）ごと閉じるため、run が使っているメインページの session まで失われる。2026-09-02 の実サイト dry-run では reCAPTCHA を使う9サイトすべてで `observe` 段階の `CDP_COMMAND_FAILED` が発生し、CDP エラーは -32001 `Session with given id not found`、`browser_verification_frames` は常に0件だった。制限付き再開が毎回失敗して `Target.closeTarget` に落ち、メインページを閉じていたためである。`type` が `page` などの新規ウィンドウ / popup / Worker の target は所有ページを持たないため、従来どおり `Target.closeTarget` する。
 
-- `Fetch.enable` が失敗し制限を掛けきれなかった allowlist の iframe。widget は従来と同じく接続に失敗する。
-- allowlist 外の iframe。Document 遮断で本来到達しないが防御的に切り離す。
-- `waitingForDebugger` が false の iframe。制限を掛ける前に走っているため、policy failure も記録する。
+**切り離しは停止ではない。** `waitForDebuggerOnStart` の一時停止は browser プロセス側が frame の navigation を保留しているものであり、Chrome は保留を持っていた session が消えると保留を解放する。したがって `Target.detachFromTarget` だけでは frame は「実行されないまま」にならず、制限なしで走り出す。そこで停止処理は次の順で行う。
 
-切り離しの失敗は policy failure にしない。切り離せなかった target は attach されたまま一時停止しており、実行されない点は同じだからである。allowlist の iframe に制限を掛けきれなかった場合も policy failure にしない。policy failure は driver の以降の全 CDP コマンドを reject させるため、フレームを実行させずに済んでいる状況で run 全体を落とす必要がないからである。`type` が `page` などの新規ウィンドウ / popup / Worker の target は所有ページを持たないため、従来どおり `Target.closeTarget` する。
+1. その iframe session へ `Page.navigate({ url: "about:blank" })` を送る。frame target の `Page.navigate` は browser プロセスが処理するため、当該 frame の一時停止した renderer を待たない。かつ保留中の navigation を置き換えるため、widget の document は commit されない。
+2. navigate が受理された場合だけ `Runtime.runIfWaitingForDebugger` を送る。順序が逆だと widget がそのまま走り、navigate が拒否された後に解除しても同じく走るためである。解除後に実行されるのは空ページだけである。
+3. 最後に `Target.detachFromTarget({ sessionId })` を送る。成否は問わない。
+
+停止した session は以後 continue しない。停止マークを付けた session の `Fetch.requestPaused` は allowlist に一致しても `failRequest` する。停止処理中に飛んできた request で通信させないためである。停止は `browser_verification_frame_stopped` として1行出力し、`reason` は固定値 `RESTRICTION_FAILED` / `NOT_PAUSED` / `NOT_ALLOWLISTED` のみとする。
+
+停止処理を行うのは次の場合である。
+
+- 必須の制限が1つでも入らなかった allowlist の iframe（`RESTRICTION_FAILED`）。widget は従来と同じく接続に失敗する。
+- allowlist 外の iframe（`NOT_ALLOWLISTED`）。トップフレーム以外の `Document` を allowlist 外では通さないため本来到達しないが、防御的に停止する。
+- `waitingForDebugger` が false の iframe で、必須の制限が1つでも入らなかった場合（`NOT_PAUSED`）。既に走り出している iframe は、まず必須の制限を試み、3つすべて成功した場合は解除コマンドを送らずそのまま監視下に置く。いずれの場合も policy failure を記録するため、この run は失敗する。`Fetch.enable` が後から入っても既に発行された request には掛からないためである。
+
+policy failure は driver の以降の全 CDP コマンドを reject させ run を落とす。`waitingForDebugger` が false の場合は従来どおり記録する。一方、paused な iframe に制限を掛けきれず停止した場合は policy failure にしない。frame を実行させずに済んでおり、run 全体を落とす必要がないためである。
+
+残存リスクは2つある。1つは `about:blank` への navigate 自体が拒否された場合で、その後の detach で元の document が走り得る。この経路では解除コマンドを送らないため、Chrome が保留を解放するかどうかに依存する。もう1つは `waitingForDebugger` が false の iframe で、制限適用前に発行された request と、現在の document に対して escape blocker が評価されない点である（`Page.addScriptToEvaluateOnNewDocument` は次の document から効く）。いずれも policy failure により run が失敗する経路である。上記の停止処理の順序は Chrome / CDP の構造から導いたもので、実 OOPIF での実測は未実施である。
 
 信頼境界は次のとおり維持される。iframe は cross-origin なので親ページの DOM を読めず、入力値も送信先も見えない。iframe 内の通信は固定allowlistに限定される。iframe が `window.top.location` で親フレームを遷移させようとしても、それはトップフレームの `Document` request なので既存の遮断で止まる。残存リスクは従来と同じく検証サービスへ送られる telemetry であり、widget の動作に必要なため許容する。
 
-開いたままにした target の件数は run 終了時に `browser_verification_frames` として1行だけ出力し、0件のときは出力しない。iframe 内で通した request は `browser_verification_requests` の件数に含める。どちらも URL や値は出さない。
+開いたままにした target の件数は run 終了時に `browser_verification_frames` として1行だけ出力し、0件のときは出力しない。制限がすべて入り解除まで到達した frame だけを数える。iframe 内で通した request は `browser_verification_requests` の件数に含める。どちらも URL や値は出さない。
 
 `submitting` 中に Worker が停止し、結果保存まで到達しなかった場合は自動再送せず、人間の確認対象にする。人手照合、DLQ確認、緊急停止、安全な再開のrunbookは [operations.md](operations.md) に定義済みである。照合用の専用 API / UI は未実装である。
 
