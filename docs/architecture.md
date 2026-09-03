@@ -23,7 +23,7 @@
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値を検証。一覧・キャンセルは未実装 |
 | Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
 | 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ、値を含まないagent tool診断イベント。送信前・送信後・禁止判定時のスクリーンショット証跡を Cloudflare R2 へ保存し、D1 の `events` へ sha256 付きで記録する |
-| 並列検証 | 部分実施 | 2026-09-03 の 5 並列 19 シナリオで 15 件合格。接続段階の close code 1011 / `LIMIT` が 16 件発生し、原因はジョブ終了後も session を停止していなかったことであった。consumer は `max_concurrency: 5` のままとし、session の明示停止を入れて再計測する |
+| 並列検証 | 部分実施 | 2026-09-03 の 5 並列 19 シナリオで、session 明示停止の前後とも 15 件合格。明示停止後は CDP 切断（1011 / `LIMIT`）と `exceededCpu` が 0 件になり、18 session すべてを停止できたが、session 作成 API が 429 を 15 回返し 2 件が失敗した。実際の同時 session 上限は 5 未満と判断し、consumer を `max_concurrency: 3` にする |
 
 本書では、実装済みの構成を現在形で記述し、未実装または未検証の内容は「現在の制約」「PoC 計画」「残タスク・未決事項」に明示する。
 
@@ -380,9 +380,11 @@ PoC はまず 1 並列の production で開始し、管理下テストサイト�
 
 2026-09-03 に 5 並列で管理下テストシステムの 12 シナリオを実行し、8 件が合格した。残りのうち 3 件は Worker 診断が stage `driver_connect`、code `CDP_CONNECTION_CLOSED` で、10 秒間に連続して発生した。発生時点で BrowserUse 側に既存 session が 3〜4 件あり、直前 2 分 40 秒で 9 session を作成していた。前後の接続は成功しているため、BrowserUse の同時 session 上限（プラン上 10）または session 作成レートの上限に達したと推定するが、当時は WebSocket の close code / reason を記録していなかったため原因は未確定である。
 
-同日に 19 シナリオを同時登録して 5 並列で再計測し、15 件が合格した。close code 1011、`wasClean`、reason 分類 `LIMIT` の切断が 16 件、接続再試行が 15 回発生し、`native-get` は 10 / 20 / 30 秒の再接続 3 回でも解けなかった。Worker 側では `outcome: exceededCpu` による強制終了が 1 件あった。原因はジョブ終了後に session を停止しておらず、CDP 切断後も session が 15 分の寿命まで残って同時 session 上限を食いつぶしていたことである。REST API v4 での明示的な作成・停止を入れたため、deploy 後に同じ 19 シナリオ 5 並列を再計測する。
+同日に 19 シナリオを同時登録して 5 並列で再計測し、15 件が合格した。close code 1011、`wasClean`、reason 分類 `LIMIT` の切断が 16 件、接続再試行が 15 回発生し、`native-get` は 10 / 20 / 30 秒の再接続 3 回でも解けなかった。Worker 側では `outcome: exceededCpu` による強制終了が 1 件あった。原因はジョブ終了後に session を停止しておらず、CDP 切断後も session が 15 分の寿命まで残って同時 session 上限を食いつぶしていたことである。REST API v4 での明示的な作成・停止を入れて、同じ 19 シナリオを 5 並列で再計測した。
 
-consumer は `max_concurrency: 5` とする。5 並列の管理下計測で接続段階の切断が観測されたため、接続再試行（10 / 20 / 30 秒、最大 3 回）を緩和策として入れた。再試行でも接続できない場合は再試行可能エラーとして Queue の retry / DLQ へ進む。deploy 後の再計測では `browser_use_connect_retry`、`browser_use_cdp_closed`、`browser_use_session_stopped`、`browser_use_session_reclaimed` の件数を確認する。BrowserUse のプラン上限（10）まで引き上げるのは、明示停止後の同時 session 数が想定どおりに戻ることを確認してからとする。
+明示停止後の再計測では 15 件が合格し、18 session すべてを平均約 100 ms で停止できた。CDP 切断（1011 / `LIMIT`）と `exceededCpu` は 0 件になった。一方で session 作成 API が `429 Too many concurrent active sessions` を 15 回返し、10 / 20 / 30 秒の再試行で 3 件は回復したが、`sample-request-only` と `open-shadow-dom` の 2 件は 60 秒待っても回復せず失敗した。回収ログの一致件数は常に 0 で、残骸ではなく同時実行中の session が上限を消費していた。session を毎回停止しても 5 並列で上限に達することから、この account の実際の同時 session 上限は 5 未満（Free プランの 3 と推定）である。残る不合格は、途中の CDP コマンド失敗で止まった `multi-step`（受信 0）と、禁止フォームの submit を信頼済み handler がブロックした後にモデルが `finish_prohibited` ではなく `finish_failed` を選んだ `external-iframe-secondary`（受信 0、3 回中 2 回再現）である。
+
+consumer は `max_concurrency: 3` とする。5 並列では session を毎回停止しても作成 API が 429 を返したため、推定される同時 session 上限（3）に合わせた。接続再試行（10 / 20 / 30 秒、最大 3 回）は緩和策として維持する。再試行でも接続できない場合は再試行可能エラーとして Queue の retry / DLQ へ進む。deploy 後の再計測では `browser_use_connect_retry`、`browser_use_cdp_closed`、`browser_use_session_stopped`、`browser_use_session_reclaimed` の件数を確認する。回収ログには active session の全件数と `metadata.jobId` 付きの件数を記録し、上限を消費しているのがこの deployment か外部かを切り分ける。並列数を引き上げるのは、BrowserUse のプランと同時 session 上限をダッシュボードで確認し、必要なら Pay as you go（同時 10）へ変更してからとする。
 
 再接続は送信前の接続確立に限定するため、フォームへの副作用は発生しない。
 
@@ -443,7 +445,7 @@ consumer は `max_concurrency: 5` とする。5 並列の管理下計測で接�
 ### フェーズ 2: 5 並列
 
 - [ ] 送信なし5並列で二重実行、rate limit、BrowserUse session、原価を計測する。
-- [x] `max_concurrency`を観測結果に基づいて1から5へ引き上げる。
+- [x] `max_concurrency`を観測結果に基づいて1から5へ引き上げ、429 の観測により 3 へ戻す。
 
 ### フェーズ 3: 20 並列
 
@@ -478,7 +480,9 @@ consumer は `max_concurrency: 5` とする。5 並列の管理下計測で接�
 - Provider abstraction と fallback。
 - 外部 API E2E は GitHub Actions の通常 CI に含めず、手動実行に限定する。
 - Worker の `outcome: exceededCpu` の原因特定。報告 `cpuTime` 165 ms に対して強制終了しているため、CPU 上限の引き上げでは説明できない。Workers Logs の保持期間が 7 日であるため、再発時は 7 日以内に調査する。
-- 5 並列時に `multi-step` と `external-iframe` で発生する CDP 失敗。受信 1 件で `uncertain` に倒れた例があり、明示停止後の再計測で再現するかを確認する。
+- 5 並列時に `multi-step` で発生する途中の CDP コマンド失敗（明示停止後も再現、受信 0）。`external-iframe` の送信後読み取り失敗は明示停止後の再計測では再現しなかった。
+- 禁止フォームの submit を信頼済み handler がブロックした後、モデルが `finish_prohibited` ではなく `finish_failed` を選ぶ（`external-iframe-secondary`、3 回中 2 回）。ブロック時の tool エラーを `SUBMIT_PROHIBITED` として分け、observe の `prohibitedReasonCodes` で `finish_prohibited` を呼ぶ guidance を返す。
+- BrowserUse のプランと同時 session 上限をダッシュボードで確認する。3 並列で 429 が消えることを 19 シナリオで確認する。
 - R2 アップロード後・D1 記録前に Worker が停止した場合の孤児オブジェクトは検出できない。intent イベントの先行記録または R2 ライフサイクルルールで対処する。
 - 送信前レビューの残存リスク対応: `dom` activation で照合と `requestSubmit` を同一 JS 実行内で行い、`mouse` / `enter` は activation 直前に再照合する。snapshot に禁止文言・label・option・action / method を含める。修正の証明を変更したコントロールの value / checked 差分に限定する。form 再探索の切り詰めを検出して fail-closed にする。いずれも管理下テストシステムでの E2E と併せて実施する。
 
