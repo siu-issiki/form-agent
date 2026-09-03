@@ -4,10 +4,13 @@ import { hasNewSubmissionConfirmation } from "../src/browser-submit-confirmation
 import {
 	assertCdpMessageWithinLimit,
 	BrowserUseCdpClosedError,
+	BrowserUseCdpCommandError,
 	BrowserUseCdpConnection,
 	BrowserUseCdpPayloadTooLargeError,
 	BrowserUseCdpUpgradeRejectedError,
+	type CdpCommandErrorKind,
 	classifyCdpCloseReason,
+	classifyCdpCommandError,
 	MAX_CDP_MESSAGE_CHARACTERS,
 } from "../src/browser-use-cdp";
 import {
@@ -41,6 +44,7 @@ import {
 	isAuthorizedSubmissionRedirect,
 	isExpectedNavigationDocumentRequest,
 	isPayloadIndependentClickTarget,
+	isRetryableClickPreparationError,
 	READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
 	readPageText,
 	readSubmissionConfirmation,
@@ -1979,6 +1983,134 @@ class FakeWebSocket {
 	}
 }
 
+describe("CDP command error classification", () => {
+	test("maps the fixed provider messages onto a kind", () => {
+		expect(classifyCdpCommandError("Could not find node with given id")).toBe(
+			"NODE_NOT_FOUND",
+		);
+		expect(classifyCdpCommandError("No node with given id found")).toBe(
+			"NODE_NOT_FOUND",
+		);
+		expect(
+			classifyCdpCommandError(
+				"Node with given id does not belong to the document",
+			),
+		).toBe("NODE_NOT_FOUND");
+		expect(classifyCdpCommandError("Node is not attached to the DOM")).toBe(
+			"NODE_DETACHED",
+		);
+		expect(classifyCdpCommandError("Node is detached from document")).toBe(
+			"NODE_DETACHED",
+		);
+		expect(classifyCdpCommandError("Could not compute box model.")).toBe(
+			"NO_BOX_MODEL",
+		);
+		expect(classifyCdpCommandError("Node does not have a layout object")).toBe(
+			"NO_BOX_MODEL",
+		);
+		expect(classifyCdpCommandError("Element is not focusable")).toBe(
+			"NOT_FOCUSABLE",
+		);
+		expect(
+			classifyCdpCommandError("Cannot find context with specified id"),
+		).toBe("NO_EXECUTION_CONTEXT");
+		expect(classifyCdpCommandError("Execution context was destroyed.")).toBe(
+			"NO_EXECUTION_CONTEXT",
+		);
+	});
+
+	test("falls back to OTHER for an unknown or absent message", () => {
+		expect(classifyCdpCommandError("Internal error")).toBe("OTHER");
+		expect(classifyCdpCommandError("   ")).toBe("OTHER");
+		expect(classifyCdpCommandError(undefined)).toBe("OTHER");
+		expect(classifyCdpCommandError({ message: "Could not find node" })).toBe(
+			"OTHER",
+		);
+	});
+
+	test("retries only the click preparation kinds that a settling layout reports", () => {
+		const retryable = [
+			"NO_BOX_MODEL",
+			"NODE_NOT_FOUND",
+			"NODE_DETACHED",
+			"NO_EXECUTION_CONTEXT",
+		] as const;
+		for (const kind of retryable) {
+			expect(
+				isRetryableClickPreparationError(
+					new BrowserUseCdpCommandError("DOM.getBoxModel", -32000, kind),
+				),
+			).toBe(true);
+		}
+		expect(
+			isRetryableClickPreparationError(
+				new BrowserUseCdpCommandError("DOM.focus", -32000, "NOT_FOCUSABLE"),
+			),
+		).toBe(false);
+		expect(
+			isRetryableClickPreparationError(
+				new BrowserUseCdpCommandError("DOM.getBoxModel", null, "OTHER"),
+			),
+		).toBe(false);
+		expect(isRetryableClickPreparationError(new BrowserElementError())).toBe(
+			true,
+		);
+		expect(
+			isRetryableClickPreparationError(
+				new Error("Browser Use CDP command failed"),
+			),
+		).toBe(false);
+	});
+});
+
+describe("BrowserUseCdpConnection command errors", () => {
+	test("names the failing method and classifies the provider message", async () => {
+		const webSocket = new FakeWebSocket();
+		const connection = await BrowserUseCdpConnection.connect(
+			"wss://connect.browser-use.com/session",
+			stubUpgradeFetch(webSocket),
+		);
+		const pending = connection.send("DOM.getBoxModel", { backendNodeId: 5 });
+		const sent = JSON.parse(webSocket.sent[0] ?? "{}") as { id: number };
+
+		webSocket.emit("message", {
+			data: JSON.stringify({
+				id: sent.id,
+				error: { code: -32000, message: "Could not compute box model." },
+			}),
+		});
+
+		const rejection = await pending.catch((error: unknown) => error);
+		expect(rejection).toBeInstanceOf(BrowserUseCdpCommandError);
+		const commandError = rejection as BrowserUseCdpCommandError;
+		expect(commandError.message).toBe("Browser Use CDP command failed");
+		expect(commandError.method).toBe("DOM.getBoxModel");
+		expect(commandError.code).toBe(-32000);
+		expect(commandError.kind).toBe("NO_BOX_MODEL");
+	});
+
+	test("keeps a missing code and an unreadable message reportable", async () => {
+		const webSocket = new FakeWebSocket();
+		const connection = await BrowserUseCdpConnection.connect(
+			"wss://connect.browser-use.com/session",
+			stubUpgradeFetch(webSocket),
+		);
+		const pending = connection.send("Input.dispatchMouseEvent");
+		const sent = JSON.parse(webSocket.sent[0] ?? "{}") as { id: number };
+
+		webSocket.emit("message", {
+			data: JSON.stringify({ id: sent.id, error: "rejected" }),
+		});
+
+		const rejection = await pending.catch((error: unknown) => error);
+		expect(rejection).toBeInstanceOf(BrowserUseCdpCommandError);
+		const commandError = rejection as BrowserUseCdpCommandError;
+		expect(commandError.method).toBe("Input.dispatchMouseEvent");
+		expect(commandError.code).toBeNull();
+		expect(commandError.kind).toBe("OTHER");
+	});
+});
+
 describe("BrowserUseCdpConnection close logging", () => {
 	test("records the close code, reason hint and pending command count", async () => {
 		const webSocket = new FakeWebSocket();
@@ -3129,6 +3261,38 @@ function cdpCommandFailed(): Error {
 	return new Error("Browser Use CDP command failed");
 }
 
+function cdpCommandError(
+	method: string,
+	kind: CdpCommandErrorKind,
+	code: number | null = -32000,
+): BrowserUseCdpCommandError {
+	return new BrowserUseCdpCommandError(method, code, kind);
+}
+
+/** Fails the named command for its first `failures` calls and then lets it through. */
+function failFirstCalls(
+	method: string,
+	failures: number,
+	error: () => Error,
+): (candidate: string) => Error | null {
+	let calls = 0;
+	return (candidate) => {
+		if (candidate !== method) return null;
+		calls += 1;
+		return calls <= failures ? error() : null;
+	};
+}
+
+function countSent(
+	connection: ScriptedCdpConnection,
+	method: string,
+	match: (params: Record<string, unknown>) => boolean = () => true,
+): number {
+	return connection.sent.filter(
+		(entry) => entry.method === method && match(entry.params),
+	).length;
+}
+
 function elementFixtureState(backendNodeId: number): Record<string, unknown> {
 	const base = {
 		ok: true,
@@ -3170,6 +3334,8 @@ class ScriptedCdpConnection {
 	fail:
 		| ((method: string, params: Record<string, unknown>) => Error | null)
 		| null = null;
+	respond: (method: string, params: Record<string, unknown>) => unknown =
+		scriptedCdpResponse;
 
 	send<TResult>(
 		method: string,
@@ -3178,7 +3344,7 @@ class ScriptedCdpConnection {
 		this.sent.push({ method, params });
 		const failure = this.fail?.(method, params);
 		if (failure) return Promise.reject(failure);
-		return Promise.resolve(scriptedCdpResponse(method, params) as TResult);
+		return Promise.resolve(this.respond(method, params) as TResult);
 	}
 
 	lastResponseCharacters(): number | undefined {
@@ -3387,5 +3553,167 @@ describe("BrowserUseCdpDriver element operation failures", () => {
 		expect(captured.warnings.map((entry) => JSON.parse(entry))).toEqual([
 			{ event: "browser_element_operation_failed", operation: "select" },
 		]);
+	});
+});
+
+describe("click preparation retries", () => {
+	test("repeats a click preparation that reports no box model and then clicks", async () => {
+		const { driver, connection } = await observedElementDriver();
+		connection.fail = failFirstCalls("DOM.getBoxModel", 2, () =>
+			cdpCommandError("DOM.getBoxModel", "NO_BOX_MODEL"),
+		);
+		const captured = captureLogs();
+
+		try {
+			await driver.clickNonSubmit(BUTTON_ELEMENT_ID);
+		} finally {
+			captured.restore();
+		}
+
+		expect(logEvents(captured.logs)).toEqual([
+			{
+				event: "browser_click_preparation_retry",
+				attempt: 1,
+				kind: "NO_BOX_MODEL",
+			},
+			{
+				event: "browser_click_preparation_retry",
+				attempt: 2,
+				kind: "NO_BOX_MODEL",
+			},
+		]);
+		expect(countSent(connection, "DOM.getBoxModel")).toBe(3);
+		expect(countSent(connection, "DOM.scrollIntoViewIfNeeded")).toBe(3);
+		expect(
+			countSent(
+				connection,
+				"Input.dispatchMouseEvent",
+				(params) => params.type === "mousePressed",
+			),
+		).toBe(1);
+		expect(
+			countSent(
+				connection,
+				"Input.dispatchMouseEvent",
+				(params) => params.type === "mouseReleased",
+			),
+		).toBe(1);
+	});
+
+	test("repeats a click preparation whose hit test lands on another node", async () => {
+		const { driver, connection } = await observedElementDriver();
+		let hitTests = 0;
+		connection.fail = null;
+		const scripted = connection.respond;
+		connection.respond = (method, params) => {
+			if (method !== "DOM.getNodeForLocation") return scripted(method, params);
+			hitTests += 1;
+			return hitTests <= 2
+				? { backendNodeId: 99 }
+				: { backendNodeId: BUTTON_BACKEND_NODE_ID };
+		};
+		const captured = captureLogs();
+
+		try {
+			await driver.clickNonSubmit(BUTTON_ELEMENT_ID);
+		} finally {
+			captured.restore();
+		}
+
+		expect(logEvents(captured.logs)).toEqual([
+			{
+				event: "browser_click_preparation_retry",
+				attempt: 1,
+				kind: "HIT_TEST",
+			},
+			{
+				event: "browser_click_preparation_retry",
+				attempt: 2,
+				kind: "HIT_TEST",
+			},
+		]);
+		expect(hitTests).toBe(3);
+	});
+
+	test("reports the failing method and kind once the retries are spent", async () => {
+		const { driver, connection } = await observedElementDriver();
+		connection.fail = (method) =>
+			method === "DOM.getBoxModel"
+				? cdpCommandError("DOM.getBoxModel", "NO_BOX_MODEL")
+				: null;
+		const capturedLogs = captureLogs();
+		const capturedWarnings = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await driver.clickNonSubmit(BUTTON_ELEMENT_ID);
+		} catch (error) {
+			caught = error;
+		} finally {
+			capturedWarnings.restore();
+			capturedLogs.restore();
+		}
+
+		expect(caught).toBeInstanceOf(BrowserElementOperationError);
+		expect((caught as BrowserElementOperationError).operation).toBe("click");
+		expect(countSent(connection, "DOM.getBoxModel")).toBe(3);
+		expect(logEvents(capturedLogs.logs)).toEqual([
+			{
+				event: "browser_click_preparation_retry",
+				attempt: 1,
+				kind: "NO_BOX_MODEL",
+			},
+			{
+				event: "browser_click_preparation_retry",
+				attempt: 2,
+				kind: "NO_BOX_MODEL",
+			},
+		]);
+		expect(logEvents(capturedWarnings.warnings)).toEqual([
+			{
+				event: "browser_element_operation_failed",
+				operation: "click",
+				method: "DOM.getBoxModel",
+				kind: "NO_BOX_MODEL",
+				code: -32000,
+			},
+		]);
+	});
+
+	test("does not repeat a click preparation whose failure describes the element", async () => {
+		// The kind, not the command it arrived on, decides whether another frame
+		// can help, so a non-retryable kind ends the operation on the first try.
+		for (const kind of ["NOT_FOCUSABLE", "OTHER"] as const) {
+			const { driver, connection } = await observedElementDriver();
+			connection.fail = (method) =>
+				method === "DOM.getBoxModel"
+					? cdpCommandError("DOM.getBoxModel", kind, null)
+					: null;
+			const capturedLogs = captureLogs();
+			const capturedWarnings = captureWarnings();
+
+			let caught: unknown;
+			try {
+				await driver.clickNonSubmit(BUTTON_ELEMENT_ID);
+			} catch (error) {
+				caught = error;
+			} finally {
+				capturedWarnings.restore();
+				capturedLogs.restore();
+			}
+
+			expect(caught).toBeInstanceOf(BrowserElementOperationError);
+			expect(countSent(connection, "DOM.getBoxModel")).toBe(1);
+			expect(capturedLogs.logs).toEqual([]);
+			expect(logEvents(capturedWarnings.warnings)).toEqual([
+				{
+					event: "browser_element_operation_failed",
+					operation: "click",
+					method: "DOM.getBoxModel",
+					kind,
+					code: null,
+				},
+			]);
+		}
 	});
 });

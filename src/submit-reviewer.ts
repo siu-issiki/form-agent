@@ -144,15 +144,36 @@ export class ResponsesSubmitReviewer implements SubmitReviewer {
 		}
 	}
 
+	/**
+	 * Reports the size of the request the review call is about to send, on every
+	 * exit. No duration: the encoding and serialization are synchronous, and the
+	 * Workers clock only advances at an I/O boundary, so the CPU they spend has
+	 * to be read from the runtime's own `cpuTime` instead.
+	 */
 	#body(input: SubmitReviewInput): string {
+		const imageBytes = input.screenshot?.bytes.byteLength ?? 0;
+		const record = (bodyBytes: number, withImage: boolean): void => {
+			console.log(
+				JSON.stringify({
+					event: "submit_review_request_built",
+					imageBytes,
+					bodyBytes,
+					withImage,
+				}),
+			);
+		};
 		if (input.screenshot) {
 			const withImage = this.#requestBody(input, true);
-			if (providerRequestByteLength(withImage) <= MAX_REVIEW_REQUEST_BYTES) {
+			const withImageBytes = providerRequestByteLength(withImage);
+			if (withImageBytes <= MAX_REVIEW_REQUEST_BYTES) {
+				record(withImageBytes, true);
 				return withImage;
 			}
 		}
 		const withoutImage = this.#requestBody(input, false);
-		if (providerRequestByteLength(withoutImage) > MAX_REVIEW_REQUEST_BYTES) {
+		const withoutImageBytes = providerRequestByteLength(withoutImage);
+		record(withoutImageBytes, false);
+		if (withoutImageBytes > MAX_REVIEW_REQUEST_BYTES) {
 			throw new AgentExecutionError(
 				"AGENT_CONTEXT_TOO_LARGE",
 				"The pre-submit review input exceeded the provider request limit.",
@@ -274,7 +295,9 @@ function isSubmitReviewReasonCode(
 
 /**
  * Chunked so a large screenshot never reaches the argument limit of a spread
- * call. Any failure becomes an unavailable review, never an allow.
+ * call, and each chunk is converted in one call so the string is built once
+ * per chunk instead of once per byte. Any failure becomes an unavailable
+ * review, never an allow.
  */
 export function toBase64(bytes: Uint8Array): string {
 	try {
@@ -285,9 +308,7 @@ export function toBase64(bytes: Uint8Array): string {
 			offset += BASE64_CHUNK_BYTES
 		) {
 			const chunk = bytes.subarray(offset, offset + BASE64_CHUNK_BYTES);
-			let part = "";
-			for (const byte of chunk) part += String.fromCharCode(byte);
-			binary += part;
+			binary += String.fromCharCode.apply(null, Array.from(chunk) as number[]);
 		}
 		return btoa(binary);
 	} catch {

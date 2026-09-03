@@ -2,8 +2,10 @@ import { assertAllowedBrowserRequest } from "./browser-network-policy";
 import { SUBMISSION_CONFIRMATION_PATTERN } from "./browser-submit-confirmation";
 import {
 	BrowserUseCdpClosedError,
+	BrowserUseCdpCommandError,
 	BrowserUseCdpConnection,
 	BrowserUseCdpUpgradeRejectedError,
+	type CdpCommandErrorKind,
 } from "./browser-use-cdp";
 import {
 	type CdpDomNode,
@@ -49,7 +51,7 @@ const DOM_DISCOVERY_RETRY_DELAY_MS = 500;
 const CONFIRMATION_POLL_INTERVAL_MS = 1_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MS = 15_000;
 const SUBMISSION_PERMISSION_WINDOW_MS = 2_000;
-const MAX_SUBMIT_MOUSE_PREPARATION_ATTEMPTS = 3;
+const MAX_MOUSE_PREPARATION_ATTEMPTS = 3;
 /** The CDP connection reports a per-command error response with this message. */
 const CDP_COMMAND_FAILED_MESSAGE = "Browser Use CDP command failed";
 const CONNECT_RETRY_DELAYS_MS = [10_000, 20_000, 30_000];
@@ -1020,6 +1022,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				JSON.stringify({
 					event: "browser_element_operation_failed",
 					operation,
+					...(error instanceof BrowserUseCdpCommandError
+						? {
+								method: error.method,
+								kind: error.kind,
+								code: error.code,
+							}
+						: {}),
 				}),
 			);
 			throw new BrowserElementOperationError(operation);
@@ -1617,8 +1626,15 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		onAttempt?: (attempt: number) => void,
 	): Promise<{ x: number; y: number }> {
 		let stage: SubmitActivationStage = "scroll";
-		try {
+		const scrollIntoView = async () => {
+			stage = "scroll";
 			await this.#send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
+		};
+		const waitForNextFrame = async () => {
+			stage = "retry_wait";
+			await this.#nextAnimationFrame();
+		};
+		try {
 			const prepare = async () => {
 				stage = "box_model";
 				const { model } = await this.#send<{
@@ -1649,13 +1665,29 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				}
 				return point;
 			};
-			if (!activationStrategy) return await prepare();
+			if (!activationStrategy) {
+				// A click target that is still settling reports no box model, a
+				// missing or detached node, or a hit test that lands elsewhere, so
+				// the whole preparation is repeated on the next frame instead of
+				// ending the operation on the first refusal.
+				return await retryMousePreparation(
+					async () => {
+						await scrollIntoView();
+						return await prepare();
+					},
+					waitForNextFrame,
+					{
+						shouldRetry: isRetryableClickPreparationError,
+						onRetry: (attempt, error) => {
+							console.log(createClickPreparationRetryLog(attempt, error));
+						},
+					},
+				);
+			}
+			await scrollIntoView();
 			return await retrySubmitMousePreparation(
 				prepare,
-				async () => {
-					stage = "retry_wait";
-					await this.#nextAnimationFrame();
-				},
+				waitForNextFrame,
 				onAttempt,
 			);
 		} catch (error) {
@@ -2021,30 +2053,89 @@ export function createSubmitActivationFailureLog(
 	});
 }
 
-export async function retrySubmitMousePreparation<TResult>(
+export interface MousePreparationRetryOptions {
+	/** Decides whether a preparation failure is worth another frame. */
+	shouldRetry(error: unknown): boolean;
+	onAttempt?(attempt: number): void;
+	onRetry?(attempt: number, error: unknown): void;
+}
+
+export async function retryMousePreparation<TResult>(
 	prepare: () => Promise<TResult>,
 	waitForNextFrame: () => Promise<unknown>,
-	onAttempt: (attempt: number) => void = () => undefined,
+	options: MousePreparationRetryOptions,
 ): Promise<TResult> {
 	for (
 		let attempt = 1;
-		attempt <= MAX_SUBMIT_MOUSE_PREPARATION_ATTEMPTS;
+		attempt <= MAX_MOUSE_PREPARATION_ATTEMPTS;
 		attempt += 1
 	) {
-		onAttempt(attempt);
+		options.onAttempt?.(attempt);
 		try {
 			return await prepare();
 		} catch (error) {
 			if (
-				!(error instanceof BrowserElementError) ||
-				attempt === MAX_SUBMIT_MOUSE_PREPARATION_ATTEMPTS
+				attempt === MAX_MOUSE_PREPARATION_ATTEMPTS ||
+				!options.shouldRetry(error)
 			) {
 				throw error;
 			}
+			options.onRetry?.(attempt, error);
 			await waitForNextFrame();
 		}
 	}
 	throw new BrowserElementError();
+}
+
+export function retrySubmitMousePreparation<TResult>(
+	prepare: () => Promise<TResult>,
+	waitForNextFrame: () => Promise<unknown>,
+	onAttempt: (attempt: number) => void = () => undefined,
+): Promise<TResult> {
+	return retryMousePreparation(prepare, waitForNextFrame, {
+		shouldRetry: (error) => error instanceof BrowserElementError,
+		onAttempt,
+	});
+}
+
+const RETRYABLE_CLICK_PREPARATION_KINDS: ReadonlySet<CdpCommandErrorKind> =
+	new Set<CdpCommandErrorKind>([
+		"NO_BOX_MODEL",
+		"NODE_NOT_FOUND",
+		"NODE_DETACHED",
+		"NO_EXECUTION_CONTEXT",
+	]);
+
+export type ClickPreparationRetryKind = CdpCommandErrorKind | "HIT_TEST";
+
+/**
+ * A layout that has not settled reports the click target as missing, detached,
+ * without a box model or without an execution context, and its hit test lands
+ * on a node that is about to move. Those clear on the next frame. Every other
+ * refusal describes the element itself and is reported straight away.
+ */
+export function isRetryableClickPreparationError(error: unknown): boolean {
+	if (error instanceof BrowserUseCdpCommandError) {
+		return RETRYABLE_CLICK_PREPARATION_KINDS.has(error.kind);
+	}
+	return error instanceof BrowserElementError;
+}
+
+export function clickPreparationRetryKind(
+	error: unknown,
+): ClickPreparationRetryKind {
+	return error instanceof BrowserUseCdpCommandError ? error.kind : "HIT_TEST";
+}
+
+export function createClickPreparationRetryLog(
+	attempt: number,
+	error: unknown,
+): string {
+	return JSON.stringify({
+		event: "browser_click_preparation_retry",
+		attempt,
+		kind: clickPreparationRetryKind(error),
+	});
 }
 
 export async function runSubmissionActivationWithinPermissionWindow(

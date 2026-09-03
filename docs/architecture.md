@@ -177,10 +177,14 @@ driver が submit control と識別した要素は通常の `click` で操作で
 
 `click` / `fill` / `select` の実行中に CDP が error 応答（`Browser Use CDP command failed`）を返した場合は、run 全体の再試行可能エラーにせず要素エラーとして扱い、モデルへ `ELEMENT_UNAVAILABLE` と再観察の guidance を返す。並列実行時は layout 確定前の `DOM.getBoxModel` / `DOM.scrollIntoViewIfNeeded` がこの失敗を返しやすく、ページが動いただけの失敗で run を終わらせないためである。診断イベントには `ELEMENT_OPERATION_CDP_FAILED` を記録し、通常の要素エラーと区別する。
 
+CDP の error 応答は、失敗した CDP メソッド名、error code、および error message を固定分類した kind（`NODE_NOT_FOUND` / `NODE_DETACHED` / `NO_BOX_MODEL` / `NOT_FOCUSABLE` / `NO_EXECUTION_CONTEXT` / `OTHER`）を保持する。`browser_element_operation_failed` にはこの 3 つを併記し、どのコマンドがどの理由で失敗したかを後から追えるようにする。error message の自由文はページ由来の文字列を含み得るため記録しない。
+
 変換する範囲は次のとおりである。
 
 - `click`: 要素の検査から mouse の `mousePressed` 送信まで。`mouseReleased` の失敗は変換しない。press を送った時点で click がページへ届いた可能性があり、要素エラーを返すと再観察後の再 click で二重 click になり得るためである。
 - `fill` / `select`: 要素解決後の操作全体。どちらも冪等（select-all して置換、値の setter）であり、再実行しても入力が重複しない。
+
+非 submit の `click` では、要素エラーへ変換する前に準備段階（`DOM.scrollIntoViewIfNeeded` から hit test まで）を 1 animation frame ごとに最大 3 回やり直す。やり直す対象は hit test 不一致と、kind が `NO_BOX_MODEL` / `NODE_NOT_FOUND` / `NODE_DETACHED` / `NO_EXECUTION_CONTEXT` の CDP 失敗に限る。いずれも layout が確定していないだけで、次の frame では解消し得るためである。`NOT_FOCUSABLE` と `OTHER` は要素そのものの状態を表すので再試行しない。再試行のたびに `browser_click_preparation_retry` を `attempt` と `kind`（hit test 不一致は `HIT_TEST`）付きで記録する。`mousePressed` / `mouseReleased` は再試行しない。press を送った時点で click がページへ届いた可能性があるためである。並列実行の `multi-step` で「確認画面へ」の click が再観察後も 3 回連続で CDP error になった事象への対策である。
 
 接続断（`Browser Use CDP connection closed`）、timeout、送信失敗、payload 上限超過は変換せず、従来どおり run の失敗として扱う。後続の tool 呼び出しでも回復しないためである。`submit` 経路は変換対象外であり、送信権取得後の失敗を `uncertain` に倒す既存の契約を維持する。
 
@@ -397,6 +401,8 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 - agent tool診断はbrowser tool、`finish`、unknown tool dispatchを対象とする。`data_json`にはturn、固定tool名、stage、固定result codeだけを保存し、イベント共通列にはjob ID、attempt、記録時刻を保存する。送信前レビューはstage `submit_review`、result code `SUBMIT_REVIEW_ALLOWED` / `SUBMIT_REVIEW_DENIED` / `SUBMIT_REVIEW_UNAVAILABLE`として記録する。入力値、URL、自由記述エラー、全状態遷移は保存しない。
 - retry delay は配信試行に応じた指数 backoff（30 / 60 / 120 秒）に ±20% の jitter を掛け、300 秒で上限を設ける。実際に使う遅延秒数は `job.retry_scheduled` の `delaySeconds` に保存する。
 - Workers Logs を有効にし、invocation ごとの `outcome`、`cpuTime`、`wallTime`、`console` 出力を head sampling 100% で記録する。保持期間は Free プランで 3 日であり、`outcome = exceededCpu` の調査は Cloudflare ダッシュボードの Workers Logs で 3 日以内に行う。ログに値、URL、自由文、session id を出さない方針は変わらない。
+- 送信前レビューのリクエスト構築は `submit_review_request_built` に記録する。`imageBytes`（スクリーンショットのバイト数）、`bodyBytes`（リクエストのバイト数）、`withImage` だけを出し、リクエスト本文は出さない。所要時間は出さない。Workers の時計は I/O 境界でしか進まないため、base64 化や JSON 化のような同期区間の CPU 時間は `Date.now()` でも `performance.now()` でも測れず、ランタイムが報告する `cpuTime` で見る。
+- 証跡撮影の各段階の所要時間は `submission_evidence_timing` に記録する。固定の `stage` と `phase`（`screenshot` / `digest` / `put` / `record`）、`timedOut`、`screenshotMs`、`digestMs`、`putMs`（R2）、`recordMs`（D1 の intent、captured、および失敗イベントの合計）、`bytes` だけを出す。各段階は await（I/O）を挟むためこちらは計測できるが、段階のあいだの同期区間は含まれない。1 回の撮影につき必ず 1 行だけ出す。timeout で打ち切った場合は撮影の完了を待たず、timeout 側が `timedOut: true` と到達済みの `phase` を記録する。停滞した撮影は戻らないことがあり、そのときこそ記録が必要なためである。
 - Worker の CPU 上限は既定の 30 秒のままである。`limits.cpu_ms` は Workers Free プランでは deploy が拒否される（code 100328）ため設定していない。2026-09-03 の `exceededCpu` は報告 `cpuTime` が 165 ms、`wallTime` が 91 秒であり、上限引き上げでは解消しない可能性が高いため、原因は Workers Logs で追跡する。
 
 ## 並列・リトライ方針
@@ -504,7 +510,7 @@ consumer は `max_concurrency: 3` とする。5 並列では session を毎回�
 - CSVから抽出した外部form hostをジョブ単位の完全一致allowlistへ安全に反映する運用検証。
 - Provider abstraction と fallback。
 - 外部 API E2E は GitHub Actions の通常 CI に含めず、手動実行に限定する。
-- Worker の `outcome: exceededCpu` の原因特定。報告 `cpuTime` 165 ms に対して強制終了しているため、CPU 上限の引き上げでは説明できない。Workers Logs の保持期間が Free プランで 3 日であるため、再発時は 3 日以内に調査する。
+- Worker の `outcome: exceededCpu` の原因特定。報告 `cpuTime` 165 ms に対して強制終了しているため、CPU 上限の引き上げでは説明できない。Workers Logs の保持期間が Free プランで 3 日であるため、再発時は 3 日以内に調査する。3 件とも `before_submit` の撮影完了直後から送信前レビューの Provider 呼び出しまでの区間で発生している。疑わしいのはスクリーンショットの base64 化とリクエスト構築であるため、`submit_review_request_built` と `submission_evidence_timing` の計測を追加し、base64 化は 8 KiB チャンクごとの一括変換に変更した。次の再発時はこの 2 つのログで切り分ける。3 件目は 2026-09-03 の 3 並列計測 3 回目で、`native-get` の Worker が報告 `cpuTime` 172 ms、`wallTime` 55 秒で強制終了し、ジョブは送信権取得後・activation 前の `submitting` で停止した。Queue の再配信は `job.redelivery_ignored` で ack され自動再送は起きず、テストシステム側の受信 0 件と `after_submit` 証跡なしを照合したうえで、runbook の手順で人手により `uncertain`（`OPERATOR_CONFIRMED_UNCERTAIN`）へ確定した。
 - 並列時に `multi-step` で毎回発生する turn 6 `click` の CDP コマンド失敗（3 並列でも再現、受信 0）。click / fill / select 中の CDP コマンド失敗を要素エラーへ変換する対応は実装済みであり、3 並列 3 回の実行で `multi-step` が続行して `sent` になることの確認が残る。`external-iframe` の送信後読み取り失敗は明示停止後の再計測では再現しなかった。
 - `external-iframe-tertiary` で、モデルが観察本文から禁止を読み取っているのに信頼済み handler の禁止根拠検証（iframe 親ページ側の近接要素）が通らず `FINISH_PROHIBITION_NOT_VERIFIED` になり、`uncertain` で終了した例が 1 件（4 回中）。`validateProhibited` の 1 回限りの再観察は実装済みであり、3 並列 3 回の実行で `FINISH_PROHIBITION_NOT_VERIFIED` が減ることの確認が残る。残る場合は診断とともに記録する。
 - 禁止フォームの submit を信頼済み handler がブロックした後、モデルが `finish_prohibited` ではなく `finish_failed` を選ぶ（`external-iframe-secondary`、3 回中 2 回）。`SUBMIT_PROHIBITED` への分離と guidance、system prompt への追記は実装済みであり、`external-iframe-secondary` が `prohibited` で終わることの確認が残る。
