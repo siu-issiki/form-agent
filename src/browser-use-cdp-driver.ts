@@ -13,6 +13,7 @@ import {
 } from "./browser-use-cdp";
 import {
 	type CdpDomNode,
+	type CdpFormCandidate,
 	type CdpFormDiscovery,
 	discoverCdpBodyBackendNodeIds,
 	discoverCdpForms,
@@ -47,6 +48,7 @@ import {
 	createBrowserSubmitDiagnosticError,
 	isReviewComparableField,
 	normalizeAllowedHosts,
+	normalizeTargetDomain,
 	type ObservedFieldState,
 	PROHIBITION_TEXT_PATTERN_SOURCES,
 	type RestrictedBrowserDriver,
@@ -213,7 +215,7 @@ interface ResolvedNode {
 }
 
 export interface CdpFrameTree {
-	frame: { id: string; parentId?: string };
+	frame: { id: string; parentId?: string; url?: string };
 	childFrames?: CdpFrameTree[];
 }
 
@@ -262,6 +264,7 @@ export interface ExpectedSubmissionRequest {
 }
 
 type SubmissionRequestBlockStage = "expected_request" | "network_policy";
+type ObservedFrameTrust = "trusted" | "third_party" | "unknown";
 type GetSubmissionRequestDisposition = "claim" | "block" | "ignore";
 
 export type SubmitActivationStage =
@@ -294,6 +297,25 @@ export function collectCdpFrameParentIds(
 	return parents;
 }
 
+/**
+ * Reads the URL of every frame the tree names, so the caller can tell a frame
+ * belonging to the target site from a third-party frame such as a
+ * verification widget.
+ */
+export function collectCdpFrameUrls(
+	frameTree: CdpFrameTree,
+): Map<string, string> {
+	const urls = new Map<string, string>();
+	const visit = (tree: CdpFrameTree) => {
+		if (typeof tree.frame.url === "string") {
+			urls.set(tree.frame.id, tree.frame.url);
+		}
+		for (const child of tree.childFrames ?? []) visit(child);
+	};
+	visit(frameTree);
+	return urls;
+}
+
 export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#topFrameId: string | undefined;
 	#targetDomain: string | undefined;
@@ -320,6 +342,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#targetPolicyError: Error | undefined;
 	readonly #frameNavigationRevisions = new Map<string, number>();
 	readonly #frameParentIds = new Map<string, string | undefined>();
+	readonly #frameUrls = new Map<string, string>();
 	readonly #isolatedWorldContexts = new Map<string, number>();
 	readonly #pageChangeWaiters = new Set<() => void>();
 	#elementGeneration = 0;
@@ -659,6 +682,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			prohibitedReasonCodes: string[];
 		}> = [];
 		let fieldIndex = 0;
+		let skippedThirdPartyForms = 0;
 
 		for (const candidateForm of discovery.forms) {
 			if (
@@ -667,7 +691,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			) {
 				break;
 			}
+			const frameTrust = this.#observedFrameTrust(candidateForm.frameId);
+			if (frameTrust === "third_party") {
+				skippedThirdPartyForms += 1;
+				continue;
+			}
 			const fields: unknown[] = [];
+			const formElements: Array<[string, ElementReference]> = [];
 			for (const candidate of candidateForm.fields) {
 				if (fieldIndex >= MAX_OBSERVED_FIELDS) break;
 				const state = await this.#inspectElement(candidate.backendNodeId).catch(
@@ -679,10 +709,15 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				).catch(() => null);
 				const elementId = `fa-${generation.toString(36)}-${fieldIndex.toString(36)}`;
 				fieldIndex += 1;
-				elements.set(elementId, {
-					backendNodeId: candidate.backendNodeId,
-					...(candidateForm.frameId ? { frameId: candidateForm.frameId } : {}),
-				});
+				formElements.push([
+					elementId,
+					{
+						backendNodeId: candidate.backendNodeId,
+						...(candidateForm.frameId
+							? { frameId: candidateForm.frameId }
+							: {}),
+					},
+				]);
 				fields.push({
 					elementId,
 					tag: state.tag,
@@ -702,44 +737,36 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			if (fields.length > 0) {
 				const formFrameId = candidateForm.frameId ?? this.#topFrameId;
 				if (!formFrameId) throw new BrowserElementError();
-				const formExecutionContextId =
-					await this.#prohibitionExecutionContext(formFrameId);
-				const formProhibitedReasonCodes = await this.#callFunctionOnElement<
-					string[]
-				>(
-					candidateForm.backendNodeId,
-					READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
-					[],
-					formExecutionContextId,
-				);
-				const frameOwnerBackendNodeId = candidateForm.frameId
-					? findCdpFrameOwnerBackendNodeId(root, candidateForm.frameId)
-					: undefined;
-				const parentFrameId = candidateForm.frameId
-					? this.#frameParentIds.get(candidateForm.frameId)
-					: undefined;
-				const parentExecutionContextId = parentFrameId
-					? await this.#prohibitionExecutionContext(parentFrameId)
-					: undefined;
-				const parentProhibitedReasonCodes =
-					frameOwnerBackendNodeId && parentExecutionContextId !== undefined
-						? await this.#callFunctionOnElement<string[]>(
-								frameOwnerBackendNodeId,
-								READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
-								[],
-								parentExecutionContextId,
-							)
-						: [];
+				let prohibitedReasonCodes: string[];
+				try {
+					prohibitedReasonCodes = await this.#formProhibitionReasonCodes(
+						candidateForm,
+						formFrameId,
+						root,
+					);
+				} catch (error) {
+					if (
+						frameTrust !== "unknown" ||
+						!(error instanceof BrowserUseCdpCommandError)
+					) {
+						throw error;
+					}
+					console.log(
+						JSON.stringify({
+							event: "browser_form_skipped",
+							reason: "FRAME_CONTEXT_UNAVAILABLE",
+						}),
+					);
+					continue;
+				}
+				for (const [elementId, reference] of formElements) {
+					elements.set(elementId, reference);
+				}
 				forms.push({
 					action: candidateForm.action,
 					method: candidateForm.method,
 					fields,
-					prohibitedReasonCodes: [
-						...new Set([
-							...formProhibitedReasonCodes,
-							...parentProhibitedReasonCodes,
-						]),
-					],
+					prohibitedReasonCodes,
 				});
 			}
 		}
@@ -764,7 +791,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				shadowRootCount: discovery.shadowRootCount,
 				closedShadowRootCount: discovery.closedShadowRootCount,
 				candidateFieldCount: discovery.candidateFieldCount,
-				observedFieldCount: fieldIndex,
+				observedFieldCount: elements.size,
+				skippedThirdPartyForms,
 				discoveryAttempts,
 				durationMs: Date.now() - startedAt,
 			}),
@@ -1145,20 +1173,33 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		});
 		this.connection.on("Page.frameNavigated", (params, sessionId) => {
 			if (sessionId !== this.sessionId) return;
-			const frame = (params as { frame?: { id?: unknown; parentId?: unknown } })
-				.frame;
+			const frame = (
+				params as {
+					frame?: { id?: unknown; parentId?: unknown; url?: unknown };
+				}
+			).frame;
 			const frameId = frame?.id;
 			if (typeof frameId !== "string") return;
 			this.#frameParentIds.set(
 				frameId,
 				typeof frame?.parentId === "string" ? frame.parentId : undefined,
 			);
+			if (typeof frame?.url === "string") {
+				this.#frameUrls.set(frameId, frame.url);
+			} else {
+				this.#frameUrls.delete(frameId);
+			}
 			this.#isolatedWorldContexts.delete(frameId);
 			this.#frameNavigationRevisions.set(
 				frameId,
 				(this.#frameNavigationRevisions.get(frameId) ?? 0) + 1,
 			);
 			this.#notifyPageChanged();
+		});
+		this.connection.on("Page.frameDetached", (params, sessionId) => {
+			if (sessionId !== this.sessionId) return;
+			const { frameId } = params as { frameId?: unknown };
+			if (typeof frameId === "string") this.#frameUrls.delete(frameId);
 		});
 		await this.#send("Page.enable");
 		const frameTree = (
@@ -1169,6 +1210,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			frameTree,
 		)) {
 			this.#frameParentIds.set(frameId, parentFrameId);
+		}
+		for (const [frameId, frameUrl] of collectCdpFrameUrls(frameTree)) {
+			this.#frameUrls.set(frameId, frameUrl);
 		}
 		await this.#send("Runtime.enable");
 		await this.#send("DOM.enable", { includeWhitespace: "none" });
@@ -1487,6 +1531,84 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			await this.#send("Runtime.releaseObject", { objectId }).catch(
 				() => undefined,
 			);
+		}
+	}
+
+	/**
+	 * Reads the prohibition reason codes of one candidate form, from the form
+	 * itself and from the elements next to its frame owner on the embedding
+	 * page. Both reads need an isolated world in the frame that holds the
+	 * node, so they fail for a frame the driver cannot reach.
+	 */
+	async #formProhibitionReasonCodes(
+		candidateForm: CdpFormCandidate,
+		formFrameId: string,
+		root: CdpDomNode,
+	): Promise<string[]> {
+		const formExecutionContextId =
+			await this.#prohibitionExecutionContext(formFrameId);
+		const formProhibitedReasonCodes = await this.#callFunctionOnElement<
+			string[]
+		>(
+			candidateForm.backendNodeId,
+			READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
+			[],
+			formExecutionContextId,
+		);
+		const frameOwnerBackendNodeId = candidateForm.frameId
+			? findCdpFrameOwnerBackendNodeId(root, candidateForm.frameId)
+			: undefined;
+		const parentFrameId = candidateForm.frameId
+			? this.#frameParentIds.get(candidateForm.frameId)
+			: undefined;
+		const parentExecutionContextId = parentFrameId
+			? await this.#prohibitionExecutionContext(parentFrameId)
+			: undefined;
+		const parentProhibitedReasonCodes =
+			frameOwnerBackendNodeId && parentExecutionContextId !== undefined
+				? await this.#callFunctionOnElement<string[]>(
+						frameOwnerBackendNodeId,
+						READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
+						[],
+						parentExecutionContextId,
+					)
+				: [];
+		return [
+			...new Set([
+				...formProhibitedReasonCodes,
+				...parentProhibitedReasonCodes,
+			]),
+		];
+	}
+
+	/**
+	 * Classifies the frame a candidate form sits in. `third_party` frames are
+	 * verification widgets and other embeds outside the target domain and the
+	 * job's allowed hosts: their forms are never submission targets, and CDP
+	 * calls against their execution context fail, so the observation skips
+	 * them. `unknown` covers frames whose URL the driver has not seen and
+	 * frames that inherit the embedder's origin (`about:blank`, `srcdoc`);
+	 * those are still observed.
+	 */
+	#observedFrameTrust(frameId: string | undefined): ObservedFrameTrust {
+		if (frameId === undefined || frameId === this.#topFrameId) {
+			return "trusted";
+		}
+		const targetDomain = this.#targetDomain;
+		const frameUrl = this.#frameUrls.get(frameId);
+		if (!targetDomain || frameUrl === undefined) return "unknown";
+		try {
+			// A target domain the policy cannot normalize would make every frame
+			// look third party, so leave the judgement to the caller instead.
+			normalizeTargetDomain(targetDomain);
+		} catch {
+			return "unknown";
+		}
+		try {
+			assertAllowedTargetUrl(frameUrl, targetDomain, this.#allowedHosts);
+			return "trusted";
+		} catch {
+			return /^https?:\/\//i.test(frameUrl) ? "third_party" : "unknown";
 		}
 	}
 
