@@ -116,7 +116,14 @@ export async function reclaimJobSessions(
 			(session) => session.metadata.source === SESSION_SOURCE_TAG,
 		).length;
 		for (const session of sessions) {
-			if (session.metadata.jobId !== jobId) continue;
+			// The source tag keeps a job identifier that another deployment or a
+			// local run happens to reuse from stopping that run's session.
+			if (
+				session.metadata.source !== SESSION_SOURCE_TAG ||
+				session.metadata.jobId !== jobId
+			) {
+				continue;
+			}
 			matched += 1;
 			// Only a confirmed stop is counted, so the record never claims to have
 			// released a slot the provider still holds.
