@@ -402,7 +402,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 - retry delay は配信試行に応じた指数 backoff（30 / 60 / 120 秒）に ±20% の jitter を掛け、300 秒で上限を設ける。実際に使う遅延秒数は `job.retry_scheduled` の `delaySeconds` に保存する。
 - Workers Logs を有効にし、invocation ごとの `outcome`、`cpuTime`、`wallTime`、`console` 出力を head sampling 100% で記録する。保持期間は Free プランで 3 日であり、`outcome = exceededCpu` の調査は Cloudflare ダッシュボードの Workers Logs で 3 日以内に行う。ログに値、URL、自由文、session id を出さない方針は変わらない。
 - 送信前レビューのリクエスト構築は `submit_review_request_built` に記録する。`imageBytes`（スクリーンショットのバイト数）、`bodyBytes`（リクエストのバイト数）、`withImage`、`buildMs`（base64 化と JSON 化に要した時間）だけを出し、リクエスト本文は出さない。
-- 証跡撮影の各段階の所要時間は `submission_evidence_timing` に記録する。固定の `stage` と `screenshotMs`、`digestMs`、`putMs`（R2）、`recordMs`（D1 の intent と captured の合計）、`bytes` だけを出す。
+- 証跡撮影の各段階の所要時間は `submission_evidence_timing` に記録する。固定の `stage` と `phase`（`screenshot` / `digest` / `put` / `record`）、`timedOut`、`screenshotMs`、`digestMs`、`putMs`（R2）、`recordMs`（D1 の intent と captured の合計）、`bytes` だけを出す。1 回の撮影につき必ず 1 行だけ出す。timeout で打ち切った場合は撮影の完了を待たず、timeout 側が `timedOut: true` と到達済みの `phase` を記録する。停滞した撮影は戻らないことがあり、そのときこそ記録が必要なためである。
 - Worker の CPU 上限は既定の 30 秒のままである。`limits.cpu_ms` は Workers Free プランでは deploy が拒否される（code 100328）ため設定していない。2026-09-03 の `exceededCpu` は報告 `cpuTime` が 165 ms、`wallTime` が 91 秒であり、上限引き上げでは解消しない可能性が高いため、原因は Workers Logs で追跡する。
 
 ## 並列・リトライ方針

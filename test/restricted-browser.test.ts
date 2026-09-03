@@ -1682,6 +1682,14 @@ class FakeDriver implements RestrictedBrowserDriver {
 	}
 }
 
+function evidenceTimings(
+	logs: readonly string[],
+): Array<Record<string, unknown>> {
+	return logs
+		.filter((entry) => entry.includes('"submission_evidence_timing"'))
+		.map((entry) => JSON.parse(entry) as Record<string, unknown>);
+}
+
 describe("SubmissionEvidenceRecorder", () => {
 	test("records the object key before the upload and completes the same event", async () => {
 		const driver = new FakeDriver();
@@ -1744,17 +1752,65 @@ describe("SubmissionEvidenceRecorder", () => {
 			console.log = originalLog;
 		}
 
-		const timings = logs
-			.filter((entry) => entry.includes('"submission_evidence_timing"'))
-			.map((entry) => JSON.parse(entry) as Record<string, unknown>);
+		const timings = evidenceTimings(logs);
 		expect(timings).toHaveLength(1);
 		const timing = timings[0] ?? {};
 		expect(timing.event).toBe("submission_evidence_timing");
 		expect(timing.stage).toBe("before_submit");
+		expect(timing.timedOut).toBe(false);
+		expect(timing.phase).toBe("record");
 		expect(timing.bytes).toBe(3);
 		for (const field of ["screenshotMs", "digestMs", "putMs", "recordMs"]) {
 			expect(typeof timing[field]).toBe("number");
 		}
+	});
+
+	test("reports the phase a timed out capture reached, exactly once", async () => {
+		const driver: Pick<RestrictedBrowserDriver, "captureScreenshot"> = {
+			captureScreenshot: () => new Promise<Uint8Array>(() => {}),
+		};
+		const store = new InMemoryJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const recorder = new SubmissionEvidenceRecorder(
+			driver,
+			new InMemoryEvidenceObjectStore(),
+			store,
+			input.id,
+			"run-token-1",
+			1,
+			() => "2026-08-28T00:00:02.000Z",
+			20,
+		);
+		const logs: string[] = [];
+		const originalLog = console.log;
+		const originalWarn = console.warn;
+		console.log = (message: unknown) => {
+			logs.push(String(message));
+		};
+		console.warn = () => undefined;
+
+		let result: Awaited<ReturnType<typeof recorder.capture>>;
+		try {
+			result = await recorder.capture("after_submit");
+			// The stalled screenshot never settles, so a second report could only
+			// come from the capture side. Give it a turn to prove it does not.
+			await new Promise((resolve) => setTimeout(resolve, 30));
+		} finally {
+			console.warn = originalWarn;
+			console.log = originalLog;
+		}
+
+		expect(result).toEqual({
+			captured: false,
+			failureCode: "CAPTURE_TIMEOUT",
+		});
+		const timings = evidenceTimings(logs);
+		expect(timings).toHaveLength(1);
+		expect(timings[0]?.timedOut).toBe(true);
+		expect(timings[0]?.phase).toBe("screenshot");
+		expect(timings[0]?.stage).toBe("after_submit");
+		expect(timings[0]?.bytes).toBe(0);
 	});
 
 	test("moves the intent to a failure when the upload fails", async () => {

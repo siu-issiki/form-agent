@@ -14,7 +14,11 @@ export const EVIDENCE_CONTENT_TYPE = "image/jpeg";
  */
 export const EVIDENCE_CAPTURE_TIMEOUT_MS = 15_000;
 
+/** The step a capture is in, so a timeout says where it stalled. */
+type EvidenceCapturePhase = "screenshot" | "digest" | "put" | "record";
+
 interface EvidenceCaptureTiming {
+	phase: EvidenceCapturePhase;
 	screenshotMs: number;
 	digestMs: number;
 	putMs: number;
@@ -119,6 +123,36 @@ export class SubmissionEvidenceRecorder {
 		const eventId = crypto.randomUUID();
 		const objectKey = evidenceObjectKey(this.jobId, stage, eventId);
 		let expired = false;
+		// The capture writes its measurements here as it advances. A stalled
+		// capture is exactly what the log is for, and it keeps running after the
+		// timeout wins the race, so the timeout branch reports what was reached
+		// instead of waiting for a capture that may never return.
+		const timing: EvidenceCaptureTiming = {
+			phase: "screenshot",
+			screenshotMs: 0,
+			digestMs: 0,
+			putMs: 0,
+			recordMs: 0,
+			bytes: 0,
+		};
+		let timingReported = false;
+		const reportTiming = (didTimeOut: boolean): void => {
+			if (timingReported) return;
+			timingReported = true;
+			console.log(
+				JSON.stringify({
+					event: "submission_evidence_timing",
+					stage,
+					timedOut: didTimeOut,
+					phase: timing.phase,
+					screenshotMs: timing.screenshotMs,
+					digestMs: timing.digestMs,
+					putMs: timing.putMs,
+					recordMs: timing.recordMs,
+					bytes: timing.bytes,
+				}),
+			);
+		};
 
 		let timer!: ReturnType<typeof setTimeout>;
 		const timedOut = new Promise<EvidenceCaptureResult>((resolve) => {
@@ -133,6 +167,7 @@ export class SubmissionEvidenceRecorder {
 						objectKey,
 					}),
 				);
+				reportTiming(true);
 				// The failure event write is not awaited: a stalled D1 must not
 				// extend the timeout past its bound. #failed never rejects.
 				void this.#failed(eventId, stage, "CAPTURE_TIMEOUT");
@@ -142,52 +177,26 @@ export class SubmissionEvidenceRecorder {
 
 		try {
 			return await Promise.race([
-				this.#captureUnbounded(stage, eventId, objectKey, () => expired),
+				this.#captureUnbounded(
+					stage,
+					eventId,
+					objectKey,
+					() => expired,
+					timing,
+				),
 				timedOut,
 			]);
 		} finally {
 			clearTimeout(timer);
+			reportTiming(false);
 		}
 	}
 
 	/**
-	 * Records how long each step of a capture took, on every exit, so a stalled
-	 * or CPU-heavy capture can be told apart from a slow review call. Only
-	 * durations, the byte count and the fixed stage are logged.
+	 * Writes how long each step took into `timing` as it goes, so the caller can
+	 * report what was reached even when this never returns.
 	 */
 	async #captureUnbounded(
-		stage: EvidenceStage,
-		eventId: string,
-		objectKey: string,
-		expired: () => boolean,
-	): Promise<EvidenceCaptureResult> {
-		const timing: EvidenceCaptureTiming = {
-			screenshotMs: 0,
-			digestMs: 0,
-			putMs: 0,
-			recordMs: 0,
-			bytes: 0,
-		};
-		try {
-			return await this.#captureTimed(
-				stage,
-				eventId,
-				objectKey,
-				expired,
-				timing,
-			);
-		} finally {
-			console.log(
-				JSON.stringify({
-					event: "submission_evidence_timing",
-					stage,
-					...timing,
-				}),
-			);
-		}
-	}
-
-	async #captureTimed(
 		stage: EvidenceStage,
 		eventId: string,
 		objectKey: string,
@@ -195,6 +204,7 @@ export class SubmissionEvidenceRecorder {
 		timing: EvidenceCaptureTiming,
 	): Promise<EvidenceCaptureResult> {
 		let bytes: Uint8Array;
+		timing.phase = "screenshot";
 		const screenshotStartedAt = monotonicNow();
 		try {
 			bytes = await this.driver.captureScreenshot();
@@ -212,6 +222,7 @@ export class SubmissionEvidenceRecorder {
 		}
 
 		let sha256: string;
+		timing.phase = "digest";
 		const digestStartedAt = monotonicNow();
 		try {
 			sha256 = await sha256Hex(bytes);
@@ -229,6 +240,7 @@ export class SubmissionEvidenceRecorder {
 		// The intent names the object before it exists, so a Worker that stops
 		// between the upload and the result still leaves the key in D1. Nothing
 		// is written to the object store without it.
+		timing.phase = "record";
 		const intentStartedAt = monotonicNow();
 		const intentRecorded = await this.#recordIntent(eventId, stage, objectKey);
 		timing.recordMs = elapsedMs(intentStartedAt);
@@ -237,6 +249,7 @@ export class SubmissionEvidenceRecorder {
 			return this.#failed(eventId, stage, "EVENT_NOT_RECORDED");
 		}
 
+		timing.phase = "put";
 		const putStartedAt = monotonicNow();
 		try {
 			await this.objectStore.put(
@@ -262,6 +275,7 @@ export class SubmissionEvidenceRecorder {
 		}
 
 		let recorded: boolean;
+		timing.phase = "record";
 		const recordStartedAt = monotonicNow();
 		try {
 			recorded = await this.jobs.recordEvidenceCaptured(
