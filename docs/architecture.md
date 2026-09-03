@@ -372,7 +372,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 - agent tool診断はbrowser tool、`finish`、unknown tool dispatchを対象とする。`data_json`にはturn、固定tool名、stage、固定result codeだけを保存し、イベント共通列にはjob ID、attempt、記録時刻を保存する。送信前レビューはstage `submit_review`、result code `SUBMIT_REVIEW_ALLOWED` / `SUBMIT_REVIEW_DENIED` / `SUBMIT_REVIEW_UNAVAILABLE`として記録する。入力値、URL、自由記述エラー、全状態遷移は保存しない。
 - retry delay は 30 秒固定で、指数 backoff と jitter は未実装である。
 - Workers Logs を有効にし、invocation ごとの `outcome`、`cpuTime`、`wallTime`、`console` 出力を head sampling 100% で記録する。保持期間は 7 日であり、`outcome = exceededCpu` の調査は Cloudflare ダッシュボードの Workers Logs で 7 日以内に行う。ログに値、URL、自由文、session id を出さない方針は変わらない。
-- Worker の CPU 上限を 120 秒（既定 30 秒、Paid の最大 300 秒）に設定する。上限は Queue consumer にも適用される。ただし 2026-09-03 の `exceededCpu` は報告 `cpuTime` が 165 ms、`wallTime` が 91 秒であり、上限引き上げでは解消しない可能性が高いため、原因は Workers Logs で追跡する。
+- Worker の CPU 上限は既定の 30 秒のままである。`limits.cpu_ms` は Workers Free プランでは deploy が拒否される（code 100328）ため設定していない。2026-09-03 の `exceededCpu` は報告 `cpuTime` が 165 ms、`wallTime` が 91 秒であり、上限引き上げでは解消しない可能性が高いため、原因は Workers Logs で追跡する。
 
 ## 並列・リトライ方針
 
@@ -440,11 +440,11 @@ consumer は `max_concurrency: 3` とする。5 並列では session を毎回�
 - [x] 認証付きジョブ登録・取得 API を実装する。
 - [ ] `submitting` 中にWorkerを強制停止し、状態が`submitting`のまま残って再配信でも送信されないことを検証する。
 - [ ] 状態遷移、理由、時間、token、BrowserUse 待ち時間を記録する。
-- [ ] Cloudflare 上で送信なし 5 並列を実行し、rate limit と原価を計測する。
+- [x] Cloudflare 上で 5 並列を実行し、BrowserUse の同時 session 上限（429）を観測した。原価の計測は未実施。
 
 ### フェーズ 2: 5 並列
 
-- [ ] 送信なし5並列で二重実行、rate limit、BrowserUse session、原価を計測する。
+- [x] 5 並列で二重実行なし、BrowserUse session の明示停止、作成 API の 429 を確認した。3 並列で 429 が消えることを確認し、consumer を 3 とした。原価の計測は未実施。
 - [x] `max_concurrency`を観測結果に基づいて1から5へ引き上げ、429 の観測により 3 へ戻す。
 
 ### フェーズ 3: 20 並列
