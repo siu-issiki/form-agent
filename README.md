@@ -62,8 +62,13 @@ bun run campaign:dry-run \
   --choices /path/to/choices.json \
   --csv /path/to/targets.csv \
   --campaign agb-shaken-2026-09-dryrun-v1 \
+  --offset 0 \
   --limit 5
 ```
+
+`--limit`は1〜50、`--offset`は0以上の整数で、既定値はそれぞれ5と0です。適格行の並び（`filterCampaignRows`が返す順序）の先頭から`--offset`件を読み飛ばし、続く`--limit`件を対象にします。窓は適格行の並びに対して固定されるため、redirect preflightで落ちた行もその枠を消費し、同じ`--offset`は常に同じ行を指します。適格行が足りない場合と、選ばれた行が1件でもpreflightで落ちた場合はexit 1になります。次の50件は`--offset 50`のように送ります。
+
+`--limit`を5より大きくしても、生成ジョブが`_formAgentDryRun: true`固定であることと、実送信経路を持たないことは変わりません。増えるのは1回の実行で検証する件数だけです。
 
 `--choices`は省略できます。指定する場合のJSONは`Record<string, string[]>`で、値は「登録者が事前に許可した選択肢の順序付き集合」です。信頼済みhandlerが対象コントロールのoption値・option text・ラベルと完全一致する最初の候補を選び、一致しなければ入力せずエラーにします。候補は1〜10要素、各要素1〜256文字、合計2,048文字以下で、キーが登録情報・件名・本文と衝突した場合はエラーになります。書式は`docs/examples/campaign-choices.example.json`を参照してください。
 

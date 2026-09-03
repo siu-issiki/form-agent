@@ -3832,6 +3832,68 @@ describe("ResponsesAgentExecutor", () => {
 		);
 		expect(driver.submitCount).toBe(0);
 	});
+
+	test("logs one fixed browser_tool_error line for a tool error", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-tool", "navigate", {
+				url: "https://form-agent.dev/unobserved",
+			}),
+			functionResponse("call-finish", "finish_failed", {
+				outcome: "failed",
+				formUrl: null,
+				reasonCode: "TOOL_ERROR_OBSERVED",
+				reason: "The tool reported a recoverable error.",
+				retryable: false,
+			}),
+		];
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async () => {
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => new WorkerFakeBrowserDriver(),
+		});
+		const logs: string[] = [];
+		const spy = vi.spyOn(console, "log").mockImplementation((message) => {
+			logs.push(String(message));
+		});
+
+		try {
+			await executor.execute(
+				{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+				new AbortController().signal,
+			);
+		} finally {
+			spy.mockRestore();
+		}
+
+		const errors = logs
+			.filter((entry) => entry.includes('"browser_tool_error"'))
+			.map((entry) => JSON.parse(entry) as Record<string, unknown>);
+		expect(errors).toHaveLength(1);
+		// Fixed fields only: no elementId, payloadKey, value, or URL.
+		expect(errors[0]).toEqual({
+			event: "browser_tool_error",
+			tool: "navigate",
+			code: "NAVIGATION_NOT_ALLOWED",
+			turn: 2,
+		});
+	});
 });
 
 async function readEvidenceEvents(

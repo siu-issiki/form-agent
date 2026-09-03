@@ -108,6 +108,8 @@ interface ToolExecution {
 	/** Set when the pre-submit review denied a correctable submission. */
 	reviewDenied?: true;
 	successfulTool?: BrowserToolName;
+	/** Fixed error code returned to the model instead of a tool result. */
+	errorCode?: ToolErrorCode;
 }
 
 export class ResponsesAgentExecutor implements AgentExecutor {
@@ -338,6 +340,18 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 				dryRun,
 				turn + 1,
 			);
+			if (execution.errorCode) {
+				// Fixed values only: the tool name and the error code come from
+				// closed sets, so no elementId, payloadKey, value, or URL is logged.
+				console.log(
+					JSON.stringify({
+						event: "browser_tool_error",
+						tool: diagnosticToolName(call.name),
+						code: execution.errorCode,
+						turn: turn + 1,
+					}),
+				);
+			}
 			if (execution.result) return execution.result;
 			if (execution.reviewDenied && !correctionTurnsGranted) {
 				// The single correction the review allows must not be cut short
@@ -1111,6 +1125,7 @@ function toolError(
 			...details,
 			guidance: TOOL_ERROR_GUIDANCE[code],
 		}),
+		errorCode: code,
 	};
 }
 

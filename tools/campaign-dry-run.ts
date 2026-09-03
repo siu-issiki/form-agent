@@ -8,6 +8,7 @@ import {
 	type RegistrationEntry,
 	readChoiceCandidates,
 	resolveRedirectHosts,
+	selectCampaignCandidates,
 } from "../src/campaign-import";
 import type { JobInput } from "../src/job";
 import type { TrustedFormValue } from "../src/restricted-browser";
@@ -26,19 +27,30 @@ const rows = parse(csvText, {
 }) as CampaignCsvRow[];
 const filtered = filterCampaignRows(rows);
 const registrationValues = mapRegistrationValues(registration);
+const selected = selectCampaignCandidates(
+	filtered.eligible,
+	options.offset,
+	options.limit,
+);
 console.log(
 	JSON.stringify({
 		event: "campaign_filter_summary",
 		totalRows: rows.length,
 		eligibleRows: filtered.eligible.length,
 		excluded: filtered.excluded,
-		selectedRows: options.limit,
+		offset: options.offset,
+		selectedRows: selected.length,
 	}),
 );
 
+if (selected.length !== options.limit) {
+	throw new Error(
+		`Only ${selected.length} eligible rows remain after offset ${options.offset}`,
+	);
+}
+
 const jobs: JobInput[] = [];
-for (const candidate of filtered.eligible) {
-	if (jobs.length >= options.limit) break;
+for (const candidate of selected) {
 	let resolution: RedirectResolution;
 	try {
 		resolution = await resolveRedirectHosts(candidate.targetUrl);
@@ -102,6 +114,7 @@ interface Options {
 	choicesPath: string | undefined;
 	csvPath: string;
 	campaign: string;
+	offset: number;
 	limit: number;
 	submit: boolean;
 	apiToken: string;
@@ -123,6 +136,7 @@ function parseOptions(args: string[]): Options {
 				"--choices",
 				"--csv",
 				"--campaign",
+				"--offset",
 				"--limit",
 			].includes(arg)
 		) {
@@ -139,8 +153,12 @@ function parseOptions(args: string[]): Options {
 	const csvPath = requiredOption(values, "csv");
 	const campaign = requiredOption(values, "campaign");
 	const limit = Number(values.get("limit") ?? "5");
-	if (!Number.isInteger(limit) || limit < 1 || limit > 5) {
-		throw new Error("--limit must be an integer from 1 to 5");
+	if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+		throw new Error("--limit must be an integer from 1 to 50");
+	}
+	const offset = Number(values.get("offset") ?? "0");
+	if (!Number.isInteger(offset) || offset < 0) {
+		throw new Error("--offset must be an integer of 0 or more");
 	}
 	const apiToken = process.env.JOB_API_TOKEN ?? "";
 	if (submit && !apiToken)
@@ -151,6 +169,7 @@ function parseOptions(args: string[]): Options {
 		choicesPath: values.get("choices"),
 		csvPath,
 		campaign,
+		offset,
 		limit,
 		submit,
 		apiToken,
