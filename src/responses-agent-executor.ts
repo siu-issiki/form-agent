@@ -1284,7 +1284,8 @@ const FINISH_REASON_PROPERTY = {
 	type: "string",
 	minLength: 1,
 	maxLength: 1_000,
-	description: "The observed text or condition that justifies reasonCode.",
+	description:
+		"The observed condition that justifies reasonCode. Explain in your own words; do not paste page text, put the exact quote in evidence instead.",
 } as const;
 
 const AGENT_TOOLS = [

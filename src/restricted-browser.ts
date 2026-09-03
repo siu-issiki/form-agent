@@ -1074,7 +1074,7 @@ const FORM_PURPOSE_HEADING_FILLER =
  * drops a legitimate inquiry.
  */
 const SALES_SUBJECTS =
-	"営業(?:を|の)?目的(?:と)?|営業活動|営業メール|営業(?:の)?ご?提案|勧誘目的|(?<!自)営業(?!時間|日|所|部|担当|中|カレンダー|マン|職|エリア|拠点|センター|本部|時|日程|利益|成績|年度|許可|秘密|報告|力|会議|実績|収益|外|停止|終了|再開|開始|活動報告)|勧誘|セールス|売り込み|売込み|sales|solicitation";
+	"営業(?:を|の)?目的(?:と)?|営業活動|営業メール|営業(?:の)?ご?提案|勧誘目的|(?<!自)営業(?!時間|日|所|中|カレンダー|マン|職|エリア|拠点|センター|本部|時|日程|利益|成績|年度|許可|秘密|報告|力|会議|実績|収益|外|停止|終了|再開|開始|活動報告)|勧誘|セールス|売り込み|売込み|sales|solicitation";
 
 /**
  * Ways a page refuses something. Softened refusals ("お控えください",
@@ -1145,10 +1145,19 @@ export const MIN_PROHIBITION_EVIDENCE_LENGTH = 8;
 export const MAX_PROHIBITION_EVIDENCE_LENGTH = 300;
 
 /**
- * Words a quoted sentence must contain for each reason code. They are far
- * looser than the detection patterns because the sentence itself is already
- * proven to exist on the page; the check only rules out a quote that names
- * something else entirely, such as a heading about the sales department.
+ * Refusals a quoted sentence may carry. Only negative forms count: the stems
+ * 「受け付け」「受付」「対応」「承って」 also open the acceptance a page states
+ * ("営業のご提案も受け付けております"), which would turn an invitation into a
+ * prohibition.
+ */
+const EVIDENCE_REFUSALS =
+	/受け付けて(?:おりません|いません|ません)|受け付けません|受付(?:して)?(?:おりません|いません|ません)|お断り|ご遠慮|遠慮ください|禁止|お控え|控えて|承って(?:おりません|いません|ません)|承りません|対応(?:して)?(?:おりません|いません)|(?:いた|致)しかねます|できません|しません|not accepted|prohibited|do not|refrain|decline/;
+
+/**
+ * Words a quoted sentence must contain for each reason code. They are looser
+ * than the detection patterns because the sentence itself is already proven to
+ * exist on the page; the check only rules out a quote that names something else
+ * entirely, such as a heading about the sales department.
  */
 const PROHIBITION_EVIDENCE_VOCABULARY: Record<
 	Exclude<ProhibitedReasonCode, "NO_FORM_PRESENT">,
@@ -1156,11 +1165,13 @@ const PROHIBITION_EVIDENCE_VOCABULARY: Record<
 > = {
 	SALES_PROHIBITED: [
 		/営業|勧誘|セールス|売り込み|売込み|sales|solicitation|ソリシテーション/,
-		/お断り|断り|ご遠慮|遠慮|禁止|お控え|控え|受け付け|受付|承って|承り|対応|できません|かねます|しません|not accepted|prohibited|do not|refrain/,
+		EVIDENCE_REFUSALS,
 	],
 	FORM_PURPOSE_INCOMPATIBLE: [
 		new RegExp(FORM_PURPOSE_WORDS),
-		/専用|のみ|限定|に限|以外|お断り|ご遠慮|受け付け|できません/,
+		// 「以外」 on its own introduces a general inquiry form as often as it
+		// excludes one, so it counts only through the refusal that follows it.
+		new RegExp(`専用|のみ|限定|に限|${EVIDENCE_REFUSALS.source}`),
 	],
 };
 
@@ -1194,6 +1205,15 @@ function checkProhibitionEvidence(
 	}
 	if (!normalizeForEvidence(pageText ?? "").includes(quote)) {
 		return "PROHIBITION_EVIDENCE_NOT_FOUND";
+	}
+	// A sentence that states the opposite is refused outright, so a quote such
+	// as "営業のご提案も受け付けております" cannot be read as a prohibition.
+	if (
+		PROHIBITION_TEXT_PATTERN_SOURCES.explicitAllowances.some((source) =>
+			new RegExp(source).test(quote),
+		)
+	) {
+		return "PROHIBITION_EVIDENCE_WEAK";
 	}
 	const [subject, refusal] = PROHIBITION_EVIDENCE_VOCABULARY[reasonCode];
 	return subject.test(quote) && refusal.test(quote)

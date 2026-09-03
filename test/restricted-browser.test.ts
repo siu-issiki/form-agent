@@ -15,6 +15,7 @@ import {
 	ObservationStaleError,
 	type ObservedFieldState,
 	observationFingerprint,
+	type ProhibitedReasonCode,
 	ProhibitionEvidenceError,
 	type RestrictedBrowserDriver,
 	RestrictedBrowserTools,
@@ -493,6 +494,45 @@ describe("RestrictedBrowserTools", () => {
 		});
 	});
 
+	test("refuses a quoted sentence that accepts rather than refuses", async () => {
+		const cases: Array<[ProhibitedReasonCode, string]> = [
+			["SALES_PROHIBITED", "当社では営業のご提案も受け付けております。"],
+			["SALES_PROHIBITED", "営業のご提案には対応いたします。"],
+			[
+				"FORM_PURPOSE_INCOMPATIBLE",
+				"採用に関するお問い合わせも受け付けております。",
+			],
+			[
+				"FORM_PURPOSE_INCOMPATIBLE",
+				"採用以外のお問い合わせも受け付けています。",
+			],
+		];
+		for (const [reasonCode, sentence] of cases) {
+			const driver = new FakeDriver();
+			driver.observationForms = defaultObservedForms(
+				"一般お問い合わせフォーム",
+			);
+			driver.pageText = `お問い合わせ窓口。${sentence}`;
+			const tools = await createTools(driver);
+			await tools.observe();
+			const logs = captureLogs();
+
+			let rejected: unknown;
+			try {
+				rejected = await tools
+					.validateProhibited(reasonCode, input.targetUrl, sentence)
+					.catch((error: unknown) => error);
+			} finally {
+				logs.restore();
+			}
+
+			expect(rejected).toBeInstanceOf(ProhibitionEvidenceError);
+			expect((rejected as ProhibitionEvidenceError).code).toBe(
+				"PROHIBITION_EVIDENCE_WEAK",
+			);
+		}
+	});
+
 	test("matches a quote across full-width spaces and line breaks", async () => {
 		const driver = new FakeDriver();
 		driver.observationForms = defaultObservedForms("一般お問い合わせフォーム");
@@ -667,6 +707,8 @@ describe("RestrictedBrowserTools", () => {
 			"お問い合わせフォームからの営業メールやご提案に関するメールはご遠慮ください。",
 			"このフォームはお客様専用となります。営業メールはご遠慮ください。",
 			"営業支援サービスのご案内はお断りしております。",
+			"営業部からのご提案はお断りしております。",
+			"営業担当者からのご案内はお断りしております。",
 		]) {
 			expect(detectProhibitedTextReasonCodes(text)).toContain(
 				"SALES_PROHIBITED",
