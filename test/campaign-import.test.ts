@@ -8,6 +8,7 @@ import {
 	type RegistrationEntry,
 	readChoiceCandidates,
 	resolveRedirectHosts,
+	selectCampaignCandidates,
 } from "../src/campaign-import";
 
 const registrationPairs: Array<[string, string]> = [
@@ -206,6 +207,48 @@ describe("campaign import", () => {
 				inquiryType: Array.from({ length: 11 }, (_, index) => `c${index}`),
 			}),
 		).toThrow("invalid candidate list");
+	});
+
+	test("selects the offset window from the eligible rows", () => {
+		const { eligible } = filterCampaignRows(
+			Array.from({ length: 6 }, (_, index) =>
+				row({
+					企業ドメイン: `acme-${index}.co.jp`,
+					問い合わせフォームURL: `https://acme-${index}.co.jp/contact`,
+				}),
+			),
+		);
+
+		expect(eligible).toHaveLength(6);
+		expect(
+			selectCampaignCandidates(eligible, 0, 2).map((entry) => entry.rowNumber),
+		).toEqual([2, 3]);
+		expect(
+			selectCampaignCandidates(eligible, 2, 2).map((entry) => entry.rowNumber),
+		).toEqual([4, 5]);
+		// The window is clipped instead of wrapping, so the caller detects the
+		// shortfall and stops.
+		expect(
+			selectCampaignCandidates(eligible, 5, 3).map((entry) => entry.rowNumber),
+		).toEqual([7]);
+		expect(selectCampaignCandidates(eligible, 6, 1)).toEqual([]);
+	});
+
+	test("rejects a non-integer or negative offset and limit", () => {
+		const { eligible } = filterCampaignRows([row()]);
+
+		expect(() => selectCampaignCandidates(eligible, -1, 1)).toThrow(
+			"offset must be an integer of 0 or more",
+		);
+		expect(() => selectCampaignCandidates(eligible, 1.5, 1)).toThrow(
+			"offset must be an integer of 0 or more",
+		);
+		expect(() => selectCampaignCandidates(eligible, 0, 0)).toThrow(
+			"limit must be an integer of 1 or more",
+		);
+		expect(() => selectCampaignCandidates(eligible, 0, Number.NaN)).toThrow(
+			"limit must be an integer of 1 or more",
+		);
 	});
 
 	test("keeps the example choices file within the contract", async () => {

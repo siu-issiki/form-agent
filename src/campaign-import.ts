@@ -146,6 +146,25 @@ export function filterCampaignRows(
 	return { eligible, excluded };
 }
 
+/**
+ * Picks the dry-run window out of the eligible rows. The window is taken from
+ * the eligible order itself, so a row that later fails the redirect preflight
+ * still consumes its slot and the same offset always names the same rows.
+ */
+export function selectCampaignCandidates(
+	eligible: readonly CampaignCandidate[],
+	offset: number,
+	limit: number,
+): CampaignCandidate[] {
+	if (!Number.isInteger(offset) || offset < 0) {
+		throw new Error("offset must be an integer of 0 or more");
+	}
+	if (!Number.isInteger(limit) || limit < 1) {
+		throw new Error("limit must be an integer of 1 or more");
+	}
+	return eligible.slice(offset, offset + limit);
+}
+
 export async function resolveRedirectHosts(
 	startUrl: string,
 	fetcher: typeof fetch = fetch,
