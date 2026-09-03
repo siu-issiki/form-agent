@@ -199,7 +199,7 @@ bun --env-file=.env.production run tools/browser-use-sessions.ts stop-all
 
 Worker側の記録は`browser_use_session_created`、`browser_use_session_stopped`、`browser_use_session_reclaimed`である。`browser_use_session_stopped`の`ok`が`false`の場合は`stop`が届いていないため、上記の`list`で残骸を確認する。
 
-`outcome: exceededCpu`によるWorkerの強制終了は、Cloudflareダッシュボードの Workers Logs で`outcome = exceededCpu`を検索して調査する。ログの保持期間は7日であるため、7日以内に確認する。`cpuTime`と`wallTime`を併せて読み、CPU上限（120秒）に達していない強制終了であれば上限引き上げでは解消しない。
+`outcome: exceededCpu`によるWorkerの強制終了は、Cloudflareダッシュボードの Workers Logs で`outcome = exceededCpu`を検索して調査する。ログの保持期間はFreeプランで3日であるため、3日以内に確認する。`cpuTime`と`wallTime`を併せて読み、CPU上限（既定30秒。Freeプランでは変更不可）に達していない強制終了であれば上限引き上げでは解消しない。
 
 ## 重複Queue配送の検証
 
