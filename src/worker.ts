@@ -447,6 +447,14 @@ export async function consumeJobBatch(
 			const job = claimed ?? (await store.find(message.body.jobId));
 
 			if (job?.status !== "running" || job.runToken !== runToken) {
+				// Best effort: the message is acknowledged either way, and the
+				// event only exists so that a job left in `submitting` by a
+				// stopped Worker is findable.
+				if (job) {
+					await store
+						.recordRedeliveryIgnored(job.id, job.status, now)
+						.catch(() => undefined);
+				}
 				message.ack();
 				continue;
 			}

@@ -112,6 +112,28 @@ D1 migrationはWorker deployでは自動適用されない。新しい列を参�
 
 完全な`target_url`、`form_url`、自由文の`reason`は一括出力しない。query tokenやフォーム値を含む可能性があるため、必要な場合だけ対象IDを限定し、標準出力の保存先と閲覧者を確認して取得する。
 
+### Workerが`submitting`中に停止した場合
+
+送信権を取得した直後にWorkerが停止すると、ジョブは`submitting`のまま残る。Queueがそのメッセージを再配信しても、consumerは`pending`以外を実行権として取得せず、状態が`running`でないため実行せずにackする。したがって自動での再送は起きない。
+
+この再配信を検出するため、ackしたときに`job.redelivery_ignored`イベントを記録する。`data_json`はジョブの`status`だけを保存する。
+
+```bash
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT job_id,attempt,data_json,created_at FROM events WHERE type='job.redelivery_ignored' ORDER BY created_at DESC LIMIT 20;"
+```
+
+`status`が`submitting`の行が該当する。対象ジョブは前節の外部証跡照合を行い、送信済みの可能性を否定できない場合は再投入しない。未送信・送信済みのいずれと判断した場合も、状態を`running`へ戻さず、承認記録を残したうえで人手で`uncertain`として確定する。`run_token`は監査のため残す。
+
+```bash
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "INSERT INTO results (job_id,outcome,form_url,reason_code,reason,completed_at) SELECT id,'uncertain',NULL,'OPERATOR_CONFIRMED_UNCERTAIN','Reconciled by an operator after the Worker stopped while submitting.',datetime('now') FROM jobs WHERE id='<JOB_ID>' AND status='submitting' AND NOT EXISTS (SELECT 1 FROM results WHERE results.job_id=jobs.id);"
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "UPDATE jobs SET status='uncertain',updated_at=datetime('now') WHERE id='<JOB_ID>' AND status='submitting';"
+```
+
+`results`の挿入を先に行い、挿入件数が1件であることを確認してから状態を更新する。再実行が必要な場合は既存IDを変更せず、新しいジョブIDで登録する。
+
 まず対象ジョブのD1 `evidence.captured`イベントを取得し、`after_submit`のスクリーンショットが記録されているかを確認する。取得手順は次節「証跡スクリーンショットの確認」を参照する。
 
 次の外部証跡を照合する。

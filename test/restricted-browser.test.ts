@@ -22,6 +22,7 @@ import {
 	SubmissionNotAuthorizedError,
 	SubmissionResultUncertainError,
 	type SubmitActivationStrategy,
+	SubmitProhibitedError,
 	type SubmitReviewDecision,
 	SubmitReviewDeniedError,
 	type SubmitReviewer,
@@ -296,9 +297,15 @@ describe("RestrictedBrowserTools", () => {
 		).rejects.toBeInstanceOf(BrowserElementError);
 		await tools.fill("fa-0-0", "Hello");
 		await tools.observe();
-		await expect(tools.validateSubmit("fa-0-1")).rejects.toBeInstanceOf(
-			BrowserElementError,
-		);
+		const prohibited = await tools
+			.validateSubmit("fa-0-1")
+			.catch((error: unknown) => error);
+		expect(prohibited).toBeInstanceOf(SubmitProhibitedError);
+		expect((prohibited as SubmitProhibitedError).reasonCodes).toEqual([
+			"SALES_PROHIBITED",
+			"FORM_PURPOSE_INCOMPATIBLE",
+		]);
+		expect((prohibited as SubmitProhibitedError).pageProhibited).toBe(true);
 	});
 
 	test("detects a prohibition split across adjacent context segments", async () => {
@@ -327,6 +334,68 @@ describe("RestrictedBrowserTools", () => {
 		await expect(
 			tools.validateProhibited("NO_FORM_PRESENT", input.targetUrl),
 		).rejects.toBeInstanceOf(BrowserElementError);
+	});
+
+	test("re-observes once when the current observation shows no prohibition", async () => {
+		const driver = new FakeDriver();
+		driver.observationFormsSequence = [
+			defaultObservedForms("一般お問い合わせフォーム"),
+			defaultObservedForms("営業目的での利用は禁止しています。"),
+		];
+		const tools = await createTools(driver);
+		await tools.observe();
+		const logs = captureLogs();
+
+		try {
+			await expect(
+				tools.validateProhibited("SALES_PROHIBITED", input.targetUrl),
+			).resolves.toBeUndefined();
+		} finally {
+			logs.restore();
+		}
+
+		expect(driver.observeCount).toBe(2);
+		expect(logs.entries).toEqual([
+			{ event: "prohibition_reverified", verified: true },
+		]);
+	});
+
+	test("re-observes at most once for each input revision", async () => {
+		const driver = new FakeDriver();
+		driver.observationForms = defaultObservedForms("一般お問い合わせフォーム");
+		const tools = await createTools(driver);
+		await tools.observe();
+		const logs = captureLogs();
+
+		try {
+			await expect(
+				tools.validateProhibited("SALES_PROHIBITED", input.targetUrl),
+			).rejects.toBeInstanceOf(BrowserElementError);
+			expect(driver.observeCount).toBe(2);
+			await expect(
+				tools.validateProhibited("SALES_PROHIBITED", input.targetUrl),
+			).rejects.toBeInstanceOf(BrowserElementError);
+		} finally {
+			logs.restore();
+		}
+
+		expect(driver.observeCount).toBe(2);
+		expect(logs.entries).toEqual([
+			{ event: "prohibition_reverified", verified: false },
+		]);
+	});
+
+	test("does not re-observe for a stale observation", async () => {
+		const driver = new FakeDriver();
+		driver.observationForms = defaultObservedForms("一般お問い合わせフォーム");
+		const tools = await createTools(driver);
+		await tools.observe();
+		await tools.click("fa-0-2");
+
+		await expect(
+			tools.validateProhibited("SALES_PROHIBITED", input.targetUrl),
+		).rejects.toBeInstanceOf(BrowserElementError);
+		expect(driver.observeCount).toBe(1);
 	});
 
 	test("rejects a prohibited outcome after the observed hash route changes", async () => {
@@ -362,9 +431,16 @@ describe("RestrictedBrowserTools", () => {
 		await tools.observe();
 
 		await expect(tools.validateSubmit("fa-0-4")).resolves.toBeUndefined();
-		await expect(tools.validateSubmit("fa-0-1")).rejects.toBeInstanceOf(
-			BrowserElementError,
-		);
+		const prohibited = await tools
+			.validateSubmit("fa-0-1")
+			.catch((error: unknown) => error);
+		expect(prohibited).toBeInstanceOf(SubmitProhibitedError);
+		expect((prohibited as SubmitProhibitedError).reasonCodes).toEqual([
+			"SALES_PROHIBITED",
+		]);
+		// The page-level detection needs every form to carry a code, so
+		// `finish_prohibited` would be rejected for this page.
+		expect((prohibited as SubmitProhibitedError).pageProhibited).toBe(false);
 	});
 
 	test("detects only mechanically supported prohibition reasons", () => {
@@ -1442,6 +1518,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
 
+function captureLogs(): { entries: unknown[]; restore: () => void } {
+	const entries: unknown[] = [];
+	const originalLog = console.log;
+	console.log = (message: unknown) => {
+		entries.push(JSON.parse(String(message)));
+	};
+	return {
+		entries,
+		restore: () => {
+			console.log = originalLog;
+		},
+	};
+}
+
 function defaultObservedForms(prohibitionText?: string): unknown[] {
 	return [
 		{
@@ -1477,7 +1567,10 @@ class FakeDriver implements RestrictedBrowserDriver {
 	connectionClosed = false;
 	navigationCount = 0;
 	navigationLinks: Array<{ url: string; text: string }> | undefined;
+	observeCount = 0;
 	observationForms: unknown[] = defaultObservedForms();
+	/** Replayed per observe call when set; the last entry repeats. */
+	observationFormsSequence: unknown[][] | null = null;
 	fieldStates: ObservedFieldState[] = defaultFieldStates();
 	fieldStatesError: Error | null = null;
 	/** Replayed in order; the last entry repeats. */
@@ -1506,10 +1599,15 @@ class FakeDriver implements RestrictedBrowserDriver {
 	}
 
 	async observe() {
+		this.observeCount += 1;
+		const sequence = this.observationFormsSequence;
+		const forms = sequence
+			? (sequence[Math.min(this.observeCount - 1, sequence.length - 1)] ?? [])
+			: this.observationForms;
 		return {
 			url: this.url,
 			// A real observation is a snapshot, not a live view of the page.
-			forms: structuredClone(this.observationForms),
+			forms: structuredClone(forms),
 			...(this.pageText ? { pageText: this.pageText } : {}),
 			...(this.navigationLinks
 				? { navigationLinks: this.navigationLinks }

@@ -27,6 +27,8 @@ import type { Job } from "./job";
 import {
 	assertAllowedTargetUrl,
 	BrowserElementError,
+	type BrowserElementOperation,
+	BrowserElementOperationError,
 	BrowserFormInvalidError,
 	type BrowserObservation,
 	type BrowserSubmitResult,
@@ -48,6 +50,8 @@ const CONFIRMATION_POLL_INTERVAL_MS = 1_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MS = 15_000;
 const SUBMISSION_PERMISSION_WINDOW_MS = 2_000;
 const MAX_SUBMIT_MOUSE_PREPARATION_ATTEMPTS = 3;
+/** The CDP connection reports a per-command error response with this message. */
+const CDP_COMMAND_FAILED_MESSAGE = "Browser Use CDP command failed";
 const CONNECT_RETRY_DELAYS_MS = [10_000, 20_000, 30_000];
 /**
  * The run deadline is 10 minutes and the termination grace is 30 seconds, so a
@@ -895,88 +899,131 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 
 	async clickNonSubmit(elementId: string): Promise<void> {
 		const reference = this.#element(elementId);
-		const state = await this.#inspectElement(reference.backendNodeId);
-		if (
-			!state.ok ||
-			!state.visible ||
-			state.disabled ||
-			state.submitLike ||
-			!isPayloadIndependentClickTarget(state.tag, state.type)
-		) {
-			throw new BrowserElementError();
-		}
-		this.#interactionStarted = true;
-		this.#blockNonSubmitRequests = true;
-		await this.#clickElement(reference.backendNodeId);
+		// The press is the last step a CDP failure may be reported as an element
+		// error for. Once it is sent the click may already have reached the page,
+		// so a failed release stays a run error rather than inviting a re-click.
+		const point = await this.#asElementOperation("click", async () => {
+			const state = await this.#inspectElement(reference.backendNodeId);
+			if (
+				!state.ok ||
+				!state.visible ||
+				state.disabled ||
+				state.submitLike ||
+				!isPayloadIndependentClickTarget(state.tag, state.type)
+			) {
+				throw new BrowserElementError();
+			}
+			this.#interactionStarted = true;
+			this.#blockNonSubmitRequests = true;
+			const preparedPoint = await this.#prepareMouseClick(
+				reference.backendNodeId,
+			);
+			await this.#dispatchMousePress(preparedPoint);
+			return preparedPoint;
+		});
+		await this.#dispatchMouseRelease(point);
 	}
 
 	async fill(elementId: string, value: string): Promise<void> {
 		const reference = this.#element(elementId);
-		const state = await this.#inspectElement(reference.backendNodeId);
-		if (
-			!state.ok ||
-			!state.visible ||
-			state.disabled ||
-			state.readOnly ||
-			!isFillable(state.tag, state.type)
-		) {
-			throw new BrowserElementError();
-		}
-		this.#interactionStarted = true;
-		this.#formDataEntered = true;
-		this.#blockNonSubmitRequests = true;
-		await this.#send("DOM.scrollIntoViewIfNeeded", {
-			backendNodeId: reference.backendNodeId,
+		await this.#asElementOperation("fill", async () => {
+			const state = await this.#inspectElement(reference.backendNodeId);
+			if (
+				!state.ok ||
+				!state.visible ||
+				state.disabled ||
+				state.readOnly ||
+				!isFillable(state.tag, state.type)
+			) {
+				throw new BrowserElementError();
+			}
+			this.#interactionStarted = true;
+			this.#formDataEntered = true;
+			this.#blockNonSubmitRequests = true;
+			await this.#send("DOM.scrollIntoViewIfNeeded", {
+				backendNodeId: reference.backendNodeId,
+			});
+			await this.#send("DOM.focus", {
+				backendNodeId: reference.backendNodeId,
+			});
+			await this.#replaceFocusedText(value);
+			this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
 		});
-		await this.#send("DOM.focus", {
-			backendNodeId: reference.backendNodeId,
-		});
-		await this.#replaceFocusedText(value);
-		this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
 	}
 
 	async select(elementId: string, value: string): Promise<void> {
 		const reference = this.#element(elementId);
-		const state = await this.#inspectElement(reference.backendNodeId);
-		if (!state.ok || !state.visible || state.disabled) {
+		await this.#asElementOperation("select", async () => {
+			const state = await this.#inspectElement(reference.backendNodeId);
+			if (!state.ok || !state.visible || state.disabled) {
+				throw new BrowserElementError();
+			}
+			this.#interactionStarted = true;
+			this.#formDataEntered = true;
+			this.#blockNonSubmitRequests = true;
+			if (state.tag === "select") {
+				const changed = await this.#callFunctionOnElement<boolean>(
+					reference.backendNodeId,
+					SET_SELECT_VALUE_FUNCTION,
+					[value],
+				);
+				if (!changed) throw new BrowserElementError();
+				this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
+				return;
+			}
+			const desiredChecked =
+				value === "true" || value === "checked" || value === state.value;
+			if (state.type === "checkbox") {
+				const changed = await this.#callFunctionOnElement<boolean>(
+					reference.backendNodeId,
+					SET_CHECKED_VALUE_FUNCTION,
+					[desiredChecked],
+				);
+				if (!changed) throw new BrowserElementError();
+				this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
+				return;
+			}
+			if (state.type === "radio" && value === state.value) {
+				const changed = await this.#callFunctionOnElement<boolean>(
+					reference.backendNodeId,
+					SET_CHECKED_VALUE_FUNCTION,
+					[true],
+				);
+				if (!changed) throw new BrowserElementError();
+				this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
+				return;
+			}
 			throw new BrowserElementError();
-		}
-		this.#interactionStarted = true;
-		this.#formDataEntered = true;
-		this.#blockNonSubmitRequests = true;
-		if (state.tag === "select") {
-			const changed = await this.#callFunctionOnElement<boolean>(
-				reference.backendNodeId,
-				SET_SELECT_VALUE_FUNCTION,
-				[value],
+		});
+	}
+
+	/**
+	 * Reports a CDP command rejection during an element operation as an element
+	 * error, so the model re-observes and continues instead of the run ending.
+	 * Connection loss, timeouts, and unsent commands stay run errors because a
+	 * later tool call cannot recover from them either.
+	 */
+	async #asElementOperation<TResult>(
+		operation: BrowserElementOperation,
+		run: () => Promise<TResult>,
+	): Promise<TResult> {
+		try {
+			return await run();
+		} catch (error) {
+			if (
+				!(error instanceof Error) ||
+				error.message !== CDP_COMMAND_FAILED_MESSAGE
+			) {
+				throw error;
+			}
+			console.warn(
+				JSON.stringify({
+					event: "browser_element_operation_failed",
+					operation,
+				}),
 			);
-			if (!changed) throw new BrowserElementError();
-			this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
-			return;
+			throw new BrowserElementOperationError(operation);
 		}
-		const desiredChecked =
-			value === "true" || value === "checked" || value === state.value;
-		if (state.type === "checkbox") {
-			const changed = await this.#callFunctionOnElement<boolean>(
-				reference.backendNodeId,
-				SET_CHECKED_VALUE_FUNCTION,
-				[desiredChecked],
-			);
-			if (!changed) throw new BrowserElementError();
-			this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
-			return;
-		}
-		if (state.type === "radio" && value === state.value) {
-			const changed = await this.#callFunctionOnElement<boolean>(
-				reference.backendNodeId,
-				SET_CHECKED_VALUE_FUNCTION,
-				[true],
-			);
-			if (!changed) throw new BrowserElementError();
-			this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
-			return;
-		}
-		throw new BrowserElementError();
 	}
 
 	async validateSubmit(elementId: string): Promise<void> {
@@ -1564,11 +1611,6 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		await this.#send("Input.insertText", { text: value });
 	}
 
-	async #clickElement(backendNodeId: number): Promise<void> {
-		const point = await this.#prepareMouseClick(backendNodeId);
-		await this.#dispatchMouseClick(point);
-	}
-
 	async #prepareMouseClick(
 		backendNodeId: number,
 		activationStrategy?: SubmitActivationStrategy,
@@ -1627,6 +1669,11 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async #dispatchMouseClick(point: { x: number; y: number }): Promise<void> {
+		await this.#dispatchMousePress(point);
+		await this.#dispatchMouseRelease(point);
+	}
+
+	async #dispatchMousePress(point: { x: number; y: number }): Promise<void> {
 		await this.#send("Input.dispatchMouseEvent", {
 			type: "mousePressed",
 			x: point.x,
@@ -1635,6 +1682,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			buttons: 1,
 			clickCount: 1,
 		});
+	}
+
+	async #dispatchMouseRelease(point: { x: number; y: number }): Promise<void> {
 		await this.#send("Input.dispatchMouseEvent", {
 			type: "mouseReleased",
 			x: point.x,
