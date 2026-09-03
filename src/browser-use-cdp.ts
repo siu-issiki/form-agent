@@ -161,7 +161,7 @@ export class BrowserUseCdpConnection {
 			this.#pending.delete(message.id);
 			this.#lastResponseCharacters.set(pending.method, event.data.length);
 			if (message.error)
-				pending.reject(new Error("Browser Use CDP command failed"));
+				pending.reject(createCdpCommandError(pending.method, message.error));
 			else pending.resolve(message.result);
 			return;
 		}
@@ -244,6 +244,77 @@ export function classifyCdpCloseReason(reason: string): CdpCloseReasonHint {
 		if (needles.some((needle) => normalized.includes(needle))) return hint;
 	}
 	return "OTHER";
+}
+
+export type CdpCommandErrorKind =
+	| "NODE_NOT_FOUND"
+	| "NODE_DETACHED"
+	| "NO_BOX_MODEL"
+	| "NOT_FOCUSABLE"
+	| "NO_EXECUTION_CONTEXT"
+	| "OTHER";
+
+/**
+ * A CDP error message can quote page-derived text, so only these fixed
+ * patterns are read from it and the message itself is never kept.
+ */
+const COMMAND_ERROR_KIND_PATTERNS: ReadonlyArray<
+	readonly [CdpCommandErrorKind, readonly string[]]
+> = [
+	[
+		"NODE_NOT_FOUND",
+		[
+			"could not find node",
+			"no node with given id",
+			"node with given id does not belong",
+		],
+	],
+	["NODE_DETACHED", ["not attached", "detached"]],
+	["NO_BOX_MODEL", ["box model", "could not compute"]],
+	["NOT_FOCUSABLE", ["not focusable"]],
+	["NO_EXECUTION_CONTEXT", ["execution context", "cannot find context"]],
+];
+
+export function classifyCdpCommandError(message: unknown): CdpCommandErrorKind {
+	if (typeof message !== "string") return "OTHER";
+	const normalized = message.trim().toLowerCase();
+	if (!normalized) return "OTHER";
+	for (const [kind, needles] of COMMAND_ERROR_KIND_PATTERNS) {
+		if (needles.some((needle) => normalized.includes(needle))) return kind;
+	}
+	return "OTHER";
+}
+
+/**
+ * A per-command CDP error response. The message stays the fixed string every
+ * caller already classifies on, and the failing method, the numeric code and
+ * the fixed kind ride alongside it so the cause is visible in a log without
+ * recording page-derived text.
+ */
+export class BrowserUseCdpCommandError extends Error {
+	constructor(
+		readonly method: string,
+		readonly code: number | null,
+		readonly kind: CdpCommandErrorKind,
+	) {
+		super("Browser Use CDP command failed");
+		this.name = "BrowserUseCdpCommandError";
+	}
+}
+
+function createCdpCommandError(
+	method: string,
+	error: unknown,
+): BrowserUseCdpCommandError {
+	const detail =
+		typeof error === "object" && error !== null
+			? (error as { code?: unknown; message?: unknown })
+			: {};
+	return new BrowserUseCdpCommandError(
+		method,
+		typeof detail.code === "number" ? detail.code : null,
+		classifyCdpCommandError(detail.message),
+	);
 }
 
 export class BrowserUseCdpClosedError extends Error {

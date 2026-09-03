@@ -1718,6 +1718,45 @@ describe("SubmissionEvidenceRecorder", () => {
 		);
 	});
 
+	test("records the duration of every capture step and the screenshot size", async () => {
+		const driver = new FakeDriver();
+		const store = new InMemoryJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const recorder = new SubmissionEvidenceRecorder(
+			driver,
+			new EventsAtPutEvidenceObjectStore(store),
+			store,
+			input.id,
+			"run-token-1",
+			1,
+			() => "2026-08-28T00:00:02.000Z",
+		);
+		const logs: string[] = [];
+		const originalLog = console.log;
+		console.log = (message: unknown) => {
+			logs.push(String(message));
+		};
+
+		try {
+			await recorder.capture("before_submit");
+		} finally {
+			console.log = originalLog;
+		}
+
+		const timings = logs
+			.filter((entry) => entry.includes('"submission_evidence_timing"'))
+			.map((entry) => JSON.parse(entry) as Record<string, unknown>);
+		expect(timings).toHaveLength(1);
+		const timing = timings[0] ?? {};
+		expect(timing.event).toBe("submission_evidence_timing");
+		expect(timing.stage).toBe("before_submit");
+		expect(timing.bytes).toBe(3);
+		for (const field of ["screenshotMs", "digestMs", "putMs", "recordMs"]) {
+			expect(typeof timing[field]).toBe("number");
+		}
+	});
+
 	test("moves the intent to a failure when the upload fails", async () => {
 		const driver = new FakeDriver();
 		const store = new InMemoryJobStore();

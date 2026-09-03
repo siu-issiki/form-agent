@@ -14,6 +14,26 @@ export const EVIDENCE_CONTENT_TYPE = "image/jpeg";
  */
 export const EVIDENCE_CAPTURE_TIMEOUT_MS = 15_000;
 
+interface EvidenceCaptureTiming {
+	screenshotMs: number;
+	digestMs: number;
+	putMs: number;
+	recordMs: number;
+	bytes: number;
+}
+
+/** Monotonic where the runtime offers it, so a clock step cannot skew a duration. */
+function monotonicNow(): number {
+	return typeof performance !== "undefined" &&
+		typeof performance.now === "function"
+		? performance.now()
+		: Date.now();
+}
+
+function elapsedMs(startedAt: number): number {
+	return Math.round(monotonicNow() - startedAt);
+}
+
 export interface EvidenceObjectStore {
 	put(
 		key: string,
@@ -130,46 +150,94 @@ export class SubmissionEvidenceRecorder {
 		}
 	}
 
+	/**
+	 * Records how long each step of a capture took, on every exit, so a stalled
+	 * or CPU-heavy capture can be told apart from a slow review call. Only
+	 * durations, the byte count and the fixed stage are logged.
+	 */
 	async #captureUnbounded(
 		stage: EvidenceStage,
 		eventId: string,
 		objectKey: string,
 		expired: () => boolean,
 	): Promise<EvidenceCaptureResult> {
+		const timing: EvidenceCaptureTiming = {
+			screenshotMs: 0,
+			digestMs: 0,
+			putMs: 0,
+			recordMs: 0,
+			bytes: 0,
+		};
+		try {
+			return await this.#captureTimed(
+				stage,
+				eventId,
+				objectKey,
+				expired,
+				timing,
+			);
+		} finally {
+			console.log(
+				JSON.stringify({
+					event: "submission_evidence_timing",
+					stage,
+					...timing,
+				}),
+			);
+		}
+	}
+
+	async #captureTimed(
+		stage: EvidenceStage,
+		eventId: string,
+		objectKey: string,
+		expired: () => boolean,
+		timing: EvidenceCaptureTiming,
+	): Promise<EvidenceCaptureResult> {
 		let bytes: Uint8Array;
+		const screenshotStartedAt = monotonicNow();
 		try {
 			bytes = await this.driver.captureScreenshot();
 		} catch {
+			timing.screenshotMs = elapsedMs(screenshotStartedAt);
 			return expired()
 				? timeoutResult()
 				: this.#failed(eventId, stage, "SCREENSHOT_FAILED");
 		}
+		timing.screenshotMs = elapsedMs(screenshotStartedAt);
+		timing.bytes = bytes.byteLength;
 		if (expired()) return timeoutResult();
 		if (bytes.byteLength === 0) {
 			return this.#failed(eventId, stage, "SCREENSHOT_FAILED");
 		}
 
 		let sha256: string;
+		const digestStartedAt = monotonicNow();
 		try {
 			sha256 = await sha256Hex(bytes);
 		} catch {
+			timing.digestMs = elapsedMs(digestStartedAt);
 			if (!expired()) {
 				return this.#failed(eventId, stage, "OBJECT_STORE_FAILED");
 			}
 			await this.#failed(eventId, stage, "CAPTURE_TIMEOUT", false);
 			return timeoutResult();
 		}
+		timing.digestMs = elapsedMs(digestStartedAt);
 		if (expired()) return timeoutResult();
 
 		// The intent names the object before it exists, so a Worker that stops
 		// between the upload and the result still leaves the key in D1. Nothing
 		// is written to the object store without it.
+		const intentStartedAt = monotonicNow();
 		const intentRecorded = await this.#recordIntent(eventId, stage, objectKey);
+		timing.recordMs = elapsedMs(intentStartedAt);
 		if (expired()) return timeoutResult();
 		if (!intentRecorded) {
 			return this.#failed(eventId, stage, "EVENT_NOT_RECORDED");
 		}
 
+		const putStartedAt = monotonicNow();
 		try {
 			await this.objectStore.put(
 				objectKey,
@@ -178,6 +246,7 @@ export class SubmissionEvidenceRecorder {
 				sha256,
 			);
 		} catch {
+			timing.putMs = elapsedMs(putStartedAt);
 			if (!expired()) {
 				return this.#failed(eventId, stage, "OBJECT_STORE_FAILED");
 			}
@@ -185,6 +254,7 @@ export class SubmissionEvidenceRecorder {
 			await this.#failed(eventId, stage, "CAPTURE_TIMEOUT", false);
 			return timeoutResult();
 		}
+		timing.putMs = elapsedMs(putStartedAt);
 		if (expired()) {
 			await this.#discardObject(stage, objectKey);
 			await this.#failed(eventId, stage, "CAPTURE_TIMEOUT", false);
@@ -192,6 +262,7 @@ export class SubmissionEvidenceRecorder {
 		}
 
 		let recorded: boolean;
+		const recordStartedAt = monotonicNow();
 		try {
 			recorded = await this.jobs.recordEvidenceCaptured(
 				this.jobId,
@@ -207,6 +278,8 @@ export class SubmissionEvidenceRecorder {
 		} catch {
 			recorded = false;
 		}
+		// Both D1 writes of a capture are reported as one duration.
+		timing.recordMs += elapsedMs(recordStartedAt);
 		if (expired()) {
 			await this.#failed(eventId, stage, "CAPTURE_TIMEOUT", false);
 			await this.#discardObject(stage, objectKey);

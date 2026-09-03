@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, test } from "vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 import { AgentExecutionError } from "../src/agent-executor";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobInput } from "../src/job";
@@ -15,6 +15,7 @@ import {
 	ResponsesSubmitReviewer,
 	readReviewDecision,
 	reviewPayload,
+	toBase64,
 } from "../src/submit-reviewer";
 
 const input: JobInput = {
@@ -96,6 +97,33 @@ describe("ResponsesSubmitReviewer", () => {
 		};
 		expect(payload.screenshot).toBe("attached");
 		expect(payload.formValues).toEqual({ message: "Hello" });
+	});
+
+	test("records the request build cost without the request content", async () => {
+		const reviewer = createReviewer(async () =>
+			Response.json(reviewResponse("allow", "INPUTS_MATCH")),
+		);
+		const logs: string[] = [];
+		const spy = vi.spyOn(console, "log").mockImplementation((message) => {
+			logs.push(String(message));
+		});
+
+		try {
+			await reviewer.review(reviewInput());
+		} finally {
+			spy.mockRestore();
+		}
+
+		const built = logs
+			.filter((entry) => entry.includes('"submit_review_request_built"'))
+			.map((entry) => JSON.parse(entry) as Record<string, unknown>);
+		expect(built).toHaveLength(1);
+		const entry = built[0] ?? {};
+		expect(entry.event).toBe("submit_review_request_built");
+		expect(entry.imageBytes).toBe(3);
+		expect(entry.withImage).toBe(true);
+		expect(typeof entry.bodyBytes).toBe("number");
+		expect(typeof entry.buildMs).toBe("number");
 	});
 
 	test("omits a screenshot that would exceed the review request limit", async () => {
@@ -354,6 +382,26 @@ describe("reviewPayload", () => {
 		) as { untrustedPageContent: { pageTextTruncated?: boolean } };
 
 		expect(payload.untrustedPageContent.pageTextTruncated).toBe(true);
+	});
+});
+
+describe("toBase64", () => {
+	test("encodes a multi-chunk screenshot exactly as a byte-at-a-time pass", () => {
+		const bytes = new Uint8Array(8 * 1_024 * 2 + 5);
+		for (let index = 0; index < bytes.length; index += 1) {
+			bytes[index] = (index * 31 + 7) % 256;
+		}
+		let binary = "";
+		for (const byte of bytes) binary += String.fromCharCode(byte);
+
+		expect(toBase64(bytes)).toBe(btoa(binary));
+	});
+
+	test("keeps the edge byte values and the empty screenshot unchanged", () => {
+		expect(toBase64(new Uint8Array(0))).toBe("");
+		expect(toBase64(new Uint8Array([0, 1, 127, 128, 254, 255]))).toBe(
+			btoa(String.fromCharCode(0, 1, 127, 128, 254, 255)),
+		);
 	});
 });
 
