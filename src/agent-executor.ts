@@ -10,6 +10,11 @@ export class AgentExecutionError extends Error {
 		readonly reasonCode: string,
 		message: string,
 		readonly retryable: boolean,
+		// Set only when the failure traces back to a BrowserUseCdpCommandError,
+		// so downstream logging can surface the fixed CDP method/kind without
+		// carrying page-derived text through the error chain.
+		readonly cdpMethod?: string,
+		readonly cdpKind?: string,
 	) {
 		super(message);
 		this.name = "AgentExecutionError";

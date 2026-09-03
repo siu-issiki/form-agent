@@ -9,6 +9,7 @@ import {
 } from "./browser-tool-handler";
 import {
 	BrowserUseCdpClosedError,
+	BrowserUseCdpCommandError,
 	BrowserUseCdpPayloadTooLargeError,
 	BrowserUseCdpUpgradeRejectedError,
 } from "./browser-use-cdp";
@@ -801,17 +802,24 @@ async function executeToolCall(
 		// so the breakdown is logged here as fixed values. Without it a bootstrap
 		// failure is only visible in the D1 diagnostics, not in Workers Logs. No
 		// value, URL, or session id is logged.
+		const cdpDetail =
+			originalError instanceof BrowserUseCdpCommandError
+				? { method: originalError.method, kind: originalError.kind }
+				: undefined;
 		console.log(
 			JSON.stringify({
 				event: "browser_setup_failed",
 				code: diagnosticCode,
 				stage: error instanceof BrowserToolSetupError ? error.stage : tool,
+				...cdpDetail,
 			}),
 		);
 		throw new AgentExecutionError(
 			"BROWSER_TOOL_UNAVAILABLE",
 			"The browser provider or tool became unavailable.",
 			true,
+			cdpDetail?.method,
+			cdpDetail?.kind,
 		);
 	}
 }

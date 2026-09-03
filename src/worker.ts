@@ -585,6 +585,9 @@ async function executeClaimedJob(
 						: "UNEXPECTED_AGENT_ERROR",
 				retryable:
 					error instanceof AgentExecutionError ? error.retryable : true,
+				...(error instanceof AgentExecutionError && error.cdpMethod
+					? { method: error.cdpMethod, kind: error.cdpKind }
+					: {}),
 			}),
 		);
 		const current = await store.find(job.id);
