@@ -1126,12 +1126,10 @@ describe("ResponsesAgentExecutor", () => {
 			activationStrategy: { enum: ["dom", "mouse", "enter"] },
 		});
 		expect(requestBodies[0]?.instructions).toContain("This is a dry-run");
-		expect(requestBodies[0]?.instructions).toContain(
-			"navigate only to an exact URL returned in observe.navigationLinks",
-		);
-		expect(requestBodies[0]?.instructions).toContain(
-			"Use select for select elements, checkboxes, and radio controls",
-		);
+		expect(
+			requestBodies[1]?.tools?.find((tool) => tool.name === "navigate")
+				?.description,
+		).toContain("navigationLinks");
 		expect(
 			requestBodies[1]?.tools?.find((tool) => tool.name === "select")
 				?.description,
@@ -1139,7 +1137,7 @@ describe("ResponsesAgentExecutor", () => {
 		expect(
 			requestBodies[1]?.tools?.find((tool) => tool.name === "click")
 				?.description,
-		).toContain("type=button");
+		).toContain("type is button");
 		expect(driver.validateSubmitCount).toBe(1);
 		expect(driver.submitCount).toBe(0);
 		expect(driver.closed).toBe(true);
@@ -1895,7 +1893,7 @@ describe("ResponsesAgentExecutor", () => {
 			functionResponse("call-observe", "observe", {}),
 			functionResponse("call-finish", "finish_prohibited", {
 				formUrl: input.targetUrl,
-				reasonCode: "NO_INQUIRY_FORM",
+				reasonCode: "NO_FORM_PRESENT",
 				reason: "No inquiry form is present.",
 			}),
 		];
