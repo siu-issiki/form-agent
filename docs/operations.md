@@ -90,9 +90,24 @@ Worker側は`POST /jobs`で実送信ジョブ（`_formAgentEffectiveDryRun`が`f
 
 すでに`pending`で存在する実送信ジョブの再登録は、`created_at`が当日UTCの場合だけ再queueする。日を跨いでいた場合は再queueせず409 `REAL_SEND_STALE`を返す。日次上限は作成時にしか数えないため、翌日に再queueするとその日の枠を消費せずに送信されてしまうためである。
 
+### 管理下テストシステムの免除
+
+上の4つのうち、承認記録・dry-run突合・日次上限の3つは、ジョブの`targetDomain`が`REAL_SEND_GUARD_EXEMPT_DOMAINS`（カンマ区切りの登録可能ドメイン）のいずれかと一致するか、その配下のホストである場合だけ免除する。管理下テストシステムへの送信は性質上すべて実送信であり、承認すべきdry-runも無く、回帰確認のたびに実サイト向けの日次枠を消費させないためである。
+
+**この変数は管理下テストシステム専用である。実サイトのドメインを入れてはいけない。**載せたドメインへは、人間の承認記録なしに、日次上限も消費せずに実送信できる。
+
+`wrangler.jsonc`の`vars`に`REAL_SEND_GUARD_EXEMPT_DOMAINS: "form-agent.workers.dev"`を置いている。テストシステムは自分たちのWorkerドメイン配下（`form-agent-test-system.form-agent.workers.dev` / `form-agent-test-external.form-agent.workers.dev`）にあるため、この1件で足りる。免除で受理したジョブはpayloadに`_formAgentRealSendGuardExempt: true`を持ち、D1の`real_send`列は0になるので、日次上限のカウントにも「実送信件数」の集計にも入らない。
+
+免除ジョブと通常の実送信ジョブを区別して数えるときは`real_send`列で切り分ける。
+
+```bash
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT real_send,COUNT(*) AS count FROM jobs WHERE created_at >= date('now') GROUP BY real_send;"
+```
+
 ### 日次上限の設定
 
-`REAL_SEND_DAILY_CAP`は`wrangler.jsonc`に置かない。未設定・空・整数以外はすべて0として扱い、実送信ジョブを一切受け付けない。上限を開くのはdeploy時の`--var`だけである。
+`REAL_SEND_DAILY_CAP`は`wrangler.jsonc`に置かない。未設定・空・整数以外はすべて0として扱い、実送信ジョブを一切受け付けない。上限を開くのはdeploy時の`--var`だけである。免除ドメイン向けのジョブはこの上限の対象外なので、管理下テストシステムの回帰確認に`--var`は要らない。
 
 `--var`を使うdeployでは通常設定の変数もすべて明示する。1つでも落とすとそのdeployから消えるおそれがある。
 
@@ -101,12 +116,13 @@ Worker側は`POST /jobs`で実送信ジョブ（`_formAgentEffectiveDryRun`が`f
   --var AGENT_EXECUTOR_ENABLED:true \
   --var AGENT_MODEL:gpt-5.6-luna \
   --var AGENT_DRY_RUN:false \
+  --var REAL_SEND_GUARD_EXEMPT_DOMAINS:form-agent.workers.dev \
   --var REAL_SEND_DAILY_CAP:5
 ./node_modules/.bin/wrangler deployments status --json
 ./node_modules/.bin/wrangler versions view <ACTIVE_VERSION_ID>
 ```
 
-active versionが1つ・100%で、`AGENT_DRY_RUN ("false")`と`REAL_SEND_DAILY_CAP ("5")`の両方が見えることを確認してから実行する。
+active versionが1つ・100%で、`AGENT_DRY_RUN ("false")`と`REAL_SEND_DAILY_CAP ("5")`の両方が見えることを確認してから実行する。`REAL_SEND_GUARD_EXEMPT_DOMAINS`が`form-agent.workers.dev`だけであることも同時に確認する。ここに実サイトのドメインが混ざっていれば、そのdeployは中止する。
 
 ### 日次上限の解除
 
