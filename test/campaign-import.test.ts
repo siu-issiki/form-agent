@@ -224,12 +224,43 @@ describe("campaign import", () => {
 			simpleRow({ 問い合わせリンク: "https://192.0.2.10/form" }),
 		]);
 
-		expect(result.eligible).toHaveLength(1);
+		// The http:// link is rewritten to https:// and becomes eligible; only
+		// the invalid host (an IP address) is still excluded.
+		expect(result.eligible).toHaveLength(2);
 		expect(result.excluded).toEqual({
 			empty_message: 2,
 			missing_form_url: 1,
-			invalid_or_insecure_form_url: 2,
+			invalid_or_insecure_form_url: 1,
 		});
+	});
+
+	test("upgrades an http:// simple-layout link to https:// and counts the rewrite", () => {
+		const result = filterCampaignRows([
+			simpleRow({
+				問い合わせリンク: "http://contact.acme.co.jp/form?campaign=1",
+			}),
+			simpleRow({ 問い合わせリンク: "https://www.beta.co.jp/inquiry" }),
+		]);
+
+		expect(result.excluded).toEqual({});
+		expect(result.upgradedToHttps).toBe(1);
+		expect(result.eligible[0]?.targetUrl).toBe(
+			"https://contact.acme.co.jp/form?campaign=1",
+		);
+		// The already-https row is left untouched and not counted.
+		expect(result.eligible[1]?.targetUrl).toBe(
+			"https://www.beta.co.jp/inquiry",
+		);
+	});
+
+	test("does not upgrade a non-http, non-https simple-layout link", () => {
+		const result = filterCampaignRows([
+			simpleRow({ 問い合わせリンク: "ftp://contact.acme.co.jp/form" }),
+		]);
+
+		expect(result.eligible).toHaveLength(0);
+		expect(result.upgradedToHttps).toBe(0);
+		expect(result.excluded).toEqual({ invalid_or_insecure_form_url: 1 });
 	});
 
 	test("reads the simple layout when the link column is 問い合わせフォームリンク", () => {
@@ -305,6 +336,8 @@ describe("campaign import", () => {
 			missing_form_url: 1,
 			invalid_or_insecure_form_url: 1,
 		});
+		// The full layout never rewrites http:// to https://.
+		expect(result.upgradedToHttps).toBe(0);
 	});
 
 	test("reduces a company subdomain to its registrable domain", () => {

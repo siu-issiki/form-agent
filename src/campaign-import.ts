@@ -34,6 +34,12 @@ export interface CampaignCandidate {
 export interface CampaignFilterResult {
 	eligible: CampaignCandidate[];
 	excluded: Record<string, number>;
+	/**
+	 * Simple-layout rows whose link was `http://` and got rewritten to
+	 * `https://` before validation. 0 when the file has no such rows, and
+	 * always 0 for the full 30-column layout, which never rewrites its URL.
+	 */
+	upgradedToHttps: number;
 }
 
 export interface RedirectResolution {
@@ -232,6 +238,7 @@ export function filterCampaignRows(
 	if (rows.length > 0 && !simple) assertRequiredColumns(header);
 	const eligible: CampaignCandidate[] = [];
 	const excluded: Record<string, number> = {};
+	let upgradedToHttps = 0;
 
 	for (let index = 0; index < rows.length; index += 1) {
 		const row = rows[index] ?? {};
@@ -246,9 +253,10 @@ export function filterCampaignRows(
 			continue;
 		}
 		eligible.push(outcome.candidate);
+		if (outcome.upgradedToHttps) upgradedToHttps += 1;
 	}
 
-	return { eligible, excluded };
+	return { eligible, excluded, upgradedToHttps };
 }
 
 /**
@@ -713,7 +721,9 @@ export async function buildCampaignJob(
 	};
 }
 
-type RowOutcome = { candidate: CampaignCandidate } | { reason: string };
+type RowOutcome =
+	| { candidate: CampaignCandidate; upgradedToHttps?: true }
+	| { reason: string };
 
 function isSimpleLayout(row: CampaignCsvRow): boolean {
 	return (
@@ -738,10 +748,27 @@ function simpleLinkValue(row: CampaignCsvRow): string | undefined {
  * Reads one row of the simple layout. It carries no company columns and no
  * review columns, so the company is taken from the form URL itself and the NG
  * checks of the full layout are not applied.
+ *
+ * An `http://` link is rewritten to `https://` before validation rather than
+ * rejected outright: this layout has no review step to catch a link that was
+ * only ever copied as http, and the https variant usually answers anyway.
+ * The rewrite is not itself verified here — that is what the redirect
+ * preflight (`resolveRedirectHosts`, run per candidate by the dry-run tool)
+ * is for. A host that only serves http fails that preflight and the row is
+ * skipped there (`REDIRECT_PREFLIGHT_FAILED`), never registered as a job.
  */
 function simpleRowOutcome(row: CampaignCsvRow, rowNumber: number): RowOutcome {
-	const targetUrl = simpleLinkValue(row);
-	if (!targetUrl) return { reason: "missing_form_url" };
+	const rawTargetUrl = simpleLinkValue(row);
+	if (!rawTargetUrl) return { reason: "missing_form_url" };
+	let parsedUrl: URL;
+	try {
+		parsedUrl = new URL(rawTargetUrl);
+	} catch {
+		return { reason: "invalid_or_insecure_form_url" };
+	}
+	const upgradedToHttps = parsedUrl.protocol === "http:";
+	if (upgradedToHttps) parsedUrl.protocol = "https:";
+	const targetUrl = upgradedToHttps ? parsedUrl.toString() : rawTargetUrl;
 	let url: URL;
 	try {
 		url = validatedHttpsUrl(targetUrl);
@@ -768,6 +795,7 @@ function simpleRowOutcome(row: CampaignCsvRow, rowNumber: number): RowOutcome {
 			subject,
 			message,
 		},
+		...(upgradedToHttps ? { upgradedToHttps: true as const } : {}),
 	};
 }
 

@@ -73,6 +73,7 @@ console.log(
 		totalRows: rows.length,
 		eligibleRows: filtered.eligible.length,
 		excluded: filtered.excluded,
+		upgradedToHttps: filtered.upgradedToHttps,
 		approvedEntries: approval.entries.length,
 		maxSends: options.maxSends,
 	}),
