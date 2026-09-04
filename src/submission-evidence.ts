@@ -1,5 +1,8 @@
 import type { EvidenceFailureCode, EvidenceStage, JobStore } from "./job";
-import type { RestrictedBrowserDriver } from "./restricted-browser";
+import type {
+	RestrictedBrowserDriver,
+	ScreenshotMode,
+} from "./restricted-browser";
 
 export type { EvidenceFailureCode, EvidenceStage };
 
@@ -139,13 +142,21 @@ export class SubmissionEvidenceRecorder {
 		private readonly timeoutMs: number = EVIDENCE_CAPTURE_TIMEOUT_MS,
 	) {}
 
-	/** Screenshot of the current page. */
-	capture(stage: EvidenceStage): Promise<EvidenceCaptureResult> {
+	/**
+	 * Screenshot of the current page. Evidence defaults to the whole document:
+	 * an operator approving a real submission, and the pre-submit review that
+	 * reads the same bytes, both need to see the entire form rather than the one
+	 * screen that happened to be scrolled into view.
+	 */
+	capture(
+		stage: EvidenceStage,
+		mode: ScreenshotMode = "full_page",
+	): Promise<EvidenceCaptureResult> {
 		return this.#capture(stage, {
 			phase: "screenshot",
 			contentType: EVIDENCE_CONTENT_TYPE,
 			failureCode: "SCREENSHOT_FAILED",
-			produce: () => this.driver.captureScreenshot(),
+			produce: () => this.driver.captureScreenshot(mode),
 		});
 	}
 
