@@ -574,6 +574,71 @@ describe("D1JobStore", () => {
 		expect(failed).toBe(false);
 		expect(await readEvidenceEvents(input.id)).toEqual([]);
 	});
+
+	test("dead-letters a job the queue gave up on while it was running", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+
+		const deadLettered = await store.markDeadLettered(
+			input.id,
+			"The message exhausted its retries.",
+			"2026-08-28T00:00:02.000Z",
+		);
+
+		expect(deadLettered?.status).toBe("dead_lettered");
+		expect((await store.find(input.id))?.status).toBe("dead_lettered");
+	});
+
+	test("dead-letters a job whose last attempt already failed", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		await store.recordFailed(
+			input.id,
+			"run-token-1",
+			"AGENT_FAILED",
+			"The agent could not reach the form.",
+			"2026-08-28T00:00:02.000Z",
+		);
+		expect((await store.find(input.id))?.status).toBe("failed");
+
+		const deadLettered = await store.markDeadLettered(
+			input.id,
+			"The message exhausted its retries.",
+			"2026-08-28T00:00:03.000Z",
+		);
+
+		expect(deadLettered?.status).toBe("dead_lettered");
+		expect((await store.find(input.id))?.status).toBe("dead_lettered");
+	});
+
+	test("leaves a job that already sent its form alone", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		await store.claimSubmission(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:02.000Z",
+		);
+		await store.recordSent(
+			input.id,
+			"run-token-1",
+			"https://form-agent.dev/contact",
+			"2026-08-28T00:00:03.000Z",
+		);
+		expect((await store.find(input.id))?.status).toBe("sent");
+
+		const deadLettered = await store.markDeadLettered(
+			input.id,
+			"A redelivery arrived after the form was already sent.",
+			"2026-08-28T00:00:04.000Z",
+		);
+
+		expect(deadLettered).toBeNull();
+		expect((await store.find(input.id))?.status).toBe("sent");
+	});
 });
 
 describe("Job HTTP API", () => {
