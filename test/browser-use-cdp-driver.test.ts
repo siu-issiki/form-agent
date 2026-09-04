@@ -27,8 +27,10 @@ import {
 	BrowserUseCdpDriver,
 	type CdpScreenshotResult,
 	CHECK_FORM_VALIDITY_FUNCTION,
+	captureCdpFullPageScreenshot,
 	captureCdpScreenshot,
 	centerOfQuad,
+	chooseFullPageScreenshotQuality,
 	collectCdpFrameParentIds,
 	continueSubmissionRequest,
 	createExpectedSubmissionRequest,
@@ -36,6 +38,8 @@ import {
 	denyRelatedBrowserTargets,
 	desiredCheckboxState,
 	ENTER_KEY_DOWN_EVENT,
+	FULL_PAGE_SCREENSHOT_QUALITY,
+	FULL_PAGE_SCREENSHOT_REDUCED_QUALITY,
 	getSubmissionRequestDisposition,
 	HAS_SAME_FORM_OWNER_FUNCTION,
 	hasExpectedFrameNavigated,
@@ -47,6 +51,7 @@ import {
 	isPayloadIndependentClickTarget,
 	isRetryableClickPreparationError,
 	MATCHES_CHOICE_CANDIDATE_FUNCTION,
+	planFullPageScreenshot,
 	READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
 	readPageText,
 	readRadioSelectionOutcome,
@@ -2121,6 +2126,233 @@ describe("BrowserUseCdpDriver screenshot capture", () => {
 			}),
 		).rejects.toThrow("Browser screenshot failed");
 		expect(attempts).toBe(1);
+	});
+});
+
+describe("full-page screenshot plan", () => {
+	test("scales a tall page down and cuts it at the height cap", () => {
+		const plan = planFullPageScreenshot(1920, 9000);
+
+		// 1280 / 1920 allows 0.667, but the height term is floored at 0.5 so the
+		// image stays readable; what does not fit at that scale is cut.
+		expect(plan).toEqual({
+			quality: FULL_PAGE_SCREENSHOT_QUALITY,
+			clip: { x: 0, y: 0, width: 1920, height: 8000, scale: 0.5 },
+		});
+		const clip = plan?.clip;
+		expect((clip?.width ?? 0) * (clip?.scale ?? 0)).toBe(960);
+		expect((clip?.height ?? 0) * (clip?.scale ?? 0)).toBe(4000);
+	});
+
+	test("keeps a page that already fits at full scale", () => {
+		expect(planFullPageScreenshot(1280, 2000)).toEqual({
+			quality: FULL_PAGE_SCREENSHOT_QUALITY,
+			clip: { x: 0, y: 0, width: 1280, height: 2000, scale: 1 },
+		});
+	});
+
+	test("lets the width cap override the scale floor on a wide page", () => {
+		const plan = planFullPageScreenshot(4000, 9000);
+
+		// The width cap is absolute, so the scale drops below the floor and the
+		// whole page fits without a cut.
+		expect(plan).toEqual({
+			quality: FULL_PAGE_SCREENSHOT_QUALITY,
+			clip: { x: 0, y: 0, width: 4000, height: 9000, scale: 0.32 },
+		});
+	});
+
+	test("rejects layout metrics that are not a usable size", () => {
+		for (const size of [undefined, null, 0, -100, Number.NaN, "1920"]) {
+			expect(planFullPageScreenshot(size, 2000)).toBeNull();
+			expect(planFullPageScreenshot(1280, size)).toBeNull();
+		}
+	});
+
+	test("drops the quality once the planned image exceeds the pixel budget", () => {
+		expect(chooseFullPageScreenshotQuality(6_000_000)).toBe(
+			FULL_PAGE_SCREENSHOT_QUALITY,
+		);
+		expect(chooseFullPageScreenshotQuality(6_000_001)).toBe(
+			FULL_PAGE_SCREENSHOT_REDUCED_QUALITY,
+		);
+	});
+});
+
+describe("captureCdpFullPageScreenshot", () => {
+	test("captures the whole document in a single clipped call", async () => {
+		const requests: Array<Record<string, unknown>> = [];
+
+		const bytes = await captureCdpFullPageScreenshot(
+			async () => ({ cssContentSize: { width: 1920, height: 9000 } }),
+			async (params) => {
+				requests.push(params);
+				return { data: btoa(String.fromCharCode(7, 8, 9)) };
+			},
+		);
+
+		expect(requests).toEqual([
+			{
+				format: "jpeg",
+				quality: 60,
+				captureBeyondViewport: true,
+				fromSurface: true,
+				clip: { x: 0, y: 0, width: 1920, height: 8000, scale: 0.5 },
+			},
+		]);
+		expect([...bytes]).toEqual([7, 8, 9]);
+	});
+
+	test("reports an opaque error when the layout metrics are unusable", async () => {
+		let captures = 0;
+
+		await expect(
+			captureCdpFullPageScreenshot(
+				async () => ({}),
+				async (): Promise<CdpScreenshotResult> => {
+					captures += 1;
+					return {};
+				},
+			),
+		).rejects.toThrow("Browser screenshot failed");
+		expect(captures).toBe(0);
+	});
+
+	test("reports an opaque error when the metrics command fails", async () => {
+		await expect(
+			captureCdpFullPageScreenshot(
+				async () => {
+					throw new BrowserUseCdpPayloadTooLargeError();
+				},
+				async () => ({ data: btoa("x") }),
+			),
+		).rejects.toThrow("Browser screenshot failed");
+	});
+});
+
+describe("BrowserUseCdpDriver screenshot modes", () => {
+	test("asks for a clipped full-page capture in full_page mode", async () => {
+		const connection = new ScriptedCdpConnection();
+		connection.respond = (method, params) => {
+			if (method === "Page.getLayoutMetrics") {
+				return { cssContentSize: { width: 1920, height: 9000 } };
+			}
+			if (method === "Page.captureScreenshot") {
+				return { data: btoa(String.fromCharCode(3, 4)) };
+			}
+			return scriptedCdpResponse(method, params);
+		};
+		const driver = await scriptedDriver(connection);
+
+		const bytes = await driver.captureScreenshot("full_page");
+
+		expect([...bytes]).toEqual([3, 4]);
+		const screenshots = connection.sent.filter(
+			(entry) => entry.method === "Page.captureScreenshot",
+		);
+		expect(screenshots).toHaveLength(1);
+		expect(screenshots[0]?.params).toEqual({
+			format: "jpeg",
+			quality: 60,
+			captureBeyondViewport: true,
+			fromSurface: true,
+			clip: { x: 0, y: 0, width: 1920, height: 8000, scale: 0.5 },
+		});
+	});
+
+	test("leaves the viewport mode on the unclipped parameters", async () => {
+		const connection = new ScriptedCdpConnection();
+		connection.respond = (method, params) =>
+			method === "Page.captureScreenshot"
+				? { data: btoa(String.fromCharCode(5)) }
+				: scriptedCdpResponse(method, params);
+		const driver = await scriptedDriver(connection);
+
+		const bytes = await driver.captureScreenshot("viewport");
+
+		expect([...bytes]).toEqual([5]);
+		expect(
+			connection.sent.filter(
+				(entry) => entry.method === "Page.getLayoutMetrics",
+			),
+		).toHaveLength(0);
+		expect(
+			connection.sent
+				.filter((entry) => entry.method === "Page.captureScreenshot")
+				.map((entry) => entry.params),
+		).toEqual([
+			{
+				format: "jpeg",
+				quality: 80,
+				captureBeyondViewport: false,
+				fromSurface: true,
+			},
+		]);
+	});
+
+	test("falls back to the viewport capture while the connection is open", async () => {
+		const connection = new ScriptedCdpConnection();
+		connection.fail = (method) =>
+			method === "Page.getLayoutMetrics"
+				? new BrowserUseCdpCommandError(
+						"Page.getLayoutMetrics",
+						null,
+						"unknown",
+					)
+				: null;
+		connection.respond = (method, params) =>
+			method === "Page.captureScreenshot"
+				? { data: btoa(String.fromCharCode(6)) }
+				: scriptedCdpResponse(method, params);
+		const driver = await scriptedDriver(connection);
+
+		const captured = captureLogs();
+		let bytes: Uint8Array;
+		try {
+			bytes = await driver.captureScreenshot("full_page");
+		} finally {
+			captured.restore();
+		}
+
+		expect([...bytes]).toEqual([6]);
+		expect(captured.logs).toContain(
+			JSON.stringify({ event: "browser_full_page_screenshot_fallback" }),
+		);
+		expect(
+			connection.sent
+				.filter((entry) => entry.method === "Page.captureScreenshot")
+				.map((entry) => entry.params),
+		).toEqual([
+			{
+				format: "jpeg",
+				quality: 80,
+				captureBeyondViewport: false,
+				fromSurface: true,
+			},
+		]);
+	});
+
+	test("does not retry once the oversized payload closed the connection", async () => {
+		const connection = new ScriptedCdpConnection();
+		connection.fail = (method) => {
+			if (method !== "Page.captureScreenshot") return null;
+			connection.closed = true;
+			return new BrowserUseCdpPayloadTooLargeError();
+		};
+		connection.respond = (method, params) =>
+			method === "Page.getLayoutMetrics"
+				? { cssContentSize: { width: 1280, height: 2000 } }
+				: scriptedCdpResponse(method, params);
+		const driver = await scriptedDriver(connection);
+
+		await expect(driver.captureScreenshot("full_page")).rejects.toThrow(
+			"Browser screenshot failed",
+		);
+		expect(
+			connection.sent.filter(
+				(entry) => entry.method === "Page.captureScreenshot",
+			),
+		).toHaveLength(1);
 	});
 });
 

@@ -284,6 +284,9 @@ export type BrowserSubmitResult =
 
 export type SubmitActivationStrategy = "dom" | "mouse" | "enter";
 
+/** Which part of the page a screenshot covers. */
+export type ScreenshotMode = "viewport" | "full_page";
+
 export interface RestrictedBrowserDriver {
 	close?(): Promise<void>;
 	restrictToDomain(
@@ -315,7 +318,13 @@ export interface RestrictedBrowserDriver {
 	 * previously observed elements cannot see.
 	 */
 	readFormSnapshot(elementId: string): Promise<string>;
-	captureScreenshot(): Promise<Uint8Array>;
+	/**
+	 * `viewport` captures the visible screen only. `full_page` captures the
+	 * whole document, downscaled so the payload stays inside the CDP message
+	 * limit. The caller picks, because evidence wants the whole form while a
+	 * fallback wants the cheapest capture that can still succeed.
+	 */
+	captureScreenshot(mode: ScreenshotMode): Promise<Uint8Array>;
 	submit(
 		elementId: string,
 		activationStrategy: SubmitActivationStrategy,

@@ -2530,6 +2530,38 @@ describe("SubmissionEvidenceRecorder", () => {
 		);
 	});
 
+	test("asks the driver for the whole page unless the caller says otherwise", async () => {
+		const modes: unknown[] = [];
+		const driver: Pick<RestrictedBrowserDriver, "captureScreenshot"> = {
+			captureScreenshot: async (mode) => {
+				modes.push(mode);
+				return new Uint8Array([1, 2, 3]);
+			},
+		};
+		const store = new InMemoryJobStore();
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
+		const recorder = new SubmissionEvidenceRecorder(
+			driver,
+			new InMemoryEvidenceObjectStore(),
+			store,
+			input.id,
+			"run-token-1",
+			1,
+			() => "2026-08-28T00:00:02.000Z",
+		);
+
+		const captured = captureLogs();
+		try {
+			await recorder.capture("before_submit");
+			await recorder.capture("prohibited", "viewport");
+		} finally {
+			captured.restore();
+		}
+
+		expect(modes).toEqual(["full_page", "viewport"]);
+	});
+
 	test("records the duration of every capture step and the screenshot size", async () => {
 		const driver = new FakeDriver();
 		const store = new InMemoryJobStore();
