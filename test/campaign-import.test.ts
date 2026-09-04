@@ -190,11 +190,10 @@ describe("campaign import", () => {
 		]);
 	});
 
-	test("excludes simple rows without a body, a subject, or a usable URL", () => {
+	test("excludes simple rows without a body or a usable URL", () => {
 		const result = filterCampaignRows([
 			simpleRow(),
 			simpleRow({ 本文: "" }),
-			simpleRow({ 件名: " " }),
 			simpleRow({ 問い合わせリンク: "" }),
 			simpleRow({ 問い合わせリンク: "http://contact.acme.co.jp/form" }),
 			simpleRow({ 問い合わせリンク: "https://192.0.2.10/form" }),
@@ -202,10 +201,23 @@ describe("campaign import", () => {
 
 		expect(result.eligible).toHaveLength(1);
 		expect(result.excluded).toEqual({
-			empty_message: 2,
+			empty_message: 1,
 			missing_form_url: 1,
 			invalid_or_insecure_form_url: 2,
 		});
+	});
+
+	test("keeps a simple row eligible when its subject column is blank", () => {
+		const result = filterCampaignRows([
+			simpleRow({ 件名: " " }),
+			simpleRow({ 件名: "" }),
+		]);
+
+		expect(result.excluded).toEqual({});
+		expect(result.eligible.map((candidate) => candidate.subject)).toEqual([
+			"",
+			"",
+		]);
 	});
 
 	test("keeps the source row numbering of the simple layout", () => {
@@ -237,6 +249,13 @@ describe("campaign import", () => {
 			missing_form_url: 1,
 			invalid_or_insecure_form_url: 1,
 		});
+	});
+
+	test("still requires a subject in the full 30-column layout", () => {
+		const result = filterCampaignRows([row({ 件名: "" })]);
+
+		expect(result.eligible).toHaveLength(0);
+		expect(result.excluded).toEqual({ missing_content: 1 });
 	});
 
 	test("reduces a company subdomain to its registrable domain", () => {
@@ -299,6 +318,25 @@ describe("campaign import", () => {
 		expect(Object.keys(first.payload.formValues as object)).not.toContain(
 			"会社名",
 		);
+	});
+
+	test("omits subject from formValues when the simple layout leaves it blank", async () => {
+		const candidate = filterCampaignRows([simpleRow({ 件名: "" })]).eligible[0];
+		if (!candidate) throw new Error("Expected an eligible candidate");
+		const job = await buildCampaignJob(
+			candidate,
+			mapRegistrationValues(registration, silent),
+			"agb-shaken-dryrun-v1",
+			{
+				finalUrl: "https://contact.acme.co.jp/form",
+				allowedHosts: ["contact.acme.co.jp"],
+			},
+		);
+
+		expect(Object.keys(job.payload.formValues as object)).not.toContain(
+			"subject",
+		);
+		expect(job.payload.formValues).toMatchObject({ message: "Message" });
 	});
 
 	test("merges choice candidates into the payload", async () => {

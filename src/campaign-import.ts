@@ -667,7 +667,10 @@ export async function buildCampaignJob(
 	}
 	const formValues: Record<string, TrustedFormValue> = {
 		...registrationValues,
-		subject: candidate.subject,
+		// An empty subject is not a trusted payload string (see
+		// isTrustedPayloadString), and the simple CSV layout allows a blank
+		// subject column, so omit the key entirely rather than send "".
+		...(candidate.subject ? { subject: candidate.subject } : {}),
 		message: candidate.message,
 	};
 	for (const [key, candidates] of Object.entries(choices)) {
@@ -727,9 +730,11 @@ function simpleRowOutcome(row: CampaignCsvRow, rowNumber: number): RowOutcome {
 	} catch {
 		return { reason: "invalid_company_domain" };
 	}
-	const subject = row.件名?.trim();
+	// A blank subject is eligible: the form itself may have no subject field,
+	// or one that isn't required. A blank body is never eligible.
+	const subject = row.件名?.trim() ?? "";
 	const message = row.本文?.trim();
-	if (!subject || !message) return { reason: "empty_message" };
+	if (!message) return { reason: "empty_message" };
 	return {
 		candidate: {
 			rowNumber,
