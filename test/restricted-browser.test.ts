@@ -507,6 +507,8 @@ describe("RestrictedBrowserTools", () => {
 		await tools.fill("fa-0-0", STAGE_EMAIL);
 		await tools.fill("fa-0-2", STAGE_BODY);
 		await tools.observe();
+		// The activation leads to a confirmation screen repeating what was entered.
+		driver.pageText = `${STAGE_EMAIL} ${STAGE_BODY}`;
 
 		const pending = await tools.submit("fa-0-1", "mouse");
 
@@ -514,8 +516,6 @@ describe("RestrictedBrowserTools", () => {
 		expect(tools.hasUnconfirmedSubmission()).toBe(true);
 		expect((await store.find(input.id))?.status).toBe("submitting");
 
-		// The confirmation screen repeats what was entered.
-		driver.pageText = `${STAGE_EMAIL} ${STAGE_BODY}`;
 		await tools.observe();
 		const sent = submittedJob(await tools.submit("fa-0-1", "mouse"));
 
@@ -616,6 +616,90 @@ describe("RestrictedBrowserTools", () => {
 			SubmissionNotAuthorizedError,
 		);
 		expect(driver.submitCount).toBe(3);
+	});
+
+	test("ends the submission as uncertain when the page no longer shows the values", async () => {
+		const driver = new FakeDriver();
+		driver.submitResults = [notObservedConfirmation()];
+		// The site clears its form as soon as the POST goes out, so the page
+		// after the activation is not a confirmation screen.
+		driver.resetPageAtSubmit = 1;
+		const store = new InMemoryJobStore();
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			new InMemoryEvidenceObjectStore(),
+		);
+		await tools.fill("fa-0-0", STAGE_EMAIL);
+		await tools.fill("fa-0-2", STAGE_BODY);
+		await tools.observe();
+
+		const uncertain = submittedJob(await tools.submit("fa-0-1", "mouse"));
+
+		expect(uncertain.status).toBe("uncertain");
+		expect(uncertain.result?.reasonCode).toBe(
+			"SUBMIT_CONFIRMATION_NOT_OBSERVED",
+		);
+		expect(driver.submitCount).toBe(1);
+		expect(tools.hasUnconfirmedSubmission()).toBe(false);
+		expect(
+			store.events.filter((event) => event.type === "submit.stage"),
+		).toEqual([]);
+	});
+
+	test("offers the next stage when only the fields still hold the values", async () => {
+		const driver = new FakeDriver();
+		driver.submitResults = [notObservedConfirmation()];
+		const store = new InMemoryJobStore();
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			new InMemoryEvidenceObjectStore(),
+		);
+		await tools.fill("fa-0-0", STAGE_EMAIL);
+		await tools.fill("fa-0-2", STAGE_BODY);
+		await tools.observe();
+
+		// No page text, but the controls still carry what was entered.
+		expect(await tools.submit("fa-0-1", "mouse")).toEqual({ pendingStage: 1 });
+		expect(tools.hasUnconfirmedSubmission()).toBe(true);
+	});
+
+	test("ends a later stage as uncertain when the final page shows nothing", async () => {
+		const driver = new FakeDriver();
+		driver.submitResults = [
+			notObservedConfirmation(),
+			notObservedConfirmation(),
+		];
+		// The page after the final stage no longer repeats the values.
+		driver.resetPageAtSubmit = 2;
+		const store = new InMemoryJobStore();
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			new InMemoryEvidenceObjectStore(),
+		);
+		await tools.fill("fa-0-0", STAGE_EMAIL);
+		await tools.fill("fa-0-2", STAGE_BODY);
+		await tools.observe();
+		driver.pageText = `${STAGE_EMAIL} ${STAGE_BODY}`;
+
+		expect(await tools.submit("fa-0-1", "mouse")).toEqual({ pendingStage: 1 });
+		await tools.observe();
+
+		const uncertain = submittedJob(await tools.submit("fa-0-1", "mouse"));
+
+		expect(uncertain.status).toBe("uncertain");
+		expect(uncertain.result?.reasonCode).toBe(
+			"SUBMIT_CONFIRMATION_NOT_OBSERVED",
+		);
+		expect(driver.submitCount).toBe(2);
+		expect(tools.hasUnconfirmedSubmission()).toBe(false);
+		expect(
+			store.events
+				.filter((event) => event.type === "submit.stage")
+				.map((event) => event.data),
+		).toEqual([{ stage: 2, requestObserved: true }]);
 	});
 
 	test("requires a fresh observation after trusted inputs change", async () => {
@@ -2532,6 +2616,11 @@ class FakeDriver implements RestrictedBrowserDriver {
 	submitResults: BrowserSubmitResult[] | null = null;
 	/** What each submit call was told about the fields this run filled. */
 	submitRequiredEnteredInput: boolean[] = [];
+	/**
+	 * Submit call number after which the page stops showing what was entered,
+	 * the way a site that resets its form after the POST does.
+	 */
+	resetPageAtSubmit: number | null = null;
 
 	async restrictToDomain(targetDomain: string): Promise<void> {
 		this.restrictedDomain = targetDomain;
@@ -2621,6 +2710,10 @@ class FakeDriver implements RestrictedBrowserDriver {
 		return this.fieldStates;
 	}
 
+	async readPageText(): Promise<string> {
+		return this.pageText ?? "";
+	}
+
 	async readFormSnapshot(): Promise<string> {
 		this.formSnapshotCount += 1;
 		return this.formSnapshots.length > 1
@@ -2638,6 +2731,10 @@ class FakeDriver implements RestrictedBrowserDriver {
 		this.submitRequiredEnteredInput.push(requireEnteredInput);
 		if (this.submitError) {
 			throw this.submitError;
+		}
+		if (this.resetPageAtSubmit === this.submitCount) {
+			this.pageText = "Contact";
+			this.fieldStates = [];
 		}
 		const sequence = this.submitResults;
 		return sequence

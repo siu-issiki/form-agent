@@ -1875,6 +1875,8 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	submitRequireEnteredInput: boolean[] = [];
 	/** Runs after each submit, so a test can move the page on. */
 	onSubmit: ((count: number) => void) | null = null;
+	/** Runs before each observe, so a test can move the page on. */
+	onObserve: ((count: number) => void) | null = null;
 
 	async close(): Promise<void> {
 		this.closed = true;
@@ -1905,6 +1907,7 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	async observe() {
 		this.observed = true;
 		this.observeCount += 1;
+		this.onObserve?.(this.observeCount);
 		const sequence = this.observationFormsSequence;
 		const forms = sequence
 			? (sequence[Math.min(this.observeCount - 1, sequence.length - 1)] ?? [])
@@ -1963,6 +1966,9 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	}
 	async readObservedFieldStates(): Promise<ObservedFieldState[]> {
 		return this.fieldStates;
+	}
+	async readPageText(): Promise<string> {
+		return this.pageText ?? "";
 	}
 	async readFormSnapshot(): Promise<string> {
 		return this.formSnapshots.length > 1
@@ -2379,9 +2385,18 @@ describe("ResponsesAgentExecutor", () => {
 				reason: "The page did not provide a reliable submission confirmation.",
 			},
 		];
-		// The page moved on and no longer carries what the review approved.
+		// The activation leads to a confirmation screen that repeats the values,
+		// so a further stage is offered.
 		driver.onSubmit = (count) => {
 			if (count !== 1) return;
+			driver.pageText =
+				"sales@example-agency.test We would like to ask about your services and pricing for a small team.";
+		};
+		// By the time the model observes again, the page moved on and no longer
+		// carries what the review approved.
+		driver.onObserve = (count) => {
+			if (count !== 3) return;
+			driver.pageText = undefined;
 			driver.fieldStates = [];
 			driver.observationForms = workerObservedForms();
 		};

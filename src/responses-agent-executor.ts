@@ -68,7 +68,7 @@ import { ResponsesSubmitReviewer } from "./submit-reviewer";
 
 const RUN_METRICS_WRITE_TIMEOUT_MS = 2_000;
 const MAX_PROVIDER_OUTPUT_TOKENS = 4_096;
-const MAX_PROVIDER_REQUEST_BYTES = 128 * 1_024;
+const MAX_PROVIDER_REQUEST_BYTES = 512 * 1_024;
 const MAX_JOB_PROMPT_LENGTH = 64_000;
 
 interface FunctionCall {
@@ -1247,11 +1247,38 @@ function isSubmitActivationStrategy(
 	return value === "dom" || value === "mouse" || value === "enter";
 }
 
-function readResponseOutput(value: JsonObject): JsonObject[] {
-	if (value.status !== "completed" || !Array.isArray(value.output)) {
-		throw invalidProviderResponse();
+/**
+ * Reduces a provider-supplied string to a fixed-shape token so a status or
+ * incompleteness reason can be logged without carrying free text.
+ */
+function sanitiseDetailToken(value: string): string {
+	const token = value
+		.toLowerCase()
+		.replace(/[^a-z0-9_]/g, "")
+		.slice(0, 32);
+	return token.length > 0 ? token : "other";
+}
+
+export function readResponseOutput(value: JsonObject): JsonObject[] {
+	if (value.status !== "completed") {
+		const incompleteReason =
+			value.status === "incomplete" &&
+			isRecord(value.incomplete_details) &&
+			typeof value.incomplete_details.reason === "string"
+				? value.incomplete_details.reason
+				: undefined;
+		throw invalidProviderResponse(
+			incompleteReason !== undefined
+				? `incomplete_${sanitiseDetailToken(incompleteReason)}`
+				: `status_${sanitiseDetailToken(String(value.status))}`,
+		);
 	}
-	if (!value.output.every(isRecord)) throw invalidProviderResponse();
+	if (!Array.isArray(value.output)) {
+		throw invalidProviderResponse("output_missing");
+	}
+	if (!value.output.every(isRecord)) {
+		throw invalidProviderResponse("output_item_invalid");
+	}
 	return value.output;
 }
 
