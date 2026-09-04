@@ -1,5 +1,6 @@
 import {
 	type AgentRunMetrics,
+	type CapturedEvidence,
 	DuplicateJobError,
 	type EvidenceFailureCode,
 	type EvidenceStage,
@@ -10,6 +11,7 @@ import {
 	type JobStore,
 } from "./job";
 import { normalizeAllowedHosts } from "./restricted-browser";
+import { EVIDENCE_CONTENT_TYPE } from "./submission-evidence";
 
 interface StoredJobRow {
 	id: string;
@@ -68,6 +70,7 @@ export type AgentToolDiagnosticCode =
 	| "INVALID_TOOL_INPUT"
 	| "UNKNOWN_TOOL"
 	| "DRY_RUN_COMPLETE"
+	| "DRY_RUN_REVIEW_DENIED"
 	| "FINISH_FIELDS_INVALID"
 	| "FINISH_FORM_URL_NOT_ALLOWED"
 	| "FINISH_OUTCOME_INVALID"
@@ -490,6 +493,7 @@ export class D1JobStore implements JobStore {
 		eventId: string,
 		stage: EvidenceStage,
 		objectKey: string,
+		contentType: string,
 		sha256: string,
 		byteLength: number,
 		now: string,
@@ -503,7 +507,7 @@ export class D1JobStore implements JobStore {
 		       'objectKey', ?,
 		       'sha256', ?,
 		       'byteLength', ?,
-		       'contentType', 'image/jpeg'
+		       'contentType', ?
 		     ),
 		     created_at = ?
 		 WHERE id = ?
@@ -523,6 +527,7 @@ export class D1JobStore implements JobStore {
 				objectKey,
 				sha256,
 				byteLength,
+				contentType,
 				now,
 				eventId,
 				id,
@@ -533,6 +538,38 @@ export class D1JobStore implements JobStore {
 			.run();
 
 		return result.meta.changes === 1;
+	}
+
+	/**
+	 * The captured evidence of one job, oldest first. Only the object identity
+	 * is read: the object itself holds the page and the registration values.
+	 */
+	async listCapturedEvidence(id: string): Promise<CapturedEvidence[]> {
+		const { results } = await this.db
+			.prepare(
+				`SELECT
+		   json_extract(data_json, '$.stage') AS stage,
+		   json_extract(data_json, '$.objectKey') AS object_key,
+		   json_extract(data_json, '$.contentType') AS content_type,
+		   created_at
+		 FROM events
+		 WHERE job_id = ?
+		   AND type = 'evidence.captured'
+		 ORDER BY created_at, rowid`,
+			)
+			.bind(id)
+			.all<{
+				stage: string;
+				object_key: string;
+				content_type: string | null;
+				created_at: string;
+			}>();
+		return results.map((row) => ({
+			stage: row.stage as EvidenceStage,
+			objectKey: row.object_key,
+			contentType: row.content_type ?? EVIDENCE_CONTENT_TYPE,
+			capturedAt: row.created_at,
+		}));
 	}
 
 	async recordEvidenceCaptureFailed(

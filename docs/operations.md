@@ -258,7 +258,7 @@ D1 migrationはWorker deployでは自動適用されない。新しい列を参�
   "SELECT job_id,attempt,data_json,created_at FROM events WHERE type='job.redelivery_ignored' ORDER BY created_at DESC LIMIT 20;"
 ```
 
-`status`が`submitting`の行が該当する。対象ジョブは前節の外部証跡照合を行い、送信済みの可能性を否定できない場合は再投入しない。未送信・送信済みのいずれと判断した場合も、状態を`running`へ戻さず、承認記録を残したうえで人手で`uncertain`として確定する。`run_token`は監査のため残す。
+`status`が`submitting`の行が該当する。`uncertain`のうち`DRY_RUN_REVIEW_DENIED`は送信前レビューがdry-runの送信を拒否したものであり、送信権を取得していないためこの照合の対象ではない。理由コードで切り分ける。対象ジョブは前節の外部証跡照合を行い、送信済みの可能性を否定できない場合は再投入しない。未送信・送信済みのいずれと判断した場合も、状態を`running`へ戻さず、承認記録を残したうえで人手で`uncertain`として確定する。`run_token`は監査のため残す。
 
 ```bash
 ./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
@@ -304,7 +304,22 @@ D1 migrationはWorker deployでは自動適用されない。新しい列を参�
 shasum -a 256 ./evidence.jpg
 ```
 
-画像には入力済みの個人情報が写る。確認後は取得したファイルを削除し、共有しない。R2側にはライフサイクル削除ルールを設定していないため、証跡スクリーンショットはR2上に無期限に残り続ける。この方針は運用ポリシー確定時に見直す。
+dry-run のジョブには `dry_run_before_submit`（`image/jpeg`）と `dry_run_field_map`（`application/json`）の 2 件が残る。送信前レビューが`deny`で終わった`DRY_RUN_REVIEW_DENIED`のジョブにも残るので、拒否の内訳はこの 2 件で確認する。前者は送信前レビューへ渡した画像そのもの、後者は同じ時点の各フォーム欄の値である。`objectKey` は `GET /jobs/:id` の `evidence` からも取得できる。
+
+```bash
+curl -sS -H "Authorization: Bearer $JOB_API_TOKEN" \
+  https://<worker>/jobs/<JOB_ID> | jq '.evidence'
+```
+
+拡張子は contentType に対応し、スクリーンショットは `.jpg`、フィールドマップは `.json` である。取得方法は同じで、保存先のファイル名だけを合わせる。
+
+```bash
+./node_modules/.bin/wrangler r2 object get form-agent-evidence/<objectKey> --file ./dry-run-field-map.json --remote
+```
+
+`dry_run_field_map` は各欄の `elementId` / `label` / `name` / `type` / `required` / `value`（`checked` は持つ欄だけ）に加えて、`submitReview`（`decision` / `reasonCode`）、`targetUrl`、`capturedAt` を持つ。実送信を承認する前に、この 2 件で「送信直前の画面」と「各欄に入れた値」を確認する。
+
+画像とフィールドマップには入力済みの個人情報が含まれる。確認後は取得したファイルを削除し、共有しない。R2側にはライフサイクル削除ルールを設定していないため、証跡スクリーンショットはR2上に無期限に残り続ける。この方針は運用ポリシー確定時に見直す。
 
 D1へのイベント記録に失敗した場合、または15秒のタイムアウト後にR2保存・D1記録が遅れて完了した場合、Workerはアップロード済みのオブジェクトを補償削除する。同じ撮影の成功・失敗は共通の`eventId`で排他的に記録するため、`CAPTURE_TIMEOUT`確定後に成功イベントへ戻ることはない。補償削除にも失敗した場合は、D1から辿れないオブジェクトが残り、Workerログに`submission_evidence_orphan`イベントとして`objectKey`が出力される。ログから`objectKey`を取得し、手動で削除する。
 
