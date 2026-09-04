@@ -4,15 +4,24 @@
  */
 export const JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
-export type JobStatus =
-	| "pending"
-	| "running"
-	| "submitting"
-	| "sent"
-	| "prohibited"
-	| "uncertain"
-	| "failed"
-	| "dead_lettered";
+/**
+ * Every status a job row may hold, in the order the lifecycle visits them.
+ * It is the single source the `JobStatus` type, the SQL status sets in
+ * `d1-job-store.ts`, and the `jobs.status` CHECK constraint in
+ * `migrations/0001_initial.sql` all have to agree on.
+ */
+export const JOB_STATUSES = [
+	"pending",
+	"running",
+	"submitting",
+	"sent",
+	"prohibited",
+	"uncertain",
+	"failed",
+	"dead_lettered",
+] as const;
+
+export type JobStatus = (typeof JOB_STATUSES)[number];
 
 /**
  * Statuses a job never leaves. Everything else is still in flight, so a poller

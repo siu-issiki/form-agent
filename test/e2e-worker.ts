@@ -1,6 +1,7 @@
 import { D1JobStore } from "../src/d1-job-store";
+import type { Env, JobMessage } from "../src/env";
 import type { JobInput } from "../src/job";
-import worker, { type Env, type JobMessage, registerJob } from "../src/worker";
+import worker, { registerJob } from "../src/worker";
 
 interface E2eEnv extends Env {
 	E2E_TOKEN?: string;

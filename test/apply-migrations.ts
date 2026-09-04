@@ -1,7 +1,7 @@
 import { applyD1Migrations, type D1Migration } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll } from "vitest";
-import type { Env as WorkerEnv } from "../src/worker";
+import type { Env as WorkerEnv } from "../src/env";
 
 declare global {
 	namespace Cloudflare {

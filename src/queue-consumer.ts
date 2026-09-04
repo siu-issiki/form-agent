@@ -7,8 +7,8 @@ import type { AgentRunResult } from "./agent-runtime";
 import { BrowserUseClient } from "./browser-use-client";
 import { reclaimJobSessions } from "./browser-use-session";
 import { D1JobStore } from "./d1-job-store";
+import type { Env, JobMessage } from "./env";
 import { type Job, MAX_ATTEMPTS_KEY } from "./job";
-import type { Env, JobMessage } from "./worker";
 
 const DEAD_LETTER_QUEUE = "form-agent-jobs-dlq";
 const BASE_RETRY_DELAY_SECONDS = 30;
