@@ -6704,3 +6704,232 @@ describe("submission confirmation text", () => {
 		).toBe(true);
 	});
 });
+
+/**
+ * The resolve / call / release steps of one operation, in the order they were
+ * sent. Every objectId `DOM.resolveNode` hands out has to be given back, or the
+ * page keeps the node alive for the rest of the session.
+ */
+function objectLifetimeTrace(
+	sent: readonly { method: string; params: Record<string, unknown> }[],
+): string[] {
+	const steps: string[] = [];
+	for (const entry of sent) {
+		if (entry.method === "DOM.resolveNode") {
+			steps.push(`resolve ${entry.params.backendNodeId}`);
+		} else if (entry.method === "Runtime.callFunctionOn") {
+			steps.push(`call ${entry.params.objectId}`);
+		} else if (entry.method === "Runtime.releaseObject") {
+			steps.push(`release ${entry.params.objectId}`);
+		}
+	}
+	return steps;
+}
+
+/** The objectIds `DOM.resolveNode` handed out, sorted so counts can be compared. */
+function resolvedObjectIds(
+	sent: readonly { method: string; params: Record<string, unknown> }[],
+): string[] {
+	return sent
+		.filter((entry) => entry.method === "DOM.resolveNode")
+		.map((entry) => `object-${entry.params.backendNodeId}`)
+		.sort();
+}
+
+/** The objectIds `Runtime.releaseObject` gave back, sorted the same way. */
+function releasedObjectIds(
+	sent: readonly { method: string; params: Record<string, unknown> }[],
+): string[] {
+	return sent
+		.filter((entry) => entry.method === "Runtime.releaseObject")
+		.map((entry) => String(entry.params.objectId))
+		.sort();
+}
+
+describe("BrowserUseCdpDriver CDP object lifetime", () => {
+	test("releases the object of every element call of a select", async () => {
+		const { driver, connection } = await observedElementDriver();
+		const mark = connection.sent.length;
+
+		await driver.select(SELECT_ELEMENT_ID, ["sales"]);
+
+		const sent = connection.sent.slice(mark);
+		expect(objectLifetimeTrace(sent)).toEqual([
+			// The state read and the option choice each resolve their own object.
+			"resolve 4",
+			"call object-4",
+			"release object-4",
+			"resolve 4",
+			"call object-4",
+			"release object-4",
+		]);
+		expect(releasedObjectIds(sent)).toEqual(resolvedObjectIds(sent));
+	});
+
+	test("releases the object of an element call the page refused", async () => {
+		const { driver, connection } = await observedElementDriver();
+		connection.fail = (method, params) =>
+			method === "Runtime.callFunctionOn" &&
+			params.functionDeclaration === SELECT_OPTION_BY_CANDIDATE_FUNCTION
+				? cdpCommandFailed()
+				: null;
+		const mark = connection.sent.length;
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await driver.select(SELECT_ELEMENT_ID, ["sales"]);
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect(caught).toBeInstanceOf(BrowserElementOperationError);
+		const sent = connection.sent.slice(mark);
+		expect(objectLifetimeTrace(sent)).toEqual([
+			"resolve 4",
+			"call object-4",
+			"release object-4",
+			"resolve 4",
+			"call object-4",
+			"release object-4",
+		]);
+		expect(releasedObjectIds(sent)).toEqual(resolvedObjectIds(sent));
+	});
+
+	test("releases both objects of a call that takes an element argument", async () => {
+		const { driver, connection } = await submissionDriver([]);
+		const mark = connection.sent.length;
+
+		await driver.validateSubmit(BUTTON_ELEMENT_ID);
+
+		const sent = connection.sent.slice(mark);
+		expect(objectLifetimeTrace(sent)).toEqual([
+			// The state read of the submit control.
+			"resolve 5",
+			"call object-5",
+			"release object-5",
+			// The form-owner tie holds the control and the filled field at once.
+			"resolve 5",
+			"resolve 3",
+			"call object-5",
+			"release object-5",
+			"release object-3",
+			// The validity check.
+			"resolve 5",
+			"call object-5",
+			"release object-5",
+		]);
+		expect(releasedObjectIds(sent)).toEqual(resolvedObjectIds(sent));
+		await closeQuietly(driver);
+	});
+
+	test("releases both objects when the call with an element argument fails", async () => {
+		const { driver, connection } = await submissionDriver([]);
+		connection.fail = (method, params) =>
+			method === "Runtime.callFunctionOn" &&
+			params.functionDeclaration === HAS_SAME_FORM_OWNER_FUNCTION
+				? cdpCommandFailed()
+				: null;
+		const mark = connection.sent.length;
+
+		const caught = await driver
+			.validateSubmit(BUTTON_ELEMENT_ID)
+			.catch((error: unknown) => error);
+
+		expect((caught as Error).message).toBe("Browser Use CDP command failed");
+		const sent = connection.sent.slice(mark);
+		expect(objectLifetimeTrace(sent)).toEqual([
+			"resolve 5",
+			"call object-5",
+			"release object-5",
+			"resolve 5",
+			"resolve 3",
+			"call object-5",
+			"release object-5",
+			"release object-3",
+		]);
+		expect(releasedObjectIds(sent)).toEqual(resolvedObjectIds(sent));
+		await closeQuietly(driver);
+	});
+
+	test("releases both objects of the hit-test descendant check", async () => {
+		const { driver, connection } = await observedElementDriver();
+		useShadowHitTest(connection);
+		const mark = connection.sent.length;
+
+		await driver.clickNonSubmit(BUTTON_ELEMENT_ID);
+
+		const sent = connection.sent.slice(mark);
+		expect(objectLifetimeTrace(sent)).toEqual([
+			"resolve 5",
+			"call object-5",
+			"release object-5",
+			// The hit test landed on a descendant, so both nodes are held at once.
+			"resolve 5",
+			"resolve 9",
+			"call object-5",
+			"release object-5",
+			"release object-9",
+		]);
+		expect(releasedObjectIds(sent)).toEqual(resolvedObjectIds(sent));
+	});
+
+	test("releases both objects when the descendant check fails", async () => {
+		const { driver, connection } = await observedElementDriver();
+		useShadowHitTest(connection);
+		connection.fail = (method, params) =>
+			method === "Runtime.callFunctionOn" &&
+			params.functionDeclaration === IS_COMPOSED_DESCENDANT_FUNCTION
+				? cdpCommandFailed()
+				: null;
+		const mark = connection.sent.length;
+		const captured = captureWarnings();
+
+		let caught: unknown;
+		try {
+			await driver.clickNonSubmit(BUTTON_ELEMENT_ID);
+		} catch (error) {
+			caught = error;
+		} finally {
+			captured.restore();
+		}
+
+		expect(caught).toBeInstanceOf(BrowserElementOperationError);
+		const sent = connection.sent.slice(mark);
+		expect(objectLifetimeTrace(sent)).toEqual([
+			"resolve 5",
+			"call object-5",
+			"release object-5",
+			"resolve 5",
+			"resolve 9",
+			"call object-5",
+			"release object-5",
+			"release object-9",
+		]);
+		expect(releasedObjectIds(sent)).toEqual(resolvedObjectIds(sent));
+	});
+});
+
+const SHADOW_CHILD_BACKEND_NODE_ID = 9;
+
+/**
+ * Makes the hit test land on a node inside the control instead of on the
+ * control itself, which is the only shape that reaches the descendant check.
+ */
+function useShadowHitTest(connection: ScriptedCdpConnection): void {
+	const fixture = connection.respond;
+	connection.respond = (method, params) => {
+		if (method === "DOM.getNodeForLocation") {
+			return { backendNodeId: SHADOW_CHILD_BACKEND_NODE_ID };
+		}
+		if (
+			method === "Runtime.callFunctionOn" &&
+			params.functionDeclaration === IS_COMPOSED_DESCENDANT_FUNCTION
+		) {
+			return { result: { value: true } };
+		}
+		return fixture(method, params);
+	};
+}

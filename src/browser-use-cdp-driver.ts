@@ -1481,36 +1481,75 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		};
 	}
 
+	/**
+	 * Resolves every node of one call, hands the objectIds to `use`, and gives
+	 * them back to the page afterwards, whether the call answered or threw. An
+	 * object that is never released keeps its node alive in the page for the
+	 * rest of the session, so this is the only place that resolves a node.
+	 */
+	async #withResolvedObjects<TResult>(
+		requests: readonly Record<string, unknown>[],
+		use: (objectIds: readonly string[]) => Promise<TResult>,
+	): Promise<TResult> {
+		const resolved = await Promise.all(
+			requests.map((request) =>
+				this.#send<ResolvedNode>("DOM.resolveNode", request),
+			),
+		);
+		const objectIds = resolved.map((node) => node.object.objectId);
+		const held = objectIds.filter((objectId): objectId is string => !!objectId);
+		if (held.length !== objectIds.length) {
+			// A node the page would not resolve ends the call, and the objects
+			// that did resolve are released before it does.
+			await this.#releaseObjects(held);
+			throw new BrowserElementError();
+		}
+		try {
+			return await use(held);
+		} finally {
+			await this.#releaseObjects(held);
+		}
+	}
+
+	/** Gives held objects back, ignoring a page that already dropped them. */
+	async #releaseObjects(objectIds: readonly string[]): Promise<void> {
+		await Promise.all(
+			objectIds.map((objectId) =>
+				this.#send("Runtime.releaseObject", { objectId }).catch(
+					() => undefined,
+				),
+			),
+		);
+	}
+
 	async #callFunctionOnElement<TResult>(
 		backendNodeId: number,
 		functionDeclaration: string,
 		args: unknown[] = [],
 		executionContextId?: number,
 	): Promise<TResult> {
-		const resolved = await this.#send<ResolvedNode>("DOM.resolveNode", {
-			backendNodeId,
-			objectGroup: "form-agent-elements",
-			...(executionContextId === undefined ? {} : { executionContextId }),
-		});
-		const objectId = resolved.object.objectId;
-		if (!objectId) throw new BrowserElementError();
-		try {
-			const result = await this.#send<EvaluateResult>(
-				"Runtime.callFunctionOn",
+		return this.#withResolvedObjects(
+			[
 				{
-					objectId,
-					functionDeclaration,
-					arguments: args.map((value) => ({ value })),
-					returnByValue: true,
+					backendNodeId,
+					objectGroup: "form-agent-elements",
+					...(executionContextId === undefined ? {} : { executionContextId }),
 				},
-			);
-			if (result.exceptionDetails) throw new BrowserElementError();
-			return result.result.value as TResult;
-		} finally {
-			await this.#send("Runtime.releaseObject", { objectId }).catch(
-				() => undefined,
-			);
-		}
+			],
+			async ([objectId]) => {
+				const result = await this.#send<EvaluateResult>(
+					"Runtime.callFunctionOn",
+					{
+						objectId,
+						functionDeclaration,
+						arguments: args.map((value) => ({ value })),
+						returnByValue: true,
+					},
+				);
+				if (result.exceptionDetails) throw new BrowserElementError();
+				return result.result.value as TResult;
+			},
+		);
 	}
 
 	/**
@@ -1611,54 +1650,25 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		functionDeclaration: string,
 		args: unknown[] = [],
 	): Promise<TResult> {
-		const [resolved, argumentResolved] = await Promise.all([
-			this.#send<ResolvedNode>("DOM.resolveNode", { backendNodeId }),
-			this.#send<ResolvedNode>("DOM.resolveNode", {
-				backendNodeId: argumentBackendNodeId,
-			}),
-		]);
-		const objectId = resolved.object.objectId;
-		const argumentObjectId = argumentResolved.object.objectId;
-		if (!objectId || !argumentObjectId) {
-			await Promise.all([
-				objectId
-					? this.#send("Runtime.releaseObject", { objectId }).catch(
-							() => undefined,
-						)
-					: Promise.resolve(),
-				argumentObjectId
-					? this.#send("Runtime.releaseObject", {
-							objectId: argumentObjectId,
-						}).catch(() => undefined)
-					: Promise.resolve(),
-			]);
-			throw new BrowserElementError();
-		}
-		try {
-			const result = await this.#send<EvaluateResult>(
-				"Runtime.callFunctionOn",
-				{
-					objectId,
-					functionDeclaration,
-					arguments: [
-						{ objectId: argumentObjectId },
-						...args.map((value) => ({ value })),
-					],
-					returnByValue: true,
-				},
-			);
-			if (result.exceptionDetails) throw new BrowserElementError();
-			return result.result.value as TResult;
-		} finally {
-			await Promise.all([
-				this.#send("Runtime.releaseObject", { objectId }).catch(
-					() => undefined,
-				),
-				this.#send("Runtime.releaseObject", {
-					objectId: argumentObjectId,
-				}).catch(() => undefined),
-			]);
-		}
+		return this.#withResolvedObjects(
+			[{ backendNodeId }, { backendNodeId: argumentBackendNodeId }],
+			async ([objectId, argumentObjectId]) => {
+				const result = await this.#send<EvaluateResult>(
+					"Runtime.callFunctionOn",
+					{
+						objectId,
+						functionDeclaration,
+						arguments: [
+							{ objectId: argumentObjectId },
+							...args.map((value) => ({ value })),
+						],
+						returnByValue: true,
+					},
+				);
+				if (result.exceptionDetails) throw new BrowserElementError();
+				return result.result.value as TResult;
+			},
+		);
 	}
 
 	async #replaceFocusedText(value: string): Promise<void> {
@@ -1977,42 +1987,31 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		candidateBackendNodeId: number,
 	): Promise<boolean> {
 		if (ancestorBackendNodeId === candidateBackendNodeId) return true;
-		const [ancestor, candidate] = await Promise.all([
-			this.#send<ResolvedNode>("DOM.resolveNode", {
-				backendNodeId: ancestorBackendNodeId,
-				objectGroup: "form-agent-hit-test",
-			}),
-			this.#send<ResolvedNode>("DOM.resolveNode", {
-				backendNodeId: candidateBackendNodeId,
-				objectGroup: "form-agent-hit-test",
-			}),
-		]);
-		const ancestorObjectId = ancestor.object.objectId;
-		const candidateObjectId = candidate.object.objectId;
-		if (!ancestorObjectId || !candidateObjectId)
-			throw new BrowserElementError();
-		try {
-			const result = await this.#send<EvaluateResult>(
-				"Runtime.callFunctionOn",
+		return this.#withResolvedObjects(
+			[
 				{
-					objectId: ancestorObjectId,
-					functionDeclaration: IS_COMPOSED_DESCENDANT_FUNCTION,
-					arguments: [{ objectId: candidateObjectId }],
-					returnByValue: true,
+					backendNodeId: ancestorBackendNodeId,
+					objectGroup: "form-agent-hit-test",
 				},
-			);
-			if (result.exceptionDetails) throw new BrowserElementError();
-			return result.result.value === true;
-		} finally {
-			await Promise.all([
-				this.#send("Runtime.releaseObject", {
-					objectId: ancestorObjectId,
-				}).catch(() => undefined),
-				this.#send("Runtime.releaseObject", {
-					objectId: candidateObjectId,
-				}).catch(() => undefined),
-			]);
-		}
+				{
+					backendNodeId: candidateBackendNodeId,
+					objectGroup: "form-agent-hit-test",
+				},
+			],
+			async ([ancestorObjectId, candidateObjectId]) => {
+				const result = await this.#send<EvaluateResult>(
+					"Runtime.callFunctionOn",
+					{
+						objectId: ancestorObjectId,
+						functionDeclaration: IS_COMPOSED_DESCENDANT_FUNCTION,
+						arguments: [{ objectId: candidateObjectId }],
+						returnByValue: true,
+					},
+				);
+				if (result.exceptionDetails) throw new BrowserElementError();
+				return result.result.value === true;
+			},
+		);
 	}
 
 	async #evaluate<TResult>(expression: string): Promise<TResult> {
