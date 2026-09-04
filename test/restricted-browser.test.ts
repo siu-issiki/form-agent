@@ -29,7 +29,6 @@ import {
 	SubmissionEvidenceError,
 	SubmissionNotAuthorizedError,
 	SubmissionResultUncertainError,
-	type SubmitActivationStrategy,
 	SubmitProhibitedError,
 	type SubmitReviewDecision,
 	SubmitReviewDeniedError,
@@ -46,6 +45,8 @@ import {
 	SubmissionEvidenceRecorder,
 	sha256Hex,
 } from "../src/submission-evidence";
+import { FakeBrowserDriver } from "./helpers/fake-browser-driver";
+import { captureLogs, logEvents, logEventsNamed } from "./helpers/logs";
 
 const input: JobInput = {
 	id: "job-001",
@@ -803,7 +804,7 @@ describe("RestrictedBrowserTools", () => {
 		}
 
 		expect(driver.observeCount).toBe(2);
-		expect(logs.entries).toEqual([
+		expect(logEvents(logs.logs)).toEqual([
 			{ event: "prohibition_reverified", verified: true },
 		]);
 	});
@@ -828,7 +829,7 @@ describe("RestrictedBrowserTools", () => {
 		}
 
 		expect(driver.observeCount).toBe(2);
-		expect(logs.entries).toEqual([
+		expect(logEvents(logs.logs)).toEqual([
 			{ event: "prohibition_reverified", verified: false },
 		]);
 	});
@@ -870,7 +871,7 @@ describe("RestrictedBrowserTools", () => {
 
 		// Accepted without a re-observation, and the quote never reaches the log.
 		expect(driver.observeCount).toBe(1);
-		expect(logs.entries).toEqual([
+		expect(logEvents(logs.logs)).toEqual([
 			{
 				event: "browser_prohibition_evidence",
 				outcome: "PROHIBITION_EVIDENCE_VERIFIED",
@@ -903,7 +904,7 @@ describe("RestrictedBrowserTools", () => {
 		expect((rejected as ProhibitionEvidenceError).code).toBe(
 			"PROHIBITION_EVIDENCE_NOT_FOUND",
 		);
-		expect(logs.entries).toContainEqual({
+		expect(logEvents(logs.logs)).toContainEqual({
 			event: "browser_prohibition_evidence",
 			outcome: "PROHIBITION_EVIDENCE_NOT_FOUND",
 		});
@@ -934,7 +935,7 @@ describe("RestrictedBrowserTools", () => {
 		expect((rejected as ProhibitionEvidenceError).code).toBe(
 			"PROHIBITION_EVIDENCE_WEAK",
 		);
-		expect(logs.entries).toContainEqual({
+		expect(logEvents(logs.logs)).toContainEqual({
 			event: "browser_prohibition_evidence",
 			outcome: "PROHIBITION_EVIDENCE_WEAK",
 		});
@@ -1076,7 +1077,7 @@ describe("RestrictedBrowserTools", () => {
 			logs.restore();
 		}
 
-		expect(logs.entries).not.toContainEqual(
+		expect(logEvents(logs.logs)).not.toContainEqual(
 			expect.objectContaining({ event: "browser_prohibition_evidence" }),
 		);
 	});
@@ -1271,7 +1272,7 @@ describe("RestrictedBrowserTools", () => {
 
 	test("validates the selected submit control before claiming permission", async () => {
 		const driver = new FakeDriver();
-		driver.submitValidationError = new Error("not a submit control");
+		driver.validateSubmitError = new Error("not a submit control");
 		const store = new InMemoryJobStore();
 		await store.create(input, "2026-08-28T00:00:00.000Z");
 		await store.claimRun(input.id, "run-token-1", "2026-08-28T00:00:01.000Z");
@@ -2547,20 +2548,6 @@ function captureConsole(): { entries: unknown[]; restore: () => void } {
 	};
 }
 
-function captureLogs(): { entries: unknown[]; restore: () => void } {
-	const entries: unknown[] = [];
-	const originalLog = console.log;
-	console.log = (message: unknown) => {
-		entries.push(JSON.parse(String(message)));
-	};
-	return {
-		entries,
-		restore: () => {
-			console.log = originalLog;
-		},
-	};
-}
-
 function defaultObservedForms(prohibitionText?: string): unknown[] {
 	return [
 		{
@@ -2582,174 +2569,22 @@ function defaultFieldStates(): ObservedFieldState[] {
 	];
 }
 
-class FakeDriver implements RestrictedBrowserDriver {
-	url = input.targetUrl;
-	restrictedDomain: string | null = null;
-	redirectTo: string | null = null;
-	submitCount = 0;
-	submitActivationStrategies: SubmitActivationStrategy[] = [];
-	submitError: Error | null = null;
-	submitValidationError: Error | null = null;
-	screenshotCount = 0;
-	failScreenshotAt: number | null = null;
-	closeConnectionOnScreenshotFailure = false;
-	connectionClosed = false;
-	navigationCount = 0;
-	navigationLinks: Array<{ url: string; text: string }> | undefined;
-	observeCount = 0;
-	observationForms: unknown[] = defaultObservedForms();
-	/** Replayed per observe call when set; the last entry repeats. */
-	observationFormsSequence: unknown[][] | null = null;
-	fieldStates: ObservedFieldState[] = defaultFieldStates();
-	fieldStatesError: Error | null = null;
-	/** Values each choice control offers, by elementId. */
-	selectOptions: Record<string, string[]> = {};
-	/** Replayed in order; the last entry repeats. */
-	formSnapshots: string[] = ['["form"]'];
-	formSnapshotCount = 0;
-	pageText: string | undefined;
-	submitResult: BrowserSubmitResult = {
-		outcome: "sent",
-		formUrl: input.targetUrl,
-	};
-	/** Replayed per submit call when set; the last entry repeats. */
-	submitResults: BrowserSubmitResult[] | null = null;
-	/** What each submit call was told about the fields this run filled. */
-	submitRequiredEnteredInput: boolean[] = [];
-	/**
-	 * Submit call number after which the page stops showing what was entered,
-	 * the way a site that resets its form after the POST does.
-	 */
-	resetPageAtSubmit: number | null = null;
-
-	async restrictToDomain(targetDomain: string): Promise<void> {
-		this.restrictedDomain = targetDomain;
-	}
-
-	async currentUrl(): Promise<string> {
-		if (this.connectionClosed) {
-			throw new Error("Browser Use CDP connection is closed");
-		}
-		return this.url;
-	}
-
-	async navigate(url: string): Promise<void> {
-		this.navigationCount += 1;
-		this.url = this.redirectTo ?? url;
-	}
-
-	async observe() {
-		this.observeCount += 1;
-		const sequence = this.observationFormsSequence;
-		const forms = sequence
-			? (sequence[Math.min(this.observeCount - 1, sequence.length - 1)] ?? [])
-			: this.observationForms;
-		return {
-			url: this.url,
-			// A real observation is a snapshot, not a live view of the page.
-			forms: structuredClone(forms),
-			...(this.pageText ? { pageText: this.pageText } : {}),
-			...(this.navigationLinks
-				? { navigationLinks: this.navigationLinks }
-				: {}),
-		};
-	}
-
-	async clickNonSubmit(): Promise<void> {}
-
-	async fill(elementId: string, value: string): Promise<void> {
-		this.applyValue(elementId, value);
-	}
-
-	async select(
-		elementId: string,
-		candidates: readonly string[],
-	): Promise<void> {
-		const offered = this.selectOptions[elementId];
-		const chosen = offered
-			? candidates.find((candidate) => offered.includes(candidate))
-			: candidates[0];
-		if (chosen === undefined) throw new BrowserElementError();
-		this.applyValue(elementId, chosen);
-	}
-
-	/** Mirrors what a real browser shows on the next observation. */
-	applyValue(elementId: string, value: string): void {
-		for (const form of this.observationForms) {
-			if (!isRecord(form) || !Array.isArray(form.fields)) continue;
-			for (const field of form.fields) {
-				if (isRecord(field) && field.elementId === elementId) {
-					field.value = value;
-				}
-			}
-		}
-		for (const state of this.fieldStates) {
-			if (state.elementId === elementId) state.value = value;
-		}
-	}
-
-	async captureScreenshot(): Promise<Uint8Array> {
-		this.screenshotCount += 1;
-		if (this.failScreenshotAt === this.screenshotCount) {
-			if (this.closeConnectionOnScreenshotFailure) {
-				this.connectionClosed = true;
-			}
-			throw new Error("Browser screenshot failed");
-		}
-		return new Uint8Array([this.screenshotCount, 2, 3]);
-	}
-
-	async validateSubmit(): Promise<void> {
-		if (this.submitValidationError) {
-			throw this.submitValidationError;
-		}
-	}
-
-	async readObservedFieldStates(): Promise<ObservedFieldState[]> {
-		if (this.fieldStatesError) throw this.fieldStatesError;
-		return this.fieldStates;
-	}
-
-	async readPageText(): Promise<string> {
-		return this.pageText ?? "";
-	}
-
-	async readFormSnapshot(): Promise<string> {
-		this.formSnapshotCount += 1;
-		return this.formSnapshots.length > 1
-			? (this.formSnapshots.shift() as string)
-			: (this.formSnapshots[0] as string);
-	}
-
-	async submit(
-		_elementId: string,
-		activationStrategy: SubmitActivationStrategy,
-		requireEnteredInput = true,
-	): Promise<BrowserSubmitResult> {
-		this.submitCount += 1;
-		this.submitActivationStrategies.push(activationStrategy);
-		this.submitRequiredEnteredInput.push(requireEnteredInput);
-		if (this.submitError) {
-			throw this.submitError;
-		}
-		if (this.resetPageAtSubmit === this.submitCount) {
-			this.pageText = "Contact";
-			this.fieldStates = [];
-		}
-		const sequence = this.submitResults;
-		return sequence
-			? (sequence[Math.min(this.submitCount - 1, sequence.length - 1)] ??
-					this.submitResult)
-			: this.submitResult;
+class FakeDriver extends FakeBrowserDriver {
+	constructor() {
+		super({
+			url: input.targetUrl,
+			forms: defaultObservedForms(),
+			fieldStates: defaultFieldStates(),
+		});
+		// Keeps the historic fixed result, unaffected by a later url change.
+		this.submitResult = { outcome: "sent", formUrl: input.targetUrl };
 	}
 }
 
 function evidenceTimings(
 	logs: readonly string[],
 ): Array<Record<string, unknown>> {
-	return logs
-		.filter((entry) => entry.includes('"submission_evidence_timing"'))
-		.map((entry) => JSON.parse(entry) as Record<string, unknown>);
+	return logEventsNamed(logs, "submission_evidence_timing");
 }
 
 describe("SubmissionEvidenceRecorder", () => {
