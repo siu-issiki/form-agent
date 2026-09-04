@@ -42,7 +42,7 @@ Content-Type: application/json
 
 `targetDomain`は企業の登録可能ドメインです。フォームが外部サービスにある場合だけ、CSVのフォームURLと事前に解決したredirect先の**完全一致hostname**をジョブ固有の`allowedHosts`へ設定します。許可は他ジョブへ共有されず、`google.com`のような上位ドメインへ自動拡張しません。
 
-登録成功は`201`、同じID・同じ内容のジョブが既に存在する場合は`200`を返します。既存ジョブが`pending`なら、作成後のQueue投入失敗から復旧できるよう再度Queueへ投入します。同じIDで内容が異なる場合は、既存情報を返さず`409`とします。`GET /jobs/:id`は同じBearer認証で現在状態を返します。いずれのレスポンスにも実行権を表す`runToken`は含めません。一覧・キャンセルAPIは未実装です。
+登録成功は`201`、同じID・同じ内容のジョブが既に存在する場合は`200`を返します。既存ジョブが`pending`なら、作成後のQueue投入失敗から復旧できるよう再度Queueへ投入します。同じIDで内容が異なる場合は、既存情報を返さず`409`とします。実送信になるジョブ（`AGENT_DRY_RUN=false`かつpayloadに`_formAgentDryRun: true`が無い）は、承認記録`_formAgentSendApproval`が無ければ`400 SEND_APPROVAL_REQUIRED`、承認が指すdry-runが同じフォームURLで完了していなければ`400 DRY_RUN_NOT_COMPLETED`、当日（UTC）の実送信件数が`REAL_SEND_DAILY_CAP`に達していれば`429 REAL_SEND_CAP_REACHED`で拒否します。`GET /jobs/:id`は同じBearer認証で現在状態を返します。いずれのレスポンスにも実行権を表す`runToken`は含めません。一覧・キャンセルAPIは未実装です。
 
 BrowserUse は Agent API ではなく standalone browser API だけを使用します。top-level navigationと入力後の通信は対象ドメイン内に制限し、入力前の公開HTTPS read-only subresourceだけを許可します。送信は D1 上で `running` から `submitting` へ遷移できたジョブにだけ許可します。
 
@@ -79,6 +79,42 @@ bun run campaign:dry-run \
 productionへ登録する場合だけ`JOB_API_TOKEN`を環境変数へ設定し、同じコマンドへ`--submit-dry-run`を追加します。生成ジョブは必ず`_formAgentDryRun: true`と`_formAgentMaxAttempts: 1`を持ち、再試行と`submitting` / `sent`を防ぎます。成功条件は各ジョブが1 attemptで`prohibited / DRY_RUN_COMPLETE`になることです。
 
 同じ`--campaign`名で登録値・件名・本文・選択肢を変えて再実行しないでください。ジョブIDはcampaign名・企業ドメイン・フォームURLから決まるため、内容を変えても同じIDになります。登録レスポンスが失われた際の存在確認は入力の一致まで検証するので、不一致は`REGISTRATION_UNKNOWN`として扱われexit 1になります。入力を変える場合はcampaign名も変えてください。
+
+## CSVキャンペーンの実送信
+
+実送信ジョブを作れるのは`campaign:send`だけです。`campaign:dry-run`は`_formAgentDryRun: true`固定のままで、実送信できません。
+
+実行前に、対象行がすべてdry-runを通り`prohibited / DRY_RUN_COMPLETE`で終わっていること、production Workerに`REAL_SEND_DAILY_CAP`が設定されていることを確認してください。手順の全体は[docs/operations.md](docs/operations.md)の「実送信のrunbook」にあります。
+
+```bash
+JOB_API_TOKEN=... bun run campaign:send \
+  --registration /path/to/registration.json \
+  --csv /path/to/targets.csv \
+  --approved /path/to/approved.json \
+  --campaign agb-shaken-2026-09-send-v1 \
+  --max-sends 5 \
+  --confirm-real-send
+```
+
+`--confirm-real-send`が無い場合、ツールはCSVも承認ファイルも読まずにexit 1で終了します。`--max-sends`の既定は5、上限は50で、承認ファイルのentriesがこれを超えるとexit 1になります。`--choices`と`--no-default-choices`はdry-runと同じ意味です。`--campaign`はdry-runと別の名前にしてください。ジョブIDはcampaign名・企業ドメイン・フォームURLから決まるため、同じ名前だと409 `JOB_ID_CONFLICT`になります。
+
+承認ファイルは「誰がいつどの行を承認したか」の記録です。
+
+```json
+{
+  "approvedBy": "sales-ops@example.com",
+  "approvedAt": "2026-09-04T09:00:00.000Z",
+  "entries": [
+    { "sourceRow": 12, "dryRunJobId": "<dry-runのjobId>", "note": "目視確認済み" }
+  ]
+}
+```
+
+`sourceRow`はCSVの行番号（ヘッダーを1行目とする2以上の整数）で、dry-runジョブのpayloadの`sourceRow`と同じ定義です。`dryRunJobId`はdry-runの`campaign_job_result`ログに出た`jobId`です。`sourceRow`と`dryRunJobId`の重複は拒否します。サンプルは[docs/examples/campaign-send-approval.example.json](docs/examples/campaign-send-approval.example.json)にあります。承認ファイルと登録情報JSONはリポジトリへ追加せず、ローカルパスから読み込みます。
+
+各行は登録前に`GET /jobs/<dryRunJobId>`でフォームURLの一致とdry-run完了を確認し、満たさない行は登録せず`APPROVAL_MISMATCH`として集計します。Worker側でも`POST /jobs`が承認記録（400 `SEND_APPROVAL_REQUIRED`）、dry-run完了（400 `DRY_RUN_NOT_COMPLETED`）、当日（UTC）の日次上限（429 `REAL_SEND_CAP_REACHED`）を検証します。`REAL_SEND_DAILY_CAP`は未設定なら0で、実送信ジョブを一切受け付けません。
+
+承認されたentriesがすべて`sent`または`prohibited`で終わった場合だけexit 0になります。`prohibited`は実サイト側の判断による正常な終了です。
 
 ## エージェント実行境界
 
