@@ -3,7 +3,10 @@ import {
 	isVerificationProviderRequest,
 	isVerificationProviderUrl,
 } from "./browser-network-policy";
-import { SUBMISSION_CONFIRMATION_PATTERN } from "./browser-submit-confirmation";
+import {
+	SUBMISSION_CONFIRMATION_PATTERN,
+	SUBMISSION_PENDING_PATTERN,
+} from "./browser-submit-confirmation";
 import {
 	BrowserUseCdpClosedError,
 	BrowserUseCdpCommandError,
@@ -1476,7 +1479,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 					this.#callFunctionOnElement<boolean>(
 						backendNodeId,
 						HAS_CONFIRMATION_TEXT_FUNCTION,
-						[SUBMISSION_CONFIRMATION_PATTERN],
+						[SUBMISSION_CONFIRMATION_PATTERN, SUBMISSION_PENDING_PATTERN],
 					),
 			),
 		);
@@ -3037,8 +3040,12 @@ const INSPECT_ELEMENT_FUNCTION = String.raw`function() {
   };
 }`;
 
-const HAS_CONFIRMATION_TEXT_FUNCTION = `function(pattern) {
-  return new RegExp(pattern, "i").test(String(this.innerText || ""));
+const HAS_CONFIRMATION_TEXT_FUNCTION = `function(pattern, pendingPattern) {
+  const text = String(this.innerText || "");
+  // A review-before-send screen ("まだ送信は完了していません", "この内容で送信")
+  // mentions completion without being one, so it never counts.
+  if (new RegExp(pendingPattern, "i").test(text)) return false;
+  return new RegExp(pattern, "i").test(text);
 }`;
 
 export function createExpectedSubmissionRequest(
