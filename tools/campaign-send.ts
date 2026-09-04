@@ -1,6 +1,5 @@
 import {
 	buildCampaignJob,
-	jobContentFingerprint,
 	mapRegistrationValues,
 	type RedirectResolution,
 	readSendApprovalFile,
@@ -10,11 +9,14 @@ import {
 	type SendApprovalFile,
 } from "../src/campaign-import";
 import {
-	EFFECTIVE_DRY_RUN_KEY,
 	type JobInput,
 	type JobStatus,
 	TERMINAL_JOB_STATUSES,
 } from "../src/job";
+import {
+	isCompletedDryRunFor,
+	matchesDryRunContent,
+} from "../src/real-send-guard";
 import {
 	loadChoiceCandidates,
 	PRODUCTION_BASE_URL,
@@ -165,20 +167,8 @@ async function hasCompletedDryRun(
 		options.apiToken,
 		EVENT_PREFIX,
 	);
-	if (!state) return false;
-	if (
-		state.targetUrl !== job.targetUrl ||
-		state.payload?.[EFFECTIVE_DRY_RUN_KEY] === false ||
-		state.status !== "prohibited" ||
-		state.result?.reasonCode !== "DRY_RUN_COMPLETE"
-	) {
-		return false;
-	}
-	const [approved, requested] = await Promise.all([
-		jobContentFingerprint(state.targetUrl, state.companyId, state.payload),
-		jobContentFingerprint(job.targetUrl, job.companyId, job.payload),
-	]);
-	return approved === requested;
+	if (!isCompletedDryRunFor(state, job)) return false;
+	return matchesDryRunContent(state, job);
 }
 
 function approvalRecord(file: SendApprovalFile, entry: SendApprovalEntry) {

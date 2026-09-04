@@ -1,0 +1,336 @@
+import { describe, expect, test } from "bun:test";
+import type { Job, JobInput } from "../src/job";
+import { EFFECTIVE_DRY_RUN_KEY } from "../src/job";
+import {
+	checkRealSendGuard,
+	DRY_RUN_COMPLETE_REASON_CODE,
+	type DryRunRecord,
+	isCompletedDryRunFor,
+	matchesDryRunContent,
+	type RealSendGuardStore,
+	utcDayRange,
+} from "../src/real-send-guard";
+import {
+	REAL_SEND_GUARD_EXEMPT_KEY,
+	SEND_APPROVAL_KEY,
+} from "../src/send-approval";
+
+const TARGET_URL = "https://example.com/contact";
+const DRY_RUN_JOB_ID = "job-dry-001";
+const APPROVAL = {
+	approvedBy: "operator",
+	approvedAt: "2026-09-04T00:00:00Z",
+	dryRunJobId: DRY_RUN_JOB_ID,
+};
+
+interface CountCall {
+	startAt: string;
+	endAt: string;
+	excludeId: string;
+}
+
+class FakeStore implements RealSendGuardStore {
+	readonly countCalls: CountCall[] = [];
+	readonly findCalls: string[] = [];
+
+	constructor(
+		private readonly record: DryRunRecord | null,
+		private readonly used = 0,
+	) {}
+
+	async find(id: string): Promise<DryRunRecord | null> {
+		this.findCalls.push(id);
+		return this.record;
+	}
+
+	async countRealSendJobsCreatedBetween(
+		startAt: string,
+		endAt: string,
+		excludeId: string,
+	): Promise<number> {
+		this.countCalls.push({ startAt, endAt, excludeId });
+		return this.used;
+	}
+}
+
+function sendInput(overrides: Partial<JobInput> = {}): JobInput {
+	return {
+		id: "job-send-001",
+		companyId: "company-001",
+		companyName: "Example Inc.",
+		targetUrl: TARGET_URL,
+		targetDomain: "example.com",
+		allowedHosts: [],
+		payload: {
+			formValues: { message: "Hello" },
+			[EFFECTIVE_DRY_RUN_KEY]: false,
+			[SEND_APPROVAL_KEY]: { ...APPROVAL },
+		},
+		...overrides,
+	};
+}
+
+function dryRunRecord(overrides: Partial<DryRunRecord> = {}): DryRunRecord {
+	return {
+		targetUrl: TARGET_URL,
+		companyId: "company-001",
+		status: "prohibited",
+		payload: {
+			formValues: { message: "Hello" },
+			[EFFECTIVE_DRY_RUN_KEY]: true,
+		},
+		result: { reasonCode: DRY_RUN_COMPLETE_REASON_CODE },
+		...overrides,
+	};
+}
+
+describe("checkRealSendGuard", () => {
+	test("leaves a dry-run job alone without reading the store", async () => {
+		const store = new FakeStore(null);
+		const input = sendInput({
+			payload: { formValues: {}, [EFFECTIVE_DRY_RUN_KEY]: true },
+		});
+		expect(await checkRealSendGuard(input, new Date(), 0, store)).toEqual({
+			allowed: true,
+		});
+		expect(store.findCalls).toEqual([]);
+		expect(store.countCalls).toEqual([]);
+	});
+
+	test("lets a job the API stamped as exempt through without a cap", async () => {
+		const store = new FakeStore(null);
+		const input = sendInput({
+			payload: {
+				formValues: {},
+				[EFFECTIVE_DRY_RUN_KEY]: false,
+				[REAL_SEND_GUARD_EXEMPT_KEY]: true,
+			},
+		});
+		expect(await checkRealSendGuard(input, new Date(), 0, store)).toEqual({
+			allowed: true,
+		});
+		expect(store.countCalls).toEqual([]);
+	});
+
+	test("refuses a real send with no approval record", async () => {
+		const store = new FakeStore(dryRunRecord());
+		const input = sendInput({
+			payload: { formValues: {}, [EFFECTIVE_DRY_RUN_KEY]: false },
+		});
+		expect(await checkRealSendGuard(input, new Date(), 5, store)).toEqual({
+			allowed: false,
+			refusal: "SEND_APPROVAL_REQUIRED",
+		});
+		expect(store.findCalls).toEqual([]);
+	});
+
+	test("refuses a real send whose approval record is malformed", async () => {
+		const store = new FakeStore(dryRunRecord());
+		const input = sendInput({
+			payload: {
+				formValues: {},
+				[EFFECTIVE_DRY_RUN_KEY]: false,
+				[SEND_APPROVAL_KEY]: { ...APPROVAL, approvedBy: "" },
+			},
+		});
+		expect(await checkRealSendGuard(input, new Date(), 5, store)).toEqual({
+			allowed: false,
+			refusal: "SEND_APPROVAL_REQUIRED",
+		});
+	});
+
+	test("refuses a real send whose dry-run cannot be found", async () => {
+		const store = new FakeStore(null);
+		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
+			{ allowed: false, refusal: "DRY_RUN_NOT_COMPLETED" },
+		);
+		expect(store.findCalls).toEqual([DRY_RUN_JOB_ID]);
+	});
+
+	test("refuses a dry-run that ran against a different form URL", async () => {
+		const store = new FakeStore(
+			dryRunRecord({ targetUrl: "https://example.com/other" }),
+		);
+		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
+			{ allowed: false, refusal: "DRY_RUN_NOT_COMPLETED" },
+		);
+	});
+
+	test("refuses an approval that names a real send", async () => {
+		const store = new FakeStore(
+			dryRunRecord({
+				payload: {
+					formValues: { message: "Hello" },
+					[EFFECTIVE_DRY_RUN_KEY]: false,
+				},
+			}),
+		);
+		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
+			{ allowed: false, refusal: "DRY_RUN_NOT_COMPLETED" },
+		);
+	});
+
+	test("refuses a dry-run that did not stop at the dry-run boundary", async () => {
+		const store = new FakeStore(dryRunRecord({ status: "failed" }));
+		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
+			{ allowed: false, refusal: "DRY_RUN_NOT_COMPLETED" },
+		);
+	});
+
+	test("refuses a dry-run whose result carries another reason code", async () => {
+		const store = new FakeStore(
+			dryRunRecord({ result: { reasonCode: "FORM_PROHIBITED" } }),
+		);
+		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
+			{ allowed: false, refusal: "DRY_RUN_NOT_COMPLETED" },
+		);
+	});
+
+	test("refuses a send whose content differs from the reviewed dry-run", async () => {
+		const store = new FakeStore(
+			dryRunRecord({
+				payload: {
+					formValues: { message: "Something else" },
+					[EFFECTIVE_DRY_RUN_KEY]: true,
+				},
+			}),
+		);
+		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
+			{ allowed: false, refusal: "DRY_RUN_CONTENT_MISMATCH" },
+		);
+		expect(store.countCalls).toEqual([]);
+	});
+
+	test("refuses a send whose company differs from the reviewed dry-run", async () => {
+		const store = new FakeStore(dryRunRecord({ companyId: "company-002" }));
+		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
+			{ allowed: false, refusal: "DRY_RUN_CONTENT_MISMATCH" },
+		);
+	});
+
+	test("refuses every real send while the cap is 0, without counting", async () => {
+		const store = new FakeStore(dryRunRecord());
+		expect(await checkRealSendGuard(sendInput(), new Date(), 0, store)).toEqual(
+			{ allowed: false, refusal: "REAL_SEND_CAP_REACHED" },
+		);
+		expect(store.countCalls).toEqual([]);
+	});
+
+	test("refuses the send that would reach the cap", async () => {
+		const store = new FakeStore(dryRunRecord(), 5);
+		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
+			{ allowed: false, refusal: "REAL_SEND_CAP_REACHED" },
+		);
+	});
+
+	test("refuses a send once the day is already over the cap", async () => {
+		const store = new FakeStore(dryRunRecord(), 6);
+		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
+			{ allowed: false, refusal: "REAL_SEND_CAP_REACHED" },
+		);
+	});
+
+	test("allows the last send that still fits inside the cap", async () => {
+		const store = new FakeStore(dryRunRecord(), 4);
+		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
+			{ allowed: true },
+		);
+	});
+
+	test("counts the UTC day of the registration and skips the job itself", async () => {
+		const store = new FakeStore(dryRunRecord(), 0);
+		const now = new Date("2026-09-04T23:59:59.999Z");
+		expect(await checkRealSendGuard(sendInput(), now, 5, store)).toEqual({
+			allowed: true,
+		});
+		expect(store.countCalls).toEqual([
+			{
+				startAt: "2026-09-04T00:00:00.000Z",
+				endAt: "2026-09-05T00:00:00.000Z",
+				excludeId: "job-send-001",
+			},
+		]);
+	});
+});
+
+describe("utcDayRange", () => {
+	test("spans the UTC day the instant falls in", () => {
+		expect(utcDayRange(new Date("2026-09-04T00:00:00.000Z"))).toEqual({
+			from: "2026-09-04T00:00:00.000Z",
+			to: "2026-09-05T00:00:00.000Z",
+		});
+		expect(utcDayRange(new Date("2026-09-04T23:59:59.999Z"))).toEqual({
+			from: "2026-09-04T00:00:00.000Z",
+			to: "2026-09-05T00:00:00.000Z",
+		});
+		// The local day would still be the 4th in a positive-offset zone.
+		expect(utcDayRange(new Date("2026-09-05T00:00:00.000Z"))).toEqual({
+			from: "2026-09-05T00:00:00.000Z",
+			to: "2026-09-06T00:00:00.000Z",
+		});
+	});
+});
+
+describe("isCompletedDryRunFor", () => {
+	test("accepts a stored job read back over the API with no payload", () => {
+		// `JobState` from the operator tool carries a nullable payload; a missing
+		// one is not a real send, so it passes the same way the Worker's does.
+		expect(
+			isCompletedDryRunFor(dryRunRecord({ payload: null }), {
+				targetUrl: TARGET_URL,
+			}),
+		).toBe(true);
+	});
+
+	test("accepts a Worker job record unchanged", () => {
+		const job: Job = {
+			...sendInput(),
+			payload: { formValues: {}, [EFFECTIVE_DRY_RUN_KEY]: true },
+			status: "prohibited",
+			attemptCount: 1,
+			submitReviewDenialCount: 0,
+			runToken: null,
+			result: {
+				outcome: "prohibited",
+				formUrl: TARGET_URL,
+				reasonCode: DRY_RUN_COMPLETE_REASON_CODE,
+				reason: null,
+				completedAt: "2026-09-04T00:00:00.000Z",
+			},
+			createdAt: "2026-09-04T00:00:00.000Z",
+			updatedAt: "2026-09-04T00:00:00.000Z",
+		};
+		expect(isCompletedDryRunFor(job, { targetUrl: TARGET_URL })).toBe(true);
+	});
+
+	test("rejects a null record and a result that is missing", () => {
+		expect(isCompletedDryRunFor(null, { targetUrl: TARGET_URL })).toBe(false);
+		expect(
+			isCompletedDryRunFor(dryRunRecord({ result: null }), {
+				targetUrl: TARGET_URL,
+			}),
+		).toBe(false);
+	});
+});
+
+describe("matchesDryRunContent", () => {
+	test("compares only the form URL, the company, and the form values", async () => {
+		// The stored payload carries the frozen mode and the approval record, so
+		// the whole payload cannot be compared.
+		const input = sendInput();
+		expect(await matchesDryRunContent(dryRunRecord(), input)).toBe(true);
+	});
+
+	test("treats a payload that is missing as carrying no form values", async () => {
+		expect(
+			await matchesDryRunContent(dryRunRecord({ payload: null }), {
+				targetUrl: TARGET_URL,
+				companyId: "company-001",
+				payload: {},
+			}),
+		).toBe(true);
+		expect(
+			await matchesDryRunContent(dryRunRecord({ payload: null }), sendInput()),
+		).toBe(false);
+	});
+});
