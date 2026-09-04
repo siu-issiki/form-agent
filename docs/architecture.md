@@ -455,6 +455,10 @@ policy failure は driver の以降の全 CDP コマンドを reject させ run 
 
 ### キャンペーン取り込み
 
+CSV は 2 つの形式を受け付ける。ヘッダーに `問い合わせリンク` / `件名` / `本文` が揃っている場合を簡易形式とし、それ以外は従来の 30 列形式として必須列を検証する。案件ごとに CSV の作り手が違い、簡易形式には企業名・企業ドメイン・NG チェックの各列が無いためである。簡易形式では企業ドメインをフォーム URL のホストから `normalizeCompanyDomain` で導出し、企業名にはホスト名を入れる。`buildCampaignJob` の `companyId` は登録可能ドメインから決まるので、企業名が表示用の値になっても重複判定は変わらない。チェック列が存在しない以上、その列による除外は行わない。除外理由は本文または件名が空なら `empty_message`、URL が空なら `missing_form_url`、https でない・ホストが許可形式でないなら従来と同じ `invalid_or_insecure_form_url` である。`sourceRow`（ヘッダーを 1 行目とする CSV の行番号）の定義は両形式で同じで、承認ファイルの `sourceRow` もそのまま使える。
+
+登録値 JSON は順序と件数の完全一致から label 名での照合へ変えた。同じ項目が案件によって別の書き方（「氏名（フルネーム漢字）」/「フルネーム漢字」、「電話1」/「電話番号1」、「部署名」/「部署」、「フリガナ」/「フルネームカタカナ」など）で届くためである。key ごとに label を優先順に並べ、正規の label が別名より先に一致する。`役職`（jobTitle）と `年齢`（age）を key に追加した。`電話番号` は同じ label が 2 件並ぶ想定を維持し、1 件目を `phone`、2 件目を数字のみの `phoneDigits` とする。1 件しか無い場合は両方へ同じ値を入れる。値が空の項目と未知の label は無視する。登録値ファイルは今後も項目が増えるため、未知の label でファイル全体を拒否すると運用が止まるからである。ただし無視した件数は `campaign_registration_summary` の `unknownLabels` として出し、label 名や値は出さない。`fullName` / `lastName` / `firstName` / `email` / `phone` / `companyName` が揃わない場合はエラーで停止する。フォームを埋められない値で dry-run を回しても意味がないためである。
+
 `tools/campaign-dry-run.ts` は CSV と登録値 JSON からジョブを組み立てる。選択肢が必要なサイト向けに `--choices <path>` を追加した。JSON は `Record<string, string[]>` で、キーは payload key の書式、値は候補リストの契約（1〜10 要素、各要素 1〜256 文字、合計 2,048 文字以下）で検証する。登録値・件名・本文とキーが衝突した場合は優先順位を設けずエラーにする。サンプルは `docs/examples/campaign-choices.example.json` にある。
 
 選択肢候補は `src/campaign-import.ts` の `DEFAULT_CHOICE_CANDIDATES`（`inquiryType` / `contactMethod` / `privacyConsent`）として同梱し、既定で常に適用する。実サイトでは同じ形の選択肢が繰り返し現れ、毎回ファイルを渡すと運用ミスで欠落するためである。`--choices` を渡した場合はキー単位でファイル側が勝ち、ファイルに無いキーは既定が残る。`--no-default-choices` は既定セット全体を無効化する。マージ結果は `mergeChoiceCandidates` が `readChoiceCandidates` と同じ契約で検証し、登録値とのキー衝突は従来どおり `buildCampaignJob` がエラーにする。既定の `privacyConsent: ["checked"]` はプライバシーポリシー同意を自動でチェックするという運用判断であり、無効化するには `--no-default-choices` を使う。
