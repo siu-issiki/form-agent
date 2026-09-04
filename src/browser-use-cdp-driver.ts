@@ -1482,14 +1482,25 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			depth: -1,
 			pierce: true,
 		});
+		let staleBodyCount = 0;
 		const matches = await Promise.all(
 			discoverCdpBodyBackendNodeIds(root, 20, frameId, this.#topFrameId).map(
-				(backendNodeId) =>
-					this.#callFunctionOnElement<boolean>(
-						backendNodeId,
-						HAS_CONFIRMATION_TEXT_FUNCTION,
-						[SUBMISSION_CONFIRMATION_PATTERN, SUBMISSION_PENDING_PATTERN],
-					),
+				async (backendNodeId) => {
+					try {
+						return await this.#callFunctionOnElement<boolean>(
+							backendNodeId,
+							HAS_CONFIRMATION_TEXT_FUNCTION,
+							[SUBMISSION_CONFIRMATION_PATTERN, SUBMISSION_PENDING_PATTERN],
+						);
+					} catch (error) {
+						// A body discovered a moment ago can already be gone while the
+						// page navigates. Counting it as non-matching keeps the bodies
+						// that are still readable from failing the whole snapshot.
+						if (!isTransientConfirmationReadError(error)) throw error;
+						staleBodyCount += 1;
+						return false;
+					}
+				},
 			),
 		);
 		const matchingBodyCount = matches.filter(Boolean).length;
@@ -1498,6 +1509,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				event: "browser_confirmation_snapshot",
 				bodyCount: matches.length,
 				matchingBodyCount,
+				staleBodyCount,
 				frameScoped: frameId !== undefined,
 			}),
 		);
@@ -2508,6 +2520,55 @@ export async function continueSubmissionRequest(
 	recordObserved();
 }
 
+/**
+ * The CDP failures a document or a frame answers with while it is navigating,
+ * which is exactly the moment the confirmation is read in. A fresh
+ * `DOM.getDocument` on the next poll rediscovers the bodies, so a read that
+ * fails this way is not yet an answer about the submission.
+ */
+const TRANSIENT_CONFIRMATION_READ_KINDS: ReadonlySet<CdpCommandErrorKind> =
+	new Set([
+		"NODE_NOT_FOUND",
+		"NODE_DETACHED",
+		"CONTEXT_NOT_FOUND",
+		"CONTEXT_DESTROYED",
+		"NO_EXECUTION_CONTEXT",
+		"FRAME_NOT_FOUND",
+		"TARGET_NAVIGATED",
+	]);
+
+export function isTransientConfirmationReadError(
+	error: unknown,
+): error is BrowserUseCdpCommandError {
+	return (
+		error instanceof BrowserUseCdpCommandError &&
+		TRANSIENT_CONFIRMATION_READ_KINDS.has(error.kind)
+	);
+}
+
+/**
+ * The confirmation could not be read yet. It carries only the failing CDP
+ * method and its fixed kind, never page text, and never means the submission
+ * itself failed or succeeded.
+ */
+export class ConfirmationReadPendingError extends Error {
+	readonly cdpMethod: string;
+	readonly cdpKind: CdpCommandErrorKind;
+
+	constructor(readonly cause: BrowserUseCdpCommandError) {
+		super("The submission confirmation could not be read yet");
+		this.name = "ConfirmationReadPendingError";
+		this.cdpMethod = cause.method;
+		this.cdpKind = cause.kind;
+	}
+}
+
+/**
+ * Reads one confirmation snapshot. A read that failed only because the page
+ * was mid-navigation raises `ConfirmationReadPendingError`, which asks the
+ * caller to poll again; every other failure stays the diagnostic error the
+ * submission ends on.
+ */
 export async function readSubmissionConfirmation(
 	beforeCount: number,
 	requestObserved: boolean,
@@ -2519,6 +2580,8 @@ export async function readSubmissionConfirmation(
 	try {
 		afterCount = await readAfterCount();
 	} catch (error) {
+		if (isTransientConfirmationReadError(error))
+			throw new ConfirmationReadPendingError(error);
 		throw createBrowserSubmitDiagnosticError("SUBMIT_READ_AFTER_TEXT", error);
 	}
 	if (
@@ -2534,6 +2597,14 @@ export async function readSubmissionConfirmation(
 	}
 }
 
+/**
+ * Polls for the confirmation until the deadline. A read the page was too busy
+ * navigating to answer is retried on the next poll instead of ending the
+ * submission, because one second later the completion page is usually there.
+ * Only a read still failing that way after the deadline becomes the
+ * `SUBMIT_READ_AFTER_TEXT` diagnostic an operator sees, so the outcome is
+ * unchanged when the page never became readable at all.
+ */
 export async function waitForSubmissionConfirmation(
 	readConfirmation: () => Promise<BrowserSubmitResult | null>,
 	waitForChange: (milliseconds: number) => Promise<void>,
@@ -2545,10 +2616,32 @@ export async function waitForSubmissionConfirmation(
 		await waitForChange(
 			Math.min(CONFIRMATION_POLL_INTERVAL_MS, deadline - now()),
 		);
-		const confirmation = await readConfirmation();
+		let confirmation: BrowserSubmitResult | null;
+		try {
+			confirmation = await readConfirmation();
+		} catch (error) {
+			if (!(error instanceof ConfirmationReadPendingError)) throw error;
+			console.log(
+				JSON.stringify({
+					event: "browser_confirmation_read_retry",
+					method: error.cdpMethod,
+					kind: error.cdpKind,
+				}),
+			);
+			continue;
+		}
 		if (confirmation) return confirmation;
 	}
-	return readConfirmation();
+	try {
+		return await readConfirmation();
+	} catch (error) {
+		if (error instanceof ConfirmationReadPendingError)
+			throw createBrowserSubmitDiagnosticError(
+				"SUBMIT_READ_AFTER_TEXT",
+				error.cause,
+			);
+		throw error;
+	}
 }
 
 export function hasExpectedFrameNavigated(

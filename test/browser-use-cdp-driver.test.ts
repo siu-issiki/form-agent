@@ -29,6 +29,7 @@ import {
 	BrowserUseCdpDriver,
 	type CdpScreenshotResult,
 	CHECK_FORM_VALIDITY_FUNCTION,
+	ConfirmationReadPendingError,
 	captureCdpFullPageScreenshot,
 	captureCdpScreenshot,
 	centerOfQuad,
@@ -52,6 +53,7 @@ import {
 	isExpectedNavigationDocumentRequest,
 	isPayloadIndependentClickTarget,
 	isRetryableClickPreparationError,
+	isTransientConfirmationReadError,
 	MATCHES_CHOICE_CANDIDATE_FUNCTION,
 	MAX_SUBMISSION_REQUESTS,
 	planFullPageScreenshot,
@@ -1766,6 +1768,165 @@ describe("BrowserUseCdpDriver submission confirmation", () => {
 		expect(result).toBeNull();
 		expect(elapsed).toBe(3_500);
 		expect(reads).toBe(5);
+	});
+
+	test("retries a confirmation read the navigating page could not answer", async () => {
+		let elapsed = 0;
+		let reads = 0;
+		const captured = captureLogs();
+		let result: BrowserSubmitResult | null;
+		try {
+			result = await waitForSubmissionConfirmation(
+				async () => {
+					reads += 1;
+					if (reads <= 2) {
+						throw new ConfirmationReadPendingError(
+							cdpCommandError("Runtime.callFunctionOn", "NODE_DETACHED"),
+						);
+					}
+					return {
+						outcome: "sent" as const,
+						formUrl: "https://example.com/complete",
+					};
+				},
+				async (milliseconds) => {
+					elapsed += milliseconds;
+				},
+				15_000,
+				() => elapsed,
+			);
+		} finally {
+			captured.restore();
+		}
+
+		expect(result).toEqual({
+			outcome: "sent",
+			formUrl: "https://example.com/complete",
+		});
+		expect(reads).toBe(3);
+		expect(elapsed).toBe(3_000);
+		expect(logEvents(captured.logs)).toEqual([
+			{
+				event: "browser_confirmation_read_retry",
+				method: "Runtime.callFunctionOn",
+				kind: "NODE_DETACHED",
+			},
+			{
+				event: "browser_confirmation_read_retry",
+				method: "Runtime.callFunctionOn",
+				kind: "NODE_DETACHED",
+			},
+		]);
+	});
+
+	test("reports the after-text failure only once the deadline passed", async () => {
+		let elapsed = 0;
+		let reads = 0;
+		const captured = captureLogs();
+		try {
+			const confirmation = waitForSubmissionConfirmation(
+				async () => {
+					reads += 1;
+					throw new ConfirmationReadPendingError(
+						cdpCommandError("DOM.getDocument", "CONTEXT_DESTROYED"),
+					);
+				},
+				async (milliseconds) => {
+					elapsed += milliseconds;
+				},
+				3_500,
+				() => elapsed,
+			);
+
+			const error = await confirmation.catch((reason: unknown) => reason);
+			expect(error).toBeInstanceOf(BrowserSubmitDiagnosticError);
+			expect(error).toMatchObject({
+				stage: "SUBMIT_READ_AFTER_TEXT",
+				diagnosticCode: "CDP_COMMAND_FAILED",
+			});
+		} finally {
+			captured.restore();
+		}
+
+		expect(elapsed).toBe(3_500);
+		// Four polls inside the window plus the final read after the deadline.
+		expect(reads).toBe(5);
+	});
+
+	test("ends the submission on a confirmation read failure that is not transient", async () => {
+		let elapsed = 0;
+		let reads = 0;
+		const failure = new BrowserSubmitDiagnosticError(
+			"SUBMIT_READ_AFTER_TEXT",
+			"CDP_COMMAND_FAILED",
+		);
+
+		const confirmation = waitForSubmissionConfirmation(
+			async () => {
+				reads += 1;
+				throw failure;
+			},
+			async (milliseconds) => {
+				elapsed += milliseconds;
+			},
+			15_000,
+			() => elapsed,
+		);
+
+		expect(await confirmation.catch((reason: unknown) => reason)).toBe(failure);
+		expect(reads).toBe(1);
+		expect(elapsed).toBe(1_000);
+	});
+
+	test("asks for another poll when the after-text read hit a detached node", async () => {
+		const confirmation = readSubmissionConfirmation(
+			0,
+			true,
+			async () => {
+				throw cdpCommandError("Runtime.callFunctionOn", "NODE_DETACHED");
+			},
+			async () => "https://example.com/complete",
+		);
+
+		const error = await confirmation.catch((reason: unknown) => reason);
+		expect(error).toBeInstanceOf(ConfirmationReadPendingError);
+		expect(error).toMatchObject({
+			cdpMethod: "Runtime.callFunctionOn",
+			cdpKind: "NODE_DETACHED",
+		});
+	});
+
+	test("keeps a non-transient after-text failure a submission diagnostic", async () => {
+		const confirmation = readSubmissionConfirmation(
+			0,
+			true,
+			async () => {
+				throw cdpCommandError(
+					"Runtime.callFunctionOn",
+					"INVALID_PARAMS",
+					-32602,
+				);
+			},
+			async () => "https://example.com/complete",
+		);
+
+		const error = await confirmation.catch((reason: unknown) => reason);
+		expect(error).toBeInstanceOf(BrowserSubmitDiagnosticError);
+		expect(error).toMatchObject({ stage: "SUBMIT_READ_AFTER_TEXT" });
+	});
+
+	test("treats only a mid-navigation CDP failure as a pending read", () => {
+		expect(
+			isTransientConfirmationReadError(
+				cdpCommandError("DOM.getDocument", "CONTEXT_DESTROYED"),
+			),
+		).toBe(true);
+		expect(
+			isTransientConfirmationReadError(
+				cdpCommandError("DOM.getDocument", "OTHER"),
+			),
+		).toBe(false);
+		expect(isTransientConfirmationReadError(new Error("boom"))).toBe(false);
 	});
 
 	test("accepts only a navigation of the submitted form frame", () => {
@@ -5938,6 +6099,80 @@ describe("BrowserUseCdpDriver submission network policy", () => {
 	});
 });
 
+const SUBMISSION_BODY_BACKEND_NODE_ID = 8;
+
+/** The fixture page with the body node the confirmation snapshot reads. */
+const SUBMISSION_PAGE_DOCUMENT = {
+	backendNodeId: 1,
+	nodeName: "#document",
+	children: [
+		{
+			backendNodeId: SUBMISSION_BODY_BACKEND_NODE_ID,
+			nodeName: "BODY",
+			children: ELEMENT_PAGE_DOCUMENT.children,
+		},
+	],
+};
+
+describe("BrowserUseCdpDriver confirmation snapshot", () => {
+	test("counts a body the navigation detached as non-matching", async () => {
+		const { driver } = await submissionDriver(
+			[
+				{
+					requestId: "post-1",
+					resourceType: "XHR",
+					frameId: "frame-1",
+					request: { url: "https://acme.co.jp/send", method: "POST" },
+				},
+			],
+			(connection) => {
+				const scripted = connection.respond;
+				connection.respond = (method, params) =>
+					method === "DOM.getDocument"
+						? { root: SUBMISSION_PAGE_DOCUMENT }
+						: scripted(method, params);
+				// The body node was rediscovered a moment before the page navigated
+				// away from it, so the call on it no longer finds the node.
+				connection.fail = (method, params) =>
+					method === "Runtime.callFunctionOn" &&
+					params.objectId === `object-${SUBMISSION_BODY_BACKEND_NODE_ID}`
+						? new BrowserUseCdpCommandError(
+								"Runtime.callFunctionOn",
+								-32000,
+								classifyCdpCommandError("Could not find node with given id"),
+							)
+						: null;
+			},
+		);
+		const captured = captureLogs();
+		let result: BrowserSubmitResult;
+		try {
+			result = await driver.submit(BUTTON_ELEMENT_ID, "dom");
+		} finally {
+			captured.restore();
+		}
+
+		expect(
+			logEvents(captured.logs).filter(
+				(entry) =>
+					(entry as { event?: string }).event ===
+					"browser_confirmation_snapshot",
+			)[0],
+		).toEqual({
+			event: "browser_confirmation_snapshot",
+			bodyCount: 1,
+			matchingBodyCount: 0,
+			staleBodyCount: 1,
+			frameScoped: false,
+		});
+		expect(result).toMatchObject({
+			outcome: "uncertain",
+			reasonCode: "SUBMIT_CONFIRMATION_NOT_OBSERVED",
+		});
+		await closeQuietly(driver);
+	});
+});
+
 /**
  * A driver on the fixture page whose submit control is a real submit button,
  * with one filled field, ready for `submit`. The paused requests are delivered
@@ -5946,9 +6181,11 @@ describe("BrowserUseCdpDriver submission network policy", () => {
  */
 async function submissionDriver(
 	pausedRequests: readonly Record<string, unknown>[],
+	prepare?: (connection: ScriptedCdpConnection) => void,
 ): Promise<{ driver: BrowserUseCdpDriver; connection: ScriptedCdpConnection }> {
 	const connection = new ScriptedCdpConnection();
 	connection.respond = submitFixtureResponse(connection, pausedRequests);
+	prepare?.(connection);
 	const captured = captureLogs();
 	try {
 		const driver = await BrowserUseCdpDriver.connect(
