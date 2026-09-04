@@ -6,22 +6,24 @@ import {
 	isVerificationProviderUrl,
 	VERIFICATION_PROVIDER_ALLOWLIST,
 } from "../src/browser-network-policy";
-import { InMemoryJobStore, type Job, type JobInput } from "../src/job";
+import {
+	detectProhibitedReasonCodes,
+	detectProhibitedTextReasonCodes,
+	type ProhibitedReasonCode,
+} from "../src/form-prohibition";
+import type { Job, JobInput } from "../src/job";
 import {
 	BrowserElementError,
 	BrowserSubmitDiagnosticError,
 	type BrowserSubmitResult,
 	CorrectionRequiredError,
 	createBrowserSubmitDiagnosticError,
-	detectProhibitedReasonCodes,
-	detectProhibitedTextReasonCodes,
 	FormStateChangedError,
 	isSubmitStagePending,
 	NavigationPolicyError,
 	ObservationStaleError,
 	type ObservedFieldState,
 	observationFingerprint,
-	type ProhibitedReasonCode,
 	ProhibitionEvidenceError,
 	type RestrictedBrowserDriver,
 	RestrictedBrowserTools,
@@ -46,6 +48,7 @@ import {
 	sha256Hex,
 } from "../src/submission-evidence";
 import { FakeBrowserDriver } from "./helpers/fake-browser-driver";
+import { InMemoryJobStore } from "./helpers/in-memory-job-store";
 import { captureLogs, logEvents, logEventsNamed } from "./helpers/logs";
 
 const input: JobInput = {

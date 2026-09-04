@@ -5,7 +5,13 @@ import {
 } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, test, vi } from "vitest";
+import {
+	CORRECTION_TURNS,
+	MAX_PROVIDER_REQUESTS,
+	MAX_TURNS,
+} from "../src/agent-budget";
 import { AgentExecutionError, type AgentExecutor } from "../src/agent-executor";
+import { TOOL_ERROR_GUIDANCE } from "../src/agent-tool-schema";
 import {
 	BrowserToolCoordinator,
 	BrowserToolInputError,
@@ -20,15 +26,9 @@ import { BrowserUseApiError } from "../src/browser-use-client";
 import { D1JobStore } from "../src/d1-job-store";
 import type { AgentRunMetrics, JobInput } from "../src/job";
 import {
-	CORRECTION_TURNS,
-	MAX_PROVIDER_REQUESTS,
-	MAX_TURNS,
-} from "../src/openai-responses-client";
-import {
 	classifyToolDiagnostic,
 	isJobDryRun,
 	ResponsesAgentExecutor,
-	TOOL_ERROR_GUIDANCE,
 } from "../src/responses-agent-executor";
 import {
 	BrowserElementError,
@@ -3383,7 +3383,7 @@ describe("ResponsesAgentExecutor", () => {
 		);
 	});
 
-	test("normalizes prohibited reason code aliases", async () => {
+	test("stores a prohibited reason code from the fixed set", async () => {
 		const store = new D1JobStore(env.DB);
 		await store.create(input, "2026-08-28T00:00:00.000Z");
 		const job = await store.claimRun(

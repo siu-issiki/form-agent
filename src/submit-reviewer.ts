@@ -1,10 +1,10 @@
+import { MAX_PROVIDER_REQUESTS } from "./agent-budget";
 import { AgentExecutionError } from "./agent-executor";
 import { D1JobStore } from "./d1-job-store";
 import {
 	invalidProviderResponse,
 	isRecord,
 	type JsonObject,
-	MAX_PROVIDER_REQUESTS,
 	type ProviderUsage,
 	providerRequestByteLength,
 	readProviderUsage,

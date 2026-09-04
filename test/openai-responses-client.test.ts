@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { AgentExecutionError } from "../src/agent-executor";
-import { readBoundedJson } from "../src/openai-responses-client";
-import { readResponseOutput } from "../src/responses-agent-executor";
+import {
+	readBoundedJson,
+	readResponseOutput,
+} from "../src/openai-responses-client";
 
 /** The AgentExecutionError a rejected provider-response read produced. */
 async function rejection(

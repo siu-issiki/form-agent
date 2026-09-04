@@ -1,11 +1,13 @@
 import { D1JobStore } from "./d1-job-store";
+import type {
+	ProhibitedReasonCode,
+	ProhibitionVerification,
+} from "./form-prohibition";
 import type { EvidenceStage, Job } from "./job";
 import {
 	type BrowserObservation,
 	isSubmitStagePending,
 	PAYLOAD_KEY_PATTERN,
-	type ProhibitedReasonCode,
-	type ProhibitionVerification,
 	type RestrictedBrowserDriver,
 	RestrictedBrowserTools,
 	readTrustedFormValues,

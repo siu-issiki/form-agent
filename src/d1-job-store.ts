@@ -1,3 +1,8 @@
+import type {
+	AgentToolDiagnosticCode,
+	AgentToolDiagnosticStage,
+	AgentToolDiagnosticToolName,
+} from "./agent-tool-diagnostic";
 import {
 	type AgentRunMetrics,
 	type CapturedEvidence,
@@ -39,81 +44,6 @@ interface JobRow extends StoredJobRow {
 }
 
 type QuerySource = Pick<D1Database, "prepare">;
-
-export type AgentToolDiagnosticToolName =
-	| "navigate"
-	| "observe"
-	| "click"
-	| "fill"
-	| "select"
-	| "submit"
-	| "finish"
-	| "unknown";
-
-export type AgentToolDiagnosticStage =
-	| "input_parse"
-	| "finish_validation"
-	| "tool_dispatch"
-	| "driver_connect"
-	| "scope_setup"
-	| "bootstrap_navigate"
-	| "navigate"
-	| "observe"
-	| "click"
-	| "fill"
-	| "select"
-	| "submit"
-	| "submit_validate"
-	| "submit_review";
-
-export type AgentToolDiagnosticCode =
-	| "OK"
-	| "INVALID_TOOL_INPUT"
-	| "UNKNOWN_TOOL"
-	| "DRY_RUN_COMPLETE"
-	| "DRY_RUN_REVIEW_DENIED"
-	| "FINISH_FIELDS_INVALID"
-	| "FINISH_FORM_URL_NOT_ALLOWED"
-	| "FINISH_OUTCOME_INVALID"
-	| "FINISH_PROHIBITION_NOT_VERIFIED"
-	| "PROHIBITION_EVIDENCE_VERIFIED"
-	| "PROHIBITION_EVIDENCE_NOT_FOUND"
-	| "PROHIBITION_EVIDENCE_WEAK"
-	| "SUBMIT_RESULT_NOT_PERSISTED"
-	| "SUBMIT_STAGE_PENDING"
-	| "SUBMIT_STAGE_UNVERIFIED"
-	| "SUBMIT_CONFIRMATION_NOT_OBSERVED"
-	| "SUBMIT_REVIEW_ALLOWED"
-	| "SUBMIT_REVIEW_DENIED"
-	| "SUBMIT_REVIEW_UNAVAILABLE"
-	| "JOB_STATE_CONFLICT"
-	| "CDP_CONNECTION_FAILED"
-	| "CDP_UPGRADE_REJECTED"
-	| "CDP_CONNECTION_CLOSED"
-	| "CDP_COMMAND_TIMEOUT"
-	| "CDP_COMMAND_SEND_FAILED"
-	| "CDP_COMMAND_FAILED"
-	| "CDP_ENDPOINT_INVALID"
-	| "BROWSER_SESSION_LIMIT"
-	| "BROWSER_SESSION_API_FAILED"
-	| "BROWSER_CREDENTIALS_MISSING"
-	| "SCOPE_CONFIGURATION_FAILED"
-	| "NAVIGATION_FAILED"
-	| "PAGE_NOT_READY"
-	| "DOM_DISCOVERY_FAILED"
-	| "PAGE_EVALUATION_FAILED"
-	| "PAYLOAD_TOO_LARGE"
-	| "ELEMENT_UNAVAILABLE"
-	| "ELEMENT_OPERATION_CDP_FAILED"
-	| "SUBMIT_PROHIBITED"
-	| "FORM_INVALID"
-	| "NAVIGATION_POLICY"
-	| "TOOL_INPUT_INVALID"
-	| "SUBMISSION_NOT_AUTHORIZED"
-	| "SUBMISSION_RESULT_UNCERTAIN"
-	| "SCREENSHOT_FAILED"
-	| "EVIDENCE_CAPTURE_FAILED"
-	| "UNKNOWN";
 
 export class D1JobStore implements JobStore {
 	constructor(private readonly db: D1Database) {}
