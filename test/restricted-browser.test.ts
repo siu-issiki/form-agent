@@ -13,6 +13,7 @@ import {
 	type ProhibitedReasonCode,
 } from "../src/form-prohibition";
 import type { Job, JobInput } from "../src/job";
+import { parseObservedForms } from "../src/observed-form";
 import {
 	BrowserElementError,
 	BrowserSubmitDiagnosticError,
@@ -1133,13 +1134,13 @@ describe("RestrictedBrowserTools", () => {
 	test("detects only mechanically supported prohibition reasons", () => {
 		expect(
 			detectProhibitedReasonCodes({
-				forms: [],
+				forms: parseObservedForms([]),
 				pageText: "お問い合わせフォームはありません。",
 			}),
 		).toEqual(["NO_FORM_PRESENT"]);
 		expect(
 			detectProhibitedReasonCodes({
-				forms: [{}],
+				forms: parseObservedForms([{}]),
 				pageText: "採用お問い合わせ専用です。営業目的の利用は禁止です。",
 			}),
 		).toEqual(["SALES_PROHIBITED", "FORM_PURPOSE_INCOMPATIBLE"]);
@@ -1160,10 +1161,10 @@ describe("RestrictedBrowserTools", () => {
 	test("does not prohibit the page when another observed form remains usable", () => {
 		expect(
 			detectProhibitedReasonCodes({
-				forms: [
+				forms: parseObservedForms([
 					{ prohibitedReasonCodes: ["SALES_PROHIBITED"] },
 					{ prohibitedReasonCodes: [] },
-				],
+				]),
 			}),
 		).toEqual([]);
 	});
@@ -1171,10 +1172,10 @@ describe("RestrictedBrowserTools", () => {
 	test("accepts either trusted reason when every observed form is blocked", () => {
 		expect(
 			detectProhibitedReasonCodes({
-				forms: [
+				forms: parseObservedForms([
 					{ prohibitedReasonCodes: ["SALES_PROHIBITED"] },
 					{ prohibitedReasonCodes: ["FORM_PURPOSE_INCOMPATIBLE"] },
-				],
+				]),
 			}),
 		).toEqual(["SALES_PROHIBITED", "FORM_PURPOSE_INCOMPATIBLE"]);
 	});
@@ -1217,7 +1218,10 @@ describe("RestrictedBrowserTools", () => {
 	test("takes a sales prohibition from the page text outside every form", () => {
 		expect(
 			detectProhibitedReasonCodes({
-				forms: [{ prohibitedReasonCodes: [] }, { prohibitedReasonCodes: [] }],
+				forms: parseObservedForms([
+					{ prohibitedReasonCodes: [] },
+					{ prohibitedReasonCodes: [] },
+				]),
 				pageText:
 					"お問い合わせ窓口のご案内。営業目的のメールはお控えください。",
 			}),
@@ -1227,7 +1231,9 @@ describe("RestrictedBrowserTools", () => {
 	test("keeps a form-only purpose restriction out of the page text detection", () => {
 		expect(
 			detectProhibitedReasonCodes({
-				forms: [{ prohibitedReasonCodes: ["FORM_PURPOSE_INCOMPATIBLE"] }],
+				forms: parseObservedForms([
+					{ prohibitedReasonCodes: ["FORM_PURPOSE_INCOMPATIBLE"] },
+				]),
 				pageText: "一般のお問い合わせはこちらのフォームからお願いします。",
 			}),
 		).toEqual(["FORM_PURPOSE_INCOMPATIBLE"]);
@@ -2276,53 +2282,47 @@ describe("dry-run evidence", () => {
 
 describe("observationFingerprint", () => {
 	test("ignores element ids and non-comparable controls", () => {
-		const withSubmit = observationFingerprint({
-			url: input.targetUrl,
-			forms: [
+		const withSubmit = observationFingerprint(
+			parseObservedForms([
 				{
 					fields: [
 						{ elementId: "fa-0-0", tag: "input", type: "text", value: "a" },
 						{ elementId: "fa-0-1", tag: "input", type: "submit", value: "Go" },
 					],
 				},
-			],
-		});
-		const renumberedWithoutSubmit = observationFingerprint({
-			url: input.targetUrl,
-			forms: [
+			]),
+		);
+		const renumberedWithoutSubmit = observationFingerprint(
+			parseObservedForms([
 				{
 					fields: [
 						{ elementId: "fa-9-7", tag: "input", type: "text", value: "a" },
 					],
 				},
-			],
-		});
+			]),
+		);
 
 		expect(withSubmit).toBe(renumberedWithoutSubmit);
 	});
 
 	test("changes when a value or checked state changes", () => {
-		const base = {
-			url: input.targetUrl,
-			forms: [
-				{
-					fields: [
-						{ elementId: "fa-0-0", tag: "input", type: "text", value: "a" },
-						{
-							elementId: "fa-0-1",
-							tag: "input",
-							type: "checkbox",
-							checked: false,
-						},
-					],
-				},
-			],
-		};
+		const base = parseObservedForms([
+			{
+				fields: [
+					{ elementId: "fa-0-0", tag: "input", type: "text", value: "a" },
+					{
+						elementId: "fa-0-1",
+						tag: "input",
+						type: "checkbox",
+						checked: false,
+					},
+				],
+			},
+		]);
 
 		expect(observationFingerprint(base)).not.toBe(
-			observationFingerprint({
-				...base,
-				forms: [
+			observationFingerprint(
+				parseObservedForms([
 					{
 						fields: [
 							{ elementId: "fa-0-0", tag: "input", type: "text", value: "b" },
@@ -2334,13 +2334,12 @@ describe("observationFingerprint", () => {
 							},
 						],
 					},
-				],
-			}),
+				]),
+			),
 		);
 		expect(observationFingerprint(base)).not.toBe(
-			observationFingerprint({
-				...base,
-				forms: [
+			observationFingerprint(
+				parseObservedForms([
 					{
 						fields: [
 							{ elementId: "fa-0-0", tag: "input", type: "text", value: "a" },
@@ -2352,8 +2351,8 @@ describe("observationFingerprint", () => {
 							},
 						],
 					},
-				],
-			}),
+				]),
+			),
 		);
 	});
 });
