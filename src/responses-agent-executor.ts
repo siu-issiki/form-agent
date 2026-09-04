@@ -623,9 +623,37 @@ async function executeToolCall(
 					: "SUBMIT_REVIEW_DENIED",
 			);
 			// The operator reviews the same screen the pre-submit review saw,
-			// plus the values it carried, before approving a real send. Both are
-			// best effort and never change the dry-run result.
+			// plus the values it carried, before approving a real send. The
+			// evidence is kept for a denial too, because that is where the
+			// operator looks to see what the review objected to. Both captures
+			// are best effort and never change the dry-run result.
 			await coordinator.captureDryRunEvidence(job.id, runToken, decision);
+			// A denied review must not reach the dry-run boundary. The real-send
+			// guard treats `DRY_RUN_COMPLETE` as a passed dry-run, so a denial
+			// that kept that code would put refused content in front of an
+			// approver. The dry-run has no correction path -- it reviews through
+			// `validateSubmit` instead of `submit`, so the denial budget and the
+			// correction turns of a real submission never run -- and one denial
+			// therefore ends the run.
+			if (decision.decision === "deny") {
+				await recordToolDiagnostic(
+					db,
+					job,
+					runToken,
+					turn,
+					tool,
+					"submit_validate",
+					"DRY_RUN_REVIEW_DENIED",
+				);
+				return {
+					output: JSON.stringify({ status: "dry_run", submitted: false }),
+					result: {
+						outcome: "uncertain",
+						reasonCode: "DRY_RUN_REVIEW_DENIED",
+						reason: `Dry-run stopped before submission authorization because the pre-submit review denied the submission. Pre-submit review: deny (${decision.reasonCode}).`,
+					},
+				};
+			}
 			await recordToolDiagnostic(
 				db,
 				job,

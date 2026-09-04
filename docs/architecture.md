@@ -110,7 +110,7 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 - Queue から受け取った 1 ジョブについて Responses API と browser tool の反復を制御する。
 - 1 回の実行で 1 社だけを処理する。
 - `parallel_tool_calls: false` と strict schema により、1 turn で最大 1 tool だけを処理する。
-- `AGENT_DRY_RUN`とbooleanの`_formAgentDryRun`から実効モードをジョブ登録時に保存する。旧形式のジョブは常にdry-runとし、deployment切替で既存ジョブの意味を変えない。dry-runでは`submit`をモデルへ公開したまま、送信対象と同じフォームへの入力成功、現在のsubmit要素、`form.checkValidity()`の成功を実ブラウザで検証し、送信権取得とブラウザsubmitより前に`DRY_RUN_COMPLETE`で終了する。
+- `AGENT_DRY_RUN`とbooleanの`_formAgentDryRun`から実効モードをジョブ登録時に保存する。旧形式のジョブは常にdry-runとし、deployment切替で既存ジョブの意味を変えない。dry-runでは`submit`をモデルへ公開したまま、送信対象と同じフォームへの入力成功、現在のsubmit要素、`form.checkValidity()`の成功を実ブラウザで検証し、送信権取得とブラウザsubmitより前に終了する。送信前レビューが`allow`の場合だけ`prohibited` / `DRY_RUN_COMPLETE`とし、`deny`の場合は`uncertain` / `DRY_RUN_REVIEW_DENIED`とする。
 - 最大 40 turn、ジョブ prompt 最大 64,000 文字とする。1 項目の入力が 1 turn を消費するため、実サイトの入力項目数の多いフォームでは 16 turn では submit へ到達できず `AGENT_TURN_LIMIT` になっていた。turn 上限に達した run は Worker ログの `agent_turn_limit_reached`（観察回数、tool 呼び出し回数、tool エラー回数の件数だけ）で内訳を追う。
 - `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返す。
 - `prohibited`のreason codeは`NO_FORM_PRESENT`、`SALES_PROHIBITED`、`FORM_PURPOSE_INCOMPATIBLE`だけを許可し、旧aliasは保存前に正規化する。
@@ -308,6 +308,21 @@ pending ── claim ──► running ── claim submit ──► submitting 
 pending / running / failed ── retry 上限超過 ──► dead_lettered
 ```
 
+### dry-run の終了コード
+
+dry-run の `submit` 経路は送信前レビューの判定で分岐する。
+
+| 送信前レビュー | status | reasonCode |
+| --- | --- | --- |
+| `allow` | `prohibited` | `DRY_RUN_COMPLETE` |
+| `deny` | `uncertain` | `DRY_RUN_REVIEW_DENIED` |
+
+実送信の承認ガードは `prohibited` / `DRY_RUN_COMPLETE` だけを「dry-run を通過した」と読む。両者を同じ code にすると、レビューが拒否した内容が承認候補に紛れ込むためである。
+
+dry-run には実送信の「1 回だけ修正して再レビュー」経路は無い。dry-run はレビューを `submit` ではなく `validateSubmit` から呼ぶため、denial budget（`submitReviewDenialCount`）も `SubmitReviewDeniedError` による correction turns の付与も走らない。したがって dry-run では 1 回目の `deny` でそのまま `DRY_RUN_REVIEW_DENIED` として終了する。`INPUT_MISMATCH` の修正を dry-run でも試させるかは未決とし、実送信と同じ経路を dry-run へ通す形で別途検討する。
+
+`DRY_RUN_REVIEW_DENIED` の `uncertain` は送信を伴わないため、`submitting` / `uncertain` の照合手順の対象ではない。reason code で区別する。
+
 `prohibited` と `uncertain` は自動 retry しない。retryable error は `failed` を保存せず、`running` と同じ `runToken` を維持したまま Queue の再配信を待つ。再配信では新しい Agent 実行と browser session を開始する。`submitting` または `sent` を受け取った Consumer は送信を再実行しない。
 
 ### 送信証跡スクリーンショット
@@ -319,7 +334,7 @@ pending / running / failed ── retry 上限超過 ──► dead_lettered
 | `before_submit` | `submit` tool内、送信前検証成功の直後、送信前レビューと送信権取得（`claimSubmission`）の前 | `running` | 必須。撮影に失敗した場合はレビューも送信権取得も driver への送信も行わず、何も送信しない。再試行可能なエラーとして扱う。レビュー deny 後の再 submit では再撮影するため、1 attempt に複数件になり得る |
 | `after_submit` | driver への送信が成功または例外で終わった直後、結果確定（`sent` / `uncertain`）の前 | `submitting` | ベストエフォート。失敗しても送信結果（`sent` / `uncertain` / 例外経路）は変えない |
 | `prohibited` | `finish` tool で禁止判定の結果を返す直前 | `running` | ベストエフォート。ブラウザセッションが未作成の場合は撮影せず、未撮影であることだけを記録する |
-| `dry_run_before_submit` | dry-run の `submit` 経路、送信前レビューの判定直後、`DRY_RUN_COMPLETE` を返す前 | `running` | ベストエフォート。失敗しても結果は `DRY_RUN_COMPLETE` のままで、`dry_run_evidence_capture_failed` を固定値でログへ出す |
+| `dry_run_before_submit` | dry-run の `submit` 経路、送信前レビューの判定直後、結果を返す前 | `running` | ベストエフォート。失敗しても結果は `DRY_RUN_COMPLETE` のままで、`dry_run_evidence_capture_failed` を固定値でログへ出す |
 | `dry_run_field_map` | 同上、`dry_run_before_submit` の直後 | `running` | 同上。スクリーンショットの成否とは独立に保存する |
 
 `before_submit` の撮影失敗は送信前の唯一のブロッキング条件であり、二重送信防止と同様に「不確実なら送信しない」方針に従う。`after_submit` と `prohibited` は既存の結果確定ロジックに影響しない。送信後 URL の検証に使う値は `after_submit` の撮影より前に取得しておき、撮影失敗で CDP 接続が閉じても送信結果（`sent` / `uncertain`）は変わらない。
@@ -335,7 +350,7 @@ dry-run は送信しないため、運用者が実送信を承認する前に見
 
 `dry_run_field_map` の値はページ由来のデータと登録情報そのものなので、R2 のオブジェクトにだけ置く。D1 の `events` とログへ出るのは既存の証跡と同じ `objectKey` / `sha256` / `byteLength` / `contentType` だけである。送信ボタンやその他の button は「入力した欄」ではないため、送信前レビューの観察指紋と同じ規則で除外する。`password` の値は driver の観察と同様に空にする。
 
-2 件はどちらもベストエフォートで、保存に失敗しても dry-run の結果は `DRY_RUN_COMPLETE` のまま変わらない。失敗は D1 の `evidence.capture_failed` と、`stage` と `failureCode` だけを持つ固定値ログ `dry_run_evidence_capture_failed` に残る。
+証跡はレビューが `allow` でも `deny` でも保存する。`deny` の内訳を確認できるのがこの 2 件だけだからである。2 件はどちらもベストエフォートで、保存に失敗しても dry-run の結果は変わらない。失敗は D1 の `evidence.capture_failed` と、`stage` と `failureCode` だけを持つ固定値ログ `dry_run_evidence_capture_failed` に残る。
 
 撮影・保存・記録は合計 15 秒で打ち切り、超過時は `CAPTURE_TIMEOUT` として記録する。`after_submit` の stall が全体期限による `uncertain` を招かないようにするため。同じ撮影の成功・失敗は共通の `eventId` で排他的に記録し、撮影開始時の attempt を固定する。タイムアウト後に R2 保存または D1 記録が遅れて完了しても成功イベントへ戻さず、保存済みオブジェクトは補償削除する。
 

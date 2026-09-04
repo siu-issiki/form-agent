@@ -258,7 +258,7 @@ D1 migrationはWorker deployでは自動適用されない。新しい列を参�
   "SELECT job_id,attempt,data_json,created_at FROM events WHERE type='job.redelivery_ignored' ORDER BY created_at DESC LIMIT 20;"
 ```
 
-`status`が`submitting`の行が該当する。対象ジョブは前節の外部証跡照合を行い、送信済みの可能性を否定できない場合は再投入しない。未送信・送信済みのいずれと判断した場合も、状態を`running`へ戻さず、承認記録を残したうえで人手で`uncertain`として確定する。`run_token`は監査のため残す。
+`status`が`submitting`の行が該当する。`uncertain`のうち`DRY_RUN_REVIEW_DENIED`は送信前レビューがdry-runの送信を拒否したものであり、送信権を取得していないためこの照合の対象ではない。理由コードで切り分ける。対象ジョブは前節の外部証跡照合を行い、送信済みの可能性を否定できない場合は再投入しない。未送信・送信済みのいずれと判断した場合も、状態を`running`へ戻さず、承認記録を残したうえで人手で`uncertain`として確定する。`run_token`は監査のため残す。
 
 ```bash
 ./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
@@ -304,7 +304,7 @@ D1 migrationはWorker deployでは自動適用されない。新しい列を参�
 shasum -a 256 ./evidence.jpg
 ```
 
-dry-run のジョブには `dry_run_before_submit`（`image/jpeg`）と `dry_run_field_map`（`application/json`）の 2 件が残る。前者は送信前レビューが判定した画面、後者は同じ時点の各フォーム欄の値である。`objectKey` は `GET /jobs/:id` の `evidence` からも取得できる。
+dry-run のジョブには `dry_run_before_submit`（`image/jpeg`）と `dry_run_field_map`（`application/json`）の 2 件が残る。送信前レビューが`deny`で終わった`DRY_RUN_REVIEW_DENIED`のジョブにも残るので、拒否の内訳はこの 2 件で確認する。前者は送信前レビューが判定した画面、後者は同じ時点の各フォーム欄の値である。`objectKey` は `GET /jobs/:id` の `evidence` からも取得できる。
 
 ```bash
 curl -sS -H "Authorization: Bearer $JOB_API_TOKEN" \

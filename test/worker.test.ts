@@ -1026,6 +1026,39 @@ describe("Real-send guard", () => {
 		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
 	});
 
+	test("refuses an approval whose dry-run was denied by the pre-submit review", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(
+			{
+				...input,
+				id: sendApproval.dryRunJobId,
+				payload: { ...input.payload, _formAgentEffectiveDryRun: true },
+			},
+			"2026-09-01T00:00:00.000Z",
+		);
+		await store.claimRun(
+			sendApproval.dryRunJobId,
+			"dry-run-token",
+			"2026-09-01T00:00:01.000Z",
+		);
+		await store.recordUncertain(
+			sendApproval.dryRunJobId,
+			"dry-run-token",
+			"DRY_RUN_REVIEW_DENIED",
+			"Dry-run stopped before submission authorization because the pre-submit review denied the submission. Pre-submit review: deny (INPUT_MISMATCH).",
+			"2026-09-01T00:00:02.000Z",
+		);
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
+			sendEnv,
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({ error: "DRY_RUN_NOT_COMPLETED" });
+		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
+	});
+
 	test("refuses an approval whose dry-run never reached the boundary", async () => {
 		const store = new D1JobStore(env.DB);
 		await store.create(
@@ -1587,6 +1620,7 @@ describe("BrowserToolCoordinator", () => {
 async function runDryRunSubmit(
 	jobInput: JobInput,
 	driver: WorkerFakeBrowserDriver,
+	review: ReturnType<typeof reviewResponse> = reviewResponse("allow"),
 ): Promise<unknown> {
 	const store = new D1JobStore(env.DB);
 	await store.create(
@@ -1613,7 +1647,7 @@ async function runDryRunSubmit(
 			elementId: "fa-0-1",
 			activationStrategy: "mouse",
 		}),
-		reviewResponse("allow"),
+		review,
 	];
 	const executor = new ResponsesAgentExecutor({
 		db: env.DB,
@@ -4271,6 +4305,70 @@ describe("ResponsesAgentExecutor", () => {
 			expect(typeof entry.capturedAt).toBe("string");
 		}
 		expect(JSON.stringify(fetchedBody.evidence)).not.toContain("Hello");
+	});
+
+	test("stops a dry-run whose pre-submit review denied the submission", async () => {
+		const jobInput = { ...input, id: "job-dry-run-denied" };
+		const driver = new WorkerFakeBrowserDriver();
+
+		const result = await runDryRunSubmit(
+			jobInput,
+			driver,
+			reviewResponse(
+				"deny",
+				"INPUT_MISMATCH",
+				"The entered values do not match the job payload.",
+			),
+		);
+
+		// `DRY_RUN_COMPLETE` is what the real-send guard reads as a passed
+		// dry-run, so a denial must not carry it.
+		expect(result).toEqual({
+			outcome: "uncertain",
+			reasonCode: "DRY_RUN_REVIEW_DENIED",
+			reason:
+				"Dry-run stopped before submission authorization because the pre-submit review denied the submission. Pre-submit review: deny (INPUT_MISMATCH).",
+		});
+		expect(driver.submitCount).toBe(0);
+		// The operator still needs the screen and the values to see what the
+		// review objected to.
+		expect(
+			(await readEvidenceEvents(jobInput.id)).map((event) => [
+				event.type,
+				event.data.stage,
+			]),
+		).toEqual([
+			["evidence.captured", "dry_run_before_submit"],
+			["evidence.captured", "dry_run_field_map"],
+		]);
+		expect(
+			(await readAgentToolDiagnostics(jobInput.id)).filter(
+				(diagnostic) => diagnostic.stage === "submit_validate",
+			),
+		).toEqual([
+			{
+				turn: 4,
+				toolName: "submit",
+				stage: "submit_validate",
+				resultCode: "DRY_RUN_REVIEW_DENIED",
+			},
+		]);
+	});
+
+	test("reaches the dry-run boundary when the pre-submit review allows", async () => {
+		const jobInput = { ...input, id: "job-dry-run-allowed" };
+		const driver = new WorkerFakeBrowserDriver();
+
+		const result = await runDryRunSubmit(jobInput, driver);
+
+		expect(result).toEqual({
+			outcome: "prohibited",
+			formUrl: jobInput.targetUrl,
+			reasonCode: "DRY_RUN_COMPLETE",
+			reason:
+				"Dry-run validated the current submit control and stopped before submission authorization or browser submission. Pre-submit review: allow (INPUTS_MATCH).",
+		});
+		expect(driver.submitCount).toBe(0);
 	});
 
 	test("keeps the dry-run result when the evidence capture fails", async () => {
