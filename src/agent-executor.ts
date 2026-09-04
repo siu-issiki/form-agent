@@ -15,6 +15,9 @@ export class AgentExecutionError extends Error {
 		// carrying page-derived text through the error chain.
 		readonly cdpMethod?: string,
 		readonly cdpKind?: string,
+		// A fixed identifier for which check rejected the provider response.
+		// Never carries provider-supplied free text.
+		readonly detail?: string,
 	) {
 		super(message);
 		this.name = "AgentExecutionError";

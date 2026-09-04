@@ -150,7 +150,7 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 - function tool 以外を渡さないこと。
 - 1 run の Provider 呼び出しを最大 45 回（agent turn 40 + 修正 3 + 送信前レビュー最大 2）に制限すること。agent と送信前レビューは D1 の同じカウンタを共有する。レビューが deny を返した最初の 1 回だけ turn 上限を 3 増やし、turn 終盤で deny された場合でも修正に必要な fill・observe・submit を実行できるようにする。
 - 出力 token を最大 4,096 に制限すること。
-- request body を最大 128 KiB に制限すること。送信前レビューだけは証跡スクリーンショットを添付するため 1 MiB を上限とし、超過時は画像を外して再構成する。
+- request body を最大 512 KiB に制限すること。送信前レビューだけは証跡スクリーンショットを添付するため 1 MiB を上限とし、超過時は画像を外して再構成する。2026-09-04 の実送信で、入力 token が約 7,000 の時点で 128 KiB に達し `AGENT_CONTEXT_TOO_LARGE` になった実測から引き上げた。
 - response body を最大 256 KiB に制限すること。
 - OpenAI API key、BrowserUse API key、`runToken` をモデル入力へ含めないこと。
 
@@ -279,7 +279,8 @@ CDP の error 応答は、失敗した CDP メソッド名、error code、およ
 日本語の問い合わせフォームには、「確認画面へ進む」で入力内容の一覧を表示し、その画面の「送信する」で初めて送信するものが多い。1 回の活性化しか許さないと、1 本目の POST（確認画面への遷移）で送信権を使い切り、本文が送られないまま `SUBMIT_CONFIRMATION_NOT_OBSERVED` で終わる。2026-09-04 の実送信 4 件のうち 1 件がこれだった。
 
 - `submit` は 1 run あたり `MAX_SUBMIT_STAGES`（3 回）まで活性化できる。送信前レビューと D1 の条件付き送信権取得（`running` → `submitting`）は 1 回目だけであり、2 回目以降は再レビューしない。
-- 1 回目の活性化で送信requestは観測できたが完了を確認できない場合、結果を保存せずモデルへ `submit_stage_pending` を返す。ジョブは `submitting` のまま、`observe` と `submit` だけが続行できる。`navigate` / `click` / `fill` / `select` は `submitting` では受け付けない。新しい入力を送信権取得後に足せないようにするためである。
+- 送信requestは観測できたが完了を確認できない場合、活性化直後のページが「入力したメールアドレス」と「入力した本文の先頭 40 文字」の両方をまだ映しているときだけ、結果を保存せずモデルへ `submit_stage_pending` を返す。判定にはページ本文（`readPageText`）を使い、含まれなければ観察済みフォーム欄の値（`readObservedFieldStates`）で代替する。映していない場合は次の段階を提示せず、その場で `uncertain` / `SUBMIT_CONFIRMATION_NOT_OBSERVED` として結果を保存する。確認画面は入力内容を再掲するのに対し、POST 後にフォームを空へ戻すサイトや最終段階の後のページは再掲しないためである。2026-09-04 の実送信では、この 2 種類のページで次の段階を提示し続けた結果、モデルが大きなページの `observe` を繰り返し、`PROVIDER_RESPONSE_INVALID` / `AGENT_CONTEXT_TOO_LARGE` で run ごと失って `AGENT_RESULT_UNKNOWN` になった。判定は `browser_submit_stage_check` ログ（`stage` 番号と `reviewedValuesShown` の真偽値のみ）に残す。
+- `submit_stage_pending` を返した間、ジョブは `submitting` のまま、`observe` と `submit` だけが続行できる。`navigate` / `click` / `fill` / `select` は `submitting` では受け付けない。新しい入力を送信権取得後に足せないようにするためである。
 - 活性化のたびに input revision を進めるため、次の段階の前に必ず再観察が必要になる。
 - 2 回目以降は、最新観察のページ本文に「入力したメールアドレス」と「入力した本文の先頭 40 文字」の両方が含まれるか、観察済みフォーム欄が同じ値を保持していることを信頼済み handler が確認する。満たさなければ `SUBMIT_STAGE_UNVERIFIED` として拒否し、活性化しない。レビュー済みの内容を映していないページで任意のボタンを押させないためである。
 - 2 回目以降は `submit.stage` イベント（`stage` 番号と `requestObserved` の真偽値のみ）を D1 へ記録する。値・URL は残さない。証跡は段階ごとに `before_submit` / `after_submit` を撮る。
@@ -303,7 +304,7 @@ CDP の error 応答は、失敗した CDP メソッド名、error code、およ
 - `contentType` は `image/jpeg` で保存する。
 - put 時に sha256 を渡し、R2 側で整合性検証する。D1 の `events` にも同じ sha256 を記録し、取得後に照合できるようにする。
 - 公開アクセスは設定しない。読み出しは `wrangler r2 object get` による手動取得だけであり、専用の閲覧 API / UI は未実装である。
-- 撮影は表示中の viewport のみとする。フルページ撮影は CDP メッセージ上限（4M 文字）を超えると接続が閉じて回復できないため採用しない。
+- 撮影はページ全体を縮小して行う（詳細は「証跡スクリーンショット」の節）。縮小前のフルページ撮影は CDP メッセージ上限（4M 文字）を超えると接続が閉じて回復できないため、`clip.scale` で 1,280 x 4,000 px 以内に収める。この計算は対象ブラウザの `deviceScaleFactor` が 1 であることを前提にしており、2026-09-04 の本番証跡（原寸 1,280 px 幅）で実測どおりであることを確認した。将来別のブラウザ環境を使う場合は `Emulation.setDeviceMetricsOverride` で 1 に固定する必要がある。
 
 ## ジョブライフサイクル
 

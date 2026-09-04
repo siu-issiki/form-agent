@@ -364,6 +364,13 @@ export interface RestrictedBrowserDriver {
 	 */
 	readObservedFieldStates(): Promise<ObservedFieldState[]>;
 	/**
+	 * Reads the visible body text of the current document, truncated at the
+	 * driver's page text limit. Used right after a submit stage to tell a
+	 * confirmation screen that repeats the entered values from a page that
+	 * no longer shows them.
+	 */
+	readPageText?(): Promise<string>;
+	/**
 	 * Rediscovers the form that owns the submit control and returns a canonical
 	 * string covering every control it holds, hidden and disabled included.
 	 * Comparing two snapshots detects elements added, removed, or altered
@@ -1117,10 +1124,26 @@ export class RestrictedBrowserTools {
 		) {
 			// The activation reached the page and a submission request went out,
 			// but nothing confirmed a completed send. A two-step form answers
-			// exactly like this, so the model is given the chance to observe the
-			// confirmation screen and activate its send control. Nothing is
-			// recorded yet and the job stays `submitting`.
-			return { pendingStage: stage };
+			// exactly like this, and its confirmation screen repeats the entered
+			// email and the start of the entered body, so the next stage is
+			// offered only when the page right after the activation still shows
+			// them. Nothing is recorded yet and the job stays `submitting`.
+			// A page that no longer shows them is either a form the site reset
+			// after the POST or the page that follows the final stage; offering
+			// another stage there only spends model turns on observations of a
+			// page that can never confirm anything, so the submission ends as
+			// uncertain right away.
+			const shown = await this.#pageStillShowsReviewedValues();
+			console.log(
+				JSON.stringify({
+					event: "browser_submit_stage_check",
+					stage,
+					reviewedValuesShown: shown,
+				}),
+			);
+			if (shown) return { pendingStage: stage };
+			// Otherwise fall through: recorded as uncertain
+			// SUBMIT_CONFIRMATION_NOT_OBSERVED below.
 		}
 
 		if (result.outcome === "uncertain") {
@@ -1222,6 +1245,16 @@ export class RestrictedBrowserTools {
 	 */
 	async #assertSubmitStageValues(): Promise<void> {
 		const observation = this.#latestObservation;
+		if (
+			!observation ||
+			!(await this.#pageShowsReviewedValues(observation.pageText ?? ""))
+		) {
+			throw new SubmitStageUnverifiedError();
+		}
+	}
+
+	/** The email and body-prefix this run entered, or undefined when either is unknown. */
+	#reviewedValueProbe(): { email: string; bodyPrefix: string } | undefined {
 		const email = this.#enteredValues
 			.find((value) => ENTERED_EMAIL_PATTERN.test(value.trim()))
 			?.trim();
@@ -1229,27 +1262,46 @@ export class RestrictedBrowserTools {
 			(longest, value) => (value.length > longest.length ? value : longest),
 			"",
 		);
-		if (!observation || !email || !body) {
-			throw new SubmitStageUnverifiedError();
+		if (!email || !body) return undefined;
+		return {
+			email,
+			bodyPrefix: body.slice(0, SUBMIT_STAGE_BODY_PREFIX_LENGTH),
+		};
+	}
+
+	/** True when the page text, or failing that the observed fields, still hold both reviewed values. */
+	async #pageShowsReviewedValues(pageText: string): Promise<boolean> {
+		const probe = this.#reviewedValueProbe();
+		if (!probe) return false;
+		if (pageText.includes(probe.email) && pageText.includes(probe.bodyPrefix)) {
+			return true;
 		}
-		const bodyPrefix = body.slice(0, SUBMIT_STAGE_BODY_PREFIX_LENGTH);
-		const pageText = observation.pageText ?? "";
-		if (pageText.includes(email) && pageText.includes(bodyPrefix)) return;
 		let values: string[];
 		try {
 			values = (await this.driver.readObservedFieldStates()).map(
 				(state) => state.value,
 			);
 		} catch {
-			throw new SubmitStageUnverifiedError();
+			return false;
 		}
-		if (
-			values.some((value) => value.includes(email)) &&
-			values.some((value) => value.includes(bodyPrefix))
-		) {
-			return;
+		return (
+			values.some((value) => value.includes(probe.email)) &&
+			values.some((value) => value.includes(probe.bodyPrefix))
+		);
+	}
+
+	/**
+	 * Same check against the page as it stands now, not against the latest
+	 * observation, so it can be applied right after an activation changed it.
+	 */
+	async #pageStillShowsReviewedValues(): Promise<boolean> {
+		let pageText = "";
+		try {
+			pageText = (await this.driver.readPageText?.()) ?? "";
+		} catch {
+			pageText = "";
 		}
-		throw new SubmitStageUnverifiedError();
+		return await this.#pageShowsReviewedValues(pageText);
 	}
 
 	/**

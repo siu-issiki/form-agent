@@ -99,7 +99,7 @@ export async function requestResponses(
 
 	const value = await readBoundedJson(response, maxResponseBytes);
 	if (!isRecord(value)) {
-		throw invalidProviderResponse();
+		throw invalidProviderResponse("not_object");
 	}
 	return value;
 }
@@ -111,9 +111,9 @@ export async function readBoundedJson(
 	const contentLength = Number(response.headers.get("content-length"));
 	if (Number.isFinite(contentLength) && contentLength > maxBytes) {
 		await response.body?.cancel().catch(() => undefined);
-		throw invalidProviderResponse();
+		throw invalidProviderResponse("response_too_large");
 	}
-	if (!response.body) throw invalidProviderResponse();
+	if (!response.body) throw invalidProviderResponse("body_missing");
 
 	const reader = response.body.getReader();
 	const chunks: Uint8Array[] = [];
@@ -125,7 +125,7 @@ export async function readBoundedJson(
 			totalBytes += value.byteLength;
 			if (totalBytes > maxBytes) {
 				await reader.cancel().catch(() => undefined);
-				throw invalidProviderResponse();
+				throw invalidProviderResponse("response_too_large");
 			}
 			chunks.push(value);
 		}
@@ -142,7 +142,7 @@ export async function readBoundedJson(
 	try {
 		return JSON.parse(new TextDecoder().decode(bytes));
 	} catch {
-		throw invalidProviderResponse();
+		throw invalidProviderResponse("invalid_json");
 	}
 }
 
@@ -156,11 +156,14 @@ export function throwIfAborted(signal: AbortSignal): void {
 	}
 }
 
-export function invalidProviderResponse(): AgentExecutionError {
+export function invalidProviderResponse(detail?: string): AgentExecutionError {
 	return new AgentExecutionError(
 		"PROVIDER_RESPONSE_INVALID",
 		"The model provider returned an invalid response.",
 		true,
+		undefined,
+		undefined,
+		detail,
 	);
 }
 

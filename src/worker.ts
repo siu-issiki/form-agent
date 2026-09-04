@@ -812,6 +812,9 @@ async function executeClaimedJob(
 				...(error instanceof AgentExecutionError && error.cdpMethod
 					? { method: error.cdpMethod, kind: error.cdpKind }
 					: {}),
+				...(error instanceof AgentExecutionError && error.detail
+					? { detail: error.detail }
+					: {}),
 			}),
 		);
 		const current = await store.find(job.id);

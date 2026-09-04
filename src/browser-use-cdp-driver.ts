@@ -881,6 +881,15 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	/**
+	 * Reads the visible body text of the current document, truncated at the
+	 * page text limit, so a caller can tell a confirmation screen that repeats
+	 * the entered values from a page that no longer shows them.
+	 */
+	async readPageText(): Promise<string> {
+		return (await this.#bodyText()).text;
+	}
+
+	/**
 	 * Rediscovers the form that owns the submit control and describes every
 	 * control it holds. Unlike `observe`, nothing is dropped for being hidden
 	 * or disabled, so a control the page adds during the review is visible in
