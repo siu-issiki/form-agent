@@ -1,3 +1,5 @@
+import { BROWSER_ERROR } from "./browser-error-messages";
+
 const CDP_COMMAND_TIMEOUT_MS = 15_000;
 const ERROR_CLOSE_FALLBACK_MS = 1_000;
 export const MAX_CDP_MESSAGE_CHARACTERS = 4 * 1024 * 1024;
@@ -64,9 +66,9 @@ export class BrowserUseCdpConnection {
 			// An aborted upgrade is the run ending, not a provider failure, so it
 			// must not be reported as a retryable connection error.
 			if (signal?.aborted) {
-				throw new Error("Browser Use CDP connection aborted");
+				throw new Error(BROWSER_ERROR.CDP_CONNECTION_ABORTED);
 			}
-			throw new Error("Browser Use CDP connection failed");
+			throw new Error(BROWSER_ERROR.CDP_CONNECTION_FAILED);
 		}
 		if (response.status !== 101 || !response.webSocket) {
 			await response.body?.cancel();
@@ -90,7 +92,7 @@ export class BrowserUseCdpConnection {
 		sessionId?: string,
 	): Promise<TResult> {
 		if (this.#closed) {
-			return Promise.reject(new Error("Browser Use CDP connection is closed"));
+			return Promise.reject(new Error(BROWSER_ERROR.CDP_CONNECTION_IS_CLOSED));
 		}
 		const id = this.#nextId++;
 		const message: CdpMessage = { id, method, params };
@@ -100,7 +102,7 @@ export class BrowserUseCdpConnection {
 		return new Promise<TResult>((resolve, reject) => {
 			const timeout = setTimeout(() => {
 				this.#pending.delete(id);
-				reject(new Error("Browser Use CDP command timed out"));
+				reject(new Error(BROWSER_ERROR.CDP_COMMAND_TIMED_OUT));
 			}, CDP_COMMAND_TIMEOUT_MS);
 			this.#pending.set(id, {
 				method,
@@ -113,7 +115,7 @@ export class BrowserUseCdpConnection {
 			} catch {
 				clearTimeout(timeout);
 				this.#pending.delete(id);
-				reject(new Error("Browser Use CDP command could not be sent"));
+				reject(new Error(BROWSER_ERROR.CDP_COMMAND_NOT_SENT));
 			}
 		});
 	}
@@ -213,7 +215,7 @@ export class BrowserUseCdpConnection {
 	}
 
 	#rejectPending(
-		error: Error = new Error("Browser Use CDP connection closed"),
+		error: Error = new Error(BROWSER_ERROR.CDP_CONNECTION_CLOSED),
 	): void {
 		if (this.#errorFallback !== undefined) {
 			clearTimeout(this.#errorFallback);
@@ -345,7 +347,7 @@ export class BrowserUseCdpCommandError extends Error {
 		readonly code: number | null,
 		readonly kind: CdpCommandErrorKind,
 	) {
-		super("Browser Use CDP command failed");
+		super(BROWSER_ERROR.CDP_COMMAND_FAILED);
 		this.name = "BrowserUseCdpCommandError";
 	}
 }
@@ -371,7 +373,7 @@ export class BrowserUseCdpClosedError extends Error {
 		readonly code: number,
 		readonly reasonHint: CdpCloseReasonHint,
 	) {
-		super("Browser Use CDP connection closed");
+		super(BROWSER_ERROR.CDP_CONNECTION_CLOSED);
 		this.name = "BrowserUseCdpClosedError";
 	}
 
@@ -386,7 +388,7 @@ export class BrowserUseCdpClosedError extends Error {
 
 export class BrowserUseCdpUpgradeRejectedError extends Error {
 	constructor(readonly status: number) {
-		super("Browser Use CDP connection failed");
+		super(BROWSER_ERROR.CDP_CONNECTION_FAILED);
 		this.name = "BrowserUseCdpUpgradeRejectedError";
 	}
 
@@ -397,7 +399,7 @@ export class BrowserUseCdpUpgradeRejectedError extends Error {
 
 export class BrowserUseCdpPayloadTooLargeError extends Error {
 	constructor() {
-		super("Browser Use CDP payload exceeded the safe Worker limit");
+		super(BROWSER_ERROR.CDP_PAYLOAD_TOO_LARGE);
 		this.name = "BrowserUseCdpPayloadTooLargeError";
 	}
 }

@@ -1,3 +1,5 @@
+import { sha256Hex } from "./digest";
+import { isRecord } from "./json-record";
 import { isSendApproval, SEND_APPROVAL_KEY } from "./send-approval";
 
 /**
@@ -14,7 +16,7 @@ export async function jobContentFingerprint(
 	companyId: unknown,
 	payload: unknown,
 ): Promise<string> {
-	return sha256(
+	return sha256Hex(
 		JSON.stringify({
 			targetUrl,
 			companyId,
@@ -42,7 +44,7 @@ export async function jobInputFingerprint(
 ): Promise<string> {
 	const values = formValuesOf(payload);
 	const approval = isRecord(payload) ? payload[SEND_APPROVAL_KEY] : undefined;
-	return sha256(
+	return sha256Hex(
 		JSON.stringify({
 			targetUrl,
 			subject: values.subject ?? null,
@@ -71,18 +73,4 @@ function formValuesOf(payload: unknown): Record<string, unknown> {
 	return isRecord(payload) && isRecord(payload.formValues)
 		? payload.formValues
 		: {};
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-async function sha256(value: string): Promise<string> {
-	const digest = await crypto.subtle.digest(
-		"SHA-256",
-		new TextEncoder().encode(value),
-	);
-	return [...new Uint8Array(digest)]
-		.map((byte) => byte.toString(16).padStart(2, "0"))
-		.join("");
 }

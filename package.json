@@ -6,7 +6,7 @@
 		"typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.workers.json",
 		"lint": "biome check src test tools vitest.config.ts vitest.browser-use.config.ts",
 		"test": "bun run test:unit && bun run test:workers",
-		"test:unit": "bun test test/job.test.ts test/browser-use-client.test.ts test/browser-use-cdp-driver.test.ts test/restricted-browser.test.ts test/agent-executor.test.ts test/openai-responses-client.test.ts test/campaign-import.test.ts",
+		"test:unit": "bun test test/job.test.ts test/browser-use-client.test.ts test/browser-use-cdp-driver.test.ts test/restricted-browser.test.ts test/agent-executor.test.ts test/agent-tool-schema.test.ts test/openai-responses-client.test.ts test/campaign-import.test.ts",
 		"test:workers": "vitest run",
 		"test:browser-use-smoke": "vitest run --config vitest.browser-use.config.ts",
 		"test:agent-e2e": "bun run test/run-agent-e2e.ts",

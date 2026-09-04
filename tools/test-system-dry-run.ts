@@ -7,18 +7,19 @@
  *   TEST_SYSTEM_API_TOKEN=... FORM_AGENT_JOB_API_TOKEN=... \
  *     bun run tools/test-system-dry-run.ts [scenarioId]
  */
+import {
+	DRY_RUN_KEY,
+	EFFECTIVE_DRY_RUN_KEY,
+	type JobStatus,
+	MAX_ATTEMPTS_KEY,
+	TERMINAL_JOB_STATUSES,
+} from "../src/job";
+
 const TEST_SYSTEM_URL = "https://form-agent-test-system.form-agent.workers.dev";
 const FORM_AGENT_URL = "https://form-agent.form-agent.workers.dev";
 const DEFAULT_SCENARIO = "native-post-redirect";
 const JOB_TIMEOUT_MS = 12 * 60 * 1_000;
 const POLL_INTERVAL_MS = 2_000;
-const TERMINAL_JOB_STATUSES = new Set([
-	"sent",
-	"prohibited",
-	"uncertain",
-	"failed",
-	"dead_lettered",
-]);
 
 interface CreatedRun {
 	runId: string;
@@ -32,7 +33,7 @@ interface CreatedRun {
 interface JobResponse {
 	job: {
 		id: string;
-		status: string;
+		status: JobStatus;
 		attemptCount: number;
 		payload: Record<string, unknown>;
 		result: {
@@ -75,8 +76,8 @@ const created = await fetchJson<JobResponse>(`${FORM_AGENT_URL}/jobs`, {
 		targetDomain: run.targetDomain,
 		allowedHosts: run.allowedHosts,
 		payload: {
-			_formAgentDryRun: true,
-			_formAgentMaxAttempts: 1,
+			[DRY_RUN_KEY]: true,
+			[MAX_ATTEMPTS_KEY]: 1,
 			scenario: scenarioId,
 			formValues: run.formValues,
 			instruction:
@@ -84,7 +85,7 @@ const created = await fetchJson<JobResponse>(`${FORM_AGENT_URL}/jobs`, {
 		},
 	}),
 });
-if (created.job.payload._formAgentEffectiveDryRun !== true) {
+if (created.job.payload[EFFECTIVE_DRY_RUN_KEY] !== true) {
 	throw new Error("The job was not registered as a dry-run");
 }
 console.log(JSON.stringify({ event: "job_registered", jobId }));
@@ -110,7 +111,7 @@ while (Date.now() < deadline) {
 	if (job.status === "submitting" || job.status === "sent") {
 		throw new Error(`Dry-run entered unsafe status ${job.status}`);
 	}
-	if (TERMINAL_JOB_STATUSES.has(job.status)) {
+	if (TERMINAL_JOB_STATUSES.includes(job.status)) {
 		console.log(
 			JSON.stringify({
 				event: "job_finished",
@@ -157,5 +158,3 @@ function requireEnvironment(name: string): string {
 	if (!value) throw new Error(`${name} is required`);
 	return value;
 }
-
-export {};

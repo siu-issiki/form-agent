@@ -1,6 +1,10 @@
 import { describe, expect, test } from "vitest";
 import { AgentExecutionError } from "../src/agent-executor";
 import type { AgentToolDiagnosticCode } from "../src/agent-tool-diagnostic";
+import {
+	BROWSER_ERROR,
+	type BrowserErrorMessage,
+} from "../src/browser-error-messages";
 import { BrowserToolInputError } from "../src/browser-tool-handler";
 import {
 	BrowserUseCdpPayloadTooLargeError,
@@ -31,43 +35,82 @@ import {
 // 2. A fallback `switch` on `error.message` for plain `Error`s thrown with a
 //    fixed string, because several call sites (browser-use-cdp.ts,
 //    browser-use-cdp-driver.ts, browser-use-client.ts) raise plain `Error`s
-//    rather than dedicated classes and there is no shared message constant.
+//    rather than dedicated classes. Throw sites and classifier share the
+//    BROWSER_ERROR constants, and this file pins which of those constants the
+//    classifier still recognises.
 // This file pins both layers, their priority order, and the fallback, so a
-// message string drifting out of sync between a throw site and the switch is
-// caught here instead of silently degrading to UNKNOWN in production.
+// message drifting out of sync between a throw site and the switch is caught
+// here instead of silently degrading to UNKNOWN in production.
+
+/**
+ * Every BROWSER_ERROR message the fallback switch classifies, and the code it
+ * yields. Referencing the constants by key means a message renamed in only one
+ * place no longer compiles here, and the closed-set test below fails when a
+ * key is dropped from the switch or newly added to it.
+ */
+const MESSAGE_TABLE: Array<
+	[key: keyof typeof BROWSER_ERROR, code: AgentToolDiagnosticCode]
+> = [
+	["CDP_CONNECTION_FAILED", "CDP_CONNECTION_FAILED"],
+	["CDP_CONNECTION_IS_CLOSED", "CDP_CONNECTION_CLOSED"],
+	["CDP_CONNECTION_CLOSED", "CDP_CONNECTION_CLOSED"],
+	["CDP_COMMAND_TIMED_OUT", "CDP_COMMAND_TIMEOUT"],
+	["CDP_COMMAND_NOT_SENT", "CDP_COMMAND_SEND_FAILED"],
+	["CDP_COMMAND_FAILED", "CDP_COMMAND_FAILED"],
+	["CDP_ENDPOINT_INVALID", "CDP_ENDPOINT_INVALID"],
+	["API_KEY_REQUIRED", "BROWSER_CREDENTIALS_MISSING"],
+	["DOMAIN_SCOPE_CANNOT_CHANGE", "SCOPE_CONFIGURATION_FAILED"],
+	["HOST_SCOPE_CANNOT_CHANGE", "SCOPE_CONFIGURATION_FAILED"],
+	["DOMAIN_SCOPE_NOT_CONFIGURED", "SCOPE_CONFIGURATION_FAILED"],
+	["NAVIGATION_FAILED", "NAVIGATION_FAILED"],
+	["PAGE_NOT_READY", "PAGE_NOT_READY"],
+	["DOM_DISCOVERY_FAILED", "DOM_DISCOVERY_FAILED"],
+	["PAGE_EVALUATION_FAILED", "PAGE_EVALUATION_FAILED"],
+	["SCREENSHOT_FAILED", "SCREENSHOT_FAILED"],
+];
 
 describe("classifyToolDiagnostic - message fallback table", () => {
-	const messageTable: Array<[message: string, code: AgentToolDiagnosticCode]> =
-		[
-			["Browser Use CDP connection failed", "CDP_CONNECTION_FAILED"],
-			["Browser Use CDP connection is closed", "CDP_CONNECTION_CLOSED"],
-			["Browser Use CDP connection closed", "CDP_CONNECTION_CLOSED"],
-			["Browser Use CDP command timed out", "CDP_COMMAND_TIMEOUT"],
-			["Browser Use CDP command could not be sent", "CDP_COMMAND_SEND_FAILED"],
-			["Browser Use CDP command failed", "CDP_COMMAND_FAILED"],
-			["Invalid Browser Use CDP endpoint", "CDP_ENDPOINT_INVALID"],
-			["Browser Use API key is required", "BROWSER_CREDENTIALS_MISSING"],
-			["Browser domain scope cannot be changed", "SCOPE_CONFIGURATION_FAILED"],
-			["Browser host scope cannot be changed", "SCOPE_CONFIGURATION_FAILED"],
-			["Browser domain scope is not configured", "SCOPE_CONFIGURATION_FAILED"],
-			["Browser navigation failed", "NAVIGATION_FAILED"],
-			["Browser page did not become ready", "PAGE_NOT_READY"],
-			["Browser DOM discovery failed", "DOM_DISCOVERY_FAILED"],
-			["Browser page evaluation failed", "PAGE_EVALUATION_FAILED"],
-			["Browser screenshot failed", "SCREENSHOT_FAILED"],
-		];
-
 	test("covers every case in the switch", () => {
 		// Guards against someone adding/removing a case in the switch without
 		// updating this table.
-		expect(messageTable).toHaveLength(16);
+		expect(MESSAGE_TABLE).toHaveLength(16);
 	});
 
-	for (const [message, code] of messageTable) {
-		test(`"${message}" -> ${code}`, () => {
-			expect(classifyToolDiagnostic(new Error(message))).toBe(code);
+	for (const [key, code] of MESSAGE_TABLE) {
+		test(`${key} -> ${code}`, () => {
+			expect(classifyToolDiagnostic(new Error(BROWSER_ERROR[key]))).toBe(code);
 		});
 	}
+});
+
+describe("classifyToolDiagnostic - classified BROWSER_ERROR messages", () => {
+	test("exactly the table's messages classify as something other than UNKNOWN", () => {
+		// The set is fixed rather than derived: a constant that is renamed or
+		// deleted at its throw site drops out of this set, and a message that
+		// starts being classified has to be added here on purpose.
+		const classified = Object.entries(BROWSER_ERROR)
+			.filter(
+				([, message]) =>
+					classifyToolDiagnostic(new Error(message)) !== "UNKNOWN",
+			)
+			.map(([key]) => key)
+			.sort();
+		const expected = [...new Set(MESSAGE_TABLE.map(([key]) => key))].sort();
+		expect(classified).toEqual(expected);
+	});
+
+	test("the remaining messages fall through to UNKNOWN", () => {
+		const unclassified: BrowserErrorMessage[] = [
+			BROWSER_ERROR.CDP_CONNECTION_ABORTED,
+			BROWSER_ERROR.CDP_PAYLOAD_TOO_LARGE,
+			BROWSER_ERROR.API_REQUEST_FAILED,
+			BROWSER_ERROR.SESSION_ID_REQUIRED,
+			BROWSER_ERROR.SESSION_WITHOUT_CDP_URL,
+		];
+		for (const message of unclassified) {
+			expect(classifyToolDiagnostic(new Error(message))).toBe("UNKNOWN");
+		}
+	});
 });
 
 describe("classifyToolDiagnostic - instanceof table", () => {
@@ -172,20 +215,20 @@ describe("classifyToolDiagnostic - instanceof takes priority over message", () =
 		const error = new BrowserUseCdpUpgradeRejectedError(500);
 		// Confirms the fixture actually collides with a switch case; otherwise
 		// this test would not be exercising the priority rule at all.
-		expect(error.message).toBe("Browser Use CDP connection failed");
+		expect(error.message).toBe(BROWSER_ERROR.CDP_CONNECTION_FAILED);
 		expect(classifyToolDiagnostic(error)).toBe("CDP_UPGRADE_REJECTED");
 	});
 
 	test("BrowserElementError classifies by type even when its message is overwritten to a switch-table string", () => {
 		const error = new BrowserElementError();
-		error.message = "Browser Use CDP connection failed";
+		error.message = BROWSER_ERROR.CDP_CONNECTION_FAILED;
 		expect(classifyToolDiagnostic(error)).toBe("ELEMENT_UNAVAILABLE");
 	});
 
 	test("AgentExecutionError is treated the same as SubmitReviewUnavailableError regardless of its own message", () => {
 		const error = new AgentExecutionError(
 			"REASON",
-			"Browser page did not become ready",
+			BROWSER_ERROR.PAGE_NOT_READY,
 			false,
 		);
 		expect(classifyToolDiagnostic(error)).toBe("SUBMIT_REVIEW_UNAVAILABLE");
@@ -208,12 +251,10 @@ describe("classifyToolDiagnostic - fallback", () => {
 
 // A "does every switch-table message still appear verbatim in src/" check
 // (reading src/*.ts with node:fs and grepping for each quoted literal) was
-// attempted here and dropped. It ran fine under `bun test`, but this file
-// runs under the Cloudflare Workers vitest pool, whose sandbox has no access
-// to the real project filesystem: `readdirSync(...)` on the repo's src/
-// directory fails with "no such file or directory, readdir ... /src" even
-// though nodejs_compat makes `node:fs` importable. Re-adding this check would
-// need the messages to come from an in-repo constant/import instead of a
-// filesystem walk - worth revisiting once the throw-site strings are
-// centralized (see the message-fallback table above for the full list this
-// would have covered).
+// attempted here and dropped, because this file runs under the Cloudflare
+// Workers vitest pool, whose sandbox cannot read the project filesystem.
+// The throw-site strings now live in BROWSER_ERROR, so that check is replaced
+// by the two tests above: the table keys the constants by name, and the
+// closed-set test pins which of them the classifier still recognises. A
+// constant renamed or removed at its throw site therefore fails here instead
+// of silently degrading to UNKNOWN in production.

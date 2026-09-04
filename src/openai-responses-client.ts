@@ -1,4 +1,5 @@
 import { AgentExecutionError } from "./agent-executor";
+import { isRecord } from "./json-record";
 
 export const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 
@@ -149,10 +150,6 @@ export function invalidProviderResponse(detail?: string): AgentExecutionError {
 		undefined,
 		detail,
 	);
-}
-
-export function isRecord(value: unknown): value is JsonObject {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**

@@ -6,6 +6,7 @@ import {
 	isVerificationProviderUrl,
 	VERIFICATION_PROVIDER_ALLOWLIST,
 } from "../src/browser-network-policy";
+import { sha256Hex } from "../src/digest";
 import {
 	detectProhibitedReasonCodes,
 	detectProhibitedTextReasonCodes,
@@ -45,7 +46,6 @@ import {
 	evidenceObjectKey,
 	InMemoryEvidenceObjectStore,
 	SubmissionEvidenceRecorder,
-	sha256Hex,
 } from "../src/submission-evidence";
 import { FakeBrowserDriver } from "./helpers/fake-browser-driver";
 import { InMemoryJobStore } from "./helpers/in-memory-job-store";

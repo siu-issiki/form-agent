@@ -1,4 +1,4 @@
-import { JOB_ID_PATTERN } from "./job";
+import { EFFECTIVE_DRY_RUN_KEY, JOB_ID_PATTERN } from "./job";
 
 /**
  * Payload key that carries the human approval of one real submission. It is
@@ -22,6 +22,20 @@ export function isRealSendGuardExemptPayload(
 	payload: Record<string, unknown>,
 ): boolean {
 	return payload[REAL_SEND_GUARD_EXEMPT_KEY] === true;
+}
+
+/**
+ * Whether this payload can reach a real submission that counts against the
+ * daily cap. The effective mode is the frozen decision, and a job the API
+ * accepted through the test-system exemption is left out: it never passed the
+ * approval and cap checks, so counting it would spend the day's budget on the
+ * managed test system.
+ */
+export function isRealSendPayload(payload: Record<string, unknown>): boolean {
+	return (
+		payload[EFFECTIVE_DRY_RUN_KEY] === false &&
+		!isRealSendGuardExemptPayload(payload)
+	);
 }
 
 export interface SendApproval {

@@ -2,6 +2,11 @@ import {
 	MAX_PROHIBITION_EVIDENCE_LENGTH,
 	MIN_PROHIBITION_EVIDENCE_LENGTH,
 } from "./form-prohibition";
+import { PAYLOAD_KEY_PATTERN } from "./restricted-browser";
+import {
+	ELEMENT_ID_PATTERN,
+	SUBMIT_ACTIVATION_STRATEGIES,
+} from "./tool-input-patterns";
 
 /**
  * The only reason codes `finish_uncertain` accepts. A fixed set keeps the
@@ -90,14 +95,14 @@ export const INITIAL_AGENT_TOOLS = [OBSERVE_TOOL] as const;
 
 const ELEMENT_ID_PROPERTY = {
 	type: "string",
-	pattern: "^fa-[a-z0-9-]+$",
+	pattern: ELEMENT_ID_PATTERN.source,
 	maxLength: 64,
 	description: "elementId of the element from the latest observe.",
 } as const;
 
 const PAYLOAD_KEY_PROPERTY = {
 	type: "string",
-	pattern: "^[A-Za-z][A-Za-z0-9_]{0,63}$",
+	pattern: PAYLOAD_KEY_PATTERN.source,
 	maxLength: 64,
 	description:
 		"A key of payload.formValues from the job input whose meaning matches this field.",
@@ -165,7 +170,7 @@ export const AGENT_TOOLS = [
 			},
 			activationStrategy: {
 				type: "string",
-				enum: ["dom", "mouse", "enter"],
+				enum: [...SUBMIT_ACTIVATION_STRATEGIES],
 				description:
 					"dom activates the control directly and suits button or input submit controls. mouse sends a trusted click at the control's live position for pages that require a real click gesture. enter presses Enter in the form for keyboard-only submission.",
 			},

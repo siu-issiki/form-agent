@@ -1,3 +1,4 @@
+import { sha256Hex } from "./digest";
 import type { EvidenceFailureCode, EvidenceStage, JobStore } from "./job";
 import type {
 	RestrictedBrowserDriver,
@@ -552,15 +553,4 @@ export function evidenceObjectKey(
 ): string {
 	const extension = contentType === EVIDENCE_JSON_CONTENT_TYPE ? "json" : "jpg";
 	return `jobs/${jobId}/${stage}/${eventId}.${extension}`;
-}
-
-export async function sha256Hex(bytes: Uint8Array): Promise<string> {
-	// The copy keeps the buffer type narrow enough for the WebCrypto signature.
-	const copy = new Uint8Array(bytes);
-	const digest = await crypto.subtle.digest("SHA-256", copy.buffer);
-	let hex = "";
-	for (const byte of new Uint8Array(digest)) {
-		hex += byte.toString(16).padStart(2, "0");
-	}
-	return hex;
 }

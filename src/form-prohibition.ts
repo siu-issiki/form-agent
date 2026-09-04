@@ -1,3 +1,4 @@
+import { isRecord } from "./json-record";
 import type { BrowserObservation } from "./restricted-browser";
 
 export type ProhibitedReasonCode =
@@ -269,8 +270,4 @@ export function isProhibitedReasonCode(
 		value === "SALES_PROHIBITED" ||
 		value === "FORM_PURPOSE_INCOMPATIBLE"
 	);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
 }

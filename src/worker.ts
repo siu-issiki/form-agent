@@ -8,12 +8,16 @@ import { BrowserUseClient } from "./browser-use-client";
 import { reclaimJobSessions } from "./browser-use-session";
 import { D1JobStore } from "./d1-job-store";
 import {
+	DRY_RUN_KEY,
 	DuplicateJobError,
+	EFFECTIVE_DRY_RUN_KEY,
 	JOB_ID_PATTERN,
 	type Job,
 	type JobInput,
+	MAX_ATTEMPTS_KEY,
 } from "./job";
 import { jobContentFingerprint } from "./job-fingerprint";
+import { isRecord } from "./json-record";
 import { ResponsesAgentExecutor } from "./responses-agent-executor";
 import {
 	assertAllowedTargetUrl,
@@ -23,7 +27,7 @@ import {
 	PAYLOAD_KEY_PATTERN,
 } from "./restricted-browser";
 import {
-	isRealSendGuardExemptPayload,
+	isRealSendPayload,
 	isSendApproval,
 	REAL_SEND_GUARD_EXEMPT_KEY,
 	SEND_APPROVAL_KEY,
@@ -119,20 +123,13 @@ export async function registerJob(
 		// sits under the cap it was accepted against, and its approval was made
 		// against a dry-run of another day. Re-queueing it would send without
 		// either check being current, so the operator has to re-approve.
-		if (isRealSendJob(job) && !isSameUtcDay(job.createdAt, now)) {
+		if (isRealSendPayload(job.payload) && !isSameUtcDay(job.createdAt, now)) {
 			throw new StaleRealSendError(job.id);
 		}
 		await queue.send({ jobId: job.id });
 	}
 
 	return { created, job };
-}
-
-function isRealSendJob(job: Job): boolean {
-	return (
-		job.payload._formAgentEffectiveDryRun === false &&
-		!isRealSendGuardExemptPayload(job.payload)
-	);
 }
 
 /** Compares two ISO timestamps by UTC day; an unparsable value is never equal. */
@@ -254,7 +251,7 @@ async function refuseUnapprovedRealSend(
 	input: JobInput,
 	now: Date,
 ): Promise<Response | null> {
-	if (input.payload._formAgentEffectiveDryRun !== false) return null;
+	if (input.payload[EFFECTIVE_DRY_RUN_KEY] !== false) return null;
 	// The exemption was decided from the env when the payload was stamped, so
 	// the caller cannot reach it: a supplied value is discarded there.
 	if (input.payload[REAL_SEND_GUARD_EXEMPT_KEY] === true) return null;
@@ -269,7 +266,7 @@ async function refuseUnapprovedRealSend(
 	if (
 		!dryRun ||
 		dryRun.targetUrl !== input.targetUrl ||
-		dryRun.payload._formAgentEffectiveDryRun === false ||
+		dryRun.payload[EFFECTIVE_DRY_RUN_KEY] === false ||
 		dryRun.status !== "prohibited" ||
 		dryRun.result?.reasonCode !== DRY_RUN_COMPLETE_REASON_CODE
 	) {
@@ -382,8 +379,8 @@ function freezeDryRunMode(
 		...input,
 		payload: {
 			...input.payload,
-			_formAgentEffectiveDryRun:
-				environmentDryRun || input.payload._formAgentDryRun === true,
+			[EFFECTIVE_DRY_RUN_KEY]:
+				environmentDryRun || input.payload[DRY_RUN_KEY] === true,
 		},
 	};
 }
@@ -500,11 +497,11 @@ function hasValidSendApproval(payload: Record<string, unknown>): boolean {
 }
 
 function hasValidFormValues(payload: Record<string, unknown>): boolean {
-	const requestedDryRun = payload._formAgentDryRun;
+	const requestedDryRun = payload[DRY_RUN_KEY];
 	if (requestedDryRun !== undefined && typeof requestedDryRun !== "boolean") {
 		return false;
 	}
-	const maxAttempts = payload._formAgentMaxAttempts;
+	const maxAttempts = payload[MAX_ATTEMPTS_KEY];
 	if (
 		maxAttempts !== undefined &&
 		(typeof maxAttempts !== "number" ||
@@ -560,10 +557,6 @@ function validRequiredString(
 		value.trim().length > 0 &&
 		value.length <= maxLength
 	);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 class InvalidJobRequestError extends Error {
@@ -959,7 +952,7 @@ async function executeClaimedJob(
 }
 
 function hasReachedAttemptLimit(job: Job): boolean {
-	const value = job.payload._formAgentMaxAttempts;
+	const value = job.payload[MAX_ATTEMPTS_KEY];
 	return (
 		typeof value === "number" &&
 		Number.isInteger(value) &&
@@ -969,7 +962,7 @@ function hasReachedAttemptLimit(job: Job): boolean {
 }
 
 function hasExceededAttemptLimit(job: Job): boolean {
-	const value = job.payload._formAgentMaxAttempts;
+	const value = job.payload[MAX_ATTEMPTS_KEY];
 	return (
 		typeof value === "number" &&
 		Number.isInteger(value) &&

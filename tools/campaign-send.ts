@@ -1,37 +1,34 @@
-import { parse } from "csv-parse/sync";
 import {
 	buildCampaignJob,
-	type CampaignCsvRow,
-	campaignApiHeaders,
-	DEFAULT_CHOICE_CANDIDATES,
-	filterCampaignRows,
 	jobContentFingerprint,
 	mapRegistrationValues,
-	mergeChoiceCandidates,
 	type RedirectResolution,
-	type RegistrationEntry,
-	readChoiceCandidates,
 	readSendApprovalFile,
 	registerCampaignJobs,
 	resolveRedirectHosts,
 	type SendApprovalEntry,
 	type SendApprovalFile,
 } from "../src/campaign-import";
-import type { JobInput } from "../src/job";
+import {
+	EFFECTIVE_DRY_RUN_KEY,
+	type JobInput,
+	type JobStatus,
+	TERMINAL_JOB_STATUSES,
+} from "../src/job";
+import {
+	loadChoiceCandidates,
+	PRODUCTION_BASE_URL,
+	pollJobsUntilTerminal,
+	readCampaignRows,
+	readJobState,
+	readRegistration,
+	requiredOption,
+} from "./campaign-common";
 
-const PRODUCTION_BASE_URL = "https://form-agent.form-agent.workers.dev";
-/** Mirrors the Queue consumer max_concurrency in wrangler.jsonc. */
-const QUEUE_MAX_CONCURRENCY = 20;
-const POLL_INTERVAL_MS = 2_000;
-const TERMINAL_STATUSES = [
-	"sent",
-	"prohibited",
-	"uncertain",
-	"failed",
-	"dead_lettered",
-];
+/** Log event prefix; the shared poller derives every job event name from it. */
+const EVENT_PREFIX = "campaign_send_job";
 /** Outcomes that need no human follow-up; anything else exits non-zero. */
-const ACCEPTED_STATUSES = ["sent", "prohibited"];
+const ACCEPTED_STATUSES: readonly JobStatus[] = ["sent", "prohibited"];
 const DEFAULT_MAX_SENDS = 5;
 const MAX_MAX_SENDS = 50;
 
@@ -41,28 +38,13 @@ const approval = readSendApprovalFile(
 	await Bun.file(options.approvedPath).json(),
 	options.maxSends,
 );
-const choices = mergeChoiceCandidates(
-	options.defaultChoices ? DEFAULT_CHOICE_CANDIDATES : {},
-	options.choicesPath
-		? readChoiceCandidates(await Bun.file(options.choicesPath).json())
-		: {},
-);
-console.log(
-	JSON.stringify({
-		event: "campaign_send_choice_summary",
-		defaultChoices: options.defaultChoices,
-		overrideFile: options.choicesPath !== undefined,
-		// Only the keys are logged; the candidate labels are payload data.
-		choiceKeys: Object.keys(choices).sort(),
-	}),
-);
+const choices = await loadChoiceCandidates({
+	eventPrefix: "campaign_send",
+	defaultChoices: options.defaultChoices,
+	choicesPath: options.choicesPath,
+});
 
-const csvText = await Bun.file(options.csvPath).text();
-const rows = parse(csvText, {
-	columns: true,
-	skip_empty_lines: true,
-}) as CampaignCsvRow[];
-const filtered = filterCampaignRows(rows);
+const { rows, filtered } = await readCampaignRows(options.csvPath);
 const registrationValues = mapRegistrationValues(registration);
 const eligibleByRow = new Map(
 	filtered.eligible.map((candidate) => [candidate.rowNumber, candidate]),
@@ -178,11 +160,15 @@ async function hasCompletedDryRun(
 	entry: SendApprovalEntry,
 	job: JobInput,
 ): Promise<boolean> {
-	const state = await readJobState(entry.dryRunJobId);
+	const state = await readJobState(
+		entry.dryRunJobId,
+		options.apiToken,
+		EVENT_PREFIX,
+	);
 	if (!state) return false;
 	if (
 		state.targetUrl !== job.targetUrl ||
-		state.payload?._formAgentEffectiveDryRun === false ||
+		state.payload?.[EFFECTIVE_DRY_RUN_KEY] === false ||
 		state.status !== "prohibited" ||
 		state.result?.reasonCode !== "DRY_RUN_COMPLETE"
 	) {
@@ -290,60 +276,24 @@ function parseOptions(args: string[]): Options {
 	};
 }
 
-async function readRegistration(path: string): Promise<RegistrationEntry[]> {
-	const value: unknown = await Bun.file(path).json();
-	if (
-		!Array.isArray(value) ||
-		!value.every(
-			(entry) =>
-				typeof entry === "object" &&
-				entry !== null &&
-				typeof (entry as RegistrationEntry).label === "string" &&
-				typeof (entry as RegistrationEntry).value === "string",
-		)
-	) {
-		throw new Error("Registration JSON must contain label/value entries");
-	}
-	return value as RegistrationEntry[];
-}
-
 interface SendCounts {
 	sent: number;
 	prohibited: number;
 }
 
 /**
- * Polls every registered job each round, exactly like the dry-run tool. A real
- * send has no safe status to abort on: `submitting` and `sent` are the point of
- * the run, so the wait only ends at a terminal status or the deadline.
+ * Waits for every registered job, exactly like the dry-run tool. A real send
+ * has no safe status to abort on: `submitting` and `sent` are the point of the
+ * run, so the wait only ends at a terminal status or the deadline.
  */
 async function waitForAll(jobs: readonly JobInput[]): Promise<SendCounts> {
 	const counts: SendCounts = { sent: 0, prohibited: 0 };
-	if (jobs.length === 0) return counts;
-
-	const pending = new Map(jobs.map((job) => [job.id, ""]));
-	const deadline =
-		Date.now() +
-		4 * 60 * 1_000 * Math.ceil(jobs.length / QUEUE_MAX_CONCURRENCY);
-	while (pending.size > 0 && Date.now() < deadline) {
-		for (const [jobId, lastStatus] of [...pending]) {
-			const state = await readJobState(jobId);
-			// A lookup failure is transient here; the job stays pending and is read
-			// again next round, and the deadline still bounds the wait.
-			if (!state) continue;
-			if (state.status !== lastStatus) {
-				pending.set(jobId, state.status);
-				console.log(
-					JSON.stringify({
-						event: "campaign_send_job_status",
-						jobId,
-						status: state.status,
-						attemptCount: state.attemptCount,
-					}),
-				);
-			}
-			if (!TERMINAL_STATUSES.includes(state.status)) continue;
-
+	await pollJobsUntilTerminal({
+		jobs,
+		apiToken: options.apiToken,
+		eventPrefix: EVENT_PREFIX,
+		terminalStatuses: TERMINAL_JOB_STATUSES,
+		onTerminal: (_jobId, state) => {
 			const reasonCode =
 				state.status === "sent"
 					? "SENT"
@@ -351,80 +301,15 @@ async function waitForAll(jobs: readonly JobInput[]): Promise<SendCounts> {
 			if (state.status === "sent") counts.sent += 1;
 			if (state.status === "prohibited") counts.prohibited += 1;
 			byReasonCode[reasonCode] = (byReasonCode[reasonCode] ?? 0) + 1;
-			pending.delete(jobId);
-			console.log(
-				JSON.stringify({
-					event: "campaign_send_job_result",
-					jobId,
-					accepted: ACCEPTED_STATUSES.includes(state.status),
-					status: state.status,
-					reasonCode,
-					attemptCount: state.attemptCount,
-				}),
-			);
-		}
-		if (pending.size > 0) await Bun.sleep(POLL_INTERVAL_MS);
-	}
-
-	for (const [jobId, lastStatus] of pending) {
-		byReasonCode.SEND_TIMED_OUT = (byReasonCode.SEND_TIMED_OUT ?? 0) + 1;
-		console.log(
-			JSON.stringify({
-				event: "campaign_send_job_result",
-				jobId,
-				accepted: false,
-				status: lastStatus || "unknown",
-				reasonCode: "SEND_TIMED_OUT",
-				attemptCount: 0,
-			}),
-		);
-	}
+			return {
+				reasonCode,
+				extra: { accepted: ACCEPTED_STATUSES.includes(state.status) },
+			};
+		},
+		onTimedOut: () => {
+			byReasonCode.SEND_TIMED_OUT = (byReasonCode.SEND_TIMED_OUT ?? 0) + 1;
+			return { reasonCode: "SEND_TIMED_OUT", extra: { accepted: false } };
+		},
+	});
 	return counts;
-}
-
-interface JobState {
-	status: string;
-	attemptCount: number;
-	targetUrl: string;
-	companyId: string;
-	payload: Record<string, unknown> | null;
-	result: { reasonCode: string | null } | null;
-}
-
-async function readJobState(jobId: string): Promise<JobState | null> {
-	try {
-		const response = await fetch(`${PRODUCTION_BASE_URL}/jobs/${jobId}`, {
-			headers: campaignApiHeaders(options.apiToken),
-			redirect: "manual",
-		});
-		if (!response.ok) {
-			await response.body?.cancel();
-			console.log(
-				JSON.stringify({
-					event: "campaign_send_job_lookup_failed",
-					jobId,
-					status: response.status,
-				}),
-			);
-			return null;
-		}
-		const body = (await response.json()) as { job: JobState };
-		return body.job;
-	} catch {
-		// Fixed values only: the failure reason may carry a URL or a host.
-		console.log(
-			JSON.stringify({
-				event: "campaign_send_job_lookup_failed",
-				jobId,
-				reason: "REQUEST_FAILED",
-			}),
-		);
-		return null;
-	}
-}
-
-function requiredOption(values: Map<string, string>, name: string): string {
-	const value = values.get(name);
-	if (!value) throw new Error(`--${name} is required`);
-	return value;
 }
