@@ -2,6 +2,7 @@ import { D1JobStore } from "./d1-job-store";
 import type { EvidenceStage, Job } from "./job";
 import {
 	type BrowserObservation,
+	isSubmitStagePending,
 	PAYLOAD_KEY_PATTERN,
 	type ProhibitedReasonCode,
 	type ProhibitionVerification,
@@ -83,6 +84,14 @@ export class BrowserToolCoordinator {
 	/** Time spent establishing the browser driver, including a failed attempt. */
 	get connectDurationMs(): number | null {
 		return this.#connectDurationMs;
+	}
+
+	/**
+	 * Whether a submit activation is still waiting for a result of its own. The
+	 * run must not end as anything but uncertain while that is true.
+	 */
+	hasUnconfirmedSubmission(): boolean {
+		return this.#tools?.hasUnconfirmedSubmission() ?? false;
 	}
 
 	/**
@@ -264,7 +273,14 @@ export class BrowserToolCoordinator {
 		if (this.#closed) {
 			throw new BrowserToolInputError();
 		}
-		const { job, tools } = await this.#getToolsAndJob(jobId, runToken);
+		// A two-step form is still being worked on after the first stage took
+		// the submission permission, so those two tools also run while the job
+		// is `submitting`. Nothing that enters new data does.
+		const { job, tools } = await this.#getToolsAndJob(
+			jobId,
+			runToken,
+			tool === "observe" || tool === "submit",
+		);
 		switch (tool) {
 			case "navigate":
 				await tools.navigate(readString(params, "url", 2_048));
@@ -295,11 +311,14 @@ export class BrowserToolCoordinator {
 				return { result: { ok: true } };
 			}
 			case "submit": {
-				const job = await tools.submit(
+				const outcome = await tools.submit(
 					readElementId(params),
 					readSubmitActivationStrategy(params),
 				);
-				const { runToken: _, ...safeJob } = job;
+				if (isSubmitStagePending(outcome)) {
+					return { result: { stage: outcome.pendingStage } };
+				}
+				const { runToken: _, ...safeJob } = outcome;
 				return { job: safeJob };
 			}
 		}
@@ -327,11 +346,15 @@ export class BrowserToolCoordinator {
 	async #getToolsAndJob(
 		jobId: string,
 		runToken: string,
+		allowSubmitting = false,
 	): Promise<{ job: Job; tools: RestrictedBrowserTools }> {
 		const key = scopeKey(jobId, runToken);
 		const store = new D1JobStore(this.db);
 		const job = await store.find(jobId);
-		if (job?.status !== "running" || job.runToken !== runToken) {
+		const statusAllowed =
+			job?.status === "running" ||
+			(allowSubmitting && job?.status === "submitting");
+		if (!job || !statusAllowed || job.runToken !== runToken) {
 			throw new BrowserToolInputError();
 		}
 		if (this.#tools) {

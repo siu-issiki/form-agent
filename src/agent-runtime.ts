@@ -2,6 +2,7 @@ import type { Job } from "./job";
 import type {
 	BrowserObservation,
 	SubmitActivationStrategy,
+	SubmitStagePending,
 } from "./restricted-browser";
 
 export interface AgentRunInput {
@@ -35,7 +36,7 @@ export interface AgentTools {
 	submit(
 		elementId: string,
 		activationStrategy: SubmitActivationStrategy,
-	): Promise<Job>;
+	): Promise<Job | SubmitStagePending>;
 }
 
 export interface AgentRuntime {

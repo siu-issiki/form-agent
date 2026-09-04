@@ -10,6 +10,18 @@ import {
 
 /** A denial only allows one correction; the second denial ends the job. */
 const MAX_SUBMIT_REVIEW_DENIALS = 2;
+/**
+ * How many submit activations one run may make. A Japanese inquiry form often
+ * answers the first submission with a confirmation screen whose own button
+ * sends the message, so a single activation is not always the whole
+ * submission. The pre-submit review runs on the first stage only; every later
+ * stage has to prove that the page still carries the reviewed values.
+ */
+export const MAX_SUBMIT_STAGES = 3;
+/** How much of the entered message a confirmation screen has to repeat. */
+const SUBMIT_STAGE_BODY_PREFIX_LENGTH = 40;
+/** Matches a single address, so the entered email can be told from other text. */
+const ENTERED_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_SUBMIT_REVIEW_REASON_LENGTH = 500;
 const SUBMIT_REVIEW_BUDGET_EXHAUSTED_REASON =
 	"Pre-submit review denied the submission and its correction budget is exhausted.";
@@ -282,6 +294,39 @@ export type BrowserSubmitResult =
 			reason: string;
 	  };
 
+/**
+ * The driver's code for "the submission request went out, but the page never
+ * showed a completion". It is the one outcome a further stage may follow.
+ */
+export const SUBMIT_CONFIRMATION_NOT_OBSERVED =
+	"SUBMIT_CONFIRMATION_NOT_OBSERVED";
+
+/**
+ * One stage was activated and the page has not confirmed a completed send.
+ * The model may observe and call `submit` again; nothing has been recorded.
+ */
+export interface SubmitStagePending {
+	pendingStage: number;
+}
+
+export function isSubmitStagePending(
+	value: Job | SubmitStagePending,
+): value is SubmitStagePending {
+	return "pendingStage" in value;
+}
+
+/**
+ * Whether the browser saw a submission request leave the page. `sent` is only
+ * reported after one was observed, and the uncertain code above says the same
+ * in the case where no completion followed.
+ */
+export function submitRequestObserved(result: BrowserSubmitResult): boolean {
+	return (
+		result.outcome === "sent" ||
+		result.reasonCode === SUBMIT_CONFIRMATION_NOT_OBSERVED
+	);
+}
+
 export type SubmitActivationStrategy = "dom" | "mouse" | "enter";
 
 /** Which part of the page a screenshot covers. */
@@ -303,7 +348,15 @@ export interface RestrictedBrowserDriver {
 	 * come from the job payload, never from the model.
 	 */
 	select(elementId: string, candidates: readonly string[]): Promise<void>;
-	validateSubmit(elementId: string): Promise<void>;
+	/**
+	 * `requireEnteredInput` is false only for a later stage of the same
+	 * submission, where the confirmation screen no longer holds the fields this
+	 * run filled.
+	 */
+	validateSubmit(
+		elementId: string,
+		requireEnteredInput?: boolean,
+	): Promise<void>;
 	/**
 	 * Re-reads the live state of every element named by the latest observation,
 	 * excluding submit controls and buttons. It is used to detect a page that
@@ -328,6 +381,7 @@ export interface RestrictedBrowserDriver {
 	submit(
 		elementId: string,
 		activationStrategy: SubmitActivationStrategy,
+		requireEnteredInput?: boolean,
 	): Promise<BrowserSubmitResult>;
 }
 
@@ -394,6 +448,19 @@ export class CorrectionRequiredError extends BrowserElementError {
 	constructor() {
 		super();
 		this.name = "CorrectionRequiredError";
+	}
+}
+
+/**
+ * A later submit stage was refused because the page did not show the values
+ * the review already approved. It is separate from a plain element error so
+ * that the model is told to observe the confirmation screen rather than to
+ * pick another control.
+ */
+export class SubmitStageUnverifiedError extends BrowserElementError {
+	constructor() {
+		super();
+		this.name = "SubmitStageUnverifiedError";
 	}
 }
 
@@ -504,7 +571,12 @@ export class RestrictedBrowserTools {
 	#observationRevision = -1;
 	/** Bounds the handler's own re-observation to one per input revision. */
 	#prohibitionReverifiedRevision = -1;
-	#submitAttempted = false;
+	/** Submit activations already made in this run, capped by MAX_SUBMIT_STAGES. */
+	#submitStage = 0;
+	/** Set while an activation happened and no result has been recorded for it. */
+	#unconfirmedSubmission = false;
+	/** Values `fill` entered, used to recognise a confirmation screen. */
+	readonly #enteredValues: string[] = [];
 	#deniedFingerprint: string | undefined;
 	#correctionInputApplied = false;
 
@@ -691,6 +763,7 @@ export class RestrictedBrowserTools {
 	async fill(elementId: string, value: string): Promise<void> {
 		await this.driver.fill(elementId, value);
 		await this.#assertCurrentUrlAllowed();
+		this.#enteredValues.push(value);
 		this.#successfulInputElementIds.add(elementId);
 		this.#inputRevision += 1;
 		// A denied review is only cleared once an input actually changed the
@@ -709,8 +782,11 @@ export class RestrictedBrowserTools {
 		this.#correctionInputApplied = true;
 	}
 
-	async validateSubmit(elementId: string): Promise<void> {
-		if (this.#successfulInputElementIds.size < 1) {
+	async validateSubmit(
+		elementId: string,
+		requireEnteredInput = true,
+	): Promise<void> {
+		if (requireEnteredInput && this.#successfulInputElementIds.size < 1) {
 			throw new BrowserElementError();
 		}
 		if (this.#deniedFingerprint !== undefined && !this.#hasCorrectedInputs()) {
@@ -738,7 +814,7 @@ export class RestrictedBrowserTools {
 			);
 		}
 		await this.#assertCurrentUrlAllowed();
-		await this.driver.validateSubmit(elementId);
+		await this.driver.validateSubmit(elementId, requireEnteredInput);
 		await this.#assertCurrentUrlAllowed();
 	}
 
@@ -846,24 +922,39 @@ export class RestrictedBrowserTools {
 		});
 	}
 
+	/**
+	 * Activates one submit control. The first call runs the pre-submit review
+	 * and takes the submission permission; a later call is a further stage of
+	 * the same submission -- the confirmation screen of a two-step form -- and
+	 * is accepted only while the page still carries the reviewed values.
+	 */
 	async submit(
 		elementId: string,
 		activationStrategy: SubmitActivationStrategy = "mouse",
-	): Promise<Job> {
-		if (this.#submitAttempted) {
+	): Promise<Job | SubmitStagePending> {
+		const stage = this.#submitStage + 1;
+		// A further stage exists only for a submission still waiting for its own
+		// confirmation. Once a result was recorded, the job is finished and a
+		// second activation would be a second submission.
+		if (stage > MAX_SUBMIT_STAGES || !this.#canActivateFurtherStage()) {
 			throw new SubmissionNotAuthorizedError();
 		}
-		await this.validateSubmit(elementId);
+		const firstStage = stage === 1;
+		await this.validateSubmit(elementId, firstStage);
 
 		// The denial budget is read from D1 before anything else happens, so a
 		// failed uncertain write cannot leave a spent job open to another
-		// review that happens to allow.
+		// review that happens to allow. A later stage runs while the job is
+		// already `submitting`, which is the permission the first stage took.
 		const persisted = await this.jobs.find(this.jobId);
 		if (
-			persisted?.status !== "running" ||
+			persisted?.status !== (firstStage ? "running" : "submitting") ||
 			persisted.runToken !== this.runToken
 		) {
 			throw new SubmissionNotAuthorizedError();
+		}
+		if (!firstStage) {
+			return this.#activateSubmitStage(stage, elementId, activationStrategy);
 		}
 		if (persisted.submitReviewDenialCount >= MAX_SUBMIT_REVIEW_DENIALS) {
 			await this.#recordUncertain(
@@ -915,7 +1006,6 @@ export class RestrictedBrowserTools {
 		// The reviewed page is not the page that gets submitted unless nothing
 		// moved in between. Untrusted page scripts run during the review.
 		await this.#assertReviewedStateUnchanged(elementId, snapshotBefore);
-		this.#submitAttempted = true;
 
 		const authorized = await this.jobs.claimSubmission(
 			this.jobId,
@@ -932,13 +1022,52 @@ export class RestrictedBrowserTools {
 		) {
 			throw new SubmissionNotAuthorizedError();
 		}
+		return this.#activateSubmitStage(stage, elementId, activationStrategy);
+	}
+
+	/**
+	 * Activates the control and turns what the browser reports into a result.
+	 * The first stage arrives here with the submission permission already
+	 * taken; a later stage first has to prove the page still shows the
+	 * reviewed values, and is recorded as a `submit.stage` event instead.
+	 */
+	async #activateSubmitStage(
+		stage: number,
+		elementId: string,
+		activationStrategy: SubmitActivationStrategy,
+	): Promise<Job | SubmitStagePending> {
+		const firstStage = stage === 1;
+		if (!firstStage) {
+			await this.#assertSubmitStageValues();
+			// Every stage sends something, so every stage is preceded by its own
+			// evidence of what the page held.
+			const before = await this.recorder.capture("before_submit");
+			if (!before.captured) {
+				throw new SubmissionEvidenceError();
+			}
+		}
+		this.#submitStage = stage;
+		this.#unconfirmedSubmission = true;
 
 		let result: BrowserSubmitResult | undefined;
 		let submitError: unknown;
 		try {
-			result = await this.driver.submit(elementId, activationStrategy);
+			result = await this.driver.submit(
+				elementId,
+				activationStrategy,
+				firstStage,
+			);
 		} catch (error) {
 			submitError = error;
+		}
+		// Whatever the page shows now was never observed, so a further stage
+		// cannot run until the model has taken a fresh observation.
+		this.#inputRevision += 1;
+		if (!firstStage) {
+			await this.#recordSubmitStage(
+				stage,
+				result !== undefined && submitRequestObserved(result),
+			);
 		}
 		// The post-submit URL is read before the screenshot capture. If the
 		// screenshot fails and closes the CDP connection, the already-captured
@@ -981,7 +1110,21 @@ export class RestrictedBrowserTools {
 			throw new SubmissionResultUncertainError();
 		}
 
+		if (
+			result.outcome === "uncertain" &&
+			result.reasonCode === SUBMIT_CONFIRMATION_NOT_OBSERVED &&
+			stage < MAX_SUBMIT_STAGES
+		) {
+			// The activation reached the page and a submission request went out,
+			// but nothing confirmed a completed send. A two-step form answers
+			// exactly like this, so the model is given the chance to observe the
+			// confirmation screen and activate its send control. Nothing is
+			// recorded yet and the job stays `submitting`.
+			return { pendingStage: stage };
+		}
+
 		if (result.outcome === "uncertain") {
+			this.#unconfirmedSubmission = false;
 			const uncertain = await this.jobs.recordUncertain(
 				this.jobId,
 				this.runToken,
@@ -1006,6 +1149,7 @@ export class RestrictedBrowserTools {
 		}
 
 		try {
+			this.#unconfirmedSubmission = false;
 			const sent = await this.jobs.recordSent(
 				this.jobId,
 				this.runToken,
@@ -1060,6 +1204,76 @@ export class RestrictedBrowserTools {
 		return denialCount;
 	}
 
+	/** Whether an activation is still waiting for a result of its own. */
+	hasUnconfirmedSubmission(): boolean {
+		return this.#unconfirmedSubmission;
+	}
+
+	#canActivateFurtherStage(): boolean {
+		return this.#submitStage === 0 || this.#unconfirmedSubmission;
+	}
+
+	/**
+	 * A later stage is only allowed on a page that still carries what the
+	 * review approved: a confirmation screen repeating the entered address and
+	 * the start of the entered message, or the same fields still holding them.
+	 * Without that check a second activation could press any control on
+	 * whatever page the site navigated to.
+	 */
+	async #assertSubmitStageValues(): Promise<void> {
+		const observation = this.#latestObservation;
+		const email = this.#enteredValues
+			.find((value) => ENTERED_EMAIL_PATTERN.test(value.trim()))
+			?.trim();
+		const body = this.#enteredValues.reduce(
+			(longest, value) => (value.length > longest.length ? value : longest),
+			"",
+		);
+		if (!observation || !email || !body) {
+			throw new SubmitStageUnverifiedError();
+		}
+		const bodyPrefix = body.slice(0, SUBMIT_STAGE_BODY_PREFIX_LENGTH);
+		const pageText = observation.pageText ?? "";
+		if (pageText.includes(email) && pageText.includes(bodyPrefix)) return;
+		let values: string[];
+		try {
+			values = (await this.driver.readObservedFieldStates()).map(
+				(state) => state.value,
+			);
+		} catch {
+			throw new SubmitStageUnverifiedError();
+		}
+		if (
+			values.some((value) => value.includes(email)) &&
+			values.some((value) => value.includes(bodyPrefix))
+		) {
+			return;
+		}
+		throw new SubmitStageUnverifiedError();
+	}
+
+	/**
+	 * Records a stage past the first. The submission permission was already
+	 * taken by the first stage, so only fixed values are written: which stage
+	 * this was and whether a request left the page.
+	 */
+	async #recordSubmitStage(
+		stage: number,
+		requestObserved: boolean,
+	): Promise<void> {
+		try {
+			await this.jobs.recordSubmitStage(
+				this.jobId,
+				this.runToken,
+				stage,
+				requestObserved,
+				this.now(),
+			);
+		} catch {
+			// The event is a record of what happened, never a gate on it.
+		}
+	}
+
 	/** True once an input changed the values a denied review looked at. */
 	#hasCorrectedInputs(): boolean {
 		const observation = this.#latestObservation;
@@ -1111,6 +1325,7 @@ export class RestrictedBrowserTools {
 	}
 
 	async #recordUncertain(reasonCode: string, reason: string): Promise<void> {
+		this.#unconfirmedSubmission = false;
 		try {
 			await this.jobs.recordUncertain(
 				this.jobId,

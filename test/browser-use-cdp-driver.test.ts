@@ -22,7 +22,6 @@ import {
 import {
 	ACTIVATE_SUBMIT_FUNCTION,
 	assertDryRunNavigationAllowed,
-	assertExpectedSubmissionRequest,
 	BLOCK_BROWSER_ESCAPE_EXPRESSION,
 	BrowserUseCdpDriver,
 	type CdpScreenshotResult,
@@ -51,6 +50,7 @@ import {
 	isPayloadIndependentClickTarget,
 	isRetryableClickPreparationError,
 	MATCHES_CHOICE_CANDIDATE_FUNCTION,
+	MAX_SUBMISSION_REQUESTS,
 	planFullPageScreenshot,
 	READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
 	readPageText,
@@ -79,6 +79,7 @@ import {
 	BrowserElementError,
 	BrowserElementOperationError,
 	BrowserSubmitDiagnosticError,
+	type BrowserSubmitResult,
 	isReviewComparableField,
 } from "../src/restricted-browser";
 
@@ -632,23 +633,27 @@ describe("BrowserUseCdpDriver child target policy", () => {
 			frameId: "form-frame",
 			request: { url: "https://example.com/complete", method: "GET" },
 		};
-		expect(
-			isAuthorizedSubmissionRedirect(paused, "submit-1", "form-frame"),
-		).toBe(true);
-		expect(isAuthorizedSubmissionRedirect(paused, "other", "form-frame")).toBe(
-			false,
+		const claimed = new Set(["submit-0", "submit-1"]);
+		expect(isAuthorizedSubmissionRedirect(paused, claimed, "form-frame")).toBe(
+			true,
 		);
+		expect(
+			isAuthorizedSubmissionRedirect(paused, new Set(["other"]), "form-frame"),
+		).toBe(false);
+		expect(
+			isAuthorizedSubmissionRedirect(paused, new Set(), "form-frame"),
+		).toBe(false);
 		expect(
 			isAuthorizedSubmissionRedirect(
 				{ ...paused, frameId: "other-frame" },
-				"submit-1",
+				claimed,
 				"form-frame",
 			),
 		).toBe(false);
 		expect(
 			isAuthorizedSubmissionRedirect(
 				{ ...paused, request: { ...paused.request, method: "POST" } },
-				"submit-1",
+				claimed,
 				"form-frame",
 			),
 		).toBe(false);
@@ -705,47 +710,6 @@ describe("BrowserUseCdpDriver child target policy", () => {
 				expected,
 			),
 		).toBe(false);
-	});
-
-	test("allows only the validated form action and method during submission", () => {
-		const expected = createExpectedSubmissionRequest(
-			"https://example.com/submit?test=1#confirmation",
-			"post",
-		);
-
-		expect(() =>
-			assertExpectedSubmissionRequest(
-				{ url: "https://example.com/submit?test=1", method: "POST" },
-				expected,
-			),
-		).not.toThrow();
-		expect(() =>
-			assertExpectedSubmissionRequest(
-				{ url: "https://example.com/analytics", method: "POST" },
-				expected,
-			),
-		).toThrow();
-		expect(() =>
-			assertExpectedSubmissionRequest(
-				{ url: "https://example.com/submit?test=1", method: "PUT" },
-				expected,
-			),
-		).toThrow();
-		expect(() =>
-			assertExpectedSubmissionRequest(
-				{
-					url: "https://example.com/search?company=AnyReach",
-					method: "GET",
-				},
-				createExpectedSubmissionRequest("https://example.com/search", "get"),
-			),
-		).not.toThrow();
-		expect(() =>
-			assertExpectedSubmissionRequest(
-				{ url: "https://example.com/other", method: "GET" },
-				createExpectedSubmissionRequest("https://example.com/search", "get"),
-			),
-		).toThrow();
 	});
 
 	test("claims only the first expected GET document navigation", () => {
@@ -5859,3 +5823,229 @@ describe("BrowserUseCdpDriver third-party frame forms", () => {
 		expect(caught).toBeInstanceOf(BrowserUseCdpCommandError);
 	});
 });
+
+/**
+ * `example.com` is a special-use name the navigation policy always refuses, so
+ * the submission tests need a domain a real job could carry.
+ */
+const SUBMISSION_TARGET_DOMAIN = "acme.co.jp";
+const SUBMISSION_PAGE_URL = `https://${SUBMISSION_TARGET_DOMAIN}/contact`;
+
+describe("BrowserUseCdpDriver submission network policy", () => {
+	test("continues a same-domain post to another path and counts it as observed", async () => {
+		const { driver, connection } = await submissionDriver([
+			{
+				requestId: "wp-json-1",
+				resourceType: "XHR",
+				frameId: "frame-1",
+				request: {
+					url: "https://acme.co.jp/wp-json/contact-form-7/v1/feedback",
+					method: "POST",
+				},
+			},
+		]);
+
+		const result = await submitFixtureForm(driver);
+
+		expect(continuedRequestIds(connection)).toEqual(["wp-json-1"]);
+		expect(failedRequestIds(connection)).toEqual([]);
+		// The request was seen, so the only thing missing is the confirmation.
+		expect(result).toEqual({
+			outcome: "uncertain",
+			reasonCode: "SUBMIT_CONFIRMATION_NOT_OBSERVED",
+			reason: "The page did not provide a reliable submission confirmation.",
+		});
+		await closeQuietly(driver);
+	});
+
+	test("blocks a submission request that leaves the target domain", async () => {
+		const { driver, connection } = await submissionDriver([
+			{
+				requestId: "offsite-1",
+				resourceType: "XHR",
+				frameId: "frame-1",
+				request: { url: "https://forms.other.test/collect", method: "POST" },
+			},
+		]);
+
+		const result = await submitFixtureForm(driver);
+
+		expect(continuedRequestIds(connection)).toEqual([]);
+		expect(failedRequestIds(connection)).toEqual(["offsite-1"]);
+		expect(result).toMatchObject({
+			outcome: "uncertain",
+			reasonCode: "SUBMIT_NETWORK_POLICY_BLOCKED",
+		});
+		await closeQuietly(driver);
+	});
+
+	test("blocks the request past the per-run submission budget", async () => {
+		const { driver, connection } = await submissionDriver(
+			Array.from({ length: MAX_SUBMISSION_REQUESTS + 1 }, (_, index) => ({
+				requestId: `post-${index + 1}`,
+				resourceType: "XHR",
+				frameId: "frame-1",
+				request: {
+					url: `https://acme.co.jp/api/step-${index + 1}`,
+					method: "POST",
+				},
+			})),
+		);
+
+		const result = await submitFixtureForm(driver);
+
+		expect(continuedRequestIds(connection)).toEqual([
+			"post-1",
+			"post-2",
+			"post-3",
+			"post-4",
+			"post-5",
+		]);
+		expect(failedRequestIds(connection)).toEqual(["post-6"]);
+		expect(result).toMatchObject({
+			outcome: "uncertain",
+			reasonCode: "SUBMIT_REQUEST_LIMIT_REACHED",
+		});
+		await closeQuietly(driver);
+	});
+
+	test("keeps blocking every request of a dry-run once the form was touched", async () => {
+		const connection = new ScriptedCdpConnection();
+		connection.respond = submitFixtureResponse(connection, []);
+		const driver = await scriptedDriver(connection, true);
+		const captured = captureLogs();
+		try {
+			await driver.observe();
+			await driver.fill(TEXT_ELEMENT_ID, "Hello");
+		} finally {
+			captured.restore();
+		}
+
+		connection.emit("Fetch.requestPaused", {
+			requestId: "dry-run-1",
+			resourceType: "XHR",
+			frameId: "frame-1",
+			request: { url: "https://acme.co.jp/send", method: "POST" },
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(continuedRequestIds(connection)).toEqual([]);
+		expect(failedRequestIds(connection)).toEqual(["dry-run-1"]);
+		await closeQuietly(driver);
+	});
+});
+
+/**
+ * A driver on the fixture page whose submit control is a real submit button,
+ * with one filled field, ready for `submit`. The paused requests are delivered
+ * while the submission is being activated, which is the only window in which
+ * the page may send anything.
+ */
+async function submissionDriver(
+	pausedRequests: readonly Record<string, unknown>[],
+): Promise<{ driver: BrowserUseCdpDriver; connection: ScriptedCdpConnection }> {
+	const connection = new ScriptedCdpConnection();
+	connection.respond = submitFixtureResponse(connection, pausedRequests);
+	const captured = captureLogs();
+	try {
+		const driver = await BrowserUseCdpDriver.connect(
+			"api-key",
+			connectJob,
+			false,
+			{
+				client: asClient(new FakeBrowserUseClient()),
+				connectConnection: async () =>
+					connection as unknown as BrowserUseCdpConnection,
+				submissionConfirmationTimeoutMs: 20,
+			},
+		);
+		await driver.restrictToDomain(SUBMISSION_TARGET_DOMAIN, []);
+		await driver.observe();
+		await driver.fill(TEXT_ELEMENT_ID, "Hello");
+		return { driver, connection };
+	} finally {
+		captured.restore();
+	}
+}
+
+async function submitFixtureForm(
+	driver: BrowserUseCdpDriver,
+): Promise<BrowserSubmitResult> {
+	const captured = captureLogs();
+	try {
+		return await driver.submit(BUTTON_ELEMENT_ID, "dom");
+	} finally {
+		captured.restore();
+	}
+}
+
+/**
+ * Answers like the shared fixture, except that the button is a submit control
+ * and the activation call delivers the paused requests the test scripted.
+ */
+function submitFixtureResponse(
+	connection: ScriptedCdpConnection,
+	pausedRequests: readonly Record<string, unknown>[],
+): (method: string, params: Record<string, unknown>) => unknown {
+	return (method, params) => {
+		if (
+			method === "Runtime.evaluate" &&
+			String(params.expression ?? "") === "location.href"
+		) {
+			return { result: { value: SUBMISSION_PAGE_URL } };
+		}
+		if (method === "Runtime.callFunctionOn") {
+			const declaration = params.functionDeclaration;
+			if (declaration === ACTIVATE_SUBMIT_FUNCTION) {
+				for (const paused of pausedRequests) {
+					connection.emit("Fetch.requestPaused", paused);
+				}
+				return { result: { value: true } };
+			}
+			if (
+				declaration === HAS_SAME_FORM_OWNER_FUNCTION ||
+				declaration === CHECK_FORM_VALIDITY_FUNCTION
+			) {
+				return { result: { value: true } };
+			}
+			const backendNodeId = Number(
+				String(params.objectId ?? "").replace("object-", ""),
+			);
+			if (backendNodeId === BUTTON_BACKEND_NODE_ID) {
+				return {
+					result: {
+						value: {
+							...elementFixtureState(backendNodeId),
+							type: "submit",
+							submitLike: true,
+							formAction: `https://${SUBMISSION_TARGET_DOMAIN}/send`,
+							formMethod: "post",
+						},
+					},
+				};
+			}
+		}
+		return scriptedCdpResponse(method, params);
+	};
+}
+
+function continuedRequestIds(connection: ScriptedCdpConnection): string[] {
+	return connection.sent
+		.filter((entry) => entry.method === "Fetch.continueRequest")
+		.map((entry) => String(entry.params.requestId));
+}
+
+function failedRequestIds(connection: ScriptedCdpConnection): string[] {
+	return connection.sent
+		.filter((entry) => entry.method === "Fetch.failRequest")
+		.map((entry) => String(entry.params.requestId));
+}
+
+async function closeQuietly(driver: BrowserUseCdpDriver): Promise<void> {
+	const captured = captureLogs();
+	try {
+		await driver.close();
+	} finally {
+		captured.restore();
+	}
+}

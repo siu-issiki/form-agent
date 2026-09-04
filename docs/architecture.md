@@ -127,7 +127,17 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 | `SUBMIT_OUTCOME_UNKNOWN` | 送信結果を確認できない |
 | `OTHER_UNCERTAINTY` | 上記のいずれにも当てはまらない |
 
-`submit`経路で信頼済みhandler自身が保存する`uncertain`（`SUBMIT_CONFIRMATION_NOT_OBSERVED`、`PRE_SUBMIT_REVIEW_DENIED`など）はモデルの申告ではないため、この集合とは別に扱う。
+`submit`経路で信頼済みhandler自身が保存する`uncertain`はモデルの申告ではないため、この集合とは別に扱う。主なものは次のとおりである。
+
+| 理由コード | 意味 |
+| --- | --- |
+| `SUBMIT_CONFIRMATION_NOT_OBSERVED` | 送信requestは観測できたが完了画面を確認できないまま run が終わった |
+| `SUBMIT_REQUEST_LIMIT_REACHED` | 1 run あたりの送信request上限（5 本）を超えた request を遮断した |
+| `SUBMIT_NETWORK_POLICY_BLOCKED` | 送信requestが対象ドメイン外などネットワークポリシーで遮断された |
+| `SUBMIT_EXPECTED_REQUEST_BLOCKED` | GET フォーム送信の照合に一致しない `Document` requestを遮断した |
+| `SUBMIT_DOM_REQUEST_NOT_OBSERVED` / `SUBMIT_MOUSE_REQUEST_NOT_OBSERVED` / `SUBMIT_ENTER_REQUEST_NOT_OBSERVED` | 活性化はできたが送信requestを観測できなかった |
+| `PRE_SUBMIT_REVIEW_DENIED` | 送信前レビューが deny し、修正予算も尽きた |
+| `SUBMIT_RESULT_UNKNOWN` | 送信権取得後に driver 側の操作が失敗した |
 - Agent 終了時または timeout 時に browser 接続を閉じる。
 - `fill` / `select`ではモデルに生の値を渡させず、`payload.formValues`内の`payloadKey`を指定させる。信頼済みhandlerがD1の保存値を解決し、存在しないキー、契約外の型、上限超過、空文字を拒否する。値は単一文字列（最大8,192文字）または選択肢候補リスト（1〜10要素、各要素1〜256文字、合計2,048文字以下）のいずれかであり、候補リストは`select`だけが受け取る。`fill`に候補リストのキーを渡した場合は`INVALID_TOOL_INPUT`とする。
 
@@ -181,7 +191,7 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 - CDP の `DOM.getDocument` を `pierce: true` で取得し、通常 DOM と open / closed Shadow DOM を Worker 側で走査する。
 - 観測した同一ページ・許可hostのリンクを最大20件までモデルへ返し、サイト内別ページのフォーム探索に利用する。
 - top documentとiframe documentを同じDOM探索対象とし、送信完了文言も各document bodyで確認する。
-- ただし第三者フレーム（検証サービス等）内のフォームは観察対象外とする。bootstrapの`Page.getFrameTree`と`Page.frameNavigated`から各frameのURLを追跡し、フォームが属するframeのURLが対象ドメイン・ジョブ固有の許可hostの範囲外であれば、そのフォームとフィールドを観察結果に含めない。対象ドメイン外のフォームは元々送信対象にならない（送信requestのclaim判定は対象ドメインのフォームactionに一致する`Document` requestだけを対象とする）ため、安全性は変わらない。reCAPTCHAのanchor iframe内のチェックボックスがフォームとして拾われ、別originのframeに対する`Page.createIsolatedWorld` / `Runtime.callFunctionOn`が失敗して観察全体が`BROWSER_TOOL_UNAVAILABLE`になっていた実測への対策である。スキップ件数は`browser_dom_observation`の`skippedThirdPartyForms`に件数だけ出し、URLは出さない。
+- ただし第三者フレーム（検証サービス等）内のフォームは観察対象外とする。bootstrapの`Page.getFrameTree`と`Page.frameNavigated`から各frameのURLを追跡し、フォームが属するframeのURLが対象ドメイン・ジョブ固有の許可hostの範囲外であれば、そのフォームとフィールドを観察結果に含めない。対象ドメイン外のフォームは元々送信対象にならない（送信requestは対象ドメインと許可host宛だけを通す）ため、安全性は変わらない。reCAPTCHAのanchor iframe内のチェックボックスがフォームとして拾われ、別originのframeに対する`Page.createIsolatedWorld` / `Runtime.callFunctionOn`が失敗して観察全体が`BROWSER_TOOL_UNAVAILABLE`になっていた実測への対策である。スキップ件数は`browser_dom_observation`の`skippedThirdPartyForms`に件数だけ出し、URLは出さない。
 - frameのURLが不明な場合（frame treeにもnavigationイベントにも現れていない場合、および`about:blank` / `srcdoc`のように埋め込み元のoriginを継承する場合）は従来どおり観察する。この場合に限り、禁止根拠の読み取りで使う`Page.createIsolatedWorld` / `Runtime.callFunctionOn`がCDP errorになったフォームだけをスキップし、`browser_form_skipped`（`reason`は`FRAME_CONTEXT_UNAVAILABLE`の固定値）を1行出して観察を続行する。トップフレームと、対象ドメイン内と判定できたframeでのCDP失敗は従来どおりrun全体のエラーにする。スキップの結果フォームが1件も残らない場合は、フォーム不在の観察としてモデルへ返り、`prohibited`の`NO_FORM_PRESENT`は信頼済みhandlerが観察のform 0件から判定する。
 - CDP の単一 response は 4 MiB を上限とし、超過時は再試行せず `BROWSER_PAYLOAD_TOO_LARGE` で終了する。
 
@@ -196,10 +206,12 @@ DeepSeek / Fireworks 等への切り替え、Provider fallback、品質・レイ
 | `click` | 非 submit 要素だけをクリックする |
 | `fill` | text input / textarea へ値を入力する |
 | `select` | select / radio / checkbox を、payload の候補リスト順に一致する最初の選択肢へ設定する |
-| `submit` | 送信前に独立レビュー（同一 Provider、ツールなし、strict JSON）を通し、D1 の送信権取得後に 1 回だけ送信する。deny は 1 回だけ修正可、2 回目で `uncertain` |
+| `submit` | 送信前に独立レビュー（同一 Provider、ツールなし、strict JSON）を通し、D1 の送信権取得後に送信する。deny は 1 回だけ修正可、2 回目で `uncertain`。2 段階フォームのために 1 run あたり最大 3 回まで活性化できる |
 | `finish` | 送信せず、構造化された終端結果を返す |
 
-driver が submit control と識別した要素は通常の `click` で操作できない。非submitの`click`、`fill`、`select`はDOMイベントを発火する前にbrowser requestを遮断し、`navigate`は直前の観察で得たfragmentを含む完全一致URLのtop-frame Document requestだけを1回許可する。`submit` 中も遮断を解除せず、全入力が同じform ownerに属し、最後の入力・選択・click後に再観察され、選択したformに禁止根拠が検出されていないことを検証してから D1 を `running` から `submitting` へ更新し、最初の期待済み送信requestと、そのrequest IDに直接連なるsafeなredirectだけを許可する。非safe HTTP methodはaction URLとmethod、GETはactionのorigin / path、`Document` resource、送信対象frameを照合する。モデルはDOM activationを優先して選択し、trusted click gestureまたはkeyboard activationが必要な場合だけmouse / Enterを選ぶ。mouseのhit testは1 animation frameごとに最大3回試行する。
+driver が submit control と識別した要素は通常の `click` で操作できない。非submitの`click`、`fill`、`select`はDOMイベントを発火する前にbrowser requestを遮断し、`navigate`は直前の観察で得たfragmentを含む完全一致URLのtop-frame Document requestだけを1回許可する。`submit` 中も遮断を解除せず、全入力が同じform ownerに属し、最後の入力・選択・click後に再観察され、選択したformに禁止根拠が検出されていないことを検証してから D1 を `running` から `submitting` へ更新する。活性化の許可窓の間は、対象ドメインとジョブ固有の許可hostへの非safe request（POST / PUT / PATCH / DELETE、`Document` / XHR / Fetch を問わない）を、URLと本数を照合せずに通す。1 run あたりの上限は `MAX_SUBMISSION_REQUESTS`（5 本）であり、超えた request は遮断して結果を `SUBMIT_REQUEST_LIMIT_REACHED` の `uncertain` とする。claim した request IDに直接連なるsafeなredirectも通す。GET のフォーム送信だけは通常のページ遷移と区別できないため、従来どおりactionのorigin / path、`Document` resource、送信対象frameを照合して1本だけをclaimする。モデルはDOM activationを優先して選択し、trusted click gestureまたはkeyboard activationが必要な場合だけmouse / Enterを選ぶ。mouseのhit testは1 animation frameごとに最大3回試行する。
+
+form の `action` との一致を要求しなくなったのは、WordPress の Contact Form 7 のように、ページの JS が `action` とは別の同一ドメイン URL（`/wp-json/contact-form-7/…`）へ POST する実装が広く使われているためである。2026-09-04 の実送信 4 件では 3 件がこの照合で遮断され `SUBMIT_EXPECTED_REQUEST_BLOCKED` に終わった。残った保護は、対象ドメイン / `allowedHosts` への限定、送信前レビューの `allow`、レビュー後のページ変化検査、D1 の条件付き送信権、活性化の許可窓（2 秒）、本数上限、dry-run の全遮断である。残存リスクとして、ページの JS が同一ドメイン内の別エンドポイントへ入力値を送る経路は通ることを許容する。同一ドメインであれば送信先は対象企業自身であり、フォーム実装の多様性を照合で吸収できないためである。
 
 #### 選択肢候補（choice candidates）
 
@@ -255,12 +267,25 @@ CDP の error 応答は、失敗した CDP メソッド名、error code、およ
 - あわせて、レビュー呼び出しの直前と allow 直後に、submit 要素が属する form 全体を DOM から再探索した snapshot を取得して比較する。snapshot には hidden と disabled を含む全コントロールの tag / type / name / value / checked / disabled を DOM 順で含め、password の値はマスクする。観察済み要素だけを再訪する照合では見えない、レビュー中の hidden input 追加、`name` の差し替え、disabled の変更もこれで検出する。
 - レビューは `running` 状態でのみ Provider 呼び出し回数を消費できるため、必ず `claimSubmission` より前に実行する。
 - 既知の残存リスク（2026-09-03 時点で受容し、未対応）:
-  - allow 後の最終照合から activation までの間（`claimSubmission` の待ち時間を含む数十 ms）は再照合しない。この窓で非信頼ページの JS がフォームを書き換えた場合、レビューされていない内容が送信され得る。送信先は対象ドメインと期待済み action / method に限定されるため、影響は対象サイト自身のフォームへの内容差異にとどまる。
+  - allow 後の最終照合から activation までの間（`claimSubmission` の待ち時間を含む数十 ms）は再照合しない。この窓で非信頼ページの JS がフォームを書き換えた場合、レビューされていない内容が送信され得る。送信先は対象ドメインとジョブ固有の許可hostに限定されるため、影響は対象サイト自身への内容差異にとどまる。
   - snapshot にはコントロールの基本属性だけを含め、禁止文言、label、select の option、form の action / method の変化は比較しない。レビュー中にこれらが変わった場合、変化後の action へ送信され得る（ドメインと method の制限は network policy が別途強制する）。
   - 修正の証明は「`fill` / `select` の実施」と「観察指紋全体の変化」で判定するため、無関係な動的フィールドや label が変わると、同じ値の再入力でも修正済みと見なされる。
   - form 全体の再探索は候補 200 field / 25 form で打ち切られるため、それを超えるページでは snapshot が form 全体を表さない。
 
 - レビューモデルは既定で `AGENT_MODEL` と同じであり、`AGENT_SUBMIT_REVIEW_MODEL` を設定した場合だけ上書きする。
+
+### 2 段階送信
+
+日本語の問い合わせフォームには、「確認画面へ進む」で入力内容の一覧を表示し、その画面の「送信する」で初めて送信するものが多い。1 回の活性化しか許さないと、1 本目の POST（確認画面への遷移）で送信権を使い切り、本文が送られないまま `SUBMIT_CONFIRMATION_NOT_OBSERVED` で終わる。2026-09-04 の実送信 4 件のうち 1 件がこれだった。
+
+- `submit` は 1 run あたり `MAX_SUBMIT_STAGES`（3 回）まで活性化できる。送信前レビューと D1 の条件付き送信権取得（`running` → `submitting`）は 1 回目だけであり、2 回目以降は再レビューしない。
+- 1 回目の活性化で送信requestは観測できたが完了を確認できない場合、結果を保存せずモデルへ `submit_stage_pending` を返す。ジョブは `submitting` のまま、`observe` と `submit` だけが続行できる。`navigate` / `click` / `fill` / `select` は `submitting` では受け付けない。新しい入力を送信権取得後に足せないようにするためである。
+- 活性化のたびに input revision を進めるため、次の段階の前に必ず再観察が必要になる。
+- 2 回目以降は、最新観察のページ本文に「入力したメールアドレス」と「入力した本文の先頭 40 文字」の両方が含まれるか、観察済みフォーム欄が同じ値を保持していることを信頼済み handler が確認する。満たさなければ `SUBMIT_STAGE_UNVERIFIED` として拒否し、活性化しない。レビュー済みの内容を映していないページで任意のボタンを押させないためである。
+- 2 回目以降は `submit.stage` イベント（`stage` 番号と `requestObserved` の真偽値のみ）を D1 へ記録する。値・URL は残さない。証跡は段階ごとに `before_submit` / `after_submit` を撮る。
+- モデルが再度 `submit` を呼ばずに `finish_*` を呼んだ場合、未確認の活性化が残っているため、宣言された結果に関わらず `uncertain` / `SUBMIT_CONFIRMATION_NOT_OBSERVED` を返す。3 回目でも完了を確認できない場合も同じ理由コードで `uncertain` を保存する。
+- `submitting` のジョブが Queue 再配信された場合の扱いは変わらない。実行せずに ack し、`job.redelivery_ignored` を記録する。
+- 段階をまたぐ間もモデルは Provider を呼ぶため、Provider 呼び出し回数の条件付き更新は `running` に加えて `submitting` でも成立させる。上限そのものは変更しない。
 
 ### Cloudflare D1
 
@@ -333,7 +358,7 @@ dry-run には実送信の「1 回だけ修正して再レビュー」経路は�
 
 | stage | 撮影位置 | ジョブ状態 | 失敗時の扱い |
 | --- | --- | --- | --- |
-| `before_submit` | `submit` tool内、送信前検証成功の直後、送信前レビューと送信権取得（`claimSubmission`）の前 | `running` | 必須。撮影に失敗した場合はレビューも送信権取得も driver への送信も行わず、何も送信しない。再試行可能なエラーとして扱う。レビュー deny 後の再 submit では再撮影するため、1 attempt に複数件になり得る |
+| `before_submit` | `submit` tool内、送信前検証成功の直後、送信前レビューと送信権取得（`claimSubmission`）の前。2 段階目以降は段階検証の直後 | 1 回目は `running`、2 回目以降は `submitting` | 必須。撮影に失敗した場合はレビューも送信権取得も driver への送信も行わず、何も送信しない。再試行可能なエラーとして扱う。レビュー deny 後の再 submit と 2 段階目以降でも再撮影するため、1 attempt に複数件になり得る |
 | `after_submit` | driver への送信が成功または例外で終わった直後、結果確定（`sent` / `uncertain`）の前 | `submitting` | ベストエフォート。失敗しても送信結果（`sent` / `uncertain` / 例外経路）は変えない |
 | `prohibited` | `finish` tool で禁止判定の結果を返す直前 | `running` | ベストエフォート。ブラウザセッションが未作成の場合は撮影せず、未撮影であることだけを記録する |
 | `dry_run_before_submit` | dry-run の `submit` 経路、送信前検証の成功直後、送信前レビューを呼ぶ前 | `running` | ベストエフォート。撮影できなかった場合はレビューを画像なしで進め、`dry_run_evidence_capture_failed` を固定値でログへ出す |
@@ -443,8 +468,8 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 - driver が submit control と識別した要素は通常の `click` で操作させず、`submit` tool へ限定する。
 - HTTP(S) の通信先を対象企業の登録可能ドメインとサブドメイン、またはジョブごとに登録した完全一致の外部hostへ限定する。
 - 上記の例外として、既知の検証サービス（reCAPTCHA / hCaptcha / Turnstile）のhostだけをコード内の固定allowlist `VERIFICATION_PROVIDER_ALLOWLIST` として全ジョブで許可する。`www.google.com` / `www.gstatic.com` / `recaptcha.net` / `www.recaptcha.net` は `/recaptcha/` 配下のみ、`hcaptcha.com` はサブドメインを含めて全パス、`challenges.cloudflare.com` は全パスとする。scheme は https のみ、methodは `GET` / `POST` のみとする。reCAPTCHA v3 はtokenを `POST` するため `GET` だけでは足りない。widgetへの通信を遮断すると「reCAPTCHAに接続できません」と表示され、人手を必要としないreCAPTCHA v3やTurnstileまで `CAPTCHA_REQUIRED` になるためである。2026-09-02 の実サイトdry-run 50件では `CAPTCHA_REQUIRED` 7件のうち4件がこの表示によるものだった。
-- POST 等の非safe HTTP methodまたは期待済みGET Documentは、送信権取得後の最初の 1 回だけ許可する。
-- 固定allowlistは経路を広げない範囲に限定する。トップフレームの `Document`（ページ遷移）は対象外で、subresourceとXHR / fetch、およびトップフレーム以外の `Document` だけを通し、ジョブ単位の `allowedHosts` の仕組みは変更しない。送信requestのclaim判定は対象ドメインのフォームactionに一致する `Document` requestだけを対象とするため、allowlistのhostが送信先としてclaimされることはなく、1回限りの送信権も消費しない。残存リスクとして、検証サービスへ送られるtelemetry（ページURLやbrowser fingerprintを含み得る）は許容する。widgetの動作に必要であり、送信先が既知の検証サービスに限られるためである。allowlist経由で通したrequestの件数はrun終了時に `browser_verification_requests` として1行だけ出力し、URLや値は出さない。0件のときは出力しない。
+- POST 等の非safe HTTP methodは、送信権取得後の活性化の許可窓の間だけ、対象ドメインとジョブ固有の許可host宛に限り許可する。1 run あたり 5 本を上限とし、超えた分は遮断する。期待済みGET Documentは従来どおり1回だけ許可する。
+- 固定allowlistは経路を広げない範囲に限定する。トップフレームの `Document`（ページ遷移）は対象外で、subresourceとXHR / fetch、およびトップフレーム以外の `Document` だけを通し、ジョブ単位の `allowedHosts` の仕組みは変更しない。検証サービスのrequestは送信requestのclaim判定より前に判別して除外するため、allowlistのhostが送信先としてclaimされることはなく、送信request上限も消費しない。残存リスクとして、検証サービスへ送られるtelemetry（ページURLやbrowser fingerprintを含み得る）は許容する。widgetの動作に必要であり、送信先が既知の検証サービスに限られるためである。allowlist経由で通したrequestの件数はrun終了時に `browser_verification_requests` として1行だけ出力し、URLや値は出さない。0件のときは出力しない。
 - popup、Worker、Service Worker、WebSocket、WebRTC 等の迂回経路を遮断する。
 - Provider / BrowserUse の認証情報と D1 の実行権をモデル入力・tool 出力へ渡さない。
 - Agent に返すジョブ情報から `runToken` を除外する。
@@ -531,7 +556,7 @@ Worker 側の 3 つのガード（承認記録、dry-run 完了、日次上限�
 
 ### Agent への安全指示
 
-system prompt では、営業禁止・用途制限の確認と送信前の再観察を指示する。入力値は信頼済みhandlerが`payload.formValues`由来であることを強制する。`prohibited`は、直前かつ現在URLと一致する観察でフォーム不在、または全候補formについてform本文、前方の近接要素、祖先側の近接要素、iframe親ページ側の近接要素から固定パターンの営業禁止・用途制限を検出した場合だけ受理する。営業禁止だけはページ本文（上限20,000文字）に対する固定パターン判定も常に和集合で加える。固定パターンが該当しない場合でも、モデルが`evidence`へ引用した拒否文が観察済みページ本文に実在し語彙条件を満たせば受理する。営業禁止の注意書きはフォームから離れたページ上部に置かれることが多く、form近傍テキストだけでは届かないためである。用途制限はform固有の性質なのでform単位の判定のままとする。送信前には選択したformの禁止根拠、全入力のform owner、native validity、現在のaction / method、入力後の再観察、1回限りの送信権を機械的に検証する。さらに送信直前には、観察・信頼済み入力値・`before_submit`スクリーンショットを入力とする独立レビューを通し、`INPUT_MISMATCH` / `SALES_PROHIBITED` / `FORM_PURPOSE_INCOMPATIBLE` / `WRONG_FORM` / `UNCLEAR`のいずれかでdenyされた場合は送信権を取得しない。修正を許可するのは`INPUT_MISMATCH`だけで、実際の入力変更と再観察に加えて、観察指紋が変化していることを次の`submit`の前提にする。他のreason codeは1回目でも、`INPUT_MISMATCH`は2回目のdenyで`PRE_SUBMIT_REVIEW_DENIED`として`uncertain`で終了する。allow後・送信権取得前には現在URLと観察済み全フィールドの値・チェック状態を読み直し、さらにレビュー前後でhidden / disabledを含むform全体のsnapshotを比較し、レビュー中にページが変化していれば送信しない。レビューを完了できない場合はallowにせず、再試行可能な`SUBMIT_REVIEW_UNAVAILABLE`として扱う。禁止判定時と送信前後には画面のスクリーンショット証跡をR2へ保存する。`observe`の結果は外部サイト由来の非信頼データとして明示し、モデルとレビューの双方へページ内の指示に従わないよう指示する。固定パターンで表現されない禁止事項は独立レビューで補完するが、完全ではない。Shadow DOM内の本文とページ上のprompt injectionに対する完全な判定は引き続き未対応である。
+system prompt では、営業禁止・用途制限の確認と送信前の再観察を指示する。入力値は信頼済みhandlerが`payload.formValues`由来であることを強制する。`prohibited`は、直前かつ現在URLと一致する観察でフォーム不在、または全候補formについてform本文、前方の近接要素、祖先側の近接要素、iframe親ページ側の近接要素から固定パターンの営業禁止・用途制限を検出した場合だけ受理する。営業禁止だけはページ本文（上限20,000文字）に対する固定パターン判定も常に和集合で加える。固定パターンが該当しない場合でも、モデルが`evidence`へ引用した拒否文が観察済みページ本文に実在し語彙条件を満たせば受理する。営業禁止の注意書きはフォームから離れたページ上部に置かれることが多く、form近傍テキストだけでは届かないためである。用途制限はform固有の性質なのでform単位の判定のままとする。送信前には選択したformの禁止根拠、全入力のform owner、native validity、入力後の再観察、D1の条件付き送信権を機械的に検証する。さらに送信直前には、観察・信頼済み入力値・`before_submit`スクリーンショットを入力とする独立レビューを通し、`INPUT_MISMATCH` / `SALES_PROHIBITED` / `FORM_PURPOSE_INCOMPATIBLE` / `WRONG_FORM` / `UNCLEAR`のいずれかでdenyされた場合は送信権を取得しない。修正を許可するのは`INPUT_MISMATCH`だけで、実際の入力変更と再観察に加えて、観察指紋が変化していることを次の`submit`の前提にする。他のreason codeは1回目でも、`INPUT_MISMATCH`は2回目のdenyで`PRE_SUBMIT_REVIEW_DENIED`として`uncertain`で終了する。allow後・送信権取得前には現在URLと観察済み全フィールドの値・チェック状態を読み直し、さらにレビュー前後でhidden / disabledを含むform全体のsnapshotを比較し、レビュー中にページが変化していれば送信しない。レビューを完了できない場合はallowにせず、再試行可能な`SUBMIT_REVIEW_UNAVAILABLE`として扱う。禁止判定時と送信前後には画面のスクリーンショット証跡をR2へ保存する。`observe`の結果は外部サイト由来の非信頼データとして明示し、モデルとレビューの双方へページ内の指示に従わないよう指示する。固定パターンで表現されない禁止事項は独立レビューで補完するが、完全ではない。Shadow DOM内の本文とページ上のprompt injectionに対する完全な判定は引き続き未対応である。
 
 ## 現在の制約
 
@@ -547,7 +572,7 @@ system prompt では、営業禁止・用途制限の確認と送信前の再観
 - 確認を挟むmulti-stepは管理下テストで検証済みである。ファイル添付とCAPTCHAは未対応である。
 - 送信完了は、許可したrequestを観測し、日本語の送信完了表現または`thank you`が5秒以内に新たに出現した場合に確定する。期待済みGET Documentは、送信対象frameの遷移と同じframe内の完了文言を必須にする。他frameの完了文言は判定に利用しない。
 - submit controlの期待済みGETは送信権で制御する。非submitの`click`、`fill`、`select`がDOMイベントを発火する直前から、その後および`submit`中のbrowser requestを遮断し、観察済みnavigateのtop-frame Document、期待済みsubmit request、またはそのrequest IDに直接連なるsafe redirectだけを許可する。`navigate`は直前の`observe.navigationLinks`で得たfragmentを含む完全一致URLまたは現在URLだけを許可する。観察済みリンク自体がGET型副作用を持つサイトは機械的に識別できないため、対象サイト側がGETをsafe methodとして扱うことは引き続き前提になる。
-- 営業禁止判定はフォーム不在と、候補form本文、前方・祖先側の近接要素、iframe親ページ側の近接要素に対する固定の日本語・英語パターンを使う。肯定表現と「禁止していない」は除外し、複数formがある場合のページ全体禁止は全formに何らかの禁止根拠がある場合だけ受理する。送信前確認は選択formの禁止根拠、form owner、native validity、action / method、入力後の再観察、1回限りの送信権を信頼済みhandlerで検証する。固定パターンに加えて送信直前の独立レビューが禁止表現と入力内容を再確認するが、レビューはモデル判断であり完全ではない。
+- 営業禁止判定はフォーム不在と、候補form本文、前方・祖先側の近接要素、iframe親ページ側の近接要素に対する固定の日本語・英語パターンを使う。肯定表現と「禁止していない」は除外し、複数formがある場合のページ全体禁止は全formに何らかの禁止根拠がある場合だけ受理する。送信前確認は選択formの禁止根拠、form owner、native validity、入力後の再観察、D1の条件付き送信権を信頼済みhandlerで検証する。送信requestは対象ドメインと許可host宛に限り、1 runあたり5本まで通す。固定パターンに加えて送信直前の独立レビューが禁止表現と入力内容を再確認するが、レビューはモデル判断であり完全ではない。
 - 固定パターンで表現されない禁止文言は引用検証で受理する。モデルは `finish_prohibited` の `evidence` にページの拒否文を一字一句そのまま引用し、信頼済み handler は NFKC 正規化と空白の畳み込みだけを行ったうえで、その引用が観察済みページ本文の部分文字列として実在することを確認する。加えて reason code ごとの緩い語彙条件（`SALES_PROHIBITED` は営業系の主語語と拒否語の両方、`FORM_PURPOSE_INCOMPATIBLE` は用途語と限定語・拒否語の両方）を課し、「営業部の紹介」のような無関係な文の引用を弾く。`NO_FORM_PRESENT` は構造の主張であってページ上の文ではないため引用を受け付けない。拒否語は否定形だけを数える。「受け付け」「対応」「承って」などの語幹は肯定文（「営業のご提案も受け付けております」）にも現れ、承諾を禁止として読んでしまうためである。既存の肯定表現パターン（「営業も受け付けています」など）に一致する引用も不受理とする。この許諾ガードのため、許諾節と拒否節が混在する一文を丸ごと引用すると不受理になる。拒否節だけを引用すれば受理されるので、system prompt では拒否を述べている文または節だけを引用するよう指示している。引用が本文に無ければ `PROHIBITION_EVIDENCE_NOT_FOUND`、実在しても語彙条件を満たさなければ `PROHIBITION_EVIDENCE_WEAK` として不受理とし、本文が切り詰められていた場合に備えて既存の 1 回限りの再観察の後に再判定する。これは「モデルは値を作れない」という原則を禁止の証跡へ広げたものであり、モデルが決めるのは「ページのどの文を根拠として示すか」だけで、その文がページに実在するかどうかは handler が判定する。`evidence` パラメータの値はページ由来の非信頼データなので、結果、D1、イベント、ログのいずれにも保存しない。引用検証について記録するのは `PROHIBITION_EVIDENCE_VERIFIED` / `PROHIBITION_EVIDENCE_NOT_FOUND` / `PROHIBITION_EVIDENCE_WEAK` の固定 code だけである。ただしこの保証は `evidence` に限る。`finish_prohibited` の `reason`（最大 1,000 文字）はモデルの自由記述であり、D1 の `results.reason` に保存され、そこにモデルがページ文言を言い換えて書きうる。`reason` は運用者が禁止判定を確認するために必要なので残す。tool の説明では自分の言葉で説明しページ本文を貼らないよう指示している。引用検証があるため固定パターンは誤検出を避ける方向に調整する。パターンの検出漏れは引用で回復できるが、誤検出は正当な問い合わせを黙って落とすためである。引用も語彙条件も満たせない禁止表現は `prohibited` として確定できず、モデルは `finish_uncertain` の `PROHIBITION_UNVERIFIED` で終了する。
 - 用途不一致（`FORM_PURPOSE_INCOMPATIBLE`）の検出語彙は、採用・求人・エントリー・応募・予約・資料請求・見積・会員・マイページ・サポート・修理受付・報道・取材・サンプルなどを含む。誤検出を避けるため、用途語単独では検出せず、「専用」「のみ」「限定」「に限ります」などの限定表現が用途語へ直接またはごく一般的な接続語（「に関する」「お問い合わせ」「フォーム」など）を挟んで続く場合に限る。用途語と限定表現の間に任意文字を許す旧パターンは廃止した。「採用以外のお問い合わせはこちら。必須項目のみご入力ください。」のように、別の文の限定表現を拾って一般の問い合わせフォームを禁止扱いにしていたためである。逆順（「専用の採用窓口」）は、間に別の語が挟まりにくい「専用」「限定」だけを対象にする。「以外は」「以外の」は限定表現として単独では扱わず、直後 20 文字以内に拒否語（「受け付けておりません」「お断り」「ご遠慮」「承っておりません」「できません」など）が続く場合だけ検出する。「採用以外のお問い合わせはこちら」は一般の問い合わせフォームへの導線であり、「採用以外のお問い合わせは受け付けておりません」だけが用途制限だからである。加えて`h1`〜`h3`、`legend`、`title`の見出し本文が用途語と一般語だけで構成される場合も検出する。見出しは32文字までを対象とし、社名など余分な語を含む見出しは検出しない。「ご予約はお電話のみで承ります」のように限定表現が別の語に掛かる文は検出しない。用途不一致は信頼境界の対象であり、handlerが証跡を検出した場合、または引用検証を通った場合だけ`prohibited`となる。どちらも成立しない場合、モデルは`finish_uncertain`の`FORM_PURPOSE_MISMATCH`で終了する。
 - dry-runではジョブURLへのbootstrap後の再navigateと、最初のclick / fill / select以降に発生するbrowser requestをすべて遮断し、座標click前にCDPのhit targetが検証済み要素またはそのcomposed descendantであることを確認する。

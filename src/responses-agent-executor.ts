@@ -60,6 +60,7 @@ import {
 	SubmitReviewDeniedError,
 	type SubmitReviewer,
 	SubmitReviewUnavailableError,
+	SubmitStageUnverifiedError,
 } from "./restricted-browser";
 import { SEND_APPROVAL_KEY } from "./send-approval";
 import type { EvidenceObjectStore } from "./submission-evidence";
@@ -503,6 +504,29 @@ async function executeToolCall(
 		return toolError("INVALID_TOOL_INPUT");
 	}
 
+	if (isFinishToolName(call.name) && coordinator.hasUnconfirmedSubmission()) {
+		// A submission was activated and the page never confirmed it. Whatever
+		// the model concludes, the run cannot end as anything but uncertain:
+		// something may well have been sent.
+		await recordToolDiagnostic(
+			db,
+			job,
+			runToken,
+			turn,
+			"finish",
+			"finish_validation",
+			"SUBMIT_CONFIRMATION_NOT_OBSERVED",
+		);
+		return {
+			output: JSON.stringify({ outcome: "uncertain" }),
+			result: {
+				outcome: "uncertain",
+				reasonCode: "SUBMIT_CONFIRMATION_NOT_OBSERVED",
+				reason:
+					"The submission was activated and the page did not confirm that it completed.",
+			},
+		};
+	}
 	if (isFinishToolName(call.name)) {
 		params = normalizeFinishParams(call.name, params);
 		const parsed = parseFinishResult(
@@ -681,6 +705,26 @@ async function executeToolCall(
 				successfulTool: tool,
 			};
 		}
+		if (tool === "submit" && "result" in value) {
+			// One stage was activated and the page has shown no completion. The
+			// job stays `submitting`; the model may observe what the page shows
+			// now and activate the next control of the same submission.
+			await recordToolDiagnostic(
+				db,
+				job,
+				runToken,
+				turn,
+				tool,
+				"submit",
+				"SUBMIT_STAGE_PENDING",
+			);
+			return {
+				output: JSON.stringify({
+					status: "submit_stage_pending",
+					...(value.result as JsonObject),
+				}),
+			};
+		}
 		if (tool === "submit" && "job" in value) {
 			const result = terminalResultFromJob(value.job);
 			if (result) {
@@ -782,6 +826,9 @@ async function executeToolCall(
 		}
 		if (originalError instanceof ObservationStaleError) {
 			return toolError("OBSERVATION_STALE");
+		}
+		if (originalError instanceof SubmitStageUnverifiedError) {
+			return toolError("SUBMIT_STAGE_UNVERIFIED");
 		}
 		if (originalError instanceof SubmitProhibitedError) {
 			return toolError("SUBMIT_PROHIBITED", {
@@ -968,6 +1015,9 @@ export function classifyToolDiagnostic(
 	}
 	if (error instanceof BrowserToolInputError || error instanceof SyntaxError) {
 		return "TOOL_INPUT_INVALID";
+	}
+	if (error instanceof SubmitStageUnverifiedError) {
+		return "SUBMIT_STAGE_UNVERIFIED";
 	}
 	if (error instanceof SubmitProhibitedError) return "SUBMIT_PROHIBITED";
 	if (error instanceof BrowserElementOperationError) {
@@ -1246,6 +1296,8 @@ export const TOOL_ERROR_GUIDANCE = {
 		"The submission result could not be persisted. Do not submit again and call finish_uncertain with SUBMIT_OUTCOME_UNKNOWN.",
 	SUBMIT_REVIEW_DENIED:
 		"The independent pre-submit review denied this submission. Re-observe, correct the inputs using payloadKeys only, and submit once more. A second denial ends the job as uncertain.",
+	SUBMIT_STAGE_UNVERIFIED:
+		"A further submit is only accepted while the page still shows the values that were reviewed, which is what a confirmation screen does. Observe again. If the page repeats the entered address and message, submit its send control; otherwise call finish_uncertain with SUBMIT_OUTCOME_UNKNOWN.",
 } as const;
 
 type ToolErrorCode = keyof typeof TOOL_ERROR_GUIDANCE;
@@ -1302,6 +1354,7 @@ function systemPrompt(dryRun: boolean): string {
 		"Some payload keys carry an ordered list of candidate labels for a choice control. For a select, radio, or checkbox, pick the payloadKey whose candidates match the control's options or label as shown in observe; the trusted handler selects the first matching candidate and rejects the call when none matches.",
 		"Before submit, re-observe and confirm every required field on the target form holds the intended payload key.",
 		"Only one submission is sent per job. A submit call that the pre-submit review denies sends nothing and, when the guidance says the inputs are correctable, may be retried once after correcting them.",
+		"Many inquiry forms answer the first submit with a confirmation screen that lists the entered content and carries a send button. When submit returns submit_stage_pending, observe the page: if it shows a confirmation screen, call submit again on that send button to complete the same submission. Never fill anything again, and stop after three submit calls.",
 		"If submit returns SUBMIT_PROHIBITED, follow its guidance: finish_prohibited when pageProhibited is true, otherwise use another inquiry form or finish_uncertain. Never call finish_failed for a prohibition.",
 		"If meaning or submission outcome is unclear, call finish_uncertain. For technical failures, call finish_failed.",
 	];
@@ -1390,7 +1443,7 @@ const AGENT_TOOLS = [
 	),
 	functionTool(
 		"submit",
-		"Submit the form that owns elementId. Accepted only after at least one successful fill or select, only against an observe taken after the last input, and only when the handler found no prohibition on that form and native validation passes. An independent review runs before anything is sent: a denial returns SUBMIT_REVIEW_DENIED with guidance and sends nothing, and only an INPUT_MISMATCH denial may be corrected and submitted again, once. At most one submission is sent per job; it reports sent or uncertain, and a rejected call returns an error code and nothing is sent.",
+		"Submit the form that owns elementId. Accepted only after at least one successful fill or select, only against an observe taken after the last input, and only when the handler found no prohibition on that form and native validation passes. An independent review runs before anything is sent: a denial returns SUBMIT_REVIEW_DENIED with guidance and sends nothing, and only an INPUT_MISMATCH denial may be corrected and submitted again, once. At most one submission is sent per job; it reports sent, uncertain, or submit_stage_pending, and a rejected call returns an error code and nothing is sent. submit_stage_pending means the request left the page but no completion was shown: observe, and when the page is a confirmation screen repeating the entered content, call submit on its send button to finish the same submission. Three submit calls per job at most.",
 		{
 			elementId: {
 				...ELEMENT_ID_PROPERTY,

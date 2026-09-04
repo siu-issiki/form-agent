@@ -249,7 +249,7 @@ D1 migrationはWorker deployでは自動適用されない。新しい列を参�
 
 ### Workerが`submitting`中に停止した場合
 
-送信権を取得した直後にWorkerが停止すると、ジョブは`submitting`のまま残る。Queueがそのメッセージを再配信しても、consumerは`pending`以外を実行権として取得せず、状態が`running`でないため実行せずにackする。したがって自動での再送は起きない。
+送信権を取得した直後にWorkerが停止すると、ジョブは`submitting`のまま残る。2 段階フォームで 1 回目の活性化と 2 回目の間に停止した場合も同じ状態になる。Queueがそのメッセージを再配信しても、consumerは`pending`以外を実行権として取得せず、状態が`running`でないため実行せずにackする。したがって自動での再送は起きない。
 
 この再配信を検出するため、ackしたときに`job.redelivery_ignored`イベントを記録する。`data_json`はジョブの`status`だけを保存する。
 
@@ -273,11 +273,19 @@ D1 migrationはWorker deployでは自動適用されない。新しい列を参�
 
 次の外部証跡を照合する。
 
-1. 証跡スクリーンショット（`after_submit`）
+1. 証跡スクリーンショット（`after_submit`）。2 段階送信では段階ごとに1件ずつ残る
 2. 送信先の受信ログ、管理画面または受信メール
 3. 対象URLと送信時刻
 4. `browser_submit_activation`の`requestObserved`と`hitTestAttempts`
-5. D1の`attempt_count`と結果
+5. D1の`submit.stage`イベント（`stage`と`requestObserved`）。2 回目以降の活性化が行われたかを示す
+6. D1の`attempt_count`と結果
+
+```bash
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT job_id,attempt,data_json,created_at FROM events WHERE type='submit.stage' ORDER BY created_at DESC LIMIT 20;"
+```
+
+`SUBMIT_CONFIRMATION_NOT_OBSERVED`で終わったジョブは、送信requestは出たが完了画面を確認できていない。`submit.stage`が無ければ1回目の活性化だけで終わっており、確認画面の「送信する」を押していない可能性がある。`SUBMIT_REQUEST_LIMIT_REACHED`は1 runあたりの送信request上限（5本）に達して遮断したもので、ページが送信以外の非safe requestを多数出している疑いがある。いずれも送信済みの可能性を否定できないため、外部証跡での照合を行う。
 
 送信済みの可能性を否定できない場合は再投入しない。未送信と判断して再実行する場合も、既存IDは変更せず、承認記録と新しいジョブIDを使用する。
 

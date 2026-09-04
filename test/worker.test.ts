@@ -1727,6 +1727,12 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	pageText: string | undefined;
 	pageTextTruncated = false;
 	validateSubmitError: Error | null = null;
+	/** Replayed per submit call when set; the last entry repeats. */
+	submitResults: BrowserSubmitResult[] | null = null;
+	/** What each submit call was told about the fields this run filled. */
+	submitRequireEnteredInput: boolean[] = [];
+	/** Runs after each submit, so a test can move the page on. */
+	onSubmit: ((count: number) => void) | null = null;
 
 	async close(): Promise<void> {
 		this.closed = true;
@@ -1829,11 +1835,65 @@ class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	async submit(
 		_elementId: string,
 		activationStrategy: SubmitActivationStrategy,
+		requireEnteredInput = true,
 	): Promise<BrowserSubmitResult> {
 		this.submitCount += 1;
 		this.submitActivationStrategies.push(activationStrategy);
-		return { outcome: "sent", formUrl: this.url };
+		this.submitRequireEnteredInput.push(requireEnteredInput);
+		const sequence = this.submitResults;
+		const result = sequence
+			? (sequence[Math.min(this.submitCount - 1, sequence.length - 1)] ?? {
+					outcome: "sent" as const,
+					formUrl: this.url,
+				})
+			: { outcome: "sent" as const, formUrl: this.url };
+		this.onSubmit?.(this.submitCount);
+		return result;
 	}
+}
+
+/** A job whose payload carries the address and the message a confirmation screen repeats. */
+const twoStepInput: JobInput = {
+	...input,
+	id: "job-two-step",
+	payload: {
+		formValues: {
+			email: "sales@example-agency.test",
+			message:
+				"We would like to ask about your services and pricing for a small team.",
+		},
+	},
+};
+
+function twoStepExecutor(
+	responses: unknown[],
+	driver: WorkerFakeBrowserDriver,
+): ResponsesAgentExecutor {
+	return new ResponsesAgentExecutor({
+		db: env.DB,
+		evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+		model: "gpt-5.6-luna",
+		openAiApiKey: "openai-secret",
+		browserUseApiKey: "browser-secret",
+		dryRun: false,
+		fetcher: (async () => {
+			const response = responses.shift();
+			if (!response) throw new Error("Unexpected provider request");
+			return Response.json(response);
+		}) as typeof fetch,
+		createBrowserDriver: async () => driver,
+	});
+}
+
+async function readSubmitStageEvents(
+	jobId: string,
+): Promise<Array<Record<string, unknown>>> {
+	const { results } = await env.DB.prepare(
+		"SELECT data_json FROM events WHERE job_id = ? AND type = 'submit.stage' ORDER BY rowid",
+	)
+		.bind(jobId)
+		.all<{ data_json: string }>();
+	return results.map((row) => JSON.parse(row.data_json));
 }
 
 function workerObservedForms(prohibitionText?: string): unknown[] {
@@ -2016,6 +2076,193 @@ describe("ResponsesAgentExecutor", () => {
 		]);
 		expect(JSON.stringify(diagnostics)).not.toContain(input.targetUrl);
 		expect(JSON.stringify(diagnostics)).not.toContain("Hello");
+	});
+
+	test("completes a two-step submission after the confirmation screen", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(twoStepInput, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			twoStepInput.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-fill-email", "fill", {
+				elementId: "fa-0-0",
+				payloadKey: "email",
+			}),
+			functionResponse("call-fill-message", "fill", {
+				elementId: "fa-0-2",
+				payloadKey: "message",
+			}),
+			functionResponse("call-confirm", "observe", {}),
+			functionResponse("call-submit", "submit", {
+				elementId: "fa-0-1",
+				activationStrategy: "mouse",
+			}),
+			reviewResponse("allow"),
+			functionResponse("call-observe-confirmation", "observe", {}),
+			functionResponse("call-submit-final", "submit", {
+				elementId: "fa-0-1",
+				activationStrategy: "mouse",
+			}),
+		];
+		const driver = new WorkerFakeBrowserDriver();
+		driver.submitResults = [
+			{
+				outcome: "uncertain",
+				reasonCode: "SUBMIT_CONFIRMATION_NOT_OBSERVED",
+				reason: "The page did not provide a reliable submission confirmation.",
+			},
+			{ outcome: "sent", formUrl: twoStepInput.targetUrl },
+		];
+		const executor = twoStepExecutor(responses, driver);
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toEqual({
+			outcome: "sent",
+			formUrl: twoStepInput.targetUrl,
+		});
+		expect(driver.submitCount).toBe(2);
+		// Only the first stage ties the control to a field this run filled.
+		expect(driver.submitRequireEnteredInput).toEqual([true, false]);
+		expect((await store.find(twoStepInput.id))?.status).toBe("sent");
+		expect(await readSubmitStageEvents(twoStepInput.id)).toEqual([
+			{ stage: 2, requestObserved: true },
+		]);
+	});
+
+	test("ends a run that stops after an unconfirmed submission as uncertain", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(twoStepInput, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			twoStepInput.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-fill-email", "fill", {
+				elementId: "fa-0-0",
+				payloadKey: "email",
+			}),
+			functionResponse("call-fill-message", "fill", {
+				elementId: "fa-0-2",
+				payloadKey: "message",
+			}),
+			functionResponse("call-confirm", "observe", {}),
+			functionResponse("call-submit", "submit", {
+				elementId: "fa-0-1",
+				activationStrategy: "mouse",
+			}),
+			reviewResponse("allow"),
+			functionResponse("call-finish", "finish_failed", {
+				reasonCode: "SUBMIT_ELEMENT_NOT_OBSERVED",
+				reason: "The confirmation screen was not understood.",
+				retryable: false,
+			}),
+		];
+		const driver = new WorkerFakeBrowserDriver();
+		driver.submitResults = [
+			{
+				outcome: "uncertain",
+				reasonCode: "SUBMIT_CONFIRMATION_NOT_OBSERVED",
+				reason: "The page did not provide a reliable submission confirmation.",
+			},
+		];
+		const executor = twoStepExecutor(responses, driver);
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(result).toEqual({
+			outcome: "uncertain",
+			reasonCode: "SUBMIT_CONFIRMATION_NOT_OBSERVED",
+			reason:
+				"The submission was activated and the page did not confirm that it completed.",
+		});
+		expect(driver.submitCount).toBe(1);
+		expect((await store.find(twoStepInput.id))?.status).toBe("submitting");
+	});
+
+	test("refuses a further stage on a page that lost the entered values", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(twoStepInput, "2026-08-28T00:00:00.000Z");
+		const job = await store.claimRun(
+			twoStepInput.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-fill-email", "fill", {
+				elementId: "fa-0-0",
+				payloadKey: "email",
+			}),
+			functionResponse("call-fill-message", "fill", {
+				elementId: "fa-0-2",
+				payloadKey: "message",
+			}),
+			functionResponse("call-confirm", "observe", {}),
+			functionResponse("call-submit", "submit", {
+				elementId: "fa-0-1",
+				activationStrategy: "mouse",
+			}),
+			reviewResponse("allow"),
+			functionResponse("call-observe-elsewhere", "observe", {}),
+			functionResponse("call-submit-final", "submit", {
+				elementId: "fa-0-1",
+				activationStrategy: "mouse",
+			}),
+			functionResponse("call-finish", "finish_uncertain", {
+				reasonCode: "SUBMIT_OUTCOME_UNKNOWN",
+				reason: "The page after the submission could not be read.",
+			}),
+		];
+		const driver = new WorkerFakeBrowserDriver();
+		driver.submitResults = [
+			{
+				outcome: "uncertain",
+				reasonCode: "SUBMIT_CONFIRMATION_NOT_OBSERVED",
+				reason: "The page did not provide a reliable submission confirmation.",
+			},
+		];
+		// The page moved on and no longer carries what the review approved.
+		driver.onSubmit = (count) => {
+			if (count !== 1) return;
+			driver.fieldStates = [];
+			driver.observationForms = workerObservedForms();
+		};
+		const executor = twoStepExecutor(responses, driver);
+
+		const result = await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(driver.submitCount).toBe(1);
+		expect(result).toEqual({
+			outcome: "uncertain",
+			reasonCode: "SUBMIT_CONFIRMATION_NOT_OBSERVED",
+			reason:
+				"The submission was activated and the page did not confirm that it completed.",
+		});
+		expect(await readAgentToolDiagnostics(twoStepInput.id)).toContainEqual({
+			turn: 7,
+			toolName: "submit",
+			stage: "submit",
+			resultCode: "SUBMIT_STAGE_UNVERIFIED",
+		});
 	});
 
 	test("rejects a guessed dry-run submit element before observation", async () => {
@@ -5926,6 +6173,49 @@ describe("Queue orchestration", () => {
 				data_json: JSON.stringify({ status: "submitting" }),
 			},
 		]);
+	});
+
+	test("acknowledges a redelivery of a job left between submit stages", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(input, "2026-08-28T00:00:00.000Z");
+		await store.claimRun(input.id, "message-1", "2026-08-28T00:00:01.000Z");
+		await store.claimSubmission(
+			input.id,
+			"message-1",
+			"2026-08-28T00:00:02.000Z",
+		);
+		// A run that stopped after a further stage leaves exactly this state.
+		await store.recordSubmitStage(
+			input.id,
+			"message-1",
+			2,
+			true,
+			"2026-08-28T00:00:03.000Z",
+		);
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
+			{
+				id: "message-1",
+				timestamp: new Date("2026-08-28T00:00:04.000Z"),
+				body: { jobId: input.id },
+				attempts: 2,
+			},
+		]);
+		const ctx = createExecutionContext();
+		let executions = 0;
+		const executor: AgentExecutor = {
+			async execute() {
+				executions += 1;
+				return { outcome: "sent", formUrl: input.targetUrl };
+			},
+		};
+
+		await consumeJobBatch(batch, env, executor);
+		const result = await getQueueResult(batch, ctx);
+
+		expect(executions).toBe(0);
+		expect(result.explicitAcks).toEqual(["message-1"]);
+		expect(result.retryMessages).toEqual([]);
+		expect((await store.find(input.id))?.status).toBe("submitting");
 	});
 
 	test("marks a safe job state as dead-lettered", async () => {
