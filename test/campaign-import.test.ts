@@ -4,12 +4,14 @@ import {
 	type CampaignCsvRow,
 	DEFAULT_CHOICE_CANDIDATES,
 	filterCampaignRows,
+	jobContentFingerprint,
 	jobInputFingerprint,
 	mapRegistrationValues,
 	mergeChoiceCandidates,
 	normalizeCompanyDomain,
 	type RegistrationEntry,
 	readChoiceCandidates,
+	readSendApprovalFile,
 	registerCampaignJobs,
 	resolveRedirectHosts,
 	selectCampaignCandidates,
@@ -484,6 +486,306 @@ describe("campaign import", () => {
 		).rejects.toThrow("dry-run guard");
 	});
 
+	test("builds a real-send job that carries its approval record", async () => {
+		const candidate = filterCampaignRows([row()]).eligible[0];
+		if (!candidate) throw new Error("Expected an eligible candidate");
+		const job = await buildCampaignJob(
+			candidate,
+			mapRegistrationValues(registration),
+			"agb-shaken-send-v1",
+			{
+				finalUrl: "https://acme.co.jp/contact",
+				allowedHosts: ["acme.co.jp"],
+			},
+			{},
+			{ dryRun: false, approval },
+		);
+
+		expect(job.payload._formAgentDryRun).toBe(false);
+		expect(job.payload._formAgentMaxAttempts).toBe(1);
+		expect(job.payload._formAgentSendApproval).toEqual(approval);
+		expect(job.payload.instruction).toContain("submit it once");
+	});
+
+	test("keeps the default job a dry-run without an approval", async () => {
+		const candidate = filterCampaignRows([row()]).eligible[0];
+		if (!candidate) throw new Error("Expected an eligible candidate");
+		const job = await buildCampaignJob(
+			candidate,
+			mapRegistrationValues(registration),
+			"agb-shaken-dryrun-v1",
+			{
+				finalUrl: "https://acme.co.jp/contact",
+				allowedHosts: ["acme.co.jp"],
+			},
+		);
+
+		expect(job.payload._formAgentDryRun).toBe(true);
+		expect(job.payload).not.toHaveProperty("_formAgentSendApproval");
+		expect(job.payload.instruction).toContain("must stop before submission");
+	});
+
+	test("refuses to build a send without an approval or a dry-run with one", async () => {
+		const candidate = filterCampaignRows([row()]).eligible[0];
+		if (!candidate) throw new Error("Expected an eligible candidate");
+		const resolution = {
+			finalUrl: "https://acme.co.jp/contact",
+			allowedHosts: ["acme.co.jp"],
+		};
+		const build = (mode: Record<string, unknown>) =>
+			buildCampaignJob(
+				candidate,
+				mapRegistrationValues(registration),
+				"agb-shaken-send-v1",
+				resolution,
+				{},
+				mode,
+			);
+
+		await expect(build({ dryRun: false })).rejects.toThrow(
+			"requires a valid send approval",
+		);
+		await expect(
+			build({ dryRun: false, approval: { ...approval, approvedAt: "today" } }),
+		).rejects.toThrow("requires a valid send approval");
+		await expect(build({ dryRun: true, approval })).rejects.toThrow(
+			"must not carry a send approval",
+		);
+	});
+
+	test("registers a real-send job only with its approval record", async () => {
+		const approved = sendJob("job-send-1");
+		const unapproved = { ...approved, payload: { ...approved.payload } };
+		delete unapproved.payload._formAgentSendApproval;
+		const stillDryRun = {
+			...approved,
+			payload: { ...approved.payload, _formAgentDryRun: true },
+		};
+		const registerOptions = {
+			baseUrl: "https://api.test",
+			apiToken: "token",
+			log: () => undefined,
+			realSend: true,
+			fetcher: async () => new Response(null, { status: 201 }),
+		};
+
+		const result = await registerCampaignJobs([approved], registerOptions);
+
+		expect(result.registered.map((job) => job.id)).toEqual(["job-send-1"]);
+		await expect(
+			registerCampaignJobs([unapproved], registerOptions),
+		).rejects.toThrow("approval record");
+		await expect(
+			registerCampaignJobs([stillDryRun], registerOptions),
+		).rejects.toThrow("dry-run flag to false");
+	});
+
+	test("refuses to register a real-send job as a dry-run registration", async () => {
+		await expect(
+			registerCampaignJobs([sendJob("job-send-1")], {
+				baseUrl: "https://api.test",
+				apiToken: "token",
+				log: () => undefined,
+				fetcher: async () => new Response(null, { status: 201 }),
+			}),
+		).rejects.toThrow("dry-run guard");
+	});
+
+	test("binds the content fingerprint to the URL, company, and form values", async () => {
+		const base = sendJob("job-send-1");
+		const digest = (job: JobInput) =>
+			jobContentFingerprint(job.targetUrl, job.companyId, job.payload);
+
+		const same = await digest({
+			...base,
+			id: "job-send-2",
+			payload: { ...base.payload, campaign: "another-name" },
+		});
+		const otherMessage = await digest({
+			...base,
+			payload: {
+				...base.payload,
+				formValues: { ...(base.payload.formValues as object), message: "Hi" },
+			},
+		});
+		const otherCompany = await digest({ ...base, companyId: "company-2" });
+		const otherUrl = await digest({
+			...base,
+			targetUrl: "https://acme.co.jp/contact2",
+		});
+
+		// The campaign name and the job id are not part of the approved content.
+		expect(same).toBe(await digest(base));
+		expect(otherMessage).not.toBe(same);
+		expect(otherCompany).not.toBe(same);
+		expect(otherUrl).not.toBe(same);
+	});
+
+	test("refuses a stored dry-run job as a real-send registration", async () => {
+		const job = sendJob("job-send-1");
+		const logs: Array<Record<string, unknown>> = [];
+
+		const result = await registerCampaignJobs([job], {
+			baseUrl: "https://api.test",
+			apiToken: "token",
+			realSend: true,
+			log: (entry) => logs.push(entry),
+			fetcher: async (_resource, init) => {
+				if (init?.method === "POST") throw new TypeError("network error");
+				// The same campaign name already registered this id as a dry-run.
+				return storedJobResponse(dryRunJob("job-send-1"));
+			},
+		});
+
+		expect(result).toMatchObject({
+			registered: [],
+			notRegistered: 0,
+			unknown: 1,
+		});
+		expect(logs.map((entry) => entry.outcome)).toContain("mismatched");
+	});
+
+	test("keeps a real-send registration the API holds with the same approval", async () => {
+		const job = sendJob("job-send-1");
+
+		const result = await registerCampaignJobs([job], {
+			baseUrl: "https://api.test",
+			apiToken: "token",
+			realSend: true,
+			log: () => undefined,
+			fetcher: async (_resource, init) => {
+				if (init?.method === "POST") throw new TypeError("network error");
+				return storedSendJobResponse(job);
+			},
+		});
+
+		expect(result.registered.map((registered) => registered.id)).toEqual([
+			"job-send-1",
+		]);
+	});
+
+	test("refuses a stored real send approved by someone else", async () => {
+		const job = sendJob("job-send-1");
+		const stored = {
+			...job,
+			payload: {
+				...job.payload,
+				_formAgentSendApproval: { ...approval, approvedBy: "someone-else" },
+			},
+		};
+
+		const result = await registerCampaignJobs([job], {
+			baseUrl: "https://api.test",
+			apiToken: "token",
+			realSend: true,
+			log: () => undefined,
+			fetcher: async (_resource, init) => {
+				if (init?.method === "POST") throw new TypeError("network error");
+				return storedSendJobResponse(stored);
+			},
+		});
+
+		expect(result).toMatchObject({ registered: [], unknown: 1 });
+	});
+
+	test("reads an approval file that names the dry-run of every row", () => {
+		const file = readSendApprovalFile(
+			{
+				approvedBy: "operator",
+				approvedAt: "2026-09-04T00:00:00.000Z",
+				entries: [
+					{ sourceRow: 2, dryRunJobId: "dry-1", note: "確認済み" },
+					{ sourceRow: 3, dryRunJobId: "dry-2" },
+				],
+			},
+			5,
+		);
+
+		expect(file.approvedBy).toBe("operator");
+		expect(file.entries).toEqual([
+			{ sourceRow: 2, dryRunJobId: "dry-1", note: "確認済み" },
+			{ sourceRow: 3, dryRunJobId: "dry-2" },
+		]);
+	});
+
+	test("refuses an approval file above the send limit", () => {
+		const entries = [
+			{ sourceRow: 2, dryRunJobId: "dry-1" },
+			{ sourceRow: 3, dryRunJobId: "dry-2" },
+		];
+
+		expect(() =>
+			readSendApprovalFile(
+				{
+					approvedBy: "operator",
+					approvedAt: "2026-09-04T00:00:00.000Z",
+					entries,
+				},
+				1,
+			),
+		).toThrow("above the limit of 1");
+	});
+
+	test.each([
+		[{ entries: [{ sourceRow: 2, dryRunJobId: "dry-1" }] }, "approvedBy"],
+		[
+			{
+				approvedBy: "operator",
+				approvedAt: "2026-09-04",
+				entries: [{ sourceRow: 2, dryRunJobId: "dry-1" }],
+			},
+			"ISO 8601",
+		],
+		[
+			{
+				approvedBy: "operator",
+				approvedAt: "2026-09-04T00:00:00.000Z",
+				entries: [],
+			},
+			"at least one entry",
+		],
+		[
+			{
+				approvedBy: "operator",
+				approvedAt: "2026-09-04T00:00:00.000Z",
+				entries: [{ dryRunJobId: "dry-1" }],
+			},
+			"sourceRow",
+		],
+		[
+			{
+				approvedBy: "operator",
+				approvedAt: "2026-09-04T00:00:00.000Z",
+				entries: [{ sourceRow: 2, dryRunJobId: "../etc" }],
+			},
+			"dryRunJobId",
+		],
+		[
+			{
+				approvedBy: "operator",
+				approvedAt: "2026-09-04T00:00:00.000Z",
+				entries: [
+					{ sourceRow: 2, dryRunJobId: "dry-1" },
+					{ sourceRow: 2, dryRunJobId: "dry-2" },
+				],
+			},
+			"duplicate sourceRow",
+		],
+		[
+			{
+				approvedBy: "operator",
+				approvedAt: "2026-09-04T00:00:00.000Z",
+				entries: [
+					{ sourceRow: 2, dryRunJobId: "dry-1" },
+					{ sourceRow: 3, dryRunJobId: "dry-1" },
+				],
+			},
+			"duplicate dryRunJobId",
+		],
+	])("refuses an approval file outside its contract %#", (value, message) => {
+		expect(() => readSendApprovalFile(value, 5)).toThrow(message);
+	});
+
 	test("validates the merged candidates against the same contract", () => {
 		expect(() =>
 			mergeChoiceCandidates(DEFAULT_CHOICE_CANDIDATES, { inquiryType: [] }),
@@ -493,6 +795,25 @@ describe("campaign import", () => {
 		).toThrow("invalid payload key");
 	});
 });
+
+/** Approval record the real-send cases in this file build against. */
+const approval = {
+	approvedBy: "operator",
+	approvedAt: "2026-09-04T00:00:00.000Z",
+	dryRunJobId: "dry-run-job-1",
+};
+
+function sendJob(id: string): JobInput {
+	const job = dryRunJob(id);
+	return {
+		...job,
+		payload: {
+			...job.payload,
+			_formAgentDryRun: false,
+			_formAgentSendApproval: approval,
+		},
+	};
+}
 
 function dryRunJob(id: string, message = "Hello"): JobInput {
 	return {
@@ -520,6 +841,18 @@ function storedJobResponse(job: JobInput): Response {
 		job: {
 			...job,
 			payload: { ...job.payload, _formAgentEffectiveDryRun: true },
+			status: "pending",
+			attemptCount: 0,
+		},
+	});
+}
+
+/** Mirrors `GET /jobs/:id` for a job the API froze as a real send. */
+function storedSendJobResponse(job: JobInput): Response {
+	return Response.json({
+		job: {
+			...job,
+			payload: { ...job.payload, _formAgentEffectiveDryRun: false },
 			status: "pending",
 			attemptCount: 0,
 		},

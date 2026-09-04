@@ -1,3 +1,9 @@
+/**
+ * Shape every job id must have. It lives here because the API path parser, the
+ * registration check, and the send-approval record all have to agree on it.
+ */
+export const JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
 export type JobStatus =
 	| "pending"
 	| "running"

@@ -73,6 +73,141 @@ deploymentが1つのversionへ100%配信されていること、そのactive ver
 
 切替前に登録された旧ジョブには実効モードが保存されていないため、Consumerは必ずdry-runとして扱う。切替後に登録されたジョブだけが登録時の`false`を保存し、実送信できる。
 
+## 実送信のrunbook
+
+実送信ジョブを作れる経路は`tools/campaign-send.ts`だけである。`tools/campaign-dry-run.ts`は`_formAgentDryRun: true`固定のままで、実送信できない。
+
+Worker側は`POST /jobs`で実送信ジョブ（`_formAgentEffectiveDryRun`が`false`）になる場合だけ次の4つを検証する。1つでも満たさなければジョブを作らない。
+
+| 検証 | 失敗時 |
+| --- | --- |
+| payloadに承認記録`_formAgentSendApproval`があること | 400 `SEND_APPROVAL_REQUIRED` |
+| `dryRunJobId`のジョブが存在し、同じ`targetUrl`のdry-runで、`prohibited` / `DRY_RUN_COMPLETE`で終わっていること | 400 `DRY_RUN_NOT_COMPLETED` |
+| そのdry-runと実送信の内容フィンガープリント（`targetUrl` + `companyId` + `payload.formValues`のSHA-256）が一致すること | 400 `DRY_RUN_CONTENT_MISMATCH` |
+| 当日（UTC）に作成済みの実送信ジョブ数が`REAL_SEND_DAILY_CAP`未満であること | 429 `REAL_SEND_CAP_REACHED` |
+
+承認記録はpayloadへそのまま保存し、`GET /jobs/:id`とD1で「誰がいつどのdry-runに対して承認したか」を後から追える。承認記録はモデルにも送信前レビューにも渡さない。
+
+すでに`pending`で存在する実送信ジョブの再登録は、`created_at`が当日UTCの場合だけ再queueする。日を跨いでいた場合は再queueせず409 `REAL_SEND_STALE`を返す。日次上限は作成時にしか数えないため、翌日に再queueするとその日の枠を消費せずに送信されてしまうためである。
+
+### 日次上限の設定
+
+`REAL_SEND_DAILY_CAP`は`wrangler.jsonc`に置かない。未設定・空・整数以外はすべて0として扱い、実送信ジョブを一切受け付けない。上限を開くのはdeploy時の`--var`だけである。
+
+`--var`を使うdeployでは通常設定の変数もすべて明示する。1つでも落とすとそのdeployから消えるおそれがある。
+
+```bash
+./node_modules/.bin/wrangler deploy \
+  --var AGENT_EXECUTOR_ENABLED:true \
+  --var AGENT_MODEL:gpt-5.6-luna \
+  --var AGENT_DRY_RUN:false \
+  --var REAL_SEND_DAILY_CAP:5
+./node_modules/.bin/wrangler deployments status --json
+./node_modules/.bin/wrangler versions view <ACTIVE_VERSION_ID>
+```
+
+active versionが1つ・100%で、`AGENT_DRY_RUN ("false")`と`REAL_SEND_DAILY_CAP ("5")`の両方が見えることを確認してから実行する。
+
+### 日次上限の解除
+
+引数なしのdeployは`wrangler.jsonc`のvarsだけを配るため、`REAL_SEND_DAILY_CAP`が消えて上限0に戻る。実送信の枠を閉じる操作はこれで足りる。
+
+```bash
+./node_modules/.bin/wrangler deploy
+./node_modules/.bin/wrangler versions view <ACTIVE_VERSION_ID>
+```
+
+active versionの環境変数一覧に`REAL_SEND_DAILY_CAP`が無いことを確認する。
+
+### 承認ファイルの作り方
+
+対象行はすべて、同じCSV・同じ登録情報でdry-runを通し、`prohibited` / `DRY_RUN_COMPLETE`になっていなければならない。dry-runの`campaign_job_result`ログに出る`jobId`が、そのまま承認ファイルの`dryRunJobId`になる。
+
+```json
+{
+  "approvedBy": "sales-ops@example.com",
+  "approvedAt": "2026-09-04T09:00:00.000Z",
+  "entries": [
+    { "sourceRow": 12, "dryRunJobId": "<dry-runのjobId>", "note": "目視確認済み" }
+  ]
+}
+```
+
+- `approvedBy`は1〜64文字、`approvedAt`はISO 8601、`note`は200文字以内。
+- `sourceRow`はCSVの行番号（ヘッダーを1行目とする2以上の整数）で、dry-runジョブのpayloadの`sourceRow`と同じ定義である。
+- `sourceRow`と`dryRunJobId`の重複は拒否する。1つの承認で2件送れてしまうためである。
+- サンプルは[examples/campaign-send-approval.example.json](examples/campaign-send-approval.example.json)にある。
+- ファイルはリポジトリへ追加せず、ローカルパスから読み込む。
+
+### 実行手順
+
+1. migration `0007_real_send.sql`をremote D1へ適用済みであることを確認する（「D1 schema migrationを含むデプロイ」の手順に従う）。
+2. 対象行のdry-runを完了させ、結果を目視で確認する。
+3. 承認ファイルを作る。
+4. `REAL_SEND_DAILY_CAP`を今回の件数以上にしてdeployし、active versionを確認する。
+5. Queue配送がresumeされていることを確認する。
+6. 送信を実行する。campaign名はdry-runと必ず別にする。同じ名前にするとジョブIDが衝突し、409 `JOB_ID_CONFLICT`になる。
+
+```bash
+JOB_API_TOKEN=... bun run campaign:send \
+  --registration /path/to/registration.json \
+  --csv /path/to/targets.csv \
+  --approved /path/to/approved.json \
+  --campaign agb-shaken-2026-09-send-v1 \
+  --max-sends 5 \
+  --confirm-real-send
+```
+
+`--confirm-real-send`が無い場合、ツールはCSVも承認ファイルも読まずにexit 1で終了する。`--max-sends`の既定は5、上限は50で、承認ファイルのentriesがこれを超えるとexit 1になる。
+
+### 結果と証跡の確認
+
+ツールは`campaign_send_summary`を1行出力する。`sentJobs` + `prohibitedJobs`が`approvedEntries`に満たない場合はexit 1になる。`byReasonCode`の内訳は次のとおりである。
+
+| reason code | 意味 |
+| --- | --- |
+| `SENT` | 送信完了 |
+| `ROW_NOT_ELIGIBLE` | 承認された`sourceRow`がCSVの適格行に無い |
+| `APPROVAL_MISMATCH` | `dryRunJobId`のジョブがフォームURL・dry-run・`DRY_RUN_COMPLETE`・内容フィンガープリントのいずれかを満たさない、または照会できない |
+| `REDIRECT_PREFLIGHT_FAILED` | redirect preflightに失敗し、登録しなかった |
+| `REGISTRATION_FAILED` / `REGISTRATION_UNKNOWN` | dry-runツールと同じ登録失敗・確認不能 |
+| `SEND_TIMED_OUT` | 期限内に終端状態へ到達しなかった |
+| その他 | ジョブの`result.reasonCode` |
+
+送信後は次を確認する。
+
+```bash
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT id,status,attempt_count,created_at FROM jobs WHERE real_send=1 ORDER BY created_at DESC LIMIT 20;"
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT id,json_extract(payload_json,'\$._formAgentSendApproval.approvedBy') AS approved_by,json_extract(payload_json,'\$._formAgentSendApproval.dryRunJobId') AS dry_run_job_id FROM jobs WHERE real_send=1 ORDER BY created_at DESC LIMIT 20;"
+```
+
+2つ目のクエリが承認記録の監査に使う行である。`real_send`列は登録時に確定した実効モードと一致するため、当日の実送信件数もこの列で数えられる。
+
+`uncertain`が出た場合は「`submitting` / `uncertain`の照合」に従う。送信前後のスクリーンショットは「証跡スクリーンショットの確認」で取得する。
+
+### 実送信の緊急停止
+
+実送信を止める操作は2つある。両方行う。
+
+```bash
+./node_modules/.bin/wrangler deploy
+./node_modules/.bin/wrangler queues pause-delivery form-agent-jobs
+```
+
+1つ目のdeployで`REAL_SEND_DAILY_CAP`が消え、新しい実送信ジョブは429で拒否される。2つ目のpauseで、すでにQueueへ載っているジョブの配送が止まる。実行中のConsumerは取り消されないため、「緊急停止」の手順で`running` / `submitting`が0件になるまで確認する。
+
+停止中に`pending`のまま日を跨いだ実送信ジョブは、resume後に同じ内容で再登録しても409 `REAL_SEND_STALE`になる。承認と上限判定をやり直す設計であるためで、再開時は次のいずれかを選ぶ。
+
+- そのまま配送をresumeして既存の`pending`を流す。Queueのメッセージは残っているため再登録は不要である。
+- 流さない場合は、対象を確認したうえで新しいcampaign名でdry-runからやり直し、承認ファイルを作り直す。既存ジョブを手作業で`pending`へ戻したり削除したりしない。
+
+```bash
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT id,created_at FROM jobs WHERE real_send=1 AND status='pending' ORDER BY created_at;"
+```
+
 ## D1 schema migrationを含むデプロイ
 
 D1 migrationはWorker deployでは自動適用されない。新しい列を参照するコードを先にdeployすると全ジョブの読み書きが失敗するため、必ず次の順序で実施する。

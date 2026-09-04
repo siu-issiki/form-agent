@@ -19,8 +19,8 @@
 | Agent 実行 | 実装済み | Worker から OpenAI Responses API の function calling を直接実行 |
 | 推論 Provider | 部分実装 | OpenAI Responses API のみ。モデル、回数、本文、出力 token を Worker 側で制限 |
 | BrowserUse | 実装済み | REST API v4 で standalone browser session を作成・停止し、CDP 接続では用途限定ツールだけを公開 |
-| E2E | 管理下範囲を実装済み | 常設テストシステムの13シナリオ、重複配送、送信後`uncertain`をproductionで検証済み。外部の実サイト送信は未実施 |
-| HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値（単一文字列または選択肢候補リスト）を検証。一覧・キャンセルは未実装 |
+| E2E | 管理下範囲を実装済み | 常設テストシステムの13シナリオ、重複配送、送信後`uncertain`をproductionで検証済み。外部の実サイトへは`tools/campaign-send.ts`と承認・上限のガードを実装済みで、実送信そのものは未実施 |
+| HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値（単一文字列または選択肢候補リスト）を検証。実送信になるジョブは承認記録・dry-run完了・日次上限の3つを満たす場合だけ受け付ける。一覧・キャンセルは未実装 |
 | Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
 | 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ、値を含まないagent tool診断イベント、ジョブ単位の実行メトリクス（turn、Provider 呼び出し、token、送信前レビュー、browser 接続時間、実行時間）。送信前・送信後・禁止判定時のスクリーンショット証跡を Cloudflare R2 へ保存し、D1 の `events` へ sha256 付きで記録する |
 | 並列検証 | 部分実施 | 2026-09-03 の 5 並列 19 シナリオで、session 明示停止の前後とも 15 件合格。明示停止後は CDP 切断（1011 / `LIMIT`）と `exceededCpu` が 0 件になり、18 session すべてを停止できたが、session 作成 API が 429 を 15 回返し 2 件が失敗した。当時の同時 session 上限は 5 未満と判断し、consumer を `max_concurrency: 3` にした。3 並列の 19 シナリオでは 17 件合格、429 / CDP 切断 / `exceededCpu` はいずれも 0 件、19 session すべてを停止できた。その後 Cloudflare Workers を Paid、BrowserUse を dev（有料）プランへ移行し、consumer を `max_concurrency: 20` にした。dev プランの同時ブラウザ上限 25 のうち 5 は leak した session の余裕として残している。20 並列での実測は未実施であり、上限は `browser_use_session_limit` で計測して調整する |
@@ -341,6 +341,7 @@ pending / running / failed ── retry 上限超過 ──► dead_lettered
 | `submit_review_denial_count` | INTEGER | 送信前レビューが消費した deny 予算。修正を許可しない deny は残り予算をすべて消費する。Queue 再配信をまたいで共有する |
 | `run_token` | TEXT NULL | 現在の実行権を識別する token |
 | `provider_request_count` | INTEGER | 現在の run が使用した Provider 呼び出し回数 |
+| `real_send` | INTEGER | 登録時の実効モードが実送信なら 1。日次上限の集計対象で、`(real_send, created_at)` に index を張る |
 | `created_at` | TEXT | 作成日時 |
 | `updated_at` | TEXT | 更新日時 |
 
@@ -405,6 +406,12 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 - レビューのdenyで修正を許可するのは`INPUT_MISMATCH`だけとし、実際の`fill` / `select`と観察指紋の変化を次の`submit`の前提にする。deny予算はD1のジョブ行に保存し、実行と再配信をまたいで共有する。
 - レビューのallowから送信権取得までの間に、現在URLと観察済み全フィールドの値・チェック状態を読み直し、あわせてhidden / disabledを含むform全体のsnapshotをレビュー前後で比較し、1件でも異なれば送信しない。
 - ジョブ間で browser session、cookie、入力データを共有しない。
+- 実送信になるジョブ（登録時に確定した `_formAgentEffectiveDryRun` が `false`）は、payload に承認記録 `_formAgentSendApproval`（`approvedBy` 1〜64 文字、ISO 8601 の `approvedAt`、`dryRunJobId`、任意の `note` 200 文字以内）を持たなければ登録できない。未知のキーを含む承認記録は受け付けない。承認記録は payload にそのまま保存し、誰がいつどの dry-run に対して承認したかを D1 の行から追えるようにする。
+- 承認記録の `dryRunJobId` は、同じ `targetUrl` の dry-run ジョブで、`prohibited` / `DRY_RUN_COMPLETE` で終わっているものでなければならない。さらに、その dry-run と実送信の内容フィンガープリント（`targetUrl` + `companyId` + `payload.formValues` の正規化 JSON を SHA-256）が一致しなければならない。一致しない場合は 400 `DRY_RUN_CONTENT_MISMATCH` とする。URL だけを比べると、承認済みの行を別の本文や別の入力値で登録し直せてしまうためである。
+- 実送信の承認記録 `_formAgentSendApproval` はモデルにも送信前レビューにも渡さない。フォーム入力の材料ではなく、ページ由来の非信頼データがそれを引用できてはならないためである。除外は `runToken` と同じ経路で行う。
+- 実送信ジョブの登録は、UTC の同一日に作成済みの実送信ジョブ数が `REAL_SEND_DAILY_CAP` 未満の場合だけ受け付ける。この変数は `wrangler.jsonc` に置かず、未設定・空・整数以外はすべて 0 として扱う。引数なしの `wrangler deploy` は上限 0 に戻す。
+- `pending` のまま UTC の日を跨いだ実送信ジョブは再 queue せず 409 `REAL_SEND_STALE` を返す。上限は作成時にしか数えないため、翌日に再 queue するとその日の枠を消費せずに送信されてしまう。承認と上限判定をやり直す運用へ倒す。dry-run ジョブの再 queue は従来どおりである。
+- 実送信ジョブを組み立てられるのは `tools/campaign-send.ts` だけとし、`tools/campaign-dry-run.ts` は `_formAgentDryRun: true` 固定のままにする。
 
 #### 検証サービスのiframe
 
@@ -455,6 +462,20 @@ policy failure は driver の以降の全 CDP コマンドを reject させ run 
 既定セットを同梱しても信頼境界は変わらない。候補は運用者が決めた値であり、モデルは `payloadKey` を指すだけで候補文字列を組み立てられず、信頼済み handler が対象コントロールとの完全一致を確認してから入力する。
 
 `--submit-dry-run` では全件を先に `POST /jobs` へ登録し、その後で登録済みジョブ全体を 2 秒間隔でポーリングする。1 件登録して完了を待つ直列実行では Queue consumer の `max_concurrency` が活きず、2026-09-02 の 20 件で約 15 分を要したためである。待ち時間の上限は「4 分 × ceil(件数 / `max_concurrency`)」とし、満杯のバッチの後ろに並んだジョブが枠の空きを待つ分を見込む。登録が途中で失敗した場合は以降の登録を止め、登録済みの分だけ結果を待って集計し、exit code 1 で終了する。登録の `fetch` が例外（タイムアウト・ネットワーク断）になった場合は、リクエストが API へ届いた可能性があるため失敗とは扱わない。ジョブ ID は campaign・企業ドメイン・フォーム URL から決定的に生成されるので、`GET /jobs/:id` で存在を確認する。存在した場合は、返ってきたジョブのフォーム URL と `payload.formValues`（キーと値、候補リストは順序込み）の SHA-256 が今回登録しようとした内容と一致する場合だけ監視対象に含める。同じ campaign 名を別の入力で再実行した場合、その ID には前回の内容が入っており、queue へ載るのはこの実行が組み立てた内容ではないためである。不一致は `REGISTRATION_UNKNOWN` とし、404 なら未登録として数える。この確認自体が失敗した場合も `REGISTRATION_UNKNOWN` とする。比較は digest だけで行い、値はログへ出さない。再 POST はしない。同じ企業を二重に queue へ載せる方が、1 件を取りこぼすより危険なためである。ジョブ照会の一時的な失敗は次の周回で読み直し、`campaign_dry_run_summary` には `byReasonCode` として reason code 別の件数（未登録は `REGISTRATION_FAILED`、確認不能は `REGISTRATION_UNKNOWN`、期限切れは `DRY_RUN_TIMED_OUT`）を出力する。`submitting` / `sent` を観測した場合は従来どおり即座に中断する。
+
+### 実送信の承認と日次上限
+
+`tools/campaign-send.ts` は dry-run ツールと同じ入力（`--registration` / `--csv` / `--campaign`、既定候補と `--choices` / `--no-default-choices`）に加えて `--approved <path>` と `--confirm-real-send` を要求する。`--confirm-real-send` が無い場合は CSV も承認ファイルも読まずに exit 1 で終了する。`--max-sends` の既定は 5、上限は 50 で、承認ファイルの entries がこれを超えても exit 1 になる。
+
+承認ファイルは `{ approvedBy, approvedAt, entries: [{ sourceRow, dryRunJobId, note? }] }` である。`sourceRow` は `buildCampaignJob` が payload へ入れる `sourceRow`（CSV の行番号）と同じ定義で、`filterCampaignRows` の適格行にその行が無ければ `ROW_NOT_ELIGIBLE` として登録しない。`sourceRow` と `dryRunJobId` の重複は拒否する。1 つの承認が 2 件の送信に使われることを防ぐためである。
+
+各行は登録前に `GET /jobs/<dryRunJobId>` を引き、フォーム URL の一致、そのジョブ自体が dry-run であること、`prohibited` / `DRY_RUN_COMPLETE` で終わっていること、そして内容フィンガープリントの一致を確認する。照会自体に失敗した場合も含め、満たさない行は `APPROVAL_MISMATCH` として登録しない。API へ届かないことが送信につながらないようにするためである。Worker 側も同じ比較を行うので、ツールの確認は 400 を待たずにバッチから外すためのものである。登録は dry-run ツールと同じく全件を先に `POST /jobs` へ送ってから全体をポーリングし、`registerCampaignJobs` は実送信登録では `_formAgentDryRun: false` と有効な承認記録の両方を要求する。dry-run 登録では従来どおり `_formAgentDryRun: true` が無いジョブを拒否するため、dry-run ツールから実送信ジョブが出ることはない。
+
+登録レスポンスが失われた際の存在確認も実送信ではモードと承認込みで行う。ジョブ ID は campaign 名から決まるため、同じ ID に前回の dry-run が入っていることがあり、実効モードが `false` でないジョブや承認記録（`approvedBy` / `approvedAt` / `dryRunJobId`）が一致しないジョブは「登録済み」と認めない。
+
+実送信ジョブの `instruction` は dry-run 用と別にし、「1 回だけ送信する」ことと「営業禁止なら送信せずに止まる」ことを明示する。`_formAgentMaxAttempts` は dry-run と同じく 1 で、再試行はしない。exit code は、承認された entries がすべて `sent` または `prohibited` で終わった場合だけ 0 である。`prohibited` は実サイト側の判断による正常な終了なので送信失敗として扱わない。
+
+Worker 側の 3 つのガード（承認記録、dry-run 完了、日次上限）は `POST /jobs` にあり、ツールを経由しない登録にも掛かる。件数の集計と行の挿入は 1 つのトランザクションではないが、実送信は運用者が 1 つのツールから流すため窓は狭く、上限を超えるには同時実行が要る。その場合も承認記録と行ごとの dry-run 確認は残る。
 
 ### Agent への安全指示
 

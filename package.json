@@ -12,6 +12,7 @@
 		"test:agent-e2e": "bun run test/run-agent-e2e.ts",
 		"test:agent-e2e:production": "bun run test/run-production-agent-e2e.ts",
 		"campaign:dry-run": "bun run tools/campaign-dry-run.ts",
+		"campaign:send": "bun run tools/campaign-send.ts",
 		"browser-use:sessions": "bun run tools/browser-use-sessions.ts",
 		"db:migrate:local": "wrangler d1 migrations apply DB --local",
 		"dev": "wrangler dev"

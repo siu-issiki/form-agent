@@ -61,6 +61,7 @@ import {
 	type SubmitReviewer,
 	SubmitReviewUnavailableError,
 } from "./restricted-browser";
+import { SEND_APPROVAL_KEY } from "./send-approval";
 import type { EvidenceObjectStore } from "./submission-evidence";
 import { ResponsesSubmitReviewer } from "./submit-reviewer";
 
@@ -260,7 +261,7 @@ export class ResponsesAgentExecutor implements AgentExecutor {
 		dryRun: boolean,
 		counters: RunCounters,
 	): Promise<AgentRunResult> {
-		const safeJob = withoutRunToken(input.job);
+		const safeJob = withoutTrustedOnlyFields(input.job);
 		const jobJson = JSON.stringify(safeJob);
 		if (jobJson.length > MAX_JOB_PROMPT_LENGTH) {
 			return failed("JOB_INPUT_TOO_LARGE", false);
@@ -1241,9 +1242,18 @@ function failed(reasonCode: string, retryable: boolean): AgentRunResult {
 	};
 }
 
-function withoutRunToken(job: Job): Omit<Job, "runToken"> {
-	const { runToken: _, ...safeJob } = job;
-	return safeJob;
+/**
+ * Strips the fields the model must never see: the run token that carries the
+ * execution right, and the human approval record, which names the operator and
+ * the dry-run it was granted against. Neither is an input to filling a form,
+ * and page content reaching the model must never be able to quote them back.
+ * The pre-submit reviewer receives only `payload.formValues`, so the approval
+ * never reaches it either.
+ */
+function withoutTrustedOnlyFields(job: Job): Omit<Job, "runToken"> {
+	const { runToken: _runToken, payload, ...rest } = job;
+	const { [SEND_APPROVAL_KEY]: _approval, ...safePayload } = payload;
+	return { ...rest, payload: safePayload };
 }
 
 function systemPrompt(dryRun: boolean): string {

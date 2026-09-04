@@ -48,6 +48,7 @@ import worker, {
 	handleHttpRequest,
 	isAgentDryRun,
 	type JobMessage,
+	realSendDailyCap,
 	registerJob,
 } from "../src/worker";
 
@@ -72,6 +73,13 @@ const input: JobInput = {
 	targetDomain: "form-agent.dev",
 	allowedHosts: [],
 	payload: { formValues: { message: "Hello", subject: "Introduction" } },
+};
+
+/** Approval record every real-send test in this file registers against. */
+const sendApproval = {
+	approvedBy: "operator@example.com",
+	approvedAt: "2026-09-04T00:00:00.000Z",
+	dryRunJobId: "job-dry-source",
 };
 
 test("keeps agent dry-run enabled unless production submission is explicitly enabled", () => {
@@ -601,9 +609,10 @@ describe("Job HTTP API", () => {
 	});
 
 	test("freezes the effective submission mode when the job is registered", async () => {
+		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
 		const realSubmit = await handleHttpRequest(
-			jobRequest("POST", "/jobs", input, apiToken),
-			{ ...apiEnv, AGENT_DRY_RUN: "false" },
+			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
+			{ ...apiEnv, AGENT_DRY_RUN: "false", REAL_SEND_DAILY_CAP: "5" },
 		);
 		expect(realSubmit.status).toBe(201);
 		expect(
@@ -909,6 +918,400 @@ describe("Job HTTP API", () => {
 		expect(queued).toEqual([]);
 	});
 });
+
+describe("Real-send guard", () => {
+	const apiToken = "test-job-api-token";
+	const queued: JobMessage[] = [];
+	const sendEnv = {
+		DB: env.DB,
+		EVIDENCE_BUCKET: env.EVIDENCE_BUCKET,
+		JOB_API_TOKEN: apiToken,
+		AGENT_DRY_RUN: "false",
+		REAL_SEND_DAILY_CAP: "2",
+		JOB_QUEUE: {
+			async send(message: JobMessage) {
+				queued.push(message);
+			},
+		} as unknown as Queue<JobMessage>,
+	};
+
+	beforeEach(() => {
+		queued.length = 0;
+	});
+
+	test("reads the daily cap and closes it for anything unparsable", () => {
+		expect(realSendDailyCap("5")).toBe(5);
+		expect(realSendDailyCap(" 5 ")).toBe(5);
+		expect(realSendDailyCap("0")).toBe(0);
+		expect(realSendDailyCap(undefined)).toBe(0);
+		expect(realSendDailyCap("")).toBe(0);
+		expect(realSendDailyCap("five")).toBe(0);
+		expect(realSendDailyCap("-1")).toBe(0);
+		expect(realSendDailyCap("2.5")).toBe(0);
+		expect(realSendDailyCap("1e3")).toBe(0);
+	});
+
+	test("refuses a real send that carries no approval record", async () => {
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", input, apiToken),
+			sendEnv,
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({ error: "SEND_APPROVAL_REQUIRED" });
+		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
+		expect(queued).toEqual([]);
+	});
+
+	test.each([
+		{ ...sendApproval, approvedBy: "" },
+		{ ...sendApproval, approvedBy: "a".repeat(65) },
+		{ ...sendApproval, approvedAt: "2026-09-04" },
+		{ ...sendApproval, approvedAt: "not-a-date" },
+		{ ...sendApproval, dryRunJobId: "../etc" },
+		{ ...sendApproval, note: "n".repeat(201) },
+		{ ...sendApproval, extra: "value" },
+		{ approvedBy: "operator" },
+		"operator",
+	])("refuses an approval record outside its contract %#", async (approval) => {
+		const response = await handleHttpRequest(
+			jobRequest(
+				"POST",
+				"/jobs",
+				{
+					...input,
+					payload: { ...input.payload, _formAgentSendApproval: approval },
+				},
+				apiToken,
+			),
+			sendEnv,
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({ error: "INVALID_JOB" });
+		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
+		expect(queued).toEqual([]);
+	});
+
+	test("refuses an approval whose dry-run job is unknown", async () => {
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
+			sendEnv,
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({ error: "DRY_RUN_NOT_COMPLETED" });
+		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
+		expect(queued).toEqual([]);
+	});
+
+	test("refuses an approval whose dry-run job used another form URL", async () => {
+		await completeDryRun(
+			sendApproval.dryRunJobId,
+			"https://form-agent.dev/other",
+		);
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
+			sendEnv,
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({ error: "DRY_RUN_NOT_COMPLETED" });
+		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
+	});
+
+	test("refuses an approval whose dry-run never reached the boundary", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(
+			{
+				...input,
+				id: sendApproval.dryRunJobId,
+				payload: { ...input.payload, _formAgentEffectiveDryRun: true },
+			},
+			"2026-09-01T00:00:00.000Z",
+		);
+		await store.claimRun(
+			sendApproval.dryRunJobId,
+			"dry-run-token",
+			"2026-09-01T00:00:01.000Z",
+		);
+		await store.recordProhibited(
+			sendApproval.dryRunJobId,
+			"dry-run-token",
+			input.targetUrl,
+			"SALES_PROHIBITED",
+			"The page prohibits sales outreach.",
+			"2026-09-01T00:00:02.000Z",
+		);
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
+			sendEnv,
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({ error: "DRY_RUN_NOT_COMPLETED" });
+		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
+	});
+
+	test("refuses every real send while the daily cap is unset", async () => {
+		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
+		const { REAL_SEND_DAILY_CAP: _cap, ...closed } = sendEnv;
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
+			closed,
+		);
+
+		expect(response.status).toBe(429);
+		expect(await response.json()).toEqual({ error: "REAL_SEND_CAP_REACHED" });
+		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
+		expect(queued).toEqual([]);
+	});
+
+	test("refuses a real send once the daily cap is reached", async () => {
+		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
+		await createRealSend("job-send-earlier", new Date().toISOString());
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
+			{ ...sendEnv, REAL_SEND_DAILY_CAP: "1" },
+		);
+
+		expect(response.status).toBe(429);
+		expect(await response.json()).toEqual({ error: "REAL_SEND_CAP_REACHED" });
+		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
+		expect(queued).toEqual([]);
+	});
+
+	test("counts only the real sends created on the same UTC day", async () => {
+		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
+		await createRealSend(
+			"job-send-yesterday",
+			new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+		);
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
+			{ ...sendEnv, REAL_SEND_DAILY_CAP: "1" },
+		);
+
+		expect(response.status).toBe(201);
+		expect(queued).toEqual([{ jobId: input.id }]);
+	});
+
+	test("keeps the approval record on an accepted real send", async () => {
+		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
+
+		const response = await handleHttpRequest(
+			jobRequest(
+				"POST",
+				"/jobs",
+				approvedSend(input.id, { note: "1件目" }),
+				apiToken,
+			),
+			sendEnv,
+		);
+
+		expect(response.status).toBe(201);
+		expect(queued).toEqual([{ jobId: input.id }]);
+		expect(
+			(await new D1JobStore(env.DB).find(input.id))?.payload,
+		).toMatchObject({
+			_formAgentEffectiveDryRun: false,
+			_formAgentSendApproval: { ...sendApproval, note: "1件目" },
+		});
+	});
+
+	test("does not count a repeated registration of the same real send", async () => {
+		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
+		const capOfOne = { ...sendEnv, REAL_SEND_DAILY_CAP: "1" };
+
+		const created = await handleHttpRequest(
+			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
+			capOfOne,
+		);
+		const repeated = await handleHttpRequest(
+			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
+			capOfOne,
+		);
+
+		expect(created.status).toBe(201);
+		expect(repeated.status).toBe(200);
+		expect(await repeated.json()).toMatchObject({ created: false });
+	});
+
+	test("refuses an approval whose dry-run ran different content", async () => {
+		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl, {
+			formValues: { message: "Hallo", subject: "Introduction" },
+		});
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
+			sendEnv,
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({
+			error: "DRY_RUN_CONTENT_MISMATCH",
+		});
+		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
+		expect(queued).toEqual([]);
+	});
+
+	test("accepts a real send whose content matches its dry-run", async () => {
+		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl, {
+			formValues: { subject: "Introduction", message: "Hello" },
+		});
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
+			sendEnv,
+		);
+
+		expect(response.status).toBe(201);
+		expect(queued).toEqual([{ jobId: input.id }]);
+	});
+
+	test("refuses to re-queue a pending real send from an earlier day", async () => {
+		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
+		const pending = approvedSend(input.id);
+		await new D1JobStore(env.DB).create(
+			{
+				...pending,
+				payload: { ...pending.payload, _formAgentEffectiveDryRun: false },
+			},
+			new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+		);
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", pending, apiToken),
+			sendEnv,
+		);
+
+		expect(response.status).toBe(409);
+		expect(await response.json()).toEqual({ error: "REAL_SEND_STALE" });
+		expect(queued).toEqual([]);
+	});
+
+	test("re-queues a pending real send created on the same day", async () => {
+		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
+		const pending = approvedSend(input.id);
+		await new D1JobStore(env.DB).create(
+			{
+				...pending,
+				payload: { ...pending.payload, _formAgentEffectiveDryRun: false },
+			},
+			new Date().toISOString(),
+		);
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", pending, apiToken),
+			sendEnv,
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({ created: false });
+		expect(queued).toEqual([{ jobId: input.id }]);
+	});
+
+	test("re-queues a pending dry-run job from an earlier day", async () => {
+		const { REAL_SEND_DAILY_CAP: _cap, ...closed } = sendEnv;
+		const dryRunInput = {
+			...input,
+			payload: { ...input.payload, _formAgentDryRun: true },
+		};
+		await new D1JobStore(env.DB).create(
+			{
+				...dryRunInput,
+				payload: { ...dryRunInput.payload, _formAgentEffectiveDryRun: true },
+			},
+			new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+		);
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", dryRunInput, apiToken),
+			closed,
+		);
+
+		expect(response.status).toBe(200);
+		expect(queued).toEqual([{ jobId: input.id }]);
+	});
+
+	test("leaves a dry-run job outside the real-send guard", async () => {
+		const { REAL_SEND_DAILY_CAP: _cap, ...closed } = sendEnv;
+		const dryRunInput = {
+			...input,
+			payload: { ...input.payload, _formAgentDryRun: true },
+		};
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", dryRunInput, apiToken),
+			closed,
+		);
+
+		expect(response.status).toBe(201);
+		expect(queued).toEqual([{ jobId: input.id }]);
+		expect(
+			(await new D1JobStore(env.DB).find(input.id))?.payload,
+		).not.toHaveProperty("_formAgentSendApproval");
+	});
+});
+
+/** A real-send registration approved against `sendApproval.dryRunJobId`. */
+function approvedSend(
+	id: string,
+	approvalOverrides: Record<string, unknown> = {},
+): JobInput {
+	return {
+		...input,
+		id,
+		payload: {
+			...input.payload,
+			_formAgentSendApproval: { ...sendApproval, ...approvalOverrides },
+		},
+	};
+}
+
+/** Seeds a dry-run job that already stopped at the dry-run boundary. */
+async function completeDryRun(
+	id: string,
+	targetUrl: string,
+	payload: Record<string, unknown> = input.payload,
+): Promise<void> {
+	const store = new D1JobStore(env.DB);
+	await store.create(
+		{
+			...input,
+			id,
+			targetUrl,
+			payload: { ...payload, _formAgentEffectiveDryRun: true },
+		},
+		"2026-09-01T00:00:00.000Z",
+	);
+	await store.claimRun(id, "dry-run-token", "2026-09-01T00:00:01.000Z");
+	await store.recordProhibited(
+		id,
+		"dry-run-token",
+		targetUrl,
+		"DRY_RUN_COMPLETE",
+		"The dry-run stopped before submission.",
+		"2026-09-01T00:00:02.000Z",
+	);
+}
+
+/** Seeds a job that already consumed one slot of the daily real-send cap. */
+async function createRealSend(id: string, createdAt: string): Promise<void> {
+	await new D1JobStore(env.DB).create(
+		{
+			...input,
+			id,
+			payload: { ...input.payload, _formAgentEffectiveDryRun: false },
+		},
+		createdAt,
+	);
+}
 
 function jobRequest(
 	method: "GET" | "POST",
@@ -2803,6 +3206,65 @@ describe("ResponsesAgentExecutor", () => {
 				outcome: "PROHIBITION_EVIDENCE_VERIFIED",
 			},
 		]);
+	});
+
+	test("keeps the run token and the send approval out of the model input", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(
+			{
+				...input,
+				payload: {
+					...input.payload,
+					_formAgentEffectiveDryRun: false,
+					_formAgentSendApproval: sendApproval,
+				},
+			},
+			"2026-08-28T00:00:00.000Z",
+		);
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const requestBodies: string[] = [];
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-uncertain", "finish_uncertain", {
+				reasonCode: "OTHER_UNCERTAINTY",
+				reason: "Nothing was attempted.",
+			}),
+		];
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async (_resource, init) => {
+				requestBodies.push(String(init?.body));
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => new WorkerFakeBrowserDriver(),
+		});
+
+		await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(requestBodies).toHaveLength(2);
+		const sent = requestBodies.join("\n");
+		// The job is serialized into the first user message, so the whole
+		// request is checked rather than one field of it.
+		expect(sent).toContain(input.companyName);
+		expect(sent).not.toContain("_formAgentSendApproval");
+		expect(sent).not.toContain(sendApproval.approvedBy);
+		expect(sent).not.toContain(sendApproval.dryRunJobId);
+		expect(sent).not.toContain("runToken");
+		expect(sent).not.toContain("run-token-1");
 	});
 
 	test("refuses a prohibition quote the observed page does not contain", async () => {

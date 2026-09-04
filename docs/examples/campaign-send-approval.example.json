@@ -1,0 +1,15 @@
+{
+  "approvedBy": "sales-ops@example.com",
+  "approvedAt": "2026-09-04T09:00:00.000Z",
+  "entries": [
+    {
+      "sourceRow": 12,
+      "dryRunJobId": "agb-shaken-2026-09-dryrun-v1-0123456789abcdef0123456789abcdef",
+      "note": "dry-run結果を目視確認済み"
+    },
+    {
+      "sourceRow": 18,
+      "dryRunJobId": "agb-shaken-2026-09-dryrun-v1-fedcba9876543210fedcba9876543210"
+    }
+  ]
+}

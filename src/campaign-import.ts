@@ -1,5 +1,6 @@
 import { parse } from "tldts";
-import type { JobInput } from "./job";
+import { JOB_ID_PATTERN, type JobInput } from "./job";
+import { jobContentFingerprint, jobInputFingerprint } from "./job-fingerprint";
 import {
 	isTrustedCandidateList,
 	normalizeAllowedHosts,
@@ -7,6 +8,12 @@ import {
 	PAYLOAD_KEY_PATTERN,
 	type TrustedFormValue,
 } from "./restricted-browser";
+import {
+	isIso8601,
+	isSendApproval,
+	SEND_APPROVAL_KEY,
+	type SendApproval,
+} from "./send-approval";
 
 export interface RegistrationEntry {
 	label: string;
@@ -242,6 +249,12 @@ export interface CampaignRegistrationOptions {
 	fetcher?: CampaignFetcher;
 	/** Receives fixed-field log entries; the default writes them as JSON lines. */
 	log?: (entry: Record<string, unknown>) => void;
+	/**
+	 * Registers real-send jobs instead of dry-runs. The default refuses any job
+	 * without the job-level dry-run guard, so the dry-run tool cannot register a
+	 * job that submits.
+	 */
+	realSend?: boolean;
 }
 
 export interface CampaignRegistrationResult {
@@ -259,32 +272,7 @@ export function campaignApiHeaders(apiToken: string): Record<string, string> {
 	};
 }
 
-/**
- * Digest of the inputs a dry-run actually sends: the form URL and every
- * `formValues` entry, with candidate lists compared in order. Only the digest
- * is compared or logged, so no registrant value leaves this function. The
- * stored payload also carries `_formAgentEffectiveDryRun`, which the API adds,
- * so the whole payload cannot be compared.
- */
-export async function jobInputFingerprint(
-	targetUrl: unknown,
-	payload: unknown,
-): Promise<string> {
-	const values =
-		isPlainRecord(payload) && isPlainRecord(payload.formValues)
-			? payload.formValues
-			: {};
-	return sha256(
-		JSON.stringify({
-			targetUrl,
-			subject: values.subject ?? null,
-			message: values.message ?? null,
-			formValues: Object.keys(values)
-				.sort()
-				.map((key) => [key, values[key]]),
-		}),
-	);
-}
+export { jobContentFingerprint, jobInputFingerprint };
 
 /**
  * Confirms whether the API already holds this exact job. Job ids are derived
@@ -318,15 +306,135 @@ export async function confirmJobRegistration(
 	}
 	if (!isPlainRecord(body) || !isPlainRecord(body.job)) return "unknown";
 	const stored = body.job;
+	const realSend = job.payload._formAgentDryRun === false;
+	// Only the stored side carries the effective mode, so it is checked here
+	// rather than inside the digest. A dry-run job under the same id is not
+	// this registration: the queued run would send nothing.
+	if (
+		realSend &&
+		(!isPlainRecord(stored.payload) ||
+			stored.payload._formAgentEffectiveDryRun !== false)
+	) {
+		return "mismatched";
+	}
 	const [expected, actual] = await Promise.all([
-		jobInputFingerprint(job.targetUrl, job.payload),
-		jobInputFingerprint(stored.targetUrl, stored.payload),
+		jobInputFingerprint(job.targetUrl, job.payload, realSend),
+		jobInputFingerprint(stored.targetUrl, stored.payload, realSend),
 	]);
 	return expected === actual ? "registered" : "mismatched";
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Last check before a job leaves the tool. A dry-run registration refuses any
+ * job that could submit, and a real-send registration refuses any job that is
+ * not explicitly marked as a send and does not carry its approval record.
+ */
+function assertRegisterableJob(job: JobInput, realSend: boolean): void {
+	if (!realSend) {
+		if (job.payload._formAgentDryRun !== true) {
+			throw new Error("Job-level dry-run guard is missing");
+		}
+		return;
+	}
+	if (job.payload._formAgentDryRun !== false) {
+		throw new Error("Real-send job must set the dry-run flag to false");
+	}
+	if (!isSendApproval(job.payload[SEND_APPROVAL_KEY])) {
+		throw new Error("Real-send job is missing its approval record");
+	}
+}
+
+/** One approved CSV row, naming the dry-run it already passed. */
+export interface SendApprovalEntry {
+	/** `sourceRow` of the dry-run job: the 1-based CSV line, header included. */
+	sourceRow: number;
+	dryRunJobId: string;
+	note?: string;
+}
+
+export interface SendApprovalFile {
+	approvedBy: string;
+	approvedAt: string;
+	entries: SendApprovalEntry[];
+}
+
+const MAX_APPROVED_BY_LENGTH = 64;
+const MAX_NOTE_LENGTH = 200;
+
+/**
+ * Validates the approval file the send tool is given. Every entry has to name
+ * both a CSV row and the dry-run job that row already passed, and the file may
+ * not hold more entries than the run's own send limit. Duplicate rows and
+ * duplicate dry-run jobs are refused, because either would let one approval
+ * stand for a second send.
+ */
+export function readSendApprovalFile(
+	value: unknown,
+	maxEntries: number,
+): SendApprovalFile {
+	if (!isPlainRecord(value)) {
+		throw new Error("Approval JSON must be an object");
+	}
+	const { approvedBy, approvedAt, entries } = value;
+	if (
+		typeof approvedBy !== "string" ||
+		approvedBy.trim().length === 0 ||
+		approvedBy.length > MAX_APPROVED_BY_LENGTH
+	) {
+		throw new Error("Approval JSON needs approvedBy of 1 to 64 characters");
+	}
+	if (!isIso8601(approvedAt)) {
+		throw new Error("Approval JSON needs an ISO 8601 approvedAt");
+	}
+	if (!Array.isArray(entries) || entries.length === 0) {
+		throw new Error("Approval JSON needs at least one entry");
+	}
+	if (entries.length > maxEntries) {
+		throw new Error(
+			`Approval JSON holds ${entries.length} entries, above the limit of ${maxEntries}`,
+		);
+	}
+
+	const rows = new Set<number>();
+	const dryRunJobIds = new Set<string>();
+	const validated: SendApprovalEntry[] = [];
+	for (const entry of entries) {
+		if (!isPlainRecord(entry)) {
+			throw new Error("Approval JSON holds an entry that is not an object");
+		}
+		const { sourceRow, dryRunJobId, note } = entry;
+		if (!Number.isInteger(sourceRow) || (sourceRow as number) < 2) {
+			throw new Error("Approval entry needs a sourceRow of 2 or more");
+		}
+		if (typeof dryRunJobId !== "string" || !JOB_ID_PATTERN.test(dryRunJobId)) {
+			throw new Error("Approval entry needs a valid dryRunJobId");
+		}
+		if (
+			note !== undefined &&
+			(typeof note !== "string" || note.length > MAX_NOTE_LENGTH)
+		) {
+			throw new Error("Approval entry note must be 200 characters or fewer");
+		}
+		if (rows.has(sourceRow as number)) {
+			throw new Error("Approval JSON holds a duplicate sourceRow");
+		}
+		if (dryRunJobIds.has(dryRunJobId)) {
+			throw new Error("Approval JSON holds a duplicate dryRunJobId");
+		}
+		rows.add(sourceRow as number);
+		dryRunJobIds.add(dryRunJobId);
+		validated.push({
+			sourceRow: sourceRow as number,
+			dryRunJobId,
+			...(note === undefined ? {} : { note }),
+		});
+	}
+
+	return { approvedBy, approvedAt, entries: validated };
 }
 
 /**
@@ -350,9 +458,7 @@ export async function registerCampaignJobs(
 	const registered: JobInput[] = [];
 	let unknown = 0;
 	for (const job of jobs) {
-		if (job.payload._formAgentDryRun !== true) {
-			throw new Error("Job-level dry-run guard is missing");
-		}
+		assertRegisterableJob(job, options.realSend === true);
 		let created: Response;
 		try {
 			created = await fetcher(`${options.baseUrl}/jobs`, {
@@ -443,13 +549,36 @@ export function mergeChoiceCandidates(
 	return readChoiceCandidates({ ...defaults, ...overrides });
 }
 
+export interface CampaignJobMode {
+	/**
+	 * Defaults to a dry-run job. A real-send job is only ever built from the
+	 * send tool, and only with the approval record that names the dry-run the
+	 * same row already passed.
+	 */
+	dryRun?: boolean;
+	approval?: SendApproval;
+}
+
+const DRY_RUN_INSTRUCTION =
+	"Fill exactly one compatible inquiry form with the supplied formValues. Call submit only after native validation; the trusted dry-run handler must stop before submission.";
+const SEND_INSTRUCTION =
+	"Fill exactly one compatible inquiry form with the supplied formValues and submit it once. Call submit only after native validation, and stop without submitting if the form prohibits sales outreach.";
+
 export async function buildCampaignJob(
 	candidate: CampaignCandidate,
 	registrationValues: Record<string, string>,
 	campaign: string,
 	resolution: RedirectResolution,
 	choices: Record<string, readonly string[]> = {},
+	mode: CampaignJobMode = {},
 ): Promise<JobInput> {
+	const dryRun = mode.dryRun ?? true;
+	if (dryRun && mode.approval) {
+		throw new Error("A dry-run job must not carry a send approval");
+	}
+	if (!dryRun && !isSendApproval(mode.approval)) {
+		throw new Error("A real-send job requires a valid send approval");
+	}
 	const formValues: Record<string, TrustedFormValue> = {
 		...registrationValues,
 		subject: candidate.subject,
@@ -475,13 +604,13 @@ export async function buildCampaignJob(
 		targetDomain: candidate.companyDomain,
 		allowedHosts: normalizeAllowedHosts(resolution.allowedHosts),
 		payload: {
-			_formAgentDryRun: true,
+			_formAgentDryRun: dryRun,
 			_formAgentMaxAttempts: 1,
+			...(mode.approval ? { [SEND_APPROVAL_KEY]: mode.approval } : {}),
 			campaign,
 			sourceRow: candidate.rowNumber,
 			formValues,
-			instruction:
-				"Fill exactly one compatible inquiry form with the supplied formValues. Call submit only after native validation; the trusted dry-run handler must stop before submission.",
+			instruction: dryRun ? DRY_RUN_INSTRUCTION : SEND_INSTRUCTION,
 		},
 	};
 }

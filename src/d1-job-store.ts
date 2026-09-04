@@ -118,8 +118,8 @@ export class D1JobStore implements JobStore {
 				`INSERT OR IGNORE INTO jobs (
           id, company_id, company_name, target_url, target_domain,
           allowed_hosts_json, payload_json, status, attempt_count, run_token,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, ?, ?)`,
+          real_send, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, ?, ?, ?)`,
 			)
 			.bind(
 				input.id,
@@ -129,6 +129,7 @@ export class D1JobStore implements JobStore {
 				input.targetDomain,
 				JSON.stringify(input.allowedHosts),
 				JSON.stringify(input.payload),
+				isRealSendPayload(input.payload) ? 1 : 0,
 				now,
 				now,
 			)
@@ -139,6 +140,32 @@ export class D1JobStore implements JobStore {
 		}
 
 		return this.#findRequired(session, input.id);
+	}
+
+	/**
+	 * Counts the real-send jobs created inside one half-open window. The daily
+	 * cap is a safety limit, so the count reads the primary rather than a
+	 * replica that may not hold the sends registered moments ago. `excludeId`
+	 * keeps a repeated registration of the same job from counting against the
+	 * cap, because that request creates nothing.
+	 */
+	async countRealSendJobsCreatedBetween(
+		startAt: string,
+		endAt: string,
+		excludeId: string,
+	): Promise<number> {
+		const row = await this.db
+			.withSession("first-primary")
+			.prepare(
+				`SELECT COUNT(*) AS count FROM jobs
+         WHERE real_send = 1
+           AND created_at >= ? AND created_at < ?
+           AND id <> ?`,
+			)
+			.bind(startAt, endAt, excludeId)
+			.first<{ count: number }>();
+
+		return row?.count ?? 0;
 	}
 
 	find(id: string): Promise<Job | null> {
@@ -772,6 +799,14 @@ function mapJob(row: JobRow): Job {
 				}
 			: null,
 	};
+}
+
+/**
+ * The stored column mirrors the effective mode the API froze onto the payload,
+ * so the daily cap counts exactly the jobs that can reach a real submission.
+ */
+function isRealSendPayload(payload: Record<string, unknown>): boolean {
+	return payload._formAgentEffectiveDryRun === false;
 }
 
 function mapStoredJob(row: StoredJobRow): Job {
