@@ -407,8 +407,10 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 - レビューのallowから送信権取得までの間に、現在URLと観察済み全フィールドの値・チェック状態を読み直し、あわせてhidden / disabledを含むform全体のsnapshotをレビュー前後で比較し、1件でも異なれば送信しない。
 - ジョブ間で browser session、cookie、入力データを共有しない。
 - 実送信になるジョブ（登録時に確定した `_formAgentEffectiveDryRun` が `false`）は、payload に承認記録 `_formAgentSendApproval`（`approvedBy` 1〜64 文字、ISO 8601 の `approvedAt`、`dryRunJobId`、任意の `note` 200 文字以内）を持たなければ登録できない。未知のキーを含む承認記録は受け付けない。承認記録は payload にそのまま保存し、誰がいつどの dry-run に対して承認したかを D1 の行から追えるようにする。
-- 承認記録の `dryRunJobId` は、同じ `targetUrl` の dry-run ジョブで、`prohibited` / `DRY_RUN_COMPLETE` で終わっているものでなければならない。dry-run を通っていない行は実送信にできない。
+- 承認記録の `dryRunJobId` は、同じ `targetUrl` の dry-run ジョブで、`prohibited` / `DRY_RUN_COMPLETE` で終わっているものでなければならない。さらに、その dry-run と実送信の内容フィンガープリント（`targetUrl` + `companyId` + `payload.formValues` の正規化 JSON を SHA-256）が一致しなければならない。一致しない場合は 400 `DRY_RUN_CONTENT_MISMATCH` とする。URL だけを比べると、承認済みの行を別の本文や別の入力値で登録し直せてしまうためである。
+- 実送信の承認記録 `_formAgentSendApproval` はモデルにも送信前レビューにも渡さない。フォーム入力の材料ではなく、ページ由来の非信頼データがそれを引用できてはならないためである。除外は `runToken` と同じ経路で行う。
 - 実送信ジョブの登録は、UTC の同一日に作成済みの実送信ジョブ数が `REAL_SEND_DAILY_CAP` 未満の場合だけ受け付ける。この変数は `wrangler.jsonc` に置かず、未設定・空・整数以外はすべて 0 として扱う。引数なしの `wrangler deploy` は上限 0 に戻す。
+- `pending` のまま UTC の日を跨いだ実送信ジョブは再 queue せず 409 `REAL_SEND_STALE` を返す。上限は作成時にしか数えないため、翌日に再 queue するとその日の枠を消費せずに送信されてしまう。承認と上限判定をやり直す運用へ倒す。dry-run ジョブの再 queue は従来どおりである。
 - 実送信ジョブを組み立てられるのは `tools/campaign-send.ts` だけとし、`tools/campaign-dry-run.ts` は `_formAgentDryRun: true` 固定のままにする。
 
 #### 検証サービスのiframe
@@ -467,7 +469,9 @@ policy failure は driver の以降の全 CDP コマンドを reject させ run 
 
 承認ファイルは `{ approvedBy, approvedAt, entries: [{ sourceRow, dryRunJobId, note? }] }` である。`sourceRow` は `buildCampaignJob` が payload へ入れる `sourceRow`（CSV の行番号）と同じ定義で、`filterCampaignRows` の適格行にその行が無ければ `ROW_NOT_ELIGIBLE` として登録しない。`sourceRow` と `dryRunJobId` の重複は拒否する。1 つの承認が 2 件の送信に使われることを防ぐためである。
 
-各行は登録前に `GET /jobs/<dryRunJobId>` を引き、フォーム URL の一致、そのジョブ自体が dry-run であること、`prohibited` / `DRY_RUN_COMPLETE` で終わっていることを確認する。照会自体に失敗した場合も含め、満たさない行は `APPROVAL_MISMATCH` として登録しない。API へ届かないことが送信につながらないようにするためである。登録は dry-run ツールと同じく全件を先に `POST /jobs` へ送ってから全体をポーリングし、`registerCampaignJobs` は実送信登録では `_formAgentDryRun: false` と有効な承認記録の両方を要求する。dry-run 登録では従来どおり `_formAgentDryRun: true` が無いジョブを拒否するため、dry-run ツールから実送信ジョブが出ることはない。
+各行は登録前に `GET /jobs/<dryRunJobId>` を引き、フォーム URL の一致、そのジョブ自体が dry-run であること、`prohibited` / `DRY_RUN_COMPLETE` で終わっていること、そして内容フィンガープリントの一致を確認する。照会自体に失敗した場合も含め、満たさない行は `APPROVAL_MISMATCH` として登録しない。API へ届かないことが送信につながらないようにするためである。Worker 側も同じ比較を行うので、ツールの確認は 400 を待たずにバッチから外すためのものである。登録は dry-run ツールと同じく全件を先に `POST /jobs` へ送ってから全体をポーリングし、`registerCampaignJobs` は実送信登録では `_formAgentDryRun: false` と有効な承認記録の両方を要求する。dry-run 登録では従来どおり `_formAgentDryRun: true` が無いジョブを拒否するため、dry-run ツールから実送信ジョブが出ることはない。
+
+登録レスポンスが失われた際の存在確認も実送信ではモードと承認込みで行う。ジョブ ID は campaign 名から決まるため、同じ ID に前回の dry-run が入っていることがあり、実効モードが `false` でないジョブや承認記録（`approvedBy` / `approvedAt` / `dryRunJobId`）が一致しないジョブは「登録済み」と認めない。
 
 実送信ジョブの `instruction` は dry-run 用と別にし、「1 回だけ送信する」ことと「営業禁止なら送信せずに止まる」ことを明示する。`_formAgentMaxAttempts` は dry-run と同じく 1 で、再試行はしない。exit code は、承認された entries がすべて `sent` または `prohibited` で終わった場合だけ 0 である。`prohibited` は実サイト側の判断による正常な終了なので送信失敗として扱わない。
 

@@ -13,6 +13,7 @@ import {
 	type Job,
 	type JobInput,
 } from "./job";
+import { jobContentFingerprint } from "./job-fingerprint";
 import { ResponsesAgentExecutor } from "./responses-agent-executor";
 import {
 	assertAllowedTargetUrl,
@@ -99,10 +100,34 @@ export async function registerJob(
 	}
 
 	if (job.status === "pending") {
+		// A real send that has sat pending across a UTC day boundary no longer
+		// sits under the cap it was accepted against, and its approval was made
+		// against a dry-run of another day. Re-queueing it would send without
+		// either check being current, so the operator has to re-approve.
+		if (isRealSendJob(job) && !isSameUtcDay(job.createdAt, now)) {
+			throw new StaleRealSendError(job.id);
+		}
 		await queue.send({ jobId: job.id });
 	}
 
 	return { created, job };
+}
+
+function isRealSendJob(job: Job): boolean {
+	return job.payload._formAgentEffectiveDryRun === false;
+}
+
+/** Compares two ISO timestamps by UTC day; an unparsable value is never equal. */
+function isSameUtcDay(left: string, right: string): boolean {
+	const leftDay = utcDay(left);
+	return leftDay !== null && leftDay === utcDay(right);
+}
+
+function utcDay(value: string): string | null {
+	const time = Date.parse(value);
+	return Number.isFinite(time)
+		? new Date(time).toISOString().slice(0, 10)
+		: null;
 }
 
 const worker: ExportedHandler<Env, JobMessage> = {
@@ -160,6 +185,9 @@ export async function handleHttpRequest(
 			if (error instanceof ConflictingJobError) {
 				return apiJson({ error: "JOB_ID_CONFLICT" }, 409);
 			}
+			if (error instanceof StaleRealSendError) {
+				return apiJson({ error: "REAL_SEND_STALE" }, 409);
+			}
 			throw error;
 		}
 		return apiJson(
@@ -188,9 +216,9 @@ export async function handleHttpRequest(
 /**
  * Gate every job that would reach a real submission. A dry-run job is not
  * touched. A real-send job must carry a human approval record, must name a
- * dry-run of the same form URL that already reached the dry-run boundary, and
- * must fit inside the day's cap. The cap defaults to 0, so the path stays shut
- * unless a deploy explicitly opens it.
+ * dry-run that already reached the dry-run boundary carrying the same content,
+ * and must fit inside the day's cap. The cap defaults to 0, so the path stays
+ * shut unless a deploy explicitly opens it.
  *
  * The count and the insert are not one transaction. Real sends are registered
  * by a single operator-run tool, so the window is narrow, and overshooting it
@@ -219,6 +247,17 @@ async function refuseUnapprovedRealSend(
 		dryRun.result?.reasonCode !== DRY_RUN_COMPLETE_REASON_CODE
 	) {
 		return apiJson({ error: "DRY_RUN_NOT_COMPLETED" }, 400);
+	}
+
+	// The approval names a dry-run, so the send must carry the content that
+	// dry-run actually ran. Comparing only the form URL would let an approved
+	// row be re-registered with a different message or different form values.
+	const [approved, requested] = await Promise.all([
+		jobContentFingerprint(dryRun.targetUrl, dryRun.companyId, dryRun.payload),
+		jobContentFingerprint(input.targetUrl, input.companyId, input.payload),
+	]);
+	if (approved !== requested) {
+		return apiJson({ error: "DRY_RUN_CONTENT_MISMATCH" }, 400);
 	}
 
 	const cap = realSendDailyCap(env.REAL_SEND_DAILY_CAP);
@@ -451,6 +490,12 @@ class InvalidJobRequestError extends Error {
 class ConflictingJobError extends Error {
 	constructor(id: string) {
 		super(`Job input conflicts with the existing job: ${id}`);
+	}
+}
+
+class StaleRealSendError extends Error {
+	constructor(id: string) {
+		super(`Pending real-send job is from an earlier UTC day: ${id}`);
 	}
 }
 

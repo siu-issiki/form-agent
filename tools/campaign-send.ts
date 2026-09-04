@@ -1,11 +1,11 @@
 import { parse } from "csv-parse/sync";
 import {
 	buildCampaignJob,
-	type CampaignCandidate,
 	type CampaignCsvRow,
 	campaignApiHeaders,
 	DEFAULT_CHOICE_CANDIDATES,
 	filterCampaignRows,
+	jobContentFingerprint,
 	mapRegistrationValues,
 	mergeChoiceCandidates,
 	type RedirectResolution,
@@ -127,10 +127,6 @@ async function buildApprovedJob(
 		count("ROW_NOT_ELIGIBLE", entry.sourceRow);
 		return null;
 	}
-	if (!(await hasCompletedDryRun(entry, candidate))) {
-		count("APPROVAL_MISMATCH", entry.sourceRow);
-		return null;
-	}
 
 	let resolution: RedirectResolution;
 	try {
@@ -151,6 +147,10 @@ async function buildApprovedJob(
 			approval: approvalRecord(approval, entry),
 		},
 	);
+	if (!(await hasCompletedDryRun(entry, job))) {
+		count("APPROVAL_MISMATCH", entry.sourceRow);
+		return null;
+	}
 	console.log(
 		JSON.stringify({
 			event: "campaign_send_job_preview",
@@ -166,23 +166,32 @@ async function buildApprovedJob(
 }
 
 /**
- * Confirms the approved dry-run job really covers this row: the same form URL,
- * a run that was itself a dry-run, and a result that reached the dry-run
- * boundary. A lookup that cannot be completed counts as a mismatch, so an
- * unreachable API never turns into a send.
+ * Confirms the approved dry-run job really covers this send: the same content
+ * fingerprint (form URL, company, and every form value), a run that was itself
+ * a dry-run, and a result that reached the dry-run boundary. The Worker repeats
+ * the same comparison; this one keeps a mismatched row out of the batch instead
+ * of turning it into a 400. A lookup that cannot be completed counts as a
+ * mismatch, so an unreachable API never turns into a send.
  */
 async function hasCompletedDryRun(
 	entry: SendApprovalEntry,
-	candidate: CampaignCandidate,
+	job: JobInput,
 ): Promise<boolean> {
 	const state = await readJobState(entry.dryRunJobId);
 	if (!state) return false;
-	return (
-		state.targetUrl === candidate.targetUrl &&
-		state.payload?._formAgentEffectiveDryRun !== false &&
-		state.status === "prohibited" &&
-		state.result?.reasonCode === "DRY_RUN_COMPLETE"
-	);
+	if (
+		state.targetUrl !== job.targetUrl ||
+		state.payload?._formAgentEffectiveDryRun === false ||
+		state.status !== "prohibited" ||
+		state.result?.reasonCode !== "DRY_RUN_COMPLETE"
+	) {
+		return false;
+	}
+	const [approved, requested] = await Promise.all([
+		jobContentFingerprint(state.targetUrl, state.companyId, state.payload),
+		jobContentFingerprint(job.targetUrl, job.companyId, job.payload),
+	]);
+	return approved === requested;
 }
 
 function approvalRecord(file: SendApprovalFile, entry: SendApprovalEntry) {
@@ -376,6 +385,7 @@ interface JobState {
 	status: string;
 	attemptCount: number;
 	targetUrl: string;
+	companyId: string;
 	payload: Record<string, unknown> | null;
 	result: { reasonCode: string | null } | null;
 }

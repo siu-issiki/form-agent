@@ -1142,6 +1142,103 @@ describe("Real-send guard", () => {
 		expect(await repeated.json()).toMatchObject({ created: false });
 	});
 
+	test("refuses an approval whose dry-run ran different content", async () => {
+		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl, {
+			formValues: { message: "Hallo", subject: "Introduction" },
+		});
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
+			sendEnv,
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({
+			error: "DRY_RUN_CONTENT_MISMATCH",
+		});
+		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
+		expect(queued).toEqual([]);
+	});
+
+	test("accepts a real send whose content matches its dry-run", async () => {
+		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl, {
+			formValues: { subject: "Introduction", message: "Hello" },
+		});
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
+			sendEnv,
+		);
+
+		expect(response.status).toBe(201);
+		expect(queued).toEqual([{ jobId: input.id }]);
+	});
+
+	test("refuses to re-queue a pending real send from an earlier day", async () => {
+		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
+		const pending = approvedSend(input.id);
+		await new D1JobStore(env.DB).create(
+			{
+				...pending,
+				payload: { ...pending.payload, _formAgentEffectiveDryRun: false },
+			},
+			new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+		);
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", pending, apiToken),
+			sendEnv,
+		);
+
+		expect(response.status).toBe(409);
+		expect(await response.json()).toEqual({ error: "REAL_SEND_STALE" });
+		expect(queued).toEqual([]);
+	});
+
+	test("re-queues a pending real send created on the same day", async () => {
+		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
+		const pending = approvedSend(input.id);
+		await new D1JobStore(env.DB).create(
+			{
+				...pending,
+				payload: { ...pending.payload, _formAgentEffectiveDryRun: false },
+			},
+			new Date().toISOString(),
+		);
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", pending, apiToken),
+			sendEnv,
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({ created: false });
+		expect(queued).toEqual([{ jobId: input.id }]);
+	});
+
+	test("re-queues a pending dry-run job from an earlier day", async () => {
+		const { REAL_SEND_DAILY_CAP: _cap, ...closed } = sendEnv;
+		const dryRunInput = {
+			...input,
+			payload: { ...input.payload, _formAgentDryRun: true },
+		};
+		await new D1JobStore(env.DB).create(
+			{
+				...dryRunInput,
+				payload: { ...dryRunInput.payload, _formAgentEffectiveDryRun: true },
+			},
+			new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+		);
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", dryRunInput, apiToken),
+			closed,
+		);
+
+		expect(response.status).toBe(200);
+		expect(queued).toEqual([{ jobId: input.id }]);
+	});
+
 	test("leaves a dry-run job outside the real-send guard", async () => {
 		const { REAL_SEND_DAILY_CAP: _cap, ...closed } = sendEnv;
 		const dryRunInput = {
@@ -1178,14 +1275,18 @@ function approvedSend(
 }
 
 /** Seeds a dry-run job that already stopped at the dry-run boundary. */
-async function completeDryRun(id: string, targetUrl: string): Promise<void> {
+async function completeDryRun(
+	id: string,
+	targetUrl: string,
+	payload: Record<string, unknown> = input.payload,
+): Promise<void> {
 	const store = new D1JobStore(env.DB);
 	await store.create(
 		{
 			...input,
 			id,
 			targetUrl,
-			payload: { ...input.payload, _formAgentEffectiveDryRun: true },
+			payload: { ...payload, _formAgentEffectiveDryRun: true },
 		},
 		"2026-09-01T00:00:00.000Z",
 	);
@@ -3105,6 +3206,65 @@ describe("ResponsesAgentExecutor", () => {
 				outcome: "PROHIBITION_EVIDENCE_VERIFIED",
 			},
 		]);
+	});
+
+	test("keeps the run token and the send approval out of the model input", async () => {
+		const store = new D1JobStore(env.DB);
+		await store.create(
+			{
+				...input,
+				payload: {
+					...input.payload,
+					_formAgentEffectiveDryRun: false,
+					_formAgentSendApproval: sendApproval,
+				},
+			},
+			"2026-08-28T00:00:00.000Z",
+		);
+		const job = await store.claimRun(
+			input.id,
+			"run-token-1",
+			"2026-08-28T00:00:01.000Z",
+		);
+		if (!job) throw new Error("Expected a claimed job");
+		const requestBodies: string[] = [];
+		const responses = [
+			functionResponse("call-observe", "observe", {}),
+			functionResponse("call-uncertain", "finish_uncertain", {
+				reasonCode: "OTHER_UNCERTAINTY",
+				reason: "Nothing was attempted.",
+			}),
+		];
+		const executor = new ResponsesAgentExecutor({
+			db: env.DB,
+			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+			model: "gpt-5.6-luna",
+			openAiApiKey: "openai-secret",
+			browserUseApiKey: "browser-secret",
+			fetcher: (async (_resource, init) => {
+				requestBodies.push(String(init?.body));
+				const response = responses.shift();
+				if (!response) throw new Error("Unexpected provider request");
+				return Response.json(response);
+			}) as typeof fetch,
+			createBrowserDriver: async () => new WorkerFakeBrowserDriver(),
+		});
+
+		await executor.execute(
+			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+			new AbortController().signal,
+		);
+
+		expect(requestBodies).toHaveLength(2);
+		const sent = requestBodies.join("\n");
+		// The job is serialized into the first user message, so the whole
+		// request is checked rather than one field of it.
+		expect(sent).toContain(input.companyName);
+		expect(sent).not.toContain("_formAgentSendApproval");
+		expect(sent).not.toContain(sendApproval.approvedBy);
+		expect(sent).not.toContain(sendApproval.dryRunJobId);
+		expect(sent).not.toContain("runToken");
+		expect(sent).not.toContain("run-token-1");
 	});
 
 	test("refuses a prohibition quote the observed page does not contain", async () => {

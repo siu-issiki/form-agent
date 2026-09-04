@@ -77,15 +77,18 @@ deploymentが1つのversionへ100%配信されていること、そのactive ver
 
 実送信ジョブを作れる経路は`tools/campaign-send.ts`だけである。`tools/campaign-dry-run.ts`は`_formAgentDryRun: true`固定のままで、実送信できない。
 
-Worker側は`POST /jobs`で実送信ジョブ（`_formAgentEffectiveDryRun`が`false`）になる場合だけ次の3つを検証する。1つでも満たさなければジョブを作らない。
+Worker側は`POST /jobs`で実送信ジョブ（`_formAgentEffectiveDryRun`が`false`）になる場合だけ次の4つを検証する。1つでも満たさなければジョブを作らない。
 
 | 検証 | 失敗時 |
 | --- | --- |
 | payloadに承認記録`_formAgentSendApproval`があること | 400 `SEND_APPROVAL_REQUIRED` |
 | `dryRunJobId`のジョブが存在し、同じ`targetUrl`のdry-runで、`prohibited` / `DRY_RUN_COMPLETE`で終わっていること | 400 `DRY_RUN_NOT_COMPLETED` |
+| そのdry-runと実送信の内容フィンガープリント（`targetUrl` + `companyId` + `payload.formValues`のSHA-256）が一致すること | 400 `DRY_RUN_CONTENT_MISMATCH` |
 | 当日（UTC）に作成済みの実送信ジョブ数が`REAL_SEND_DAILY_CAP`未満であること | 429 `REAL_SEND_CAP_REACHED` |
 
-承認記録はpayloadへそのまま保存し、`GET /jobs/:id`とD1で「誰がいつどのdry-runに対して承認したか」を後から追える。
+承認記録はpayloadへそのまま保存し、`GET /jobs/:id`とD1で「誰がいつどのdry-runに対して承認したか」を後から追える。承認記録はモデルにも送信前レビューにも渡さない。
+
+すでに`pending`で存在する実送信ジョブの再登録は、`created_at`が当日UTCの場合だけ再queueする。日を跨いでいた場合は再queueせず409 `REAL_SEND_STALE`を返す。日次上限は作成時にしか数えないため、翌日に再queueするとその日の枠を消費せずに送信されてしまうためである。
 
 ### 日次上限の設定
 
@@ -165,7 +168,7 @@ JOB_API_TOKEN=... bun run campaign:send \
 | --- | --- |
 | `SENT` | 送信完了 |
 | `ROW_NOT_ELIGIBLE` | 承認された`sourceRow`がCSVの適格行に無い |
-| `APPROVAL_MISMATCH` | `dryRunJobId`のジョブがフォームURL・dry-run・`DRY_RUN_COMPLETE`のいずれかを満たさない、または照会できない |
+| `APPROVAL_MISMATCH` | `dryRunJobId`のジョブがフォームURL・dry-run・`DRY_RUN_COMPLETE`・内容フィンガープリントのいずれかを満たさない、または照会できない |
 | `REDIRECT_PREFLIGHT_FAILED` | redirect preflightに失敗し、登録しなかった |
 | `REGISTRATION_FAILED` / `REGISTRATION_UNKNOWN` | dry-runツールと同じ登録失敗・確認不能 |
 | `SEND_TIMED_OUT` | 期限内に終端状態へ到達しなかった |
@@ -194,6 +197,16 @@ JOB_API_TOKEN=... bun run campaign:send \
 ```
 
 1つ目のdeployで`REAL_SEND_DAILY_CAP`が消え、新しい実送信ジョブは429で拒否される。2つ目のpauseで、すでにQueueへ載っているジョブの配送が止まる。実行中のConsumerは取り消されないため、「緊急停止」の手順で`running` / `submitting`が0件になるまで確認する。
+
+停止中に`pending`のまま日を跨いだ実送信ジョブは、resume後に同じ内容で再登録しても409 `REAL_SEND_STALE`になる。承認と上限判定をやり直す設計であるためで、再開時は次のいずれかを選ぶ。
+
+- そのまま配送をresumeして既存の`pending`を流す。Queueのメッセージは残っているため再登録は不要である。
+- 流さない場合は、対象を確認したうえで新しいcampaign名でdry-runからやり直し、承認ファイルを作り直す。既存ジョブを手作業で`pending`へ戻したり削除したりしない。
+
+```bash
+./node_modules/.bin/wrangler d1 execute form-agent --remote --command \
+  "SELECT id,created_at FROM jobs WHERE real_send=1 AND status='pending' ORDER BY created_at;"
+```
 
 ## D1 schema migrationを含むデプロイ
 

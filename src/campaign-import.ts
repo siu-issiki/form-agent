@@ -1,5 +1,6 @@
 import { parse } from "tldts";
 import { JOB_ID_PATTERN, type JobInput } from "./job";
+import { jobContentFingerprint, jobInputFingerprint } from "./job-fingerprint";
 import {
 	isTrustedCandidateList,
 	normalizeAllowedHosts,
@@ -271,32 +272,7 @@ export function campaignApiHeaders(apiToken: string): Record<string, string> {
 	};
 }
 
-/**
- * Digest of the inputs a dry-run actually sends: the form URL and every
- * `formValues` entry, with candidate lists compared in order. Only the digest
- * is compared or logged, so no registrant value leaves this function. The
- * stored payload also carries `_formAgentEffectiveDryRun`, which the API adds,
- * so the whole payload cannot be compared.
- */
-export async function jobInputFingerprint(
-	targetUrl: unknown,
-	payload: unknown,
-): Promise<string> {
-	const values =
-		isPlainRecord(payload) && isPlainRecord(payload.formValues)
-			? payload.formValues
-			: {};
-	return sha256(
-		JSON.stringify({
-			targetUrl,
-			subject: values.subject ?? null,
-			message: values.message ?? null,
-			formValues: Object.keys(values)
-				.sort()
-				.map((key) => [key, values[key]]),
-		}),
-	);
-}
+export { jobContentFingerprint, jobInputFingerprint };
 
 /**
  * Confirms whether the API already holds this exact job. Job ids are derived
@@ -330,9 +306,20 @@ export async function confirmJobRegistration(
 	}
 	if (!isPlainRecord(body) || !isPlainRecord(body.job)) return "unknown";
 	const stored = body.job;
+	const realSend = job.payload._formAgentDryRun === false;
+	// Only the stored side carries the effective mode, so it is checked here
+	// rather than inside the digest. A dry-run job under the same id is not
+	// this registration: the queued run would send nothing.
+	if (
+		realSend &&
+		(!isPlainRecord(stored.payload) ||
+			stored.payload._formAgentEffectiveDryRun !== false)
+	) {
+		return "mismatched";
+	}
 	const [expected, actual] = await Promise.all([
-		jobInputFingerprint(job.targetUrl, job.payload),
-		jobInputFingerprint(stored.targetUrl, stored.payload),
+		jobInputFingerprint(job.targetUrl, job.payload, realSend),
+		jobInputFingerprint(stored.targetUrl, stored.payload, realSend),
 	]);
 	return expected === actual ? "registered" : "mismatched";
 }

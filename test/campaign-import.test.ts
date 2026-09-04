@@ -4,6 +4,7 @@ import {
 	type CampaignCsvRow,
 	DEFAULT_CHOICE_CANDIDATES,
 	filterCampaignRows,
+	jobContentFingerprint,
 	jobInputFingerprint,
 	mapRegistrationValues,
 	mergeChoiceCandidates,
@@ -590,6 +591,103 @@ describe("campaign import", () => {
 		).rejects.toThrow("dry-run guard");
 	});
 
+	test("binds the content fingerprint to the URL, company, and form values", async () => {
+		const base = sendJob("job-send-1");
+		const digest = (job: JobInput) =>
+			jobContentFingerprint(job.targetUrl, job.companyId, job.payload);
+
+		const same = await digest({
+			...base,
+			id: "job-send-2",
+			payload: { ...base.payload, campaign: "another-name" },
+		});
+		const otherMessage = await digest({
+			...base,
+			payload: {
+				...base.payload,
+				formValues: { ...(base.payload.formValues as object), message: "Hi" },
+			},
+		});
+		const otherCompany = await digest({ ...base, companyId: "company-2" });
+		const otherUrl = await digest({
+			...base,
+			targetUrl: "https://acme.co.jp/contact2",
+		});
+
+		// The campaign name and the job id are not part of the approved content.
+		expect(same).toBe(await digest(base));
+		expect(otherMessage).not.toBe(same);
+		expect(otherCompany).not.toBe(same);
+		expect(otherUrl).not.toBe(same);
+	});
+
+	test("refuses a stored dry-run job as a real-send registration", async () => {
+		const job = sendJob("job-send-1");
+		const logs: Array<Record<string, unknown>> = [];
+
+		const result = await registerCampaignJobs([job], {
+			baseUrl: "https://api.test",
+			apiToken: "token",
+			realSend: true,
+			log: (entry) => logs.push(entry),
+			fetcher: async (_resource, init) => {
+				if (init?.method === "POST") throw new TypeError("network error");
+				// The same campaign name already registered this id as a dry-run.
+				return storedJobResponse(dryRunJob("job-send-1"));
+			},
+		});
+
+		expect(result).toMatchObject({
+			registered: [],
+			notRegistered: 0,
+			unknown: 1,
+		});
+		expect(logs.map((entry) => entry.outcome)).toContain("mismatched");
+	});
+
+	test("keeps a real-send registration the API holds with the same approval", async () => {
+		const job = sendJob("job-send-1");
+
+		const result = await registerCampaignJobs([job], {
+			baseUrl: "https://api.test",
+			apiToken: "token",
+			realSend: true,
+			log: () => undefined,
+			fetcher: async (_resource, init) => {
+				if (init?.method === "POST") throw new TypeError("network error");
+				return storedSendJobResponse(job);
+			},
+		});
+
+		expect(result.registered.map((registered) => registered.id)).toEqual([
+			"job-send-1",
+		]);
+	});
+
+	test("refuses a stored real send approved by someone else", async () => {
+		const job = sendJob("job-send-1");
+		const stored = {
+			...job,
+			payload: {
+				...job.payload,
+				_formAgentSendApproval: { ...approval, approvedBy: "someone-else" },
+			},
+		};
+
+		const result = await registerCampaignJobs([job], {
+			baseUrl: "https://api.test",
+			apiToken: "token",
+			realSend: true,
+			log: () => undefined,
+			fetcher: async (_resource, init) => {
+				if (init?.method === "POST") throw new TypeError("network error");
+				return storedSendJobResponse(stored);
+			},
+		});
+
+		expect(result).toMatchObject({ registered: [], unknown: 1 });
+	});
+
 	test("reads an approval file that names the dry-run of every row", () => {
 		const file = readSendApprovalFile(
 			{
@@ -743,6 +841,18 @@ function storedJobResponse(job: JobInput): Response {
 		job: {
 			...job,
 			payload: { ...job.payload, _formAgentEffectiveDryRun: true },
+			status: "pending",
+			attemptCount: 0,
+		},
+	});
+}
+
+/** Mirrors `GET /jobs/:id` for a job the API froze as a real send. */
+function storedSendJobResponse(job: JobInput): Response {
+	return Response.json({
+		job: {
+			...job,
+			payload: { ...job.payload, _formAgentEffectiveDryRun: false },
 			status: "pending",
 			attemptCount: 0,
 		},
