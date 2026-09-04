@@ -149,6 +149,18 @@ export interface JobStore {
 		now: string,
 	): Promise<Job | null>;
 	/**
+	 * Records a submit activation past the first one of the same submission.
+	 * The permission itself was taken by the first stage, so this only leaves a
+	 * trail of how many stages ran and whether each sent a request.
+	 */
+	recordSubmitStage(
+		id: string,
+		runToken: string,
+		stage: number,
+		requestObserved: boolean,
+		now: string,
+	): Promise<boolean>;
+	/**
 	 * Declares the object key before the screenshot reaches the object store.
 	 * The same event id later becomes `captured` or `capture_failed`, so a row
 	 * that stays `intent` names an orphan object.
@@ -370,6 +382,28 @@ export class InMemoryJobStore implements JobStore {
 			reason,
 			completedAt: now,
 		});
+	}
+
+	/** Mirrors `D1JobStore.recordSubmitStage`: one row per stage past the first. */
+	async recordSubmitStage(
+		id: string,
+		runToken: string,
+		stage: number,
+		requestObserved: boolean,
+		_now: string,
+	): Promise<boolean> {
+		const job = this.#jobs.get(id);
+		if (job?.status !== "submitting" || job.runToken !== runToken) {
+			return false;
+		}
+
+		this.events.push({
+			jobId: id,
+			attempt: job.attemptCount,
+			type: "submit.stage",
+			data: { stage, requestObserved },
+		});
+		return true;
 	}
 
 	/** Mirrors `D1JobStore.recordAgentRunMetrics`: one row per finished run. */

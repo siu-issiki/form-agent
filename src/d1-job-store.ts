@@ -79,6 +79,9 @@ export type AgentToolDiagnosticCode =
 	| "PROHIBITION_EVIDENCE_NOT_FOUND"
 	| "PROHIBITION_EVIDENCE_WEAK"
 	| "SUBMIT_RESULT_NOT_PERSISTED"
+	| "SUBMIT_STAGE_PENDING"
+	| "SUBMIT_STAGE_UNVERIFIED"
+	| "SUBMIT_CONFIRMATION_NOT_OBSERVED"
 	| "SUBMIT_REVIEW_ALLOWED"
 	| "SUBMIT_REVIEW_DENIED"
 	| "SUBMIT_REVIEW_UNAVAILABLE"
@@ -222,12 +225,16 @@ export class D1JobStore implements JobStore {
 		maxRequests: number,
 		now: string,
 	): Promise<boolean> {
+		// `submitting` is accepted because a two-step form is still being worked
+		// on after the submission permission was taken: the model has to observe
+		// the confirmation screen and activate its send control. The count cap
+		// is what bounds the run either way.
 		const result = await this.db
 			.prepare(
 				`UPDATE jobs
          SET provider_request_count = provider_request_count + 1,
              updated_at = ?
-         WHERE id = ? AND status = 'running' AND run_token = ?
+         WHERE id = ? AND status IN ('running', 'submitting') AND run_token = ?
            AND provider_request_count < ?`,
 			)
 			.bind(now, id, runToken, maxRequests)
@@ -257,6 +264,43 @@ export class D1JobStore implements JobStore {
 			.first<{ submit_review_denial_count: number }>();
 
 		return row?.submit_review_denial_count ?? null;
+	}
+
+	/**
+	 * One row per submit activation past the first of the same submission. The
+	 * conditional UPDATE that grants the submission ran on the first stage; a
+	 * later stage only leaves a trail, so the row carries fixed values alone.
+	 */
+	async recordSubmitStage(
+		id: string,
+		runToken: string,
+		stage: number,
+		requestObserved: boolean,
+		now: string,
+	): Promise<boolean> {
+		const result = await this.db
+			.prepare(
+				`INSERT INTO events (
+          id, job_id, attempt, type, data_json, created_at
+        )
+        SELECT ?, id, attempt_count, 'submit.stage', json_object(
+          'stage', ?,
+          'requestObserved', json(?)
+        ), ?
+        FROM jobs
+        WHERE id = ? AND status = 'submitting' AND run_token = ?`,
+			)
+			.bind(
+				crypto.randomUUID(),
+				stage,
+				requestObserved ? "true" : "false",
+				now,
+				id,
+				runToken,
+			)
+			.run();
+
+		return result.meta.changes === 1;
 	}
 
 	async recordRunAttempt(

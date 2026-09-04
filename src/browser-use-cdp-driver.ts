@@ -64,6 +64,13 @@ const DOM_DISCOVERY_RETRY_DELAY_MS = 500;
 const CONFIRMATION_POLL_INTERVAL_MS = 1_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MS = 15_000;
 const SUBMISSION_PERMISSION_WINDOW_MS = 2_000;
+/**
+ * How many unsafe requests one run may send while a submission is authorized.
+ * The form action is no longer compared, so this cap -- together with the
+ * domain check -- is what bounds a page that keeps posting during the
+ * activation window.
+ */
+export const MAX_SUBMISSION_REQUESTS = 5;
 const MAX_MOUSE_PREPARATION_ATTEMPTS = 3;
 const READY_STATE_TIMEOUT_MS = 10_000;
 /**
@@ -100,6 +107,12 @@ export interface BrowserUseConnectOptions {
 		webSocketUrl: string,
 		signal?: AbortSignal,
 	) => Promise<BrowserUseCdpConnection>;
+	/**
+	 * How long a submission waits for the page to confirm it. Only a test
+	 * overrides it, so that the uncertain path can be watched without waiting
+	 * out the real window.
+	 */
+	submissionConfirmationTimeoutMs?: number;
 }
 
 function isRetryableConnectError(error: unknown): boolean {
@@ -264,7 +277,10 @@ export interface ExpectedSubmissionRequest {
 	method: string;
 }
 
-type SubmissionRequestBlockStage = "expected_request" | "network_policy";
+type SubmissionRequestBlockStage =
+	| "expected_request"
+	| "network_policy"
+	| "request_limit";
 type ObservedFrameTrust = "trusted" | "third_party" | "unknown";
 type GetSubmissionRequestDisposition = "claim" | "block" | "ignore";
 
@@ -327,8 +343,15 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		| { url: string; frameId?: string; claimed: boolean }
 		| undefined;
 	#submissionRequestInFlight = false;
-	#submissionRedirectRequestId: string | undefined;
+	/**
+	 * Requests already continued as part of the current submission. A redirect
+	 * names the request it came from, so the set is what lets the follow-up of
+	 * any claimed request through.
+	 */
+	readonly #submissionRedirectRequestIds = new Set<string>();
 	#submissionRequestCount = 0;
+	/** Submission requests continued across the whole run, capped by {@link MAX_SUBMISSION_REQUESTS}. */
+	#submissionRequestTotal = 0;
 	#verificationProviderRequestCount = 0;
 	#verificationProviderFrameCount = 0;
 	#submissionRequestObserved: (() => void) | undefined;
@@ -359,6 +382,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		private readonly sessionId: string,
 		private readonly dryRun: boolean,
 		private readonly browserSession: BrowserSessionHandle | undefined,
+		private readonly submissionConfirmationTimeoutMs = SUBMISSION_CONFIRMATION_TIMEOUT_MS,
 	) {}
 
 	/**
@@ -432,6 +456,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 					attempt,
 					openConnection,
 					signal,
+					options.submissionConfirmationTimeoutMs,
 				);
 			} catch (error) {
 				// An abort ends the run, so it is never reported as a retry.
@@ -455,6 +480,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			signal?: AbortSignal,
 		) => Promise<BrowserUseCdpConnection>,
 		signal: AbortSignal | undefined,
+		submissionConfirmationTimeoutMs: number | undefined,
 	): Promise<BrowserUseCdpDriver> {
 		let session: BrowserSession;
 		try {
@@ -498,6 +524,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				openConnection,
 				signal,
 				handle,
+				submissionConfirmationTimeoutMs,
 			);
 			console.log(
 				JSON.stringify({
@@ -522,6 +549,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		) => Promise<BrowserUseCdpConnection>,
 		signal: AbortSignal | undefined,
 		browserSession: BrowserSessionHandle | undefined,
+		submissionConfirmationTimeoutMs: number | undefined,
 	): Promise<BrowserUseCdpDriver> {
 		const connection = await openConnection(webSocketUrl, signal);
 		// Closing the connection rejects every in-flight command, so an abort
@@ -552,6 +580,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				sessionId,
 				dryRun,
 				browserSession,
+				submissionConfirmationTimeoutMs,
 			);
 			await driver.#initialize();
 			return driver;
@@ -1036,7 +1065,17 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 	}
 
-	async validateSubmit(elementId: string): Promise<void> {
+	/**
+	 * `requireEnteredInput` is false only for a later stage of the same
+	 * submission. A confirmation screen is a new document, so the fields this
+	 * run filled no longer exist and the "the submit control owns a field I
+	 * filled" tie cannot be made there. The handler checks that the page still
+	 * carries the reviewed values instead.
+	 */
+	async validateSubmit(
+		elementId: string,
+		requireEnteredInput = true,
+	): Promise<void> {
 		this.#expectedSubmissionRequest = undefined;
 		this.#validatedSubmitInputBackendNodeId = undefined;
 		const reference = this.#element(elementId);
@@ -1062,7 +1101,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			hasInputInSubmitForm = true;
 			this.#validatedSubmitInputBackendNodeId ??= inputBackendNodeId;
 		}
-		if (!hasInputInSubmitForm) throw new BrowserElementError();
+		if (requireEnteredInput && !hasInputInSubmitForm) {
+			throw new BrowserElementError();
+		}
 		const formValid = await this.#callFunctionOnElement<boolean>(
 			reference.backendNodeId,
 			CHECK_FORM_VALIDITY_FUNCTION,
@@ -1078,14 +1119,15 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	async submit(
 		elementId: string,
 		activationStrategy: SubmitActivationStrategy,
+		requireEnteredInput = true,
 	): Promise<BrowserSubmitResult> {
 		try {
-			await this.validateSubmit(elementId);
+			await this.validateSubmit(elementId, requireEnteredInput);
 		} catch (error) {
 			throw createBrowserSubmitDiagnosticError("SUBMIT_VALIDATE", error);
 		}
 		this.#blockNonSubmitRequests = true;
-		this.#submissionRedirectRequestId = undefined;
+		this.#submissionRedirectRequestIds.clear();
 		this.#interactionStarted = true;
 		if (this.#expectedSubmissionRequest?.method === "GET") {
 			this.#getSubmissionGuard ??= {
@@ -1138,6 +1180,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 						),
 					),
 				(milliseconds) => this.#waitForPageChange(milliseconds),
+				this.submissionConfirmationTimeoutMs,
 			);
 			if (confirmation) return confirmation;
 		} finally {
@@ -1277,12 +1320,11 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			if (!this.#targetDomain) {
 				throw new Error("Browser domain scope is not configured");
 			}
-			let expectedSubmissionRequest = false;
 			const canContinueSubmissionRedirect =
 				this.#submissionAttemptInProgress &&
 				isAuthorizedSubmissionRedirect(
 					paused,
-					this.#submissionRedirectRequestId,
+					this.#submissionRedirectRequestIds,
 					this.#expectedSubmissionFrameId,
 				);
 			const getSubmissionGuard = this.#getSubmissionGuard;
@@ -1305,23 +1347,27 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				blockStage = "expected_request";
 				throw new BrowserElementError();
 			}
-			if (getSubmissionDisposition === "claim") {
-				expectedSubmissionRequest = true;
-			}
-			if (this.#submissionRequestAllowed && !verificationProviderRequest) {
-				if (unsafeRequest) {
-					blockStage = "expected_request";
-					assertExpectedSubmissionRequest(
-						paused.request,
-						this.#expectedSubmissionRequest,
-					);
-					expectedSubmissionRequest = true;
-				}
+			// Once the pre-submit review has allowed the submission, every unsafe
+			// request the page makes inside the activation window is treated as
+			// part of that submission. The form `action` is deliberately not
+			// compared: a page script may post the entered values to another
+			// endpoint of the same site, which is how WordPress Contact Form 7
+			// and similar plugins submit. What still holds the values on the
+			// target site is the domain check below; how many such requests one
+			// run may make is bounded by MAX_SUBMISSION_REQUESTS.
+			const submissionWindowRequest =
+				this.#submissionRequestAllowed &&
+				unsafeRequest &&
+				!verificationProviderRequest;
+			if (
+				submissionWindowRequest &&
+				this.#submissionRequestTotal >= MAX_SUBMISSION_REQUESTS
+			) {
+				blockStage = "request_limit";
+				throw new BrowserElementError();
 			}
 			const canClaimSubmissionRequest =
-				expectedSubmissionRequest &&
-				this.#submissionRequestCount === 0 &&
-				!this.#submissionRequestInFlight;
+				getSubmissionDisposition === "claim" || submissionWindowRequest;
 			submissionRelatedRequest ||= canContinueSubmissionRedirect;
 			const expectedNavigationRequest = this.#expectedNavigationRequest;
 			const canClaimNavigationRequest =
@@ -1354,12 +1400,15 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				paused.resourceType,
 				subframeRequest,
 			);
+			// Nothing above this point awaits, so the cap is read and spent in one
+			// synchronous step even when several requests pause at once.
 			if (canClaimSubmissionRequest) {
 				this.#submissionRequestInFlight = true;
-				this.#submissionRedirectRequestId = paused.requestId;
+				this.#submissionRequestTotal += 1;
+				this.#submissionRedirectRequestIds.add(paused.requestId);
 				claimedSubmissionRequest = true;
 			} else if (canContinueSubmissionRedirect) {
-				this.#submissionRedirectRequestId = paused.requestId;
+				this.#submissionRedirectRequestIds.add(paused.requestId);
 			}
 			await continueSubmissionRequest(
 				() =>
@@ -1914,17 +1963,26 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		if (activationStrategy === "dom") {
 			const inputBackendNodeId = this.#validatedSubmitInputBackendNodeId;
 			const expectedRequest = this.#expectedSubmissionRequest;
-			if (!inputBackendNodeId || !expectedRequest) {
+			if (!expectedRequest) {
 				throw new BrowserElementError();
 			}
 			await this.#activatePreparedSubmit(async () => {
-				const activated =
-					await this.#callFunctionOnElementWithElementArgument<boolean>(
-						backendNodeId,
-						inputBackendNodeId,
-						ACTIVATE_SUBMIT_FUNCTION,
-						[expectedRequest.url, expectedRequest.method],
-					);
+				// A later stage of the same submission runs on a confirmation
+				// screen, where no field of this run survives. The control is then
+				// activated on its own; the action and method are still compared
+				// against what `validateSubmit` inspected.
+				const activated = inputBackendNodeId
+					? await this.#callFunctionOnElementWithElementArgument<boolean>(
+							backendNodeId,
+							inputBackendNodeId,
+							ACTIVATE_SUBMIT_FUNCTION,
+							[expectedRequest.url, expectedRequest.method],
+						)
+					: await this.#callFunctionOnElement<boolean>(
+							backendNodeId,
+							ACTIVATE_SUBMIT_FUNCTION,
+							[null, expectedRequest.url, expectedRequest.method],
+						);
 				if (!activated) throw new BrowserElementError();
 			}, "dom");
 			return;
@@ -2092,12 +2150,12 @@ export function shouldBlockNonSubmitRequest(
 
 export function isAuthorizedSubmissionRedirect(
 	paused: PausedRequest,
-	previousRequestId: string | undefined,
+	previousRequestIds: ReadonlySet<string>,
 	expectedFrameId: string | undefined,
 ): boolean {
 	return (
-		previousRequestId !== undefined &&
-		paused.redirectedRequestId === previousRequestId &&
+		paused.redirectedRequestId !== undefined &&
+		previousRequestIds.has(paused.redirectedRequestId) &&
 		["GET", "HEAD"].includes(paused.request.method.toUpperCase()) &&
 		["Document", "Fetch", "XHR"].includes(paused.resourceType ?? "") &&
 		(expectedFrameId === undefined || paused.frameId === expectedFrameId)
@@ -3073,6 +3131,12 @@ export function submitUncertainReasonCode(
 	requestObserved: boolean,
 	blockStage?: SubmissionRequestBlockStage,
 ): string {
+	// Reported ahead of everything else: a request of this submission was
+	// refused because the run had spent its budget, so an earlier observed
+	// request does not make the submission complete.
+	if (blockStage === "request_limit") {
+		return "SUBMIT_REQUEST_LIMIT_REACHED";
+	}
 	if (requestObserved) {
 		return "SUBMIT_CONFIRMATION_NOT_OBSERVED";
 	}
@@ -3088,15 +3152,12 @@ export function submitUncertainReasonCode(
 	return "SUBMIT_ENTER_REQUEST_NOT_OBSERVED";
 }
 
-export function assertExpectedSubmissionRequest(
-	request: { url: string; method: string },
-	expected: ExpectedSubmissionRequest | undefined,
-): void {
-	if (!isExpectedSubmissionRequest(request, expected)) {
-		throw new BrowserElementError();
-	}
-}
-
+/**
+ * Whether the request is the GET form submission `validateSubmit` recorded.
+ * A GET submission is a plain document navigation, so it can only be told
+ * apart from any other navigation by its URL; unsafe submissions are no longer
+ * matched this way.
+ */
 export function isExpectedSubmissionRequest(
 	request: { url: string; method: string },
 	expected: ExpectedSubmissionRequest | undefined,
@@ -3234,7 +3295,8 @@ export const MATCHES_CHOICE_CANDIDATE_FUNCTION = `function(candidates) {
 }`;
 
 export const ACTIVATE_SUBMIT_FUNCTION = `function(input, expectedAction, expectedMethod) {
-  if (!this.isConnected || this.disabled || !this.form || !input?.isConnected || input.form !== this.form) return false;
+  if (!this.isConnected || this.disabled || !this.form) return false;
+  if (input != null && (!input.isConnected || input.form !== this.form)) return false;
   const tag = typeof this.tagName === "string" ? this.tagName.toLowerCase() : "";
   const type = typeof this.type === "string" ? this.type.toLowerCase() : "";
   const submitLike = (tag === "button" && (!type || type === "submit")) || (tag === "input" && ["submit", "image"].includes(type));
