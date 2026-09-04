@@ -1,9 +1,5 @@
 import { BROWSER_ERROR } from "./browser-error-messages";
 import {
-	assertAllowedBrowserRequest,
-	isVerificationProviderRequest,
-} from "./browser-network-policy";
-import {
 	SUBMISSION_CONFIRMATION_PATTERN,
 	SUBMISSION_PENDING_PATTERN,
 } from "./browser-submit-confirmation";
@@ -50,6 +46,14 @@ import {
 	captureCdpScreenshot,
 } from "./browser-use-cdp-screenshot";
 import {
+	canonicalHttpRequestUrl,
+	createExpectedSubmissionRequest,
+	decidePausedRequest,
+	type PausedRequest,
+	type SubmissionRequestBlockStage,
+	SubmissionRequestPolicy,
+} from "./browser-use-cdp-submission-policy";
+import {
 	type BrowserSession,
 	BrowserUseApiError,
 	BrowserUseClient,
@@ -92,13 +96,6 @@ const DOM_DISCOVERY_RETRY_DELAY_MS = 500;
 const CONFIRMATION_POLL_INTERVAL_MS = 1_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MS = 15_000;
 const SUBMISSION_PERMISSION_WINDOW_MS = 2_000;
-/**
- * How many unsafe requests one run may send while a submission is authorized.
- * The form action is no longer compared, so this cap -- together with the
- * domain check -- is what bounds a page that keeps posting during the
- * activation window.
- */
-export const MAX_SUBMISSION_REQUESTS = 5;
 const MAX_MOUSE_PREPARATION_ATTEMPTS = 3;
 const READY_STATE_TIMEOUT_MS = 10_000;
 /**
@@ -278,25 +275,7 @@ interface ElementReference {
 	frameId?: string;
 }
 
-export interface PausedRequest {
-	requestId: string;
-	redirectedRequestId?: string;
-	resourceType?: string;
-	frameId?: string;
-	request: { url: string; method: string };
-}
-
-export interface ExpectedSubmissionRequest {
-	url: string;
-	method: string;
-}
-
-type SubmissionRequestBlockStage =
-	| "expected_request"
-	| "network_policy"
-	| "request_limit";
 type ObservedFrameTrust = "trusted" | "third_party" | "unknown";
-type GetSubmissionRequestDisposition = "claim" | "block" | "ignore";
 
 export type SubmitActivationStage =
 	| "scroll"
@@ -351,32 +330,14 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#topFrameId: string | undefined;
 	#targetDomain: string | undefined;
 	#allowedHosts: string[] = [];
-	#submissionRequestAllowed = false;
 	#blockNonSubmitRequests = false;
 	#expectedNavigationRequest:
 		| { url: string; frameId?: string; claimed: boolean }
 		| undefined;
-	#submissionRequestInFlight = false;
-	/**
-	 * Requests already continued as part of the current submission. A redirect
-	 * names the request it came from, so the set is what lets the follow-up of
-	 * any claimed request through.
-	 */
-	readonly #submissionRedirectRequestIds = new Set<string>();
-	#submissionRequestCount = 0;
-	/** Submission requests continued across the whole run, capped by {@link MAX_SUBMISSION_REQUESTS}. */
-	#submissionRequestTotal = 0;
+	/** Everything the submission window is made of: see the class JSDoc. */
+	readonly #submissionPolicy = new SubmissionRequestPolicy();
 	#verificationProviderRequestCount = 0;
 	#verificationProviderFrameCount = 0;
-	#submissionRequestObserved: (() => void) | undefined;
-	#expectedSubmissionRequest: ExpectedSubmissionRequest | undefined;
-	#submissionAttemptInProgress = false;
-	#expectedSubmissionFrameId: string | undefined;
-	#getSubmissionGuard:
-		| { request: ExpectedSubmissionRequest; frameId?: string }
-		| undefined;
-	#submissionRequestBlockStage: SubmissionRequestBlockStage | undefined;
-	#validatedSubmitInputBackendNodeId: number | undefined;
 	#targetPolicyError: Error | undefined;
 	readonly #frameNavigationRevisions = new Map<string, number>();
 	readonly #frameParentIds = new Map<string, string | undefined>();
@@ -1099,8 +1060,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		elementId: string,
 		requireEnteredInput = true,
 	): Promise<void> {
-		this.#expectedSubmissionRequest = undefined;
-		this.#validatedSubmitInputBackendNodeId = undefined;
+		this.#submissionPolicy.beginValidation();
 		const reference = this.#element(elementId);
 		const state = await this.#inspectElement(reference.backendNodeId);
 		if (
@@ -1122,7 +1082,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				);
 			if (!hasSameFormOwner) throw new BrowserElementError();
 			hasInputInSubmitForm = true;
-			this.#validatedSubmitInputBackendNodeId ??= inputBackendNodeId;
+			this.#submissionPolicy.noteValidatedInput(inputBackendNodeId);
 		}
 		if (requireEnteredInput && !hasInputInSubmitForm) {
 			throw new BrowserElementError();
@@ -1132,11 +1092,10 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			CHECK_FORM_VALIDITY_FUNCTION,
 		);
 		if (!formValid) throw new BrowserFormInvalidError();
-		this.#expectedSubmissionRequest = createExpectedSubmissionRequest(
-			state.formAction,
-			state.formMethod,
+		this.#submissionPolicy.completeValidation(
+			createExpectedSubmissionRequest(state.formAction, state.formMethod),
+			reference.frameId,
 		);
-		this.#expectedSubmissionFrameId = reference.frameId;
 	}
 
 	async submit(
@@ -1150,19 +1109,11 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			throw createBrowserSubmitDiagnosticError("SUBMIT_VALIDATE", error);
 		}
 		this.#blockNonSubmitRequests = true;
-		this.#submissionRedirectRequestIds.clear();
 		this.#interactionStarted = true;
-		if (this.#expectedSubmissionRequest?.method === "GET") {
-			this.#getSubmissionGuard ??= {
-				request: this.#expectedSubmissionRequest,
-				...(this.#expectedSubmissionFrameId
-					? { frameId: this.#expectedSubmissionFrameId }
-					: {}),
-			};
-		}
+		this.#submissionPolicy.beginSubmit();
 		const expectedDocumentGetFrameId =
-			this.#expectedSubmissionRequest?.method === "GET"
-				? this.#expectedSubmissionFrameId
+			this.#submissionPolicy.expectedRequest?.method === "GET"
+				? this.#submissionPolicy.expectedFrameId
 				: undefined;
 		let beforeConfirmationCount: number;
 		try {
@@ -1179,8 +1130,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			? (this.#frameNavigationRevisions.get(expectedDocumentGetFrameId) ?? 0)
 			: 0;
 		try {
-			this.#submissionAttemptInProgress = true;
-			this.#submissionRequestBlockStage = undefined;
+			this.#submissionPolicy.beginAttempt();
 			try {
 				await this.#activateSubmitElement(
 					this.#element(elementId).backendNodeId,
@@ -1193,7 +1143,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				() =>
 					readSubmissionConfirmation(
 						beforeConfirmationCount,
-						this.#submissionRequestCount > 0,
+						this.#submissionPolicy.requestCount > 0,
 						() => this.#confirmationBodyCount(expectedDocumentGetFrameId),
 						() => this.currentUrl(),
 						hasExpectedFrameNavigated(
@@ -1207,13 +1157,12 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			);
 			if (confirmation) return confirmation;
 		} finally {
-			this.#submissionRequestAllowed = false;
-			this.#submissionAttemptInProgress = false;
+			this.#submissionPolicy.endAttempt();
 		}
 		const reasonCode = submitUncertainReasonCode(
 			activationStrategy,
-			this.#submissionRequestCount > 0,
-			this.#submissionRequestBlockStage,
+			this.#submissionPolicy.requestCount > 0,
+			this.#submissionPolicy.blockStage,
 		);
 		return {
 			outcome: "uncertain",
@@ -1318,146 +1267,69 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async #handlePausedRequest(paused: PausedRequest): Promise<void> {
-		const unsafeRequest = !["GET", "HEAD", "OPTIONS"].includes(
-			paused.request.method.toUpperCase(),
+		const decision = decidePausedRequest(
+			paused,
+			this.#submissionPolicy.snapshot(),
+			{
+				topFrameId: this.#topFrameId,
+				targetDomain: this.#targetDomain,
+				allowedHosts: this.#allowedHosts,
+				blockNonSubmitRequests: this.#blockNonSubmitRequests,
+				formDataEntered: this.#formDataEntered,
+				dryRun: this.dryRun,
+				interactionStarted: this.#interactionStarted,
+				expectedNavigationRequest: this.#expectedNavigationRequest,
+			},
 		);
-		// The widget's own iframe loads as a `Document` request below the top
-		// frame. Only a request known to come from a subframe may take that path,
-		// so an unknown `frameId` keeps counting as the top frame.
-		const subframeRequest =
-			paused.frameId !== undefined && paused.frameId !== this.#topFrameId;
-		// A known verification widget (reCAPTCHA / hCaptcha / Turnstile) is never
-		// the form submission, so it stays outside the submission claim and out of
-		// the block-stage diagnostics.
-		const verificationProviderRequest = isVerificationProviderRequest(
-			paused.request.url,
-			paused.request.method,
-			paused.resourceType,
-			subframeRequest,
-		);
-		let blockStage: SubmissionRequestBlockStage = "network_policy";
-		let claimedSubmissionRequest = false;
-		let submissionRelatedRequest =
-			unsafeRequest && !verificationProviderRequest;
+		// The expected navigation is spent even when the request is refused
+		// afterwards, exactly as when the decision was inlined here.
+		if (decision.claimNavigation && this.#expectedNavigationRequest) {
+			this.#expectedNavigationRequest.claimed = true;
+		}
+		if (decision.action === "fail") {
+			if (decision.submissionRelated) {
+				this.#submissionPolicy.noteBlocked(decision.blockStage);
+			}
+			await this.#failPausedRequest(paused);
+			return;
+		}
+		// Nothing between the snapshot above and the claim below awaits, so the
+		// cap is read and spent in one synchronous step even when several
+		// requests pause at once.
+		if (decision.claimSubmission) {
+			this.#submissionPolicy.claim(paused.requestId);
+		} else if (decision.continueRedirect) {
+			this.#submissionPolicy.continueRedirect(paused.requestId);
+		}
 		try {
-			if (!this.#targetDomain) {
-				throw new Error(BROWSER_ERROR.DOMAIN_SCOPE_NOT_CONFIGURED);
-			}
-			const canContinueSubmissionRedirect =
-				this.#submissionAttemptInProgress &&
-				isAuthorizedSubmissionRedirect(
-					paused,
-					this.#submissionRedirectRequestIds,
-					this.#expectedSubmissionFrameId,
-				);
-			const getSubmissionGuard = this.#getSubmissionGuard;
-			const getSubmissionDisposition =
-				canContinueSubmissionRedirect || verificationProviderRequest
-					? "ignore"
-					: getSubmissionRequestDisposition(
-							paused.request,
-							paused.resourceType,
-							paused.frameId,
-							getSubmissionGuard?.request,
-							getSubmissionGuard?.frameId,
-							getSubmissionGuard !== undefined,
-							this.#submissionRequestAllowed,
-							this.#submissionRequestCount,
-							this.#submissionRequestInFlight,
-						);
-			submissionRelatedRequest ||= getSubmissionDisposition !== "ignore";
-			if (getSubmissionDisposition === "block") {
-				blockStage = "expected_request";
-				throw new BrowserElementError();
-			}
-			// Once the pre-submit review has allowed the submission, every unsafe
-			// request the page makes inside the activation window is treated as
-			// part of that submission. The form `action` is deliberately not
-			// compared: a page script may post the entered values to another
-			// endpoint of the same site, which is how WordPress Contact Form 7
-			// and similar plugins submit. What still holds the values on the
-			// target site is the domain check below; how many such requests one
-			// run may make is bounded by MAX_SUBMISSION_REQUESTS.
-			const submissionWindowRequest =
-				this.#submissionRequestAllowed &&
-				unsafeRequest &&
-				!verificationProviderRequest;
-			if (
-				submissionWindowRequest &&
-				this.#submissionRequestTotal >= MAX_SUBMISSION_REQUESTS
-			) {
-				blockStage = "request_limit";
-				throw new BrowserElementError();
-			}
-			const canClaimSubmissionRequest =
-				getSubmissionDisposition === "claim" || submissionWindowRequest;
-			submissionRelatedRequest ||= canContinueSubmissionRedirect;
-			const expectedNavigationRequest = this.#expectedNavigationRequest;
-			const canClaimNavigationRequest =
-				expectedNavigationRequest !== undefined &&
-				!expectedNavigationRequest.claimed &&
-				isExpectedNavigationDocumentRequest(
-					paused.request,
-					paused.resourceType,
-					paused.frameId,
-					expectedNavigationRequest,
-				);
-			if (canClaimNavigationRequest && expectedNavigationRequest) {
-				expectedNavigationRequest.claimed = true;
-			}
-			blockStage = "network_policy";
-			const allowedByVerificationProvider = assertAllowedBrowserRequest(
-				paused.request.url,
-				this.#targetDomain,
-				paused.request.method,
-				canClaimSubmissionRequest,
-				!this.#formDataEntered && paused.resourceType !== "Document",
-				(this.dryRun && this.#interactionStarted) ||
-					shouldBlockNonSubmitRequest(
-						this.#blockNonSubmitRequests,
-						canClaimSubmissionRequest,
-						canClaimNavigationRequest,
-						canContinueSubmissionRedirect,
-					),
-				this.#allowedHosts,
-				paused.resourceType,
-				subframeRequest,
-			);
-			// Nothing above this point awaits, so the cap is read and spent in one
-			// synchronous step even when several requests pause at once.
-			if (canClaimSubmissionRequest) {
-				this.#submissionRequestInFlight = true;
-				this.#submissionRequestTotal += 1;
-				this.#submissionRedirectRequestIds.add(paused.requestId);
-				claimedSubmissionRequest = true;
-			} else if (canContinueSubmissionRedirect) {
-				this.#submissionRedirectRequestIds.add(paused.requestId);
-			}
 			await continueSubmissionRequest(
 				() =>
 					this.#send("Fetch.continueRequest", {
 						requestId: paused.requestId,
 					}),
 				() => {
-					if (allowedByVerificationProvider) {
+					if (decision.allowedByVerificationProvider) {
 						this.#verificationProviderRequestCount += 1;
 					}
-					if (!claimedSubmissionRequest) return;
-					this.#submissionRequestCount += 1;
-					this.#submissionRequestObserved?.();
+					if (!decision.claimSubmission) return;
+					this.#submissionPolicy.recordContinued();
 				},
 			);
 		} catch {
-			if (submissionRelatedRequest && this.#submissionAttemptInProgress) {
-				this.#submissionRequestBlockStage ??= blockStage;
+			if (decision.submissionRelated) {
+				this.#submissionPolicy.noteBlocked(decision.blockStage);
 			}
-			await this.#send("Fetch.failRequest", {
-				requestId: paused.requestId,
-				errorReason: "BlockedByClient",
-			}).catch(() => undefined);
+			await this.#failPausedRequest(paused);
 		} finally {
-			if (claimedSubmissionRequest) this.#submissionRequestInFlight = false;
+			if (decision.claimSubmission) this.#submissionPolicy.release();
 		}
+	}
+
+	#failPausedRequest(paused: PausedRequest): Promise<unknown> {
+		return this.#send("Fetch.failRequest", {
+			requestId: paused.requestId,
+			errorReason: "BlockedByClient",
+		}).catch(() => undefined);
 	}
 
 	async #waitForReadyState(timeoutMs: number): Promise<void> {
@@ -1554,9 +1426,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	#clearElements(): void {
 		this.#elements.clear();
 		this.#successfulInputBackendNodeIds.clear();
-		this.#expectedSubmissionRequest = undefined;
-		this.#validatedSubmitInputBackendNodeId = undefined;
-		this.#expectedSubmissionFrameId = undefined;
+		this.#submissionPolicy.clear();
 	}
 
 	async #discoverForms(url: string): Promise<{
@@ -1996,8 +1866,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			}),
 		);
 		if (activationStrategy === "dom") {
-			const inputBackendNodeId = this.#validatedSubmitInputBackendNodeId;
-			const expectedRequest = this.#expectedSubmissionRequest;
+			const inputBackendNodeId =
+				this.#submissionPolicy.validatedInputBackendNodeId;
+			const expectedRequest = this.#submissionPolicy.expectedRequest;
 			if (!expectedRequest) {
 				throw new BrowserElementError();
 			}
@@ -2058,10 +1929,9 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		const submissionRequestObserved = new Promise<void>((resolve) => {
 			resolveSubmissionRequestObserved = resolve;
 		});
-		this.#submissionRequestCount = 0;
-		this.#submissionRequestInFlight = false;
-		this.#submissionRequestObserved = resolveSubmissionRequestObserved;
-		this.#submissionRequestAllowed = true;
+		this.#submissionPolicy.openActivationWindow(
+			resolveSubmissionRequestObserved,
+		);
 		try {
 			await runSubmissionActivationWithinPermissionWindow(
 				activate,
@@ -2073,14 +1943,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			);
 			throw error;
 		} finally {
-			this.#submissionRequestAllowed = false;
-			this.#submissionRequestObserved = undefined;
+			this.#submissionPolicy.closeActivationWindow();
 			resolveSubmissionRequestObserved();
 			console.log(
 				JSON.stringify({
 					event: "browser_submit_activation",
 					activationStrategy,
-					requestObserved: this.#submissionRequestCount > 0,
+					requestObserved: this.#submissionPolicy.requestCount > 0,
 					durationMs: Date.now() - startedAt,
 					...(hitTestAttempts === undefined ? {} : { hitTestAttempts }),
 				}),
@@ -2167,54 +2036,6 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 		return this.connection.send<TResult>(method, params, this.sessionId);
 	}
-}
-
-export function shouldBlockNonSubmitRequest(
-	blockNonSubmitRequests: boolean,
-	submissionRequestAuthorized: boolean,
-	navigationRequestAuthorized: boolean,
-	submissionRedirectAuthorized = false,
-): boolean {
-	return (
-		blockNonSubmitRequests &&
-		!submissionRequestAuthorized &&
-		!navigationRequestAuthorized &&
-		!submissionRedirectAuthorized
-	);
-}
-
-export function isAuthorizedSubmissionRedirect(
-	paused: PausedRequest,
-	previousRequestIds: ReadonlySet<string>,
-	expectedFrameId: string | undefined,
-): boolean {
-	return (
-		paused.redirectedRequestId !== undefined &&
-		previousRequestIds.has(paused.redirectedRequestId) &&
-		["GET", "HEAD"].includes(paused.request.method.toUpperCase()) &&
-		["Document", "Fetch", "XHR"].includes(paused.resourceType ?? "") &&
-		(expectedFrameId === undefined || paused.frameId === expectedFrameId)
-	);
-}
-
-export function isExpectedNavigationDocumentRequest(
-	request: ExpectedSubmissionRequest,
-	resourceType: string | undefined,
-	frameId: string | undefined,
-	expected: { url: string; frameId?: string },
-): boolean {
-	return (
-		request.method.toUpperCase() === "GET" &&
-		resourceType === "Document" &&
-		(expected.frameId === undefined || frameId === expected.frameId) &&
-		canonicalHttpRequestUrl(request.url) === expected.url
-	);
-}
-
-function canonicalHttpRequestUrl(rawUrl: string): string {
-	const url = new URL(rawUrl);
-	url.hash = "";
-	return url.toString();
 }
 
 export function createSubmitActivationFailureLog(
@@ -2537,18 +2358,6 @@ export function assertDryRunNavigationAllowed(
 	if (dryRun && navigationCount > 0) throw new BrowserElementError();
 }
 
-export function createExpectedSubmissionRequest(
-	formAction: string,
-	formMethod: string,
-): ExpectedSubmissionRequest {
-	const url = new URL(formAction);
-	if (!["http:", "https:"].includes(url.protocol) || !formMethod) {
-		throw new BrowserElementError();
-	}
-	url.hash = "";
-	return { url: url.toString(), method: formMethod.toUpperCase() };
-}
-
 /**
  * Splits the raw body text into the value the model may see and a flag saying
  * whether the page held more. Truncation is decided in the Worker so that an
@@ -2646,55 +2455,6 @@ export function submitUncertainReasonCode(
 	if (activationStrategy === "mouse")
 		return "SUBMIT_MOUSE_REQUEST_NOT_OBSERVED";
 	return "SUBMIT_ENTER_REQUEST_NOT_OBSERVED";
-}
-
-/**
- * Whether the request is the GET form submission `validateSubmit` recorded.
- * A GET submission is a plain document navigation, so it can only be told
- * apart from any other navigation by its URL; unsafe submissions are no longer
- * matched this way.
- */
-export function isExpectedSubmissionRequest(
-	request: { url: string; method: string },
-	expected: ExpectedSubmissionRequest | undefined,
-): boolean {
-	const url = new URL(request.url);
-	url.hash = "";
-	if (!expected || request.method.toUpperCase() !== expected.method)
-		return false;
-	if (expected.method !== "GET") return url.toString() === expected.url;
-	const expectedUrl = new URL(expected.url);
-	return (
-		url.origin === expectedUrl.origin && url.pathname === expectedUrl.pathname
-	);
-}
-
-export function getSubmissionRequestDisposition(
-	request: { url: string; method: string },
-	resourceType: string | undefined,
-	requestFrameId: string | undefined,
-	expected: ExpectedSubmissionRequest | undefined,
-	expectedFrameId: string | undefined,
-	getSubmissionGuardActive: boolean,
-	submissionRequestAllowed: boolean,
-	submissionRequestCount: number,
-	submissionRequestInFlight: boolean,
-): GetSubmissionRequestDisposition {
-	if (
-		!getSubmissionGuardActive ||
-		resourceType !== "Document" ||
-		expected?.method !== "GET" ||
-		!isExpectedSubmissionRequest(request, expected)
-	) {
-		return "ignore";
-	}
-	if (!requestFrameId || !expectedFrameId) return "block";
-	if (requestFrameId !== expectedFrameId) return "ignore";
-	return submissionRequestAllowed &&
-		submissionRequestCount === 0 &&
-		!submissionRequestInFlight
-		? "claim"
-		: "block";
 }
 
 export function centerOfQuad(quad: number[]): { x: number; y: number } | null {
