@@ -531,7 +531,11 @@ policy failure は driver の以降の全 CDP コマンドを reject させ run 
 
 ### キャンペーン取り込み
 
-CSV は 2 つの形式を受け付ける。ヘッダーに `件名` / `本文` と、リンク列（`問い合わせリンク` または `問い合わせフォームリンク`、両方あれば `問い合わせリンク` が勝つ）が揃っている場合を簡易形式とし、それ以外は従来の 30 列形式として必須列を検証する。先頭の無名インデックス列（CSV パーサーがキー `""` として公開する列）はこの判定に関与せず無視される。案件ごとに CSV の作り手が違い、簡易形式には企業名・企業ドメイン・NG チェックの各列が無いためである。簡易形式では企業ドメインをフォーム URL のホストから `normalizeCompanyDomain` で導出し、企業名にはホスト名を入れる。`buildCampaignJob` の `companyId` は登録可能ドメインから決まるので、企業名が表示用の値になっても重複判定は変わらない。チェック列が存在しない以上、その列による除外は行わない。除外理由は本文または件名が空なら `empty_message`、URL が空なら `missing_form_url`、https でない・ホストが許可形式でないなら従来と同じ `invalid_or_insecure_form_url`、ホストは有効でも登録可能ドメインを導出できない（public suffix そのものなど）場合は `invalid_company_domain` である。`sourceRow`（ヘッダーを 1 行目とする CSV の行番号）の定義は両形式で同じで、承認ファイルの `sourceRow` もそのまま使える。
+CSV は 2 つの形式を受け付ける。ヘッダーに `件名` / `本文` と、リンク列（`問い合わせリンク` または `問い合わせフォームリンク`、両方あれば `問い合わせリンク` が勝つ）が揃っている場合を簡易形式とし、それ以外は従来の 30 列形式として必須列を検証する。先頭の無名インデックス列（CSV パーサーがキー `""` として公開する列）はこの判定に関与せず無視される。案件ごとに CSV の作り手が違い、簡易形式には企業名・企業ドメイン・NG チェックの各列が無いためである。簡易形式では企業ドメインをフォーム URL のホストから `normalizeCompanyDomain` で導出し、企業名にはホスト名を入れる。`buildCampaignJob` の `companyId` は登録可能ドメインから決まるので、企業名が表示用の値になっても重複判定は変わらない。チェック列が存在しない以上、その列による除外は行わない。
+
+簡易形式のみ、リンクが `http://` の場合は検証前に `https://` へ書き換える（`simpleRowOutcome`）。この書き換え自体はここでは検証しない。検証しているのは後段の `resolveRedirectHosts`（`campaign-dry-run` が候補ごとに実行するリダイレクトプリフライト）で、https で応答しないホストはそこで失敗し（`REDIRECT_PREFLIGHT_FAILED`）、その行は登録されずスキップされる。書き換えた行数は `filterCampaignRows` の返り値 `upgradedToHttps` としてカウントされ、`campaign_filter_summary`（`campaign-dry-run`）・`campaign_send_filter_summary`（`campaign-send`）のログにも含まれる。従来の 30 列形式ではこの書き換えを行わず、`upgradedToHttps` は常に 0 である。
+
+除外理由は本文または件名が空なら `empty_message`、URL が空なら `missing_form_url`、https（簡易形式は書き換え後の値で判定）でない・ホストが許可形式でないなら従来と同じ `invalid_or_insecure_form_url`、ホストは有効でも登録可能ドメインを導出できない（public suffix そのものなど）場合は `invalid_company_domain` である。`sourceRow`（ヘッダーを 1 行目とする CSV の行番号）の定義は両形式で同じで、承認ファイルの `sourceRow` もそのまま使える。
 
 登録値 JSON は順序と件数の完全一致から label 名での照合へ変えた。同じ項目が案件によって別の書き方（「氏名（フルネーム漢字）」/「フルネーム漢字」、「電話1」/「電話番号1」、「部署名」/「部署」、「フリガナ」/「フルネームカタカナ」、「サービスページ」/「会社HP」など）で届くためである。key ごとに label を優先順に並べ、正規の label が別名より先に一致する。`役職`（jobTitle）と `年齢`（age）を key に追加した。`電話番号` は同じ label が 2 件並ぶ想定を維持し、1 件目を `phone`、2 件目を数字のみの `phoneDigits` とする。1 件しか無い場合は両方へ同じ値を入れる。値が空の項目と未知の label は無視する。登録値ファイルは今後も項目が増えるため、未知の label でファイル全体を拒否すると運用が止まるからである。ただし無視した件数は `campaign_registration_summary` の `unknownLabels` として出し、label 名や値は出さない。`fullName` / `lastName` / `firstName` / `email` / `phone` / `companyName` が揃わない場合はエラーで停止する。フォームを埋められない値で dry-run を回しても意味がないためである。
 

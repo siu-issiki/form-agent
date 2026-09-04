@@ -63,6 +63,7 @@ console.log(
 		totalRows: rows.length,
 		eligibleRows: filtered.eligible.length,
 		excluded: filtered.excluded,
+		upgradedToHttps: filtered.upgradedToHttps,
 		offset: options.offset,
 		selectedRows: selected.length,
 	}),
