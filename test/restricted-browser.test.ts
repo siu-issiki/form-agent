@@ -1844,6 +1844,171 @@ describe("RestrictedBrowserTools", () => {
 	});
 });
 
+describe("dry-run evidence", () => {
+	test("stores the reviewed screen and the observed values outside the logs", async () => {
+		const driver = new FakeDriver();
+		driver.observationForms = [
+			{
+				fields: [
+					{
+						elementId: "fa-0-0",
+						tag: "input",
+						type: "text",
+						name: "message",
+						label: "お問い合わせ内容",
+						required: true,
+						value: "",
+					},
+					{ elementId: "fa-0-1", tag: "input", type: "submit", value: "Send" },
+					{
+						elementId: "fa-0-2",
+						tag: "input",
+						type: "password",
+						name: "pass",
+						value: "s3cret",
+					},
+					{
+						elementId: "fa-0-3",
+						tag: "input",
+						type: "checkbox",
+						name: "agree",
+						value: "on",
+						checked: true,
+					},
+				],
+			},
+		];
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const tools = await createToolsWithEvidence(driver, store, evidence);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+
+		const logs = captureConsole();
+		try {
+			await tools.captureDryRunEvidence({
+				decision: "allow",
+				reasonCode: "INPUTS_MATCH",
+				reason: "The entered values match the payload.",
+			});
+		} finally {
+			logs.restore();
+		}
+
+		expect(store.events.map((event) => [event.type, event.data.stage])).toEqual(
+			[
+				["evidence.captured", "dry_run_before_submit"],
+				["evidence.captured", "dry_run_field_map"],
+			],
+		);
+		const screenshotKey = store.events[0]?.data.objectKey as string;
+		const fieldMapKey = store.events[1]?.data.objectKey as string;
+		expect(screenshotKey).toBe(
+			evidenceObjectKey(
+				input.id,
+				"dry_run_before_submit",
+				store.events[0]?.data.eventId as string,
+			),
+		);
+		expect(fieldMapKey).toBe(
+			evidenceObjectKey(
+				input.id,
+				"dry_run_field_map",
+				store.events[1]?.data.eventId as string,
+				"application/json",
+			),
+		);
+		expect(fieldMapKey.endsWith(".json")).toBe(true);
+		expect(store.events[1]?.data.contentType).toBe("application/json");
+
+		const object = evidence.objects.get(fieldMapKey);
+		if (!object) throw new Error("Expected a stored field map");
+		expect(object.contentType).toBe("application/json");
+		expect(object.sha256).toBe(await sha256Hex(object.body));
+		expect(
+			JSON.parse(new TextDecoder().decode(object.body)) as unknown,
+		).toEqual({
+			targetUrl: input.targetUrl,
+			capturedAt: "2026-08-28T00:00:02.000Z",
+			submitReview: { decision: "allow", reasonCode: "INPUTS_MATCH" },
+			fields: [
+				{
+					elementId: "fa-0-0",
+					label: "お問い合わせ内容",
+					name: "message",
+					type: "text",
+					required: true,
+					value: "Hello",
+				},
+				{
+					elementId: "fa-0-2",
+					label: null,
+					name: "pass",
+					type: "password",
+					required: null,
+					value: "",
+				},
+				{
+					elementId: "fa-0-3",
+					label: null,
+					name: "agree",
+					type: "checkbox",
+					required: null,
+					value: "on",
+					checked: true,
+				},
+			],
+		});
+
+		// The values live in the object store only.
+		const logged = JSON.stringify(logs.entries);
+		expect(logged).not.toContain("Hello");
+		expect(logged).not.toContain("s3cret");
+		expect(JSON.stringify(store.events)).not.toContain("Hello");
+	});
+
+	test("keeps going and logs a fixed code when the screen cannot be captured", async () => {
+		const driver = new FakeDriver();
+		driver.failScreenshotAt = 1;
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const tools = await createToolsWithEvidence(driver, store, evidence);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+
+		const logs = captureConsole();
+		try {
+			await tools.captureDryRunEvidence({
+				decision: "allow",
+				reasonCode: "INPUTS_MATCH",
+				reason: "The entered values match the payload.",
+			});
+		} finally {
+			logs.restore();
+		}
+
+		expect(store.events.map((event) => [event.type, event.data.stage])).toEqual(
+			[
+				["evidence.capture_failed", "dry_run_before_submit"],
+				["evidence.captured", "dry_run_field_map"],
+			],
+		);
+		expect(
+			logs.entries.filter(
+				(entry) =>
+					isRecord(entry) && entry.event === "dry_run_evidence_capture_failed",
+			),
+		).toEqual([
+			{
+				event: "dry_run_evidence_capture_failed",
+				stage: "dry_run_before_submit",
+				failureCode: "SCREENSHOT_FAILED",
+			},
+		]);
+		expect(evidence.objects.size).toBe(1);
+	});
+});
+
 describe("observationFingerprint", () => {
 	test("ignores element ids and non-comparable controls", () => {
 		const withSubmit = observationFingerprint({
@@ -2100,6 +2265,25 @@ function denyDecision(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
+}
+
+/** Captures both log and warn lines, which evidence failures use together. */
+function captureConsole(): { entries: unknown[]; restore: () => void } {
+	const entries: unknown[] = [];
+	const originalLog = console.log;
+	const originalWarn = console.warn;
+	const record = (message: unknown) => {
+		entries.push(JSON.parse(String(message)));
+	};
+	console.log = record;
+	console.warn = record;
+	return {
+		entries,
+		restore: () => {
+			console.log = originalLog;
+			console.warn = originalWarn;
+		},
+	};
 }
 
 function captureLogs(): { entries: unknown[]; restore: () => void } {

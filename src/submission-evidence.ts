@@ -5,6 +5,9 @@ export type { EvidenceFailureCode, EvidenceStage };
 
 export const EVIDENCE_CONTENT_TYPE = "image/jpeg";
 
+/** Content type of the dry-run field map, the only non-image evidence. */
+export const EVIDENCE_JSON_CONTENT_TYPE = "application/json";
+
 /**
  * Upper bound for a single evidence capture (screenshot -> R2 put -> D1
  * record). `after_submit` capture runs in the `submitting` state, before
@@ -15,7 +18,12 @@ export const EVIDENCE_CONTENT_TYPE = "image/jpeg";
 export const EVIDENCE_CAPTURE_TIMEOUT_MS = 15_000;
 
 /** The step a capture is in, so a timeout says where it stalled. */
-type EvidenceCapturePhase = "screenshot" | "digest" | "put" | "record";
+type EvidenceCapturePhase =
+	| "screenshot"
+	| "serialize"
+	| "digest"
+	| "put"
+	| "record";
 
 interface EvidenceCaptureTiming {
 	phase: EvidenceCapturePhase;
@@ -103,6 +111,18 @@ export class InMemoryEvidenceObjectStore implements EvidenceObjectStore {
 	}
 }
 
+/**
+ * Where one capture's bytes come from. The phase name and the failure code
+ * follow the source, so a stalled or failed capture still says what it was
+ * doing.
+ */
+interface EvidenceCaptureSource {
+	phase: EvidenceCapturePhase;
+	contentType: string;
+	failureCode: EvidenceFailureCode;
+	produce: () => Promise<Uint8Array>;
+}
+
 export type EvidenceCaptureResult =
 	| { captured: true; objectKey: string; body: Uint8Array }
 	| { captured: false; failureCode: EvidenceFailureCode };
@@ -119,16 +139,50 @@ export class SubmissionEvidenceRecorder {
 		private readonly timeoutMs: number = EVIDENCE_CAPTURE_TIMEOUT_MS,
 	) {}
 
-	async capture(stage: EvidenceStage): Promise<EvidenceCaptureResult> {
+	/** Screenshot of the current page. */
+	capture(stage: EvidenceStage): Promise<EvidenceCaptureResult> {
+		return this.#capture(stage, {
+			phase: "screenshot",
+			contentType: EVIDENCE_CONTENT_TYPE,
+			failureCode: "SCREENSHOT_FAILED",
+			produce: () => this.driver.captureScreenshot(),
+		});
+	}
+
+	/**
+	 * JSON evidence. The value holds page content and registration values, so
+	 * it only ever reaches the object store.
+	 */
+	captureJson(
+		stage: EvidenceStage,
+		value: unknown,
+	): Promise<EvidenceCaptureResult> {
+		return this.#capture(stage, {
+			phase: "serialize",
+			contentType: EVIDENCE_JSON_CONTENT_TYPE,
+			failureCode: "SERIALIZE_FAILED",
+			produce: async () => new TextEncoder().encode(JSON.stringify(value)),
+		});
+	}
+
+	async #capture(
+		stage: EvidenceStage,
+		source: EvidenceCaptureSource,
+	): Promise<EvidenceCaptureResult> {
 		const eventId = crypto.randomUUID();
-		const objectKey = evidenceObjectKey(this.jobId, stage, eventId);
+		const objectKey = evidenceObjectKey(
+			this.jobId,
+			stage,
+			eventId,
+			source.contentType,
+		);
 		let expired = false;
 		// The capture writes its measurements here as it advances. A stalled
 		// capture is exactly what the log is for, and it keeps running after the
 		// timeout wins the race, so the timeout branch reports what was reached
 		// instead of waiting for a capture that may never return.
 		const timing: EvidenceCaptureTiming = {
-			phase: "screenshot",
+			phase: source.phase,
 			screenshotMs: 0,
 			digestMs: 0,
 			putMs: 0,
@@ -179,6 +233,7 @@ export class SubmissionEvidenceRecorder {
 			return await Promise.race([
 				this.#captureUnbounded(
 					stage,
+					source,
 					eventId,
 					objectKey,
 					() => expired,
@@ -198,27 +253,28 @@ export class SubmissionEvidenceRecorder {
 	 */
 	async #captureUnbounded(
 		stage: EvidenceStage,
+		source: EvidenceCaptureSource,
 		eventId: string,
 		objectKey: string,
 		expired: () => boolean,
 		timing: EvidenceCaptureTiming,
 	): Promise<EvidenceCaptureResult> {
 		let bytes: Uint8Array;
-		timing.phase = "screenshot";
+		timing.phase = source.phase;
 		const screenshotStartedAt = monotonicNow();
 		try {
-			bytes = await this.driver.captureScreenshot();
+			bytes = await source.produce();
 		} catch {
 			timing.screenshotMs = elapsedMs(screenshotStartedAt);
 			return expired()
 				? timeoutResult()
-				: this.#recordFailure(timing, eventId, stage, "SCREENSHOT_FAILED");
+				: this.#recordFailure(timing, eventId, stage, source.failureCode);
 		}
 		timing.screenshotMs = elapsedMs(screenshotStartedAt);
 		timing.bytes = bytes.byteLength;
 		if (expired()) return timeoutResult();
 		if (bytes.byteLength === 0) {
-			return this.#recordFailure(timing, eventId, stage, "SCREENSHOT_FAILED");
+			return this.#recordFailure(timing, eventId, stage, source.failureCode);
 		}
 
 		let sha256: string;
@@ -263,12 +319,7 @@ export class SubmissionEvidenceRecorder {
 		timing.phase = "put";
 		const putStartedAt = monotonicNow();
 		try {
-			await this.objectStore.put(
-				objectKey,
-				bytes,
-				EVIDENCE_CONTENT_TYPE,
-				sha256,
-			);
+			await this.objectStore.put(objectKey, bytes, source.contentType, sha256);
 		} catch {
 			timing.putMs = elapsedMs(putStartedAt);
 			if (!expired()) {
@@ -307,6 +358,7 @@ export class SubmissionEvidenceRecorder {
 				eventId,
 				stage,
 				objectKey,
+				source.contentType,
 				sha256,
 				bytes.byteLength,
 				this.now(),
@@ -463,12 +515,32 @@ export function logSubmissionEvidence(
 	);
 }
 
+/**
+ * Fixed-value log line for a dry-run evidence capture that did not happen.
+ * The dry-run result is unchanged either way, so the log is the only place a
+ * missing capture shows up outside D1.
+ */
+export function logDryRunEvidenceCaptureFailed(
+	stage: EvidenceStage,
+	failureCode: EvidenceFailureCode,
+): void {
+	console.warn(
+		JSON.stringify({
+			event: "dry_run_evidence_capture_failed",
+			stage,
+			failureCode,
+		}),
+	);
+}
+
 export function evidenceObjectKey(
 	jobId: string,
 	stage: EvidenceStage,
 	eventId: string,
+	contentType: string = EVIDENCE_CONTENT_TYPE,
 ): string {
-	return `jobs/${jobId}/${stage}/${eventId}.jpg`;
+	const extension = contentType === EVIDENCE_JSON_CONTENT_TYPE ? "json" : "jpg";
+	return `jobs/${jobId}/${stage}/${eventId}.${extension}`;
 }
 
 export async function sha256Hex(bytes: Uint8Array): Promise<string> {

@@ -622,6 +622,10 @@ async function executeToolCall(
 					? "SUBMIT_REVIEW_ALLOWED"
 					: "SUBMIT_REVIEW_DENIED",
 			);
+			// The operator reviews the same screen the pre-submit review saw,
+			// plus the values it carried, before approving a real send. Both are
+			// best effort and never change the dry-run result.
+			await coordinator.captureDryRunEvidence(job.id, runToken, decision);
 			await recordToolDiagnostic(
 				db,
 				job,

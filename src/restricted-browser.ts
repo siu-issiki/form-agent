@@ -4,6 +4,7 @@ import {
 	EVIDENCE_CONTENT_TYPE,
 	type EvidenceCaptureResult,
 	type EvidenceObjectStore,
+	logDryRunEvidenceCaptureFailed,
 	SubmissionEvidenceRecorder,
 } from "./submission-evidence";
 
@@ -68,6 +69,71 @@ export interface ObservedFieldState {
  * a correction actually changed something. Element ids are excluded so that a
  * re-render which only renumbers elements does not read as a correction.
  */
+/** One observed form field, as the dry-run field map records it. */
+export interface DryRunEvidenceField {
+	elementId: string;
+	label: string | null;
+	name: string | null;
+	type: string | null;
+	required: boolean | null;
+	value: string;
+	checked?: boolean;
+}
+
+export interface DryRunEvidenceFieldMap {
+	targetUrl: string;
+	capturedAt: string;
+	submitReview: {
+		decision: SubmitReviewDecision["decision"];
+		reasonCode: SubmitReviewReasonCode;
+	};
+	fields: DryRunEvidenceField[];
+}
+
+/**
+ * Flattens the latest observation into the fields an operator checks before a
+ * real send. Submit controls and buttons are left out for the same reason the
+ * review fingerprint drops them: they are not fields anyone filled in. A
+ * password value is never carried, matching the driver's own observation.
+ */
+export function dryRunFieldMap(
+	observation: BrowserObservation | undefined,
+	review: SubmitReviewDecision,
+	targetUrl: string,
+	capturedAt: string,
+): DryRunEvidenceFieldMap {
+	const fields: DryRunEvidenceField[] = [];
+	for (const form of observation?.forms ?? []) {
+		if (!isRecord(form) || !Array.isArray(form.fields)) continue;
+		for (const field of form.fields) {
+			if (!isRecord(field)) continue;
+			if (!isReviewComparableField(field.tag, field.type)) continue;
+			if (typeof field.elementId !== "string") continue;
+			const type = typeof field.type === "string" ? field.type : null;
+			fields.push({
+				elementId: field.elementId,
+				label: typeof field.label === "string" ? field.label : null,
+				name: typeof field.name === "string" ? field.name : null,
+				type,
+				required: typeof field.required === "boolean" ? field.required : null,
+				value:
+					type === "password" || typeof field.value !== "string"
+						? ""
+						: field.value,
+				...(typeof field.checked === "boolean"
+					? { checked: field.checked }
+					: {}),
+			});
+		}
+	}
+	return {
+		targetUrl,
+		capturedAt,
+		submitReview: { decision: review.decision, reasonCode: review.reasonCode },
+		fields,
+	};
+}
+
 export function observationFingerprint(
 	observation: BrowserObservation,
 ): string {
@@ -496,6 +562,37 @@ export class RestrictedBrowserTools {
 
 	captureEvidence(stage: "prohibited"): Promise<EvidenceCaptureResult> {
 		return this.recorder.capture(stage);
+	}
+
+	/**
+	 * Dry-run evidence: the screen the pre-submit review judged, and the values
+	 * that screen carried. Both are best effort and never change the dry-run
+	 * result, so a failure is only a fixed-code log and a D1 failure event.
+	 *
+	 * The field map holds page content and registration values, so it exists
+	 * only as an R2 object. Nothing about it reaches D1 or the logs beyond the
+	 * object key.
+	 */
+	async captureDryRunEvidence(review: SubmitReviewDecision): Promise<void> {
+		const screenshot = await this.recorder.capture("dry_run_before_submit");
+		if (!screenshot.captured) {
+			logDryRunEvidenceCaptureFailed(
+				"dry_run_before_submit",
+				screenshot.failureCode,
+			);
+		}
+		const fieldMap = await this.recorder.captureJson(
+			"dry_run_field_map",
+			dryRunFieldMap(
+				this.#latestObservation,
+				review,
+				this.#targetUrl,
+				this.now(),
+			),
+		);
+		if (!fieldMap.captured) {
+			logDryRunEvidenceCaptureFailed("dry_run_field_map", fieldMap.failureCode);
+		}
 	}
 
 	async navigate(url: string): Promise<void> {

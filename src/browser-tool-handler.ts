@@ -1,5 +1,5 @@
 import { D1JobStore } from "./d1-job-store";
-import type { Job } from "./job";
+import type { EvidenceStage, Job } from "./job";
 import {
 	type BrowserObservation,
 	PAYLOAD_KEY_PATTERN,
@@ -15,6 +15,7 @@ import {
 } from "./restricted-browser";
 import {
 	type EvidenceObjectStore,
+	logDryRunEvidenceCaptureFailed,
 	recordEvidenceCaptureFailure,
 } from "./submission-evidence";
 
@@ -48,6 +49,12 @@ export class BrowserToolSetupError extends Error {
 		this.name = "BrowserToolSetupError";
 	}
 }
+
+/** The two evidence objects a dry-run leaves behind, in capture order. */
+const DRY_RUN_EVIDENCE_STAGES: readonly EvidenceStage[] = [
+	"dry_run_before_submit",
+	"dry_run_field_map",
+];
 
 export class BrowserToolCoordinator {
 	#driver: RestrictedBrowserDriver | undefined;
@@ -104,8 +111,8 @@ export class BrowserToolCoordinator {
 
 	/**
 	 * Dry-run path: validates the submit control and runs the same independent
-	 * pre-submit review as a real submission, without a screenshot because the
-	 * dry-run never captures evidence.
+	 * pre-submit review as a real submission. The screenshot the reviewer would
+	 * see is captured separately, after the decision, by `captureDryRunEvidence`.
 	 */
 	async validateSubmit(
 		jobId: string,
@@ -165,6 +172,26 @@ export class BrowserToolCoordinator {
 		await operation.catch(() => undefined);
 	}
 
+	/**
+	 * Captures the dry-run evidence pair once the pre-submit review has decided.
+	 * Like the prohibited capture it never throws and never creates a browser
+	 * session, so the dry-run result is the same whether or not it succeeds.
+	 */
+	async captureDryRunEvidence(
+		jobId: string,
+		runToken: string,
+		review: SubmitReviewDecision,
+	): Promise<void> {
+		const operation = this.#operationTail.then(() =>
+			this.#captureDryRunEvidence(jobId, runToken, review),
+		);
+		this.#operationTail = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		await operation.catch(() => undefined);
+	}
+
 	async #captureEvidence(
 		jobId: string,
 		runToken: string,
@@ -176,9 +203,45 @@ export class BrowserToolCoordinator {
 			!tools ||
 			this.#scopeKey !== scopeKey(jobId, runToken)
 		) {
-			const store = new D1JobStore(this.db);
-			const job = await store.find(jobId);
-			if (job?.status !== "running" || job.runToken !== runToken) return;
+			await this.#recordNoBrowserSession(jobId, runToken, [stage]);
+			return;
+		}
+		await tools.captureEvidence(stage);
+	}
+
+	async #captureDryRunEvidence(
+		jobId: string,
+		runToken: string,
+		review: SubmitReviewDecision,
+	): Promise<void> {
+		const tools = this.#tools;
+		if (
+			this.#closed ||
+			!tools ||
+			this.#scopeKey !== scopeKey(jobId, runToken)
+		) {
+			for (const stage of DRY_RUN_EVIDENCE_STAGES) {
+				logDryRunEvidenceCaptureFailed(stage, "NO_BROWSER_SESSION");
+			}
+			await this.#recordNoBrowserSession(
+				jobId,
+				runToken,
+				DRY_RUN_EVIDENCE_STAGES,
+			);
+			return;
+		}
+		await tools.captureDryRunEvidence(review);
+	}
+
+	async #recordNoBrowserSession(
+		jobId: string,
+		runToken: string,
+		stages: readonly EvidenceStage[],
+	): Promise<void> {
+		const store = new D1JobStore(this.db);
+		const job = await store.find(jobId);
+		if (job?.status !== "running" || job.runToken !== runToken) return;
+		for (const stage of stages) {
 			await recordEvidenceCaptureFailure(
 				store,
 				jobId,
@@ -189,9 +252,7 @@ export class BrowserToolCoordinator {
 				"NO_BROWSER_SESSION",
 				new Date().toISOString(),
 			);
-			return;
 		}
-		await tools.captureEvidence(stage);
 	}
 
 	async #execute(

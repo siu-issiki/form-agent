@@ -22,7 +22,7 @@
 | E2E | 管理下範囲を実装済み | 常設テストシステムの13シナリオ、重複配送、送信後`uncertain`をproductionで検証済み。外部の実サイトへは`tools/campaign-send.ts`と承認・上限のガードを実装済みで、実送信そのものは未実施 |
 | HTTP API | 部分実装 | Bearer 認証付きのジョブ登録・取得を実装。登録時に`payload.formValues`のキーと値（単一文字列または選択肢候補リスト）を検証。実送信になるジョブは承認記録・dry-run完了・日次上限の3つを満たす場合だけ受け付ける。一覧・キャンセルは未実装 |
 | Cloudflare 配備 | 実装済み | production の D1、Queue、DLQ、Worker、Secrets、公開 URL、Queue consumer を設定済み。旧 Sandbox Durable Object は削除済み |
-| 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ、値を含まないagent tool診断イベント、ジョブ単位の実行メトリクス（turn、Provider 呼び出し、token、送信前レビュー、browser 接続時間、実行時間）。送信前・送信後・禁止判定時のスクリーンショット証跡を Cloudflare R2 へ保存し、D1 の `events` へ sha256 付きで記録する |
+| 監査・メトリクス | 部分実装 | Provider 呼び出し回数、retry / DLQ、値を含まないagent tool診断イベント、ジョブ単位の実行メトリクス（turn、Provider 呼び出し、token、送信前レビュー、browser 接続時間、実行時間）。送信前・送信後・禁止判定時のスクリーンショット証跡を Cloudflare R2 へ保存し、D1 の `events` へ sha256 付きで記録する。dry-run では送信直前の画面と各欄の値を保存し、`GET /jobs/:id` が `evidence` として `objectKey` を返す |
 | 並列検証 | 部分実施 | 2026-09-03 の 5 並列 19 シナリオで、session 明示停止の前後とも 15 件合格。明示停止後は CDP 切断（1011 / `LIMIT`）と `exceededCpu` が 0 件になり、18 session すべてを停止できたが、session 作成 API が 429 を 15 回返し 2 件が失敗した。当時の同時 session 上限は 5 未満と判断し、consumer を `max_concurrency: 3` にした。3 並列の 19 シナリオでは 17 件合格、429 / CDP 切断 / `exceededCpu` はいずれも 0 件、19 session すべてを停止できた。その後 Cloudflare Workers を Paid、BrowserUse を dev（有料）プランへ移行し、consumer を `max_concurrency: 20` にした。dev プランの同時ブラウザ上限 25 のうち 5 は leak した session の余裕として残している。20 並列での実測は未実施であり、上限は `browser_use_session_limit` で計測して調整する |
 
 本書では、実装済みの構成を現在形で記述し、未実装または未検証の内容は「現在の制約」「PoC 計画」「残タスク・未決事項」に明示する。
@@ -312,15 +312,30 @@ pending / running / failed ── retry 上限超過 ──► dead_lettered
 
 ### 送信証跡スクリーンショット
 
-送信前・送信後・禁止判定時の 3 段階でスクリーンショットを撮影し、上記の Cloudflare R2（証跡）へ保存する。dry-run の `submit` 経路（`_formAgentDryRun: true`）では撮影しない。
+送信前・送信後・禁止判定時の 3 段階でスクリーンショットを撮影し、上記の Cloudflare R2（証跡）へ保存する。dry-run の `submit` 経路（`_formAgentDryRun: true`）でも、送信前レビューが判定した後に同じ画面を撮影する。
 
 | stage | 撮影位置 | ジョブ状態 | 失敗時の扱い |
 | --- | --- | --- | --- |
 | `before_submit` | `submit` tool内、送信前検証成功の直後、送信前レビューと送信権取得（`claimSubmission`）の前 | `running` | 必須。撮影に失敗した場合はレビューも送信権取得も driver への送信も行わず、何も送信しない。再試行可能なエラーとして扱う。レビュー deny 後の再 submit では再撮影するため、1 attempt に複数件になり得る |
 | `after_submit` | driver への送信が成功または例外で終わった直後、結果確定（`sent` / `uncertain`）の前 | `submitting` | ベストエフォート。失敗しても送信結果（`sent` / `uncertain` / 例外経路）は変えない |
 | `prohibited` | `finish` tool で禁止判定の結果を返す直前 | `running` | ベストエフォート。ブラウザセッションが未作成の場合は撮影せず、未撮影であることだけを記録する |
+| `dry_run_before_submit` | dry-run の `submit` 経路、送信前レビューの判定直後、`DRY_RUN_COMPLETE` を返す前 | `running` | ベストエフォート。失敗しても結果は `DRY_RUN_COMPLETE` のままで、`dry_run_evidence_capture_failed` を固定値でログへ出す |
+| `dry_run_field_map` | 同上、`dry_run_before_submit` の直後 | `running` | 同上。スクリーンショットの成否とは独立に保存する |
 
 `before_submit` の撮影失敗は送信前の唯一のブロッキング条件であり、二重送信防止と同様に「不確実なら送信しない」方針に従う。`after_submit` と `prohibited` は既存の結果確定ロジックに影響しない。送信後 URL の検証に使う値は `after_submit` の撮影より前に取得しておき、撮影失敗で CDP 接続が閉じても送信結果（`sent` / `uncertain`）は変わらない。
+
+### dry-run 証跡
+
+dry-run は送信しないため、運用者が実送信を承認する前に見るのは dry-run が残した証跡だけである。そこで `submit` を横取りする経路では、送信前レビューが `allow` / `deny` を返した直後に 2 件の証跡を残す。撮影する画面はレビューが判定した画面そのものであり、実送信の `before_submit` と同じ位置づけになる。
+
+| stage | contentType | 内容 |
+| --- | --- | --- |
+| `dry_run_before_submit` | `image/jpeg` | 送信直前の画面。レビューへ渡した画像と同じ画面 |
+| `dry_run_field_map` | `application/json` | 直前の観察に含まれる各フォーム欄の `elementId` / `label` / `name` / `type` / `required` / `value`（`checked` は持つ欄だけ）と、`submitReview`（`decision` / `reasonCode`）、`targetUrl`、`capturedAt` |
+
+`dry_run_field_map` の値はページ由来のデータと登録情報そのものなので、R2 のオブジェクトにだけ置く。D1 の `events` とログへ出るのは既存の証跡と同じ `objectKey` / `sha256` / `byteLength` / `contentType` だけである。送信ボタンやその他の button は「入力した欄」ではないため、送信前レビューの観察指紋と同じ規則で除外する。`password` の値は driver の観察と同様に空にする。
+
+2 件はどちらもベストエフォートで、保存に失敗しても dry-run の結果は `DRY_RUN_COMPLETE` のまま変わらない。失敗は D1 の `evidence.capture_failed` と、`stage` と `failureCode` だけを持つ固定値ログ `dry_run_evidence_capture_failed` に残る。
 
 撮影・保存・記録は合計 15 秒で打ち切り、超過時は `CAPTURE_TIMEOUT` として記録する。`after_submit` の stall が全体期限による `uncertain` を招かないようにするため。同じ撮影の成功・失敗は共通の `eventId` で排他的に記録し、撮影開始時の attempt を固定する。タイムアウト後に R2 保存または D1 記録が遅れて完了しても成功イベントへ戻さず、保存済みオブジェクトは補償削除する。
 
@@ -665,4 +680,4 @@ consumer は `max_concurrency: 20` とする。Cloudflare Workers を Paid、Bro
 - 送信権取得後に結果を確定できない場合は `uncertain` とし、自動 retry しない。
 - 本番処理は Cloudflare 上へ置き、手元 PC は開発・検証にだけ使う。
 - 5、20、50 並列の順に検証し、安全性、成功率、時間、rate limit、原価を確認してから引き上げる。
-- 送信前 / 送信後 / 禁止判定時の 3 段階でスクリーンショットを撮影し、Cloudflare R2 へ sha256 付きで保存し、D1 の `events` から参照する。dry-run の `submit` 経路では撮影しない。保存期間は運用ポリシー確定まで無期限とする。
+- 送信前 / 送信後 / 禁止判定時の 3 段階でスクリーンショットを撮影し、Cloudflare R2 へ sha256 付きで保存し、D1 の `events` から参照する。dry-run の `submit` 経路では、送信前レビューが見た画面と各欄の値を `dry_run_before_submit` / `dry_run_field_map` として同じ仕組みで保存する。保存期間は運用ポリシー確定まで無期限とする。

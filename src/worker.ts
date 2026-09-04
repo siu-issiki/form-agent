@@ -204,10 +204,13 @@ export async function handleHttpRequest(
 		if (!isAuthorized(request, env.JOB_API_TOKEN)) {
 			return unauthorizedResponse();
 		}
-		const job = await new D1JobStore(env.DB).find(jobId);
-		return job
-			? apiJson({ job: toPublicJob(job) }, 200)
-			: apiJson({ error: "NOT_FOUND" }, 404);
+		const store = new D1JobStore(env.DB);
+		const job = await store.find(jobId);
+		if (!job) return apiJson({ error: "NOT_FOUND" }, 404);
+		// Only the object identity: the evidence objects themselves hold the
+		// page and the registration values, and stay in R2.
+		const evidence = await store.listCapturedEvidence(jobId);
+		return apiJson({ job: toPublicJob(job), evidence }, 200);
 	}
 
 	return new Response("Not Found", { status: 404 });

@@ -46,10 +46,16 @@ export interface Job extends JobInput {
 	updatedAt: string;
 }
 
-export type EvidenceStage = "before_submit" | "after_submit" | "prohibited";
+export type EvidenceStage =
+	| "before_submit"
+	| "after_submit"
+	| "prohibited"
+	| "dry_run_before_submit"
+	| "dry_run_field_map";
 
 export type EvidenceFailureCode =
 	| "SCREENSHOT_FAILED"
+	| "SERIALIZE_FAILED"
 	| "OBJECT_STORE_FAILED"
 	| "EVENT_NOT_RECORDED"
 	| "NO_BROWSER_SESSION"
@@ -163,10 +169,17 @@ export interface JobStore {
 		eventId: string,
 		stage: EvidenceStage,
 		objectKey: string,
+		contentType: string,
 		sha256: string,
 		byteLength: number,
 		now: string,
 	): Promise<boolean>;
+	/**
+	 * Captured evidence of one job, oldest first. Only the object identity is
+	 * returned: the object bodies hold page content and registration values, so
+	 * they stay in the object store.
+	 */
+	listCapturedEvidence(id: string): Promise<CapturedEvidence[]>;
 	recordEvidenceCaptureFailed(
 		id: string,
 		runToken: string,
@@ -176,6 +189,14 @@ export interface JobStore {
 		failureCode: EvidenceFailureCode,
 		now: string,
 	): Promise<boolean>;
+}
+
+/** One `evidence.captured` row, as the job API exposes it. */
+export interface CapturedEvidence {
+	stage: EvidenceStage;
+	objectKey: string;
+	contentType: string;
+	capturedAt: string;
 }
 
 export class DuplicateJobError extends Error {
@@ -188,6 +209,8 @@ export class DuplicateJobError extends Error {
 export class InMemoryJobStore implements JobStore {
 	readonly #jobs = new Map<string, Job>();
 	readonly #evidenceEventIndexes = new Map<string, number>();
+	/** `events` carries no timestamp, so the capture time is kept beside it. */
+	readonly #evidenceCapturedAt = new Map<string, string>();
 	readonly events: JobEvent[] = [];
 
 	async create(input: JobInput, now: string): Promise<Job> {
@@ -402,11 +425,12 @@ export class InMemoryJobStore implements JobStore {
 		eventId: string,
 		stage: EvidenceStage,
 		objectKey: string,
+		contentType: string,
 		sha256: string,
 		byteLength: number,
-		_now: string,
+		now: string,
 	): Promise<boolean> {
-		return this.#transitionEvidenceEvent(
+		const recorded = this.#transitionEvidenceEvent(
 			id,
 			attempt,
 			eventId,
@@ -418,9 +442,29 @@ export class InMemoryJobStore implements JobStore {
 				objectKey,
 				sha256,
 				byteLength,
-				contentType: "image/jpeg",
+				contentType,
 			},
 		);
+		if (recorded) this.#evidenceCapturedAt.set(eventId, now);
+		return recorded;
+	}
+
+	async listCapturedEvidence(id: string): Promise<CapturedEvidence[]> {
+		const captured: CapturedEvidence[] = [];
+		for (const event of this.events) {
+			if (event.jobId !== id || event.type !== "evidence.captured") continue;
+			const eventId = event.data.eventId;
+			captured.push({
+				stage: event.data.stage as EvidenceStage,
+				objectKey: event.data.objectKey as string,
+				contentType: event.data.contentType as string,
+				capturedAt:
+					(typeof eventId === "string"
+						? this.#evidenceCapturedAt.get(eventId)
+						: undefined) ?? "",
+			});
+		}
+		return captured;
 	}
 
 	async recordEvidenceCaptureFailed(

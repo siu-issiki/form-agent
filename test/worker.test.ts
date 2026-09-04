@@ -242,6 +242,7 @@ describe("D1JobStore", () => {
 			"event-001",
 			"before_submit",
 			"jobs/job-001/before_submit/event-001.jpg",
+			"image/jpeg",
 			"a".repeat(64),
 			2_048,
 			"2026-08-28T00:00:02.000Z",
@@ -254,6 +255,7 @@ describe("D1JobStore", () => {
 			"event-missing",
 			"before_submit",
 			"jobs/job-001/before_submit/event-missing.jpg",
+			"image/jpeg",
 			"a".repeat(64),
 			2_048,
 			"2026-08-28T00:00:02.500Z",
@@ -352,6 +354,7 @@ describe("D1JobStore", () => {
 				"event-timeout",
 				"before_submit",
 				"jobs/job-001/before_submit/event-timeout.jpg",
+				"image/jpeg",
 				"a".repeat(64),
 				2_048,
 				"2026-08-28T00:00:02.000Z",
@@ -376,6 +379,7 @@ describe("D1JobStore", () => {
 				"event-timeout",
 				"before_submit",
 				"jobs/job-001/before_submit/event-timeout.jpg",
+				"image/jpeg",
 				"a".repeat(64),
 				2_048,
 				"2026-08-28T00:00:04.000Z",
@@ -520,6 +524,7 @@ describe("D1JobStore", () => {
 			"event-003",
 			"prohibited",
 			"jobs/job-001/prohibited/event-003.jpg",
+			"image/jpeg",
 			"c".repeat(64),
 			512,
 			"2026-08-28T00:00:03.000Z",
@@ -1577,6 +1582,57 @@ describe("BrowserToolCoordinator", () => {
 		expect(stored.objects).toEqual([]);
 	});
 });
+
+/** Runs one dry-run job up to its `DRY_RUN_COMPLETE` submit boundary. */
+async function runDryRunSubmit(
+	jobInput: JobInput,
+	driver: WorkerFakeBrowserDriver,
+): Promise<unknown> {
+	const store = new D1JobStore(env.DB);
+	await store.create(
+		{
+			...jobInput,
+			payload: { ...jobInput.payload, _formAgentDryRun: true },
+		},
+		"2026-08-28T00:00:00.000Z",
+	);
+	const job = await store.claimRun(
+		jobInput.id,
+		"run-token-1",
+		"2026-08-28T00:00:01.000Z",
+	);
+	if (!job) throw new Error("Expected a claimed job");
+	const responses = [
+		functionResponse("call-observe", "observe", {}),
+		functionResponse("call-fill", "fill", {
+			elementId: "fa-0-0",
+			payloadKey: "message",
+		}),
+		functionResponse("call-confirm", "observe", {}),
+		functionResponse("call-submit", "submit", {
+			elementId: "fa-0-1",
+			activationStrategy: "mouse",
+		}),
+		reviewResponse("allow"),
+	];
+	const executor = new ResponsesAgentExecutor({
+		db: env.DB,
+		evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
+		model: "gpt-5.6-luna",
+		openAiApiKey: "openai-secret",
+		browserUseApiKey: "browser-secret",
+		fetcher: (async () => {
+			const response = responses.shift();
+			if (!response) throw new Error("Unexpected provider request");
+			return Response.json(response);
+		}) as typeof fetch,
+		createBrowserDriver: async () => driver,
+	});
+	return executor.execute(
+		{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
+		new AbortController().signal,
+	);
+}
 
 class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
 	url = input.targetUrl;
@@ -4111,61 +4167,151 @@ describe("ResponsesAgentExecutor", () => {
 		expect(stored.objects).toHaveLength(1);
 	});
 
-	test("does not capture evidence for a dry-run submit", async () => {
+	test("captures the dry-run screen and field map without submitting", async () => {
 		const jobInput = { ...input, id: "job-evidence-dry-run" };
-		const store = new D1JobStore(env.DB);
-		const dryRunInput = {
-			...jobInput,
-			payload: { ...input.payload, _formAgentDryRun: true },
-		};
-		await store.create(dryRunInput, "2026-08-28T00:00:00.000Z");
-		const job = await store.claimRun(
-			jobInput.id,
-			"run-token-1",
-			"2026-08-28T00:00:01.000Z",
-		);
-		if (!job) throw new Error("Expected a claimed job");
-		const responses = [
-			functionResponse("call-observe", "observe", {}),
-			functionResponse("call-fill", "fill", {
-				elementId: "fa-0-0",
-				payloadKey: "message",
-			}),
-			functionResponse("call-confirm", "observe", {}),
-			functionResponse("call-submit", "submit", {
-				elementId: "fa-0-1",
-				activationStrategy: "mouse",
-			}),
-			reviewResponse("allow"),
-		];
 		const driver = new WorkerFakeBrowserDriver();
-		const executor = new ResponsesAgentExecutor({
-			db: env.DB,
-			evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),
-			model: "gpt-5.6-luna",
-			openAiApiKey: "openai-secret",
-			browserUseApiKey: "browser-secret",
-			fetcher: (async () => {
-				const response = responses.shift();
-				if (!response) throw new Error("Unexpected provider request");
-				return Response.json(response);
-			}) as typeof fetch,
-			createBrowserDriver: async () => driver,
-		});
-
-		const result = await executor.execute(
-			{ job, runToken: "run-token-1", maxDurationMs: 60_000 },
-			new AbortController().signal,
-		);
+		const result = await runDryRunSubmit(jobInput, driver);
 
 		expect(result).toMatchObject({ reasonCode: "DRY_RUN_COMPLETE" });
 		expect(driver.submitCount).toBe(0);
-		expect(driver.screenshotCount).toBe(0);
-		expect(await readEvidenceEvents(jobInput.id)).toEqual([]);
-		const stored = await env.EVIDENCE_BUCKET.list({
-			prefix: `jobs/${jobInput.id}/`,
+		expect(driver.screenshotCount).toBe(1);
+
+		const events = await readEvidenceEvents(jobInput.id);
+		expect(
+			events.map((event) => [
+				event.type,
+				event.data.stage,
+				event.data.contentType,
+			]),
+		).toEqual([
+			["evidence.captured", "dry_run_before_submit", "image/jpeg"],
+			["evidence.captured", "dry_run_field_map", "application/json"],
+		]);
+		// The field map holds page content and registration values, so nothing
+		// but the object identity may reach D1.
+		expect(JSON.stringify(events)).not.toContain("Hello");
+
+		const screenshotKey = events[0]?.data.objectKey as string;
+		const fieldMapKey = events[1]?.data.objectKey as string;
+		expect(screenshotKey).toMatch(
+			new RegExp(
+				`^jobs/${jobInput.id}/dry_run_before_submit/[0-9a-f-]+\\.jpg$`,
+			),
+		);
+		expect(fieldMapKey).toMatch(
+			new RegExp(`^jobs/${jobInput.id}/dry_run_field_map/[0-9a-f-]+\\.json$`),
+		);
+
+		const fieldMapObject = await env.EVIDENCE_BUCKET.get(fieldMapKey);
+		if (!fieldMapObject) throw new Error("Expected the field map object");
+		expect(fieldMapObject.httpMetadata?.contentType).toBe("application/json");
+		const fieldMap = JSON.parse(await fieldMapObject.text()) as {
+			targetUrl: string;
+			capturedAt: string;
+			submitReview: { decision: string; reasonCode: string };
+			fields: Array<Record<string, unknown>>;
+		};
+		expect(fieldMap.targetUrl).toBe(jobInput.targetUrl);
+		expect(typeof fieldMap.capturedAt).toBe("string");
+		expect(fieldMap.submitReview).toEqual({
+			decision: "allow",
+			reasonCode: "INPUTS_MATCH",
 		});
-		expect(stored.objects).toEqual([]);
+		// The submit control is not a field anyone filled in.
+		expect(fieldMap.fields).toEqual([
+			{
+				elementId: "fa-0-0",
+				label: null,
+				name: null,
+				type: "text",
+				required: null,
+				value: "Hello",
+			},
+			{
+				elementId: "fa-0-2",
+				label: null,
+				name: null,
+				type: "text",
+				required: null,
+				value: "",
+			},
+		]);
+
+		const fetched = await handleHttpRequest(
+			jobRequest(
+				"GET",
+				`/jobs/${jobInput.id}`,
+				undefined,
+				"test-job-api-token",
+			),
+			{
+				DB: env.DB,
+				EVIDENCE_BUCKET: env.EVIDENCE_BUCKET,
+				JOB_API_TOKEN: "test-job-api-token",
+				JOB_QUEUE: {
+					async send() {},
+				} as unknown as Queue<JobMessage>,
+			},
+		);
+		const fetchedBody = (await fetched.json()) as {
+			evidence: Array<Record<string, unknown>>;
+		};
+		expect(fetched.status).toBe(200);
+		expect(
+			fetchedBody.evidence.map((entry) => [
+				entry.stage,
+				entry.objectKey,
+				entry.contentType,
+			]),
+		).toEqual([
+			["dry_run_before_submit", screenshotKey, "image/jpeg"],
+			["dry_run_field_map", fieldMapKey, "application/json"],
+		]);
+		for (const entry of fetchedBody.evidence) {
+			expect(typeof entry.capturedAt).toBe("string");
+		}
+		expect(JSON.stringify(fetchedBody.evidence)).not.toContain("Hello");
+	});
+
+	test("keeps the dry-run result when the evidence capture fails", async () => {
+		const jobInput = { ...input, id: "job-evidence-dry-run-failed" };
+		const driver = new WorkerFakeBrowserDriver();
+		driver.screenshotError = new Error("The screenshot failed");
+		const warnings: unknown[] = [];
+		const warn = vi
+			.spyOn(console, "warn")
+			.mockImplementation((message: unknown) => {
+				warnings.push(message);
+			});
+		let result: unknown;
+		try {
+			result = await runDryRunSubmit(jobInput, driver);
+		} finally {
+			warn.mockRestore();
+		}
+
+		expect(result).toMatchObject({ reasonCode: "DRY_RUN_COMPLETE" });
+		expect(driver.submitCount).toBe(0);
+		const failureLines = warnings
+			.map((message) => String(message))
+			.filter((line) => line.includes("dry_run_evidence_capture_failed"));
+		expect(failureLines).toEqual([
+			JSON.stringify({
+				event: "dry_run_evidence_capture_failed",
+				stage: "dry_run_before_submit",
+				failureCode: "SCREENSHOT_FAILED",
+			}),
+		]);
+		// The field map does not depend on the screenshot, so it is still kept.
+		expect(
+			(await readEvidenceEvents(jobInput.id)).map((event) => [
+				event.type,
+				event.data.stage,
+			]),
+		).toEqual([
+			["evidence.capture_failed", "dry_run_before_submit"],
+			["evidence.captured", "dry_run_field_map"],
+		]);
 	});
 
 	test("lets the model correct the inputs after the pre-submit review denies", async () => {
