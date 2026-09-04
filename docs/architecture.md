@@ -334,18 +334,18 @@ dry-run には実送信の「1 回だけ修正して再レビュー」経路は�
 | `before_submit` | `submit` tool内、送信前検証成功の直後、送信前レビューと送信権取得（`claimSubmission`）の前 | `running` | 必須。撮影に失敗した場合はレビューも送信権取得も driver への送信も行わず、何も送信しない。再試行可能なエラーとして扱う。レビュー deny 後の再 submit では再撮影するため、1 attempt に複数件になり得る |
 | `after_submit` | driver への送信が成功または例外で終わった直後、結果確定（`sent` / `uncertain`）の前 | `submitting` | ベストエフォート。失敗しても送信結果（`sent` / `uncertain` / 例外経路）は変えない |
 | `prohibited` | `finish` tool で禁止判定の結果を返す直前 | `running` | ベストエフォート。ブラウザセッションが未作成の場合は撮影せず、未撮影であることだけを記録する |
-| `dry_run_before_submit` | dry-run の `submit` 経路、送信前レビューの判定直後、結果を返す前 | `running` | ベストエフォート。失敗しても結果は `DRY_RUN_COMPLETE` のままで、`dry_run_evidence_capture_failed` を固定値でログへ出す |
-| `dry_run_field_map` | 同上、`dry_run_before_submit` の直後 | `running` | 同上。スクリーンショットの成否とは独立に保存する |
+| `dry_run_before_submit` | dry-run の `submit` 経路、送信前検証の成功直後、送信前レビューを呼ぶ前 | `running` | ベストエフォート。撮影できなかった場合はレビューを画像なしで進め、`dry_run_evidence_capture_failed` を固定値でログへ出す |
+| `dry_run_field_map` | 同上、送信前レビューの判定直後 | `running` | 同上。スクリーンショットの成否とは独立に保存する |
 
 `before_submit` の撮影失敗は送信前の唯一のブロッキング条件であり、二重送信防止と同様に「不確実なら送信しない」方針に従う。`after_submit` と `prohibited` は既存の結果確定ロジックに影響しない。送信後 URL の検証に使う値は `after_submit` の撮影より前に取得しておき、撮影失敗で CDP 接続が閉じても送信結果（`sent` / `uncertain`）は変わらない。
 
 ### dry-run 証跡
 
-dry-run は送信しないため、運用者が実送信を承認する前に見るのは dry-run が残した証跡だけである。そこで `submit` を横取りする経路では、送信前レビューが `allow` / `deny` を返した直後に 2 件の証跡を残す。撮影する画面はレビューが判定した画面そのものであり、実送信の `before_submit` と同じ位置づけになる。
+dry-run は送信しないため、運用者が実送信を承認する前に見るのは dry-run が残した証跡だけである。そこで `submit` を横取りする経路で 2 件の証跡を残す。スクリーンショットはレビューを呼ぶ前に 1 回だけ撮り、同じバイト列をレビューの入力画像と `dry_run_before_submit` の証跡の両方に使う。撮り直すと、レビューが判定した画面と証跡が一致する保証が無くなるためである。実送信の `submit` 経路が `before_submit` の画像をレビューへ渡すのと同じ扱いである。撮影に失敗した場合はレビューを画像なしで進め、証跡は `capture_failed` として記録する。
 
 | stage | contentType | 内容 |
 | --- | --- | --- |
-| `dry_run_before_submit` | `image/jpeg` | 送信直前の画面。レビューへ渡した画像と同じ画面 |
+| `dry_run_before_submit` | `image/jpeg` | 送信直前の画面。送信前レビューへ渡した画像そのもの |
 | `dry_run_field_map` | `application/json` | 直前の観察に含まれる各フォーム欄の `elementId` / `label` / `name` / `type` / `required` / `value`（`checked` は持つ欄だけ）と、`submitReview`（`decision` / `reasonCode`）、`targetUrl`、`capturedAt` |
 
 `dry_run_field_map` の値はページ由来のデータと登録情報そのものなので、R2 のオブジェクトにだけ置く。D1 の `events` とログへ出るのは既存の証跡と同じ `objectKey` / `sha256` / `byteLength` / `contentType` だけである。送信ボタンやその他の button は「入力した欄」ではないため、送信前レビューの観察指紋と同じ規則で除外する。`password` の値は driver の観察と同様に空にする。
@@ -695,4 +695,4 @@ consumer は `max_concurrency: 20` とする。Cloudflare Workers を Paid、Bro
 - 送信権取得後に結果を確定できない場合は `uncertain` とし、自動 retry しない。
 - 本番処理は Cloudflare 上へ置き、手元 PC は開発・検証にだけ使う。
 - 5、20、50 並列の順に検証し、安全性、成功率、時間、rate limit、原価を確認してから引き上げる。
-- 送信前 / 送信後 / 禁止判定時の 3 段階でスクリーンショットを撮影し、Cloudflare R2 へ sha256 付きで保存し、D1 の `events` から参照する。dry-run の `submit` 経路では、送信前レビューが見た画面と各欄の値を `dry_run_before_submit` / `dry_run_field_map` として同じ仕組みで保存する。保存期間は運用ポリシー確定まで無期限とする。
+- 送信前 / 送信後 / 禁止判定時の 3 段階でスクリーンショットを撮影し、Cloudflare R2 へ sha256 付きで保存し、D1 の `events` から参照する。dry-run の `submit` 経路では、送信前レビューへ渡した画像そのものと各欄の値を `dry_run_before_submit` / `dry_run_field_map` として同じ仕組みで保存する。保存期間は運用ポリシー確定まで無期限とする。

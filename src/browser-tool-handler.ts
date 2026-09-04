@@ -50,11 +50,12 @@ export class BrowserToolSetupError extends Error {
 	}
 }
 
-/** The two evidence objects a dry-run leaves behind, in capture order. */
-const DRY_RUN_EVIDENCE_STAGES: readonly EvidenceStage[] = [
-	"dry_run_before_submit",
-	"dry_run_field_map",
-];
+/**
+ * The field map is the only dry-run evidence written outside the review call.
+ * The screenshot is captured inside it, because the reviewer is handed the
+ * same bytes.
+ */
+const DRY_RUN_FIELD_MAP_STAGE: EvidenceStage = "dry_run_field_map";
 
 export class BrowserToolCoordinator {
 	#driver: RestrictedBrowserDriver | undefined;
@@ -111,8 +112,9 @@ export class BrowserToolCoordinator {
 
 	/**
 	 * Dry-run path: validates the submit control and runs the same independent
-	 * pre-submit review as a real submission. The screenshot the reviewer would
-	 * see is captured separately, after the decision, by `captureDryRunEvidence`.
+	 * pre-submit review as a real submission, over the same screenshot the real
+	 * path reviews. That image is also kept as the `dry_run_before_submit`
+	 * evidence.
 	 */
 	async validateSubmit(
 		jobId: string,
@@ -124,8 +126,7 @@ export class BrowserToolCoordinator {
 			const { tools } = await this.#getToolsAndJob(jobId, runToken);
 			readSubmitActivationStrategy(params);
 			const elementId = readElementId(params);
-			await tools.validateSubmit(elementId);
-			return tools.reviewSubmit(elementId, null);
+			return tools.reviewDryRunSubmit(elementId);
 		});
 		this.#operationTail = operation.then(
 			() => undefined,
@@ -173,17 +174,17 @@ export class BrowserToolCoordinator {
 	}
 
 	/**
-	 * Captures the dry-run evidence pair once the pre-submit review has decided.
+	 * Captures the dry-run field map once the pre-submit review has decided.
 	 * Like the prohibited capture it never throws and never creates a browser
 	 * session, so the dry-run result is the same whether or not it succeeds.
 	 */
-	async captureDryRunEvidence(
+	async captureDryRunFieldMap(
 		jobId: string,
 		runToken: string,
 		review: SubmitReviewDecision,
 	): Promise<void> {
 		const operation = this.#operationTail.then(() =>
-			this.#captureDryRunEvidence(jobId, runToken, review),
+			this.#captureDryRunFieldMap(jobId, runToken, review),
 		);
 		this.#operationTail = operation.then(
 			() => undefined,
@@ -209,7 +210,7 @@ export class BrowserToolCoordinator {
 		await tools.captureEvidence(stage);
 	}
 
-	async #captureDryRunEvidence(
+	async #captureDryRunFieldMap(
 		jobId: string,
 		runToken: string,
 		review: SubmitReviewDecision,
@@ -220,17 +221,16 @@ export class BrowserToolCoordinator {
 			!tools ||
 			this.#scopeKey !== scopeKey(jobId, runToken)
 		) {
-			for (const stage of DRY_RUN_EVIDENCE_STAGES) {
-				logDryRunEvidenceCaptureFailed(stage, "NO_BROWSER_SESSION");
-			}
-			await this.#recordNoBrowserSession(
-				jobId,
-				runToken,
-				DRY_RUN_EVIDENCE_STAGES,
+			logDryRunEvidenceCaptureFailed(
+				DRY_RUN_FIELD_MAP_STAGE,
+				"NO_BROWSER_SESSION",
 			);
+			await this.#recordNoBrowserSession(jobId, runToken, [
+				DRY_RUN_FIELD_MAP_STAGE,
+			]);
 			return;
 		}
-		await tools.captureDryRunEvidence(review);
+		await tools.captureDryRunFieldMap(review);
 	}
 
 	async #recordNoBrowserSession(

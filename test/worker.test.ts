@@ -1616,11 +1616,41 @@ describe("BrowserToolCoordinator", () => {
 	});
 });
 
+/**
+ * The bytes of the image the pre-submit review request carried, or null when
+ * the request carried none.
+ */
+function reviewedImageBytes(
+	requestBodies: readonly unknown[],
+): number[] | null {
+	for (const body of requestBodies) {
+		const parts = isRecord(body) && Array.isArray(body.input) ? body.input : [];
+		for (const part of parts) {
+			const content =
+				isRecord(part) && Array.isArray(part.content) ? part.content : [];
+			for (const entry of content) {
+				if (!isRecord(entry) || entry.type !== "input_image") continue;
+				const url = String(entry.image_url ?? "");
+				const base64 = url.slice(url.indexOf(",") + 1);
+				return Array.from(
+					Uint8Array.from(atob(base64), (character) => character.charCodeAt(0)),
+				);
+			}
+		}
+	}
+	return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
 /** Runs one dry-run job up to its `DRY_RUN_COMPLETE` submit boundary. */
 async function runDryRunSubmit(
 	jobInput: JobInput,
 	driver: WorkerFakeBrowserDriver,
 	review: ReturnType<typeof reviewResponse> = reviewResponse("allow"),
+	requestBodies: unknown[] = [],
 ): Promise<unknown> {
 	const store = new D1JobStore(env.DB);
 	await store.create(
@@ -1655,7 +1685,8 @@ async function runDryRunSubmit(
 		model: "gpt-5.6-luna",
 		openAiApiKey: "openai-secret",
 		browserUseApiKey: "browser-secret",
-		fetcher: (async () => {
+		fetcher: (async (_resource, init) => {
+			requestBodies.push(JSON.parse(String(init?.body)));
 			const response = responses.shift();
 			if (!response) throw new Error("Unexpected provider request");
 			return Response.json(response);
@@ -4204,7 +4235,13 @@ describe("ResponsesAgentExecutor", () => {
 	test("captures the dry-run screen and field map without submitting", async () => {
 		const jobInput = { ...input, id: "job-evidence-dry-run" };
 		const driver = new WorkerFakeBrowserDriver();
-		const result = await runDryRunSubmit(jobInput, driver);
+		const requestBodies: unknown[] = [];
+		const result = await runDryRunSubmit(
+			jobInput,
+			driver,
+			reviewResponse("allow"),
+			requestBodies,
+		);
 
 		expect(result).toMatchObject({ reasonCode: "DRY_RUN_COMPLETE" });
 		expect(driver.submitCount).toBe(0);
@@ -4234,6 +4271,17 @@ describe("ResponsesAgentExecutor", () => {
 		);
 		expect(fieldMapKey).toMatch(
 			new RegExp(`^jobs/${jobInput.id}/dry_run_field_map/[0-9a-f-]+\\.json$`),
+		);
+
+		// The review judged the image that was stored, not a re-capture.
+		const screenshotObject = await env.EVIDENCE_BUCKET.get(screenshotKey);
+		if (!screenshotObject) throw new Error("Expected the screenshot object");
+		const storedScreenshot = new Uint8Array(
+			await screenshotObject.arrayBuffer(),
+		);
+		expect(Array.from(storedScreenshot)).toEqual([1, 2, 3]);
+		expect(reviewedImageBytes(requestBodies)).toEqual(
+			Array.from(storedScreenshot),
 		);
 
 		const fieldMapObject = await env.EVIDENCE_BUCKET.get(fieldMapKey);
@@ -4381,15 +4429,23 @@ describe("ResponsesAgentExecutor", () => {
 			.mockImplementation((message: unknown) => {
 				warnings.push(message);
 			});
+		const requestBodies: unknown[] = [];
 		let result: unknown;
 		try {
-			result = await runDryRunSubmit(jobInput, driver);
+			result = await runDryRunSubmit(
+				jobInput,
+				driver,
+				reviewResponse("allow"),
+				requestBodies,
+			);
 		} finally {
 			warn.mockRestore();
 		}
 
 		expect(result).toMatchObject({ reasonCode: "DRY_RUN_COMPLETE" });
 		expect(driver.submitCount).toBe(0);
+		// The review still ran, just without an image.
+		expect(reviewedImageBytes(requestBodies)).toBeNull();
 		const failureLines = warnings
 			.map((message) => String(message))
 			.filter((line) => line.includes("dry_run_evidence_capture_failed"));

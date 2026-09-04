@@ -1845,7 +1845,7 @@ describe("RestrictedBrowserTools", () => {
 });
 
 describe("dry-run evidence", () => {
-	test("stores the reviewed screen and the observed values outside the logs", async () => {
+	test("reviews the captured screen and keeps those exact bytes as evidence", async () => {
 		const driver = new FakeDriver();
 		driver.observationForms = [
 			{
@@ -1880,21 +1880,26 @@ describe("dry-run evidence", () => {
 		];
 		const store = new InMemoryJobStore();
 		const evidence = new InMemoryEvidenceObjectStore();
-		const tools = await createToolsWithEvidence(driver, store, evidence);
+		const reviewer = new StubSubmitReviewer();
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			evidence,
+			reviewer,
+		);
 		await tools.fill("fa-0-0", "Hello");
 		await tools.observe();
 
 		const logs = captureConsole();
+		let decision: SubmitReviewDecision;
 		try {
-			await tools.captureDryRunEvidence({
-				decision: "allow",
-				reasonCode: "INPUTS_MATCH",
-				reason: "The entered values match the payload.",
-			});
+			decision = await tools.reviewDryRunSubmit("fa-0-1");
+			await tools.captureDryRunFieldMap(decision);
 		} finally {
 			logs.restore();
 		}
 
+		expect(decision.decision).toBe("allow");
 		expect(store.events.map((event) => [event.type, event.data.stage])).toEqual(
 			[
 				["evidence.captured", "dry_run_before_submit"],
@@ -1920,6 +1925,19 @@ describe("dry-run evidence", () => {
 		);
 		expect(fieldMapKey.endsWith(".json")).toBe(true);
 		expect(store.events[1]?.data.contentType).toBe("application/json");
+
+		// The evidence must be the image the review judged, not a re-capture of
+		// a page that may have moved since.
+		expect(driver.screenshotCount).toBe(1);
+		const reviewed = reviewer.inputs[0]?.screenshot;
+		const storedScreenshot = evidence.objects.get(screenshotKey);
+		if (!reviewed || !storedScreenshot) {
+			throw new Error("Expected a reviewed and a stored screenshot");
+		}
+		expect(reviewed.contentType).toBe("image/jpeg");
+		expect(Array.from(reviewed.bytes)).toEqual(
+			Array.from(storedScreenshot.body),
+		);
 
 		const object = evidence.objects.get(fieldMapKey);
 		if (!object) throw new Error("Expected a stored field map");
@@ -1967,25 +1985,33 @@ describe("dry-run evidence", () => {
 		expect(JSON.stringify(store.events)).not.toContain("Hello");
 	});
 
-	test("keeps going and logs a fixed code when the screen cannot be captured", async () => {
+	test("reviews without an image when the screen cannot be captured", async () => {
 		const driver = new FakeDriver();
 		driver.failScreenshotAt = 1;
 		const store = new InMemoryJobStore();
 		const evidence = new InMemoryEvidenceObjectStore();
-		const tools = await createToolsWithEvidence(driver, store, evidence);
+		const reviewer = new StubSubmitReviewer();
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			evidence,
+			reviewer,
+		);
 		await tools.fill("fa-0-0", "Hello");
 		await tools.observe();
 
 		const logs = captureConsole();
+		let decision: SubmitReviewDecision;
 		try {
-			await tools.captureDryRunEvidence({
-				decision: "allow",
-				reasonCode: "INPUTS_MATCH",
-				reason: "The entered values match the payload.",
-			});
+			decision = await tools.reviewDryRunSubmit("fa-0-1");
+			await tools.captureDryRunFieldMap(decision);
 		} finally {
 			logs.restore();
 		}
+
+		// A failed capture must not stop the review, only leave it imageless.
+		expect(decision.decision).toBe("allow");
+		expect(reviewer.inputs[0]?.screenshot).toBeNull();
 
 		expect(store.events.map((event) => [event.type, event.data.stage])).toEqual(
 			[

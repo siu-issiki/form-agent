@@ -565,22 +565,45 @@ export class RestrictedBrowserTools {
 	}
 
 	/**
-	 * Dry-run evidence: the screen the pre-submit review judged, and the values
-	 * that screen carried. Both are best effort and never change the dry-run
-	 * result, so a failure is only a fixed-code log and a D1 failure event.
+	 * Dry-run review. The screen is captured once, before the review, and the
+	 * same bytes are both handed to the reviewer and kept as the
+	 * `dry_run_before_submit` evidence -- so what an operator later looks at is
+	 * the image the review judged, not a re-capture of a page that may have
+	 * moved since. This mirrors the real `submit` path, which reviews the
+	 * `before_submit` screenshot.
 	 *
-	 * The field map holds page content and registration values, so it exists
-	 * only as an R2 object. Nothing about it reaches D1 or the logs beyond the
-	 * object key.
+	 * The capture is best effort: a failure leaves the review to run without an
+	 * image, exactly as it did before any evidence existed.
 	 */
-	async captureDryRunEvidence(review: SubmitReviewDecision): Promise<void> {
-		const screenshot = await this.recorder.capture("dry_run_before_submit");
-		if (!screenshot.captured) {
+	async reviewDryRunSubmit(elementId: string): Promise<SubmitReviewDecision> {
+		await this.validateSubmit(elementId);
+		let capture: EvidenceCaptureResult;
+		try {
+			capture = await this.recorder.capture("dry_run_before_submit");
+		} catch {
+			capture = { captured: false, failureCode: "SCREENSHOT_FAILED" };
+		}
+		if (!capture.captured) {
 			logDryRunEvidenceCaptureFailed(
 				"dry_run_before_submit",
-				screenshot.failureCode,
+				capture.failureCode,
 			);
 		}
+		return this.reviewSubmit(
+			elementId,
+			capture.captured
+				? { contentType: EVIDENCE_CONTENT_TYPE, bytes: capture.body }
+				: null,
+		);
+	}
+
+	/**
+	 * The values the reviewed screen carried, written after the decision it
+	 * records. It holds page content and registration values, so it exists only
+	 * as an object in the evidence store: nothing about it reaches D1 or the
+	 * logs beyond the object key. Best effort, like the screenshot.
+	 */
+	async captureDryRunFieldMap(review: SubmitReviewDecision): Promise<void> {
 		const fieldMap = await this.recorder.captureJson(
 			"dry_run_field_map",
 			dryRunFieldMap(

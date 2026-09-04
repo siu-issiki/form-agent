@@ -622,12 +622,12 @@ async function executeToolCall(
 					? "SUBMIT_REVIEW_ALLOWED"
 					: "SUBMIT_REVIEW_DENIED",
 			);
-			// The operator reviews the same screen the pre-submit review saw,
-			// plus the values it carried, before approving a real send. The
+			// The screen the review judged is already stored as
+			// `dry_run_before_submit`; the values it carried follow here. The
 			// evidence is kept for a denial too, because that is where the
 			// operator looks to see what the review objected to. Both captures
 			// are best effort and never change the dry-run result.
-			await coordinator.captureDryRunEvidence(job.id, runToken, decision);
+			await coordinator.captureDryRunFieldMap(job.id, runToken, decision);
 			// A denied review must not reach the dry-run boundary. The real-send
 			// guard treats `DRY_RUN_COMPLETE` as a passed dry-run, so a denial
 			// that kept that code would put refused content in front of an

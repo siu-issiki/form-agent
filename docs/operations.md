@@ -304,7 +304,7 @@ D1 migrationはWorker deployでは自動適用されない。新しい列を参�
 shasum -a 256 ./evidence.jpg
 ```
 
-dry-run のジョブには `dry_run_before_submit`（`image/jpeg`）と `dry_run_field_map`（`application/json`）の 2 件が残る。送信前レビューが`deny`で終わった`DRY_RUN_REVIEW_DENIED`のジョブにも残るので、拒否の内訳はこの 2 件で確認する。前者は送信前レビューが判定した画面、後者は同じ時点の各フォーム欄の値である。`objectKey` は `GET /jobs/:id` の `evidence` からも取得できる。
+dry-run のジョブには `dry_run_before_submit`（`image/jpeg`）と `dry_run_field_map`（`application/json`）の 2 件が残る。送信前レビューが`deny`で終わった`DRY_RUN_REVIEW_DENIED`のジョブにも残るので、拒否の内訳はこの 2 件で確認する。前者は送信前レビューへ渡した画像そのもの、後者は同じ時点の各フォーム欄の値である。`objectKey` は `GET /jobs/:id` の `evidence` からも取得できる。
 
 ```bash
 curl -sS -H "Authorization: Bearer $JOB_API_TOKEN" \
