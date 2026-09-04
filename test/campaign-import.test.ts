@@ -112,6 +112,30 @@ describe("campaign import", () => {
 		expect(values.department).toBe("canonical-department");
 	});
 
+	test("maps サービスページ to companyWebsite", () => {
+		const values = mapRegistrationValues(
+			[
+				...aliasRegistration().filter((entry) => entry.label !== "会社HP"),
+				{ label: "サービスページ", value: "service-page" },
+			],
+			silent,
+		);
+
+		expect(values.companyWebsite).toBe("service-page");
+	});
+
+	test("prefers 会社HP over サービスページ when both are present", () => {
+		const values = mapRegistrationValues(
+			[
+				...aliasRegistration(),
+				{ label: "サービスページ", value: "service-page" },
+			],
+			silent,
+		);
+
+		expect(values.companyWebsite).toBe("website");
+	});
+
 	test("uses one phone entry for both phone keys", () => {
 		const values = mapRegistrationValues(aliasRegistration(), silent);
 
@@ -206,6 +230,50 @@ describe("campaign import", () => {
 			missing_form_url: 1,
 			invalid_or_insecure_form_url: 2,
 		});
+	});
+
+	test("reads the simple layout when the link column is 問い合わせフォームリンク", () => {
+		const result = filterCampaignRows([
+			{
+				件名: "Subject",
+				本文: "Message",
+				問い合わせフォームリンク: "https://contact.acme.co.jp/form",
+			},
+		]);
+
+		expect(result.excluded).toEqual({});
+		expect(result.eligible).toEqual([
+			{
+				rowNumber: 2,
+				companyName: "contact.acme.co.jp",
+				companyDomain: "acme.co.jp",
+				targetUrl: "https://contact.acme.co.jp/form",
+				subject: "Subject",
+				message: "Message",
+			},
+		]);
+	});
+
+	test("prefers 問い合わせリンク over 問い合わせフォームリンク when both are present", () => {
+		const result = filterCampaignRows([
+			{
+				件名: "Subject",
+				本文: "Message",
+				問い合わせリンク: "https://contact.acme.co.jp/form",
+				問い合わせフォームリンク: "https://www.beta.co.jp/inquiry",
+			},
+		]);
+
+		expect(result.eligible[0]?.targetUrl).toBe(
+			"https://contact.acme.co.jp/form",
+		);
+	});
+
+	test("reads the simple layout past a leading unnamed index column", () => {
+		const result = filterCampaignRows([simpleRow({ "": "1" })]);
+
+		expect(result.excluded).toEqual({});
+		expect(result.eligible).toHaveLength(1);
 	});
 
 	test("keeps the source row numbering of the simple layout", () => {

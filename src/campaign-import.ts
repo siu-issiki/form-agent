@@ -77,11 +77,23 @@ const REQUIRED_COLUMNS = [
 const BLOCKER_COLUMNS = REQUIRED_COLUMNS.slice(2, 24);
 
 /**
- * The three columns of the simple CSV layout. A file that carries all of them
- * is read as the simple layout; anything else has to satisfy the full column
- * contract above.
+ * The link column of the simple CSV layout has been spelled two ways across
+ * source files. The canonical spelling is checked first, so it wins whenever
+ * a row somehow carries both.
  */
-const SIMPLE_COLUMNS = ["問い合わせリンク", "件名", "本文"] as const;
+const SIMPLE_LINK_COLUMNS = [
+	"問い合わせリンク",
+	"問い合わせフォームリンク",
+] as const;
+
+/**
+ * The columns of the simple CSV layout: 件名 and 本文 plus one of
+ * `SIMPLE_LINK_COLUMNS`. A file that carries all of them is read as the
+ * simple layout; anything else has to satisfy the full column contract
+ * above. A leading unnamed index column (csv-parse exposes it under the key
+ * "") is simply an extra property this check never looks at.
+ */
+const SIMPLE_TEXT_COLUMNS = ["件名", "本文"] as const;
 
 /** Carried twice in a registration file: as written, then digits only. */
 const PHONE_LABEL = "電話番号";
@@ -123,7 +135,7 @@ const REGISTRATION_LABELS: Array<[string, readonly string[]]> = [
 	["postalCode", ["郵便番号"]],
 	["postalCodePart1", ["郵便番号1"]],
 	["postalCodePart2", ["郵便番号2"]],
-	["companyWebsite", ["会社HP"]],
+	["companyWebsite", ["会社HP", "サービスページ"]],
 	["email", ["メールアドレス"]],
 	["companyName", ["会社名"]],
 	["department", ["部署", "部署名"]],
@@ -704,7 +716,22 @@ export async function buildCampaignJob(
 type RowOutcome = { candidate: CampaignCandidate } | { reason: string };
 
 function isSimpleLayout(row: CampaignCsvRow): boolean {
-	return SIMPLE_COLUMNS.every((column) => column in row);
+	return (
+		SIMPLE_TEXT_COLUMNS.every((column) => column in row) &&
+		SIMPLE_LINK_COLUMNS.some((column) => column in row)
+	);
+}
+
+/**
+ * The value of the simple layout's link column. The canonical spelling wins
+ * when a row carries both, matching the alias precedence used for
+ * registration labels.
+ */
+function simpleLinkValue(row: CampaignCsvRow): string | undefined {
+	for (const column of SIMPLE_LINK_COLUMNS) {
+		if (column in row) return row[column]?.trim();
+	}
+	return undefined;
 }
 
 /**
@@ -713,7 +740,7 @@ function isSimpleLayout(row: CampaignCsvRow): boolean {
  * checks of the full layout are not applied.
  */
 function simpleRowOutcome(row: CampaignCsvRow, rowNumber: number): RowOutcome {
-	const targetUrl = row.問い合わせリンク?.trim();
+	const targetUrl = simpleLinkValue(row);
 	if (!targetUrl) return { reason: "missing_form_url" };
 	let url: URL;
 	try {
