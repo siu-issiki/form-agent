@@ -26,6 +26,10 @@ import { BrowserUseApiError } from "../src/browser-use-client";
 import { D1JobStore } from "../src/d1-job-store";
 import type { AgentRunMetrics, JobInput } from "../src/job";
 import {
+	computeRetryDelaySeconds,
+	consumeJobBatch,
+} from "../src/queue-consumer";
+import {
 	classifyToolDiagnostic,
 	isJobDryRun,
 	ResponsesAgentExecutor,
@@ -40,8 +44,6 @@ import {
 } from "../src/restricted-browser";
 import { R2EvidenceObjectStore } from "../src/submission-evidence";
 import worker, {
-	computeRetryDelaySeconds,
-	consumeJobBatch,
 	handleHttpRequest,
 	isAgentDryRun,
 	isRealSendGuardExempt,
@@ -6004,6 +6006,46 @@ describe("Queue orchestration", () => {
 			delaySeconds: expect.any(Number),
 			providerRequestCount: 0,
 		});
+	});
+
+	test("stops a retryable agent exception at a job-specific attempt limit", async () => {
+		const limitedInput = {
+			...input,
+			payload: { ...input.payload, _formAgentMaxAttempts: 1 },
+		};
+		const store = new D1JobStore(env.DB);
+		await store.create(limitedInput, "2026-08-28T00:00:00.000Z");
+		const batch = createMessageBatch<JobMessage>("form-agent-jobs", [
+			{
+				id: "message-1",
+				timestamp: new Date("2026-08-28T00:00:01.000Z"),
+				body: { jobId: limitedInput.id },
+				attempts: 1,
+			},
+		]);
+		const ctx = createExecutionContext();
+		const executor: AgentExecutor = {
+			async execute() {
+				throw new AgentExecutionError(
+					"BROWSER_TOOL_UNAVAILABLE",
+					"The browser tool became unavailable.",
+					true,
+				);
+			},
+		};
+
+		await consumeJobBatch(batch, env, executor);
+		const result = await getQueueResult(batch, ctx);
+		const persisted = await store.find(limitedInput.id);
+
+		expect(result.explicitAcks).toEqual(["message-1"]);
+		expect(result.retryMessages).toEqual([]);
+		expect(persisted?.status).toBe("failed");
+		expect(persisted?.attemptCount).toBe(1);
+		expect(persisted?.result?.reasonCode).toBe("BROWSER_TOOL_UNAVAILABLE");
+		expect(persisted?.result?.reason).toBe(
+			"The agent failed at the job attempt limit.",
+		);
 	});
 
 	test("persists a safe reason when the queue consumer schedules a retry", async () => {
