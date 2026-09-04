@@ -16,8 +16,8 @@ import {
 	type JobInput,
 	MAX_ATTEMPTS_KEY,
 } from "./job";
-import { jobContentFingerprint } from "./job-fingerprint";
 import { isRecord } from "./json-record";
+import { checkRealSendGuard, type RealSendRefusal } from "./real-send-guard";
 import { ResponsesAgentExecutor } from "./responses-agent-executor";
 import {
 	assertAllowedTargetUrl,
@@ -86,9 +86,6 @@ const MAX_AGENT_DURATION_MS = 10 * 60 * 1000;
 /** The reclaim runs after the job is already lost, so it waits only briefly. */
 const SESSION_RECLAIM_TIMEOUT_MS = 10_000;
 const MAX_JOB_REQUEST_BYTES = 64 * 1024;
-const DAY_MS = 24 * 60 * 60 * 1000;
-/** Reason code a job carries once it stopped at the dry-run boundary. */
-const DRY_RUN_COMPLETE_REASON_CODE = "DRY_RUN_COMPLETE";
 
 export async function registerJob(
 	db: D1Database,
@@ -234,70 +231,35 @@ export async function handleHttpRequest(
 	return new Response("Not Found", { status: 404 });
 }
 
+/** HTTP status each real-send refusal is reported with. */
+const REAL_SEND_REFUSAL_STATUS: Record<RealSendRefusal, number> = {
+	SEND_APPROVAL_REQUIRED: 400,
+	DRY_RUN_NOT_COMPLETED: 400,
+	DRY_RUN_CONTENT_MISMATCH: 400,
+	REAL_SEND_CAP_REACHED: 429,
+};
+
 /**
- * Gate every job that would reach a real submission. A dry-run job is not
- * touched. A real-send job must carry a human approval record, must name a
- * dry-run that already reached the dry-run boundary carrying the same content,
- * and must fit inside the day's cap. The cap defaults to 0, so the path stays
- * shut unless a deploy explicitly opens it.
- *
- * The count and the insert are not one transaction. Real sends are registered
- * by a single operator-run tool, so the window is narrow, and overshooting it
- * would take two concurrent runs; the approval record and the per-row dry-run
- * check still hold in that case.
+ * Refuses a job the real-send guard does not allow, as the HTTP answer the
+ * caller sees. The decision itself lives in `checkRealSendGuard`; this only
+ * maps each refusal onto its status code.
  */
 async function refuseUnapprovedRealSend(
 	env: Env,
 	input: JobInput,
 	now: Date,
 ): Promise<Response | null> {
-	if (input.payload[EFFECTIVE_DRY_RUN_KEY] !== false) return null;
-	// The exemption was decided from the env when the payload was stamped, so
-	// the caller cannot reach it: a supplied value is discarded there.
-	if (input.payload[REAL_SEND_GUARD_EXEMPT_KEY] === true) return null;
-
-	const approval = input.payload[SEND_APPROVAL_KEY];
-	if (!isSendApproval(approval)) {
-		return apiJson({ error: "SEND_APPROVAL_REQUIRED" }, 400);
-	}
-
-	const store = new D1JobStore(env.DB);
-	const dryRun = await store.find(approval.dryRunJobId);
-	if (
-		!dryRun ||
-		dryRun.targetUrl !== input.targetUrl ||
-		dryRun.payload[EFFECTIVE_DRY_RUN_KEY] === false ||
-		dryRun.status !== "prohibited" ||
-		dryRun.result?.reasonCode !== DRY_RUN_COMPLETE_REASON_CODE
-	) {
-		return apiJson({ error: "DRY_RUN_NOT_COMPLETED" }, 400);
-	}
-
-	// The approval names a dry-run, so the send must carry the content that
-	// dry-run actually ran. Comparing only the form URL would let an approved
-	// row be re-registered with a different message or different form values.
-	const [approved, requested] = await Promise.all([
-		jobContentFingerprint(dryRun.targetUrl, dryRun.companyId, dryRun.payload),
-		jobContentFingerprint(input.targetUrl, input.companyId, input.payload),
-	]);
-	if (approved !== requested) {
-		return apiJson({ error: "DRY_RUN_CONTENT_MISMATCH" }, 400);
-	}
-
-	const cap = realSendDailyCap(env.REAL_SEND_DAILY_CAP);
-	if (cap < 1) return apiJson({ error: "REAL_SEND_CAP_REACHED" }, 429);
-	const dayStart = Date.UTC(
-		now.getUTCFullYear(),
-		now.getUTCMonth(),
-		now.getUTCDate(),
+	const decision = await checkRealSendGuard(
+		input,
+		now,
+		realSendDailyCap(env.REAL_SEND_DAILY_CAP),
+		new D1JobStore(env.DB),
 	);
-	const used = await store.countRealSendJobsCreatedBetween(
-		new Date(dayStart).toISOString(),
-		new Date(dayStart + DAY_MS).toISOString(),
-		input.id,
+	if (decision.allowed) return null;
+	return apiJson(
+		{ error: decision.refusal },
+		REAL_SEND_REFUSAL_STATUS[decision.refusal],
 	);
-	if (used >= cap) return apiJson({ error: "REAL_SEND_CAP_REACHED" }, 429);
-	return null;
 }
 
 /**
