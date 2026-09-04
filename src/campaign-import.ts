@@ -76,78 +76,164 @@ const REQUIRED_COLUMNS = [
 
 const BLOCKER_COLUMNS = REQUIRED_COLUMNS.slice(2, 24);
 
-const REGISTRATION_FIELDS: Array<[string, string]> = [
-	["苗字", "lastName"],
-	["名前", "firstName"],
-	["苗字（カナ）", "lastNameKatakana"],
-	["名前（カナ）", "firstNameKatakana"],
-	["苗字（かな）", "lastNameHiragana"],
-	["名前（かな）", "firstNameHiragana"],
-	["フルネームカタカナ", "fullNameKatakana"],
-	["フルネーム漢字", "fullName"],
-	["フルネームひらがな", "fullNameHiragana"],
-	["住所", "address"],
-	["住所1", "addressPart1"],
-	["住所2", "addressPart2"],
-	["住所3", "addressPart3"],
-	["電話番号", "phone"],
-	["郵便番号", "postalCode"],
-	["郵便番号1", "postalCodePart1"],
-	["郵便番号2", "postalCodePart2"],
-	["会社HP", "companyWebsite"],
-	["メールアドレス", "email"],
-	["部署", "department"],
-	["会社名", "companyName"],
-	["電話番号1", "phonePart1"],
-	["電話番号2", "phonePart2"],
-	["電話番号3", "phonePart3"],
-	["電話番号", "phoneDigits"],
+/**
+ * The three columns of the simple CSV layout. A file that carries all of them
+ * is read as the simple layout; anything else has to satisfy the full column
+ * contract above.
+ */
+const SIMPLE_COLUMNS = ["問い合わせリンク", "件名", "本文"] as const;
+
+/** Carried twice in a registration file: as written, then digits only. */
+const PHONE_LABEL = "電話番号";
+
+/**
+ * Every label a registration file may use for a given form key, most preferred
+ * first. Sources differ in wording ("氏名（フルネーム漢字）" against
+ * "フルネーム漢字", "電話1" against "電話番号1"), so the mapping matches on the
+ * label rather than on position, and an alias never wins over the canonical
+ * label when both are present.
+ *
+ * `phoneDigits` has no label of its own: it is the second "電話番号" entry, the
+ * digits-only spelling of the same number.
+ */
+const REGISTRATION_LABELS: Array<[string, readonly string[]]> = [
+	["lastName", ["苗字"]],
+	["firstName", ["名前"]],
+	["lastNameKatakana", ["苗字（カナ）", "苗字（カタカナ）"]],
+	["firstNameKatakana", ["名前（カナ）", "名前（カタカナ）"]],
+	["lastNameHiragana", ["苗字（かな）"]],
+	["firstNameHiragana", ["名前（かな）"]],
+	["fullName", ["フルネーム漢字", "氏名（フルネーム漢字）"]],
+	[
+		"fullNameKatakana",
+		["フルネームカタカナ", "氏名（フルネームカタカナ）", "フリガナ"],
+	],
+	[
+		"fullNameHiragana",
+		["フルネームひらがな", "氏名（フルネームひらがな）", "ふりがな"],
+	],
+	["address", ["住所"]],
+	["addressPart1", ["住所1"]],
+	["addressPart2", ["住所2"]],
+	["addressPart3", ["住所3"]],
+	["phone", [PHONE_LABEL]],
+	["phonePart1", ["電話番号1", "電話1"]],
+	["phonePart2", ["電話番号2", "電話2"]],
+	["phonePart3", ["電話番号3", "電話3"]],
+	["postalCode", ["郵便番号"]],
+	["postalCodePart1", ["郵便番号1"]],
+	["postalCodePart2", ["郵便番号2"]],
+	["companyWebsite", ["会社HP"]],
+	["email", ["メールアドレス"]],
+	["companyName", ["会社名"]],
+	["department", ["部署", "部署名"]],
+	["jobTitle", ["役職"]],
+	["age", ["年齢"]],
 ];
 
+const KNOWN_REGISTRATION_LABELS = new Set(
+	REGISTRATION_LABELS.flatMap(([, labels]) => labels),
+);
+
+/** Without these no inquiry form can be filled, so their absence is an error. */
+const REQUIRED_REGISTRATION_KEYS = [
+	"fullName",
+	"lastName",
+	"firstName",
+	"email",
+	"phone",
+	"companyName",
+] as const;
+
+export interface RegistrationMappingOptions {
+	/** Receives fixed-field log entries; the default writes them as JSON lines. */
+	log?: (entry: Record<string, unknown>) => void;
+}
+
+/**
+ * Turns a registration file into safe ASCII form keys. Entries are matched by
+ * label, so a file may carry the fields in any order, use a known alias, and
+ * hold labels this tool has no key for. An unknown label is ignored rather than
+ * refused, because registration files keep gaining columns; only the count
+ * reaches the log, never the label itself.
+ */
 export function mapRegistrationValues(
 	entries: readonly RegistrationEntry[],
+	options: RegistrationMappingOptions = {},
 ): Record<string, string> {
-	if (entries.length !== REGISTRATION_FIELDS.length) {
-		throw new Error(
-			"Registration data does not match the expected field count",
-		);
+	const log =
+		options.log ??
+		((entry: Record<string, unknown>) => console.log(JSON.stringify(entry)));
+
+	const byLabel = new Map<string, string[]>();
+	let unknownLabels = 0;
+	for (const entry of entries) {
+		const label = entry.label.trim();
+		const value = entry.value.trim();
+		if (!value) continue;
+		if (!KNOWN_REGISTRATION_LABELS.has(label)) {
+			unknownLabels += 1;
+			continue;
+		}
+		const seen = byLabel.get(label);
+		if (seen) seen.push(value);
+		else byLabel.set(label, [value]);
 	}
 
 	const values: Record<string, string> = {};
-	for (let index = 0; index < REGISTRATION_FIELDS.length; index += 1) {
-		const expected = REGISTRATION_FIELDS[index];
-		const entry = entries[index];
-		if (!expected || !entry || entry.label !== expected[0] || !entry.value) {
-			throw new Error("Registration data does not match the expected labels");
+	for (const [key, labels] of REGISTRATION_LABELS) {
+		for (const label of labels) {
+			const value = byLabel.get(label)?.[0];
+			if (value) {
+				values[key] = value;
+				break;
+			}
 		}
-		values[expected[1]] = entry.value;
 	}
+	const phones = byLabel.get(PHONE_LABEL) ?? [];
+	// The second "電話番号" is the digits-only spelling. A file that carries one
+	// number uses it for both keys rather than leaving the digits-only key out.
+	const phoneDigits = phones[1] ?? phones[0];
+	if (phoneDigits) values.phoneDigits = phoneDigits;
+
+	const missing = REQUIRED_REGISTRATION_KEYS.filter((key) => !values[key]);
+	if (missing.length > 0) {
+		// The key names are this tool's own ASCII identifiers, not file content.
+		throw new Error(
+			`Registration data is missing required fields: ${missing.join(", ")}`,
+		);
+	}
+
+	log({
+		event: "campaign_registration_summary",
+		mappedKeys: Object.keys(values).length,
+		unknownLabels,
+	});
 	return values;
 }
 
 export function filterCampaignRows(
 	rows: readonly CampaignCsvRow[],
 ): CampaignFilterResult {
-	if (rows.length > 0) assertRequiredColumns(rows[0] ?? {});
+	const header = rows[0] ?? {};
+	const simple = rows.length > 0 && isSimpleLayout(header);
+	if (rows.length > 0 && !simple) assertRequiredColumns(header);
 	const eligible: CampaignCandidate[] = [];
 	const excluded: Record<string, number> = {};
 
 	for (let index = 0; index < rows.length; index += 1) {
 		const row = rows[index] ?? {};
-		const reason = exclusionReason(row);
-		if (reason) {
-			excluded[reason] = (excluded[reason] ?? 0) + 1;
+		// The header itself is row 1, so the first data row is row 2 in both
+		// layouts; `sourceRow` names the same line an operator sees in the file.
+		const rowNumber = index + 2;
+		const outcome = simple
+			? simpleRowOutcome(row, rowNumber)
+			: fullRowOutcome(row, rowNumber);
+		if ("reason" in outcome) {
+			excluded[outcome.reason] = (excluded[outcome.reason] ?? 0) + 1;
 			continue;
 		}
-
-		eligible.push({
-			rowNumber: index + 2,
-			companyName: required(row, "企業名"),
-			companyDomain: normalizeCompanyDomain(required(row, "企業ドメイン")),
-			targetUrl: required(row, "問い合わせフォームURL"),
-			subject: required(row, "件名"),
-			message: required(row, "メール文面"),
-		});
+		eligible.push(outcome.candidate);
 	}
 
 	return { eligible, excluded };
@@ -611,6 +697,64 @@ export async function buildCampaignJob(
 			sourceRow: candidate.rowNumber,
 			formValues,
 			instruction: dryRun ? DRY_RUN_INSTRUCTION : SEND_INSTRUCTION,
+		},
+	};
+}
+
+type RowOutcome = { candidate: CampaignCandidate } | { reason: string };
+
+function isSimpleLayout(row: CampaignCsvRow): boolean {
+	return SIMPLE_COLUMNS.every((column) => column in row);
+}
+
+/**
+ * Reads one row of the simple layout. It carries no company columns and no
+ * review columns, so the company is taken from the form URL itself and the NG
+ * checks of the full layout are not applied.
+ */
+function simpleRowOutcome(row: CampaignCsvRow, rowNumber: number): RowOutcome {
+	const targetUrl = row.問い合わせリンク?.trim();
+	if (!targetUrl) return { reason: "missing_form_url" };
+	let url: URL;
+	try {
+		url = validatedHttpsUrl(targetUrl);
+	} catch {
+		return { reason: "invalid_or_insecure_form_url" };
+	}
+	let companyDomain: string;
+	try {
+		companyDomain = normalizeCompanyDomain(url.hostname);
+	} catch {
+		return { reason: "invalid_company_domain" };
+	}
+	const subject = row.件名?.trim();
+	const message = row.本文?.trim();
+	if (!subject || !message) return { reason: "empty_message" };
+	return {
+		candidate: {
+			rowNumber,
+			// No company column exists in this layout. The host is only a label:
+			// the job's `companyId` is derived from the registrable domain.
+			companyName: url.hostname,
+			companyDomain,
+			targetUrl,
+			subject,
+			message,
+		},
+	};
+}
+
+function fullRowOutcome(row: CampaignCsvRow, rowNumber: number): RowOutcome {
+	const reason = exclusionReason(row);
+	if (reason) return { reason };
+	return {
+		candidate: {
+			rowNumber,
+			companyName: required(row, "企業名"),
+			companyDomain: normalizeCompanyDomain(required(row, "企業ドメイン")),
+			targetUrl: required(row, "問い合わせフォームURL"),
+			subject: required(row, "件名"),
+			message: required(row, "メール文面"),
 		},
 	};
 }

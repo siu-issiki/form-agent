@@ -48,10 +48,12 @@ const registrationPairs: Array<[string, string]> = [
 const registration: RegistrationEntry[] = registrationPairs.map(
 	([label, value]) => ({ label, value }),
 );
+/** Keeps the mapping summary out of the test output. */
+const silent = { log: () => {} };
 
 describe("campaign import", () => {
 	test("maps expected registration labels to safe ASCII keys", () => {
-		const values = mapRegistrationValues(registration);
+		const values = mapRegistrationValues(registration, silent);
 
 		expect(values.phone).toBe("phone");
 		expect(values.phoneDigits).toBe("phone-digits");
@@ -61,11 +63,161 @@ describe("campaign import", () => {
 		).toBe(true);
 	});
 
-	test("fails closed when registration labels drift", () => {
+	test("fails closed when a required registration label drifts", () => {
 		const changed = registration.map((entry) => ({ ...entry }));
 		changed[0] = { label: "姓", value: "last" };
 
-		expect(() => mapRegistrationValues(changed)).toThrow("expected labels");
+		expect(() => mapRegistrationValues(changed, silent)).toThrow(
+			"missing required fields: lastName",
+		);
+	});
+
+	test("fails closed when a required registration value is empty", () => {
+		const changed = registration.map((entry) =>
+			entry.label === "メールアドレス" ? { ...entry, value: " " } : entry,
+		);
+
+		expect(() => mapRegistrationValues(changed, silent)).toThrow(
+			"missing required fields: email",
+		);
+	});
+
+	test("maps alias labels and the added fields", () => {
+		const values = mapRegistrationValues(aliasRegistration(), silent);
+
+		expect(values.fullName).toBe("full");
+		expect(values.fullNameKatakana).toBe("full-k");
+		expect(values.fullNameHiragana).toBe("full-h");
+		expect(values.lastNameKatakana).toBe("last-k");
+		expect(values.firstNameKatakana).toBe("first-k");
+		expect(values.phonePart1).toBe("phone-1");
+		expect(values.phonePart3).toBe("phone-3");
+		expect(values.department).toBe("department");
+		expect(values.jobTitle).toBe("job-title");
+		expect(values.age).toBe("age");
+		expect(
+			Object.keys(values).every((key) => /^[A-Za-z][A-Za-z0-9_]*$/.test(key)),
+		).toBe(true);
+	});
+
+	test("prefers the canonical label over its alias", () => {
+		const values = mapRegistrationValues(
+			[
+				...aliasRegistration(),
+				{ label: "部署", value: "canonical-department" },
+			],
+			silent,
+		);
+
+		expect(values.department).toBe("canonical-department");
+	});
+
+	test("uses one phone entry for both phone keys", () => {
+		const values = mapRegistrationValues(aliasRegistration(), silent);
+
+		expect(values.phone).toBe("phone");
+		expect(values.phoneDigits).toBe("phone");
+	});
+
+	test("reads the second phone entry as the digits-only spelling", () => {
+		const values = mapRegistrationValues(
+			[...aliasRegistration(), { label: "電話番号", value: "phone-digits" }],
+			silent,
+		);
+
+		expect(values.phone).toBe("phone");
+		expect(values.phoneDigits).toBe("phone-digits");
+	});
+
+	test("ignores unknown labels and reports only their count", () => {
+		const entries: Record<string, unknown>[] = [];
+		const values = mapRegistrationValues(
+			[
+				...aliasRegistration(),
+				{ label: "ご担当者メモ", value: "note" },
+				{ label: "取引先コード", value: "code" },
+				{ label: "空の未知項目", value: "" },
+			],
+			{ log: (entry) => entries.push(entry) },
+		);
+
+		expect(values.note).toBeUndefined();
+		expect(entries).toEqual([
+			{
+				event: "campaign_registration_summary",
+				mappedKeys: Object.keys(values).length,
+				unknownLabels: 2,
+			},
+		]);
+		expect(JSON.stringify(entries)).not.toContain("担当者");
+	});
+
+	test("skips optional entries whose value is empty", () => {
+		const values = mapRegistrationValues(
+			aliasRegistration().map((entry) =>
+				entry.label === "役職" ? { ...entry, value: "" } : entry,
+			),
+			silent,
+		);
+
+		expect(values.jobTitle).toBeUndefined();
+	});
+
+	test("reads the simple CSV layout and derives the company domain", () => {
+		const result = filterCampaignRows([
+			simpleRow(),
+			simpleRow({ 問い合わせリンク: "https://www.beta.co.jp/inquiry" }),
+		]);
+
+		expect(result.excluded).toEqual({});
+		expect(result.eligible).toEqual([
+			{
+				rowNumber: 2,
+				companyName: "contact.acme.co.jp",
+				companyDomain: "acme.co.jp",
+				targetUrl: "https://contact.acme.co.jp/form",
+				subject: "Subject",
+				message: "Message",
+			},
+			{
+				rowNumber: 3,
+				companyName: "www.beta.co.jp",
+				companyDomain: "beta.co.jp",
+				targetUrl: "https://www.beta.co.jp/inquiry",
+				subject: "Subject",
+				message: "Message",
+			},
+		]);
+	});
+
+	test("excludes simple rows without a body, a subject, or a usable URL", () => {
+		const result = filterCampaignRows([
+			simpleRow(),
+			simpleRow({ 本文: "" }),
+			simpleRow({ 件名: " " }),
+			simpleRow({ 問い合わせリンク: "" }),
+			simpleRow({ 問い合わせリンク: "http://contact.acme.co.jp/form" }),
+			simpleRow({ 問い合わせリンク: "https://192.0.2.10/form" }),
+		]);
+
+		expect(result.eligible).toHaveLength(1);
+		expect(result.excluded).toEqual({
+			empty_message: 2,
+			missing_form_url: 1,
+			invalid_or_insecure_form_url: 2,
+		});
+	});
+
+	test("keeps the source row numbering of the simple layout", () => {
+		const result = filterCampaignRows([
+			simpleRow({ 本文: "" }),
+			simpleRow(),
+			simpleRow(),
+		]);
+
+		expect(result.eligible.map((candidate) => candidate.rowNumber)).toEqual([
+			3, 4,
+		]);
 	});
 
 	test("filters sent, blocked, missing, and insecure rows", () => {
@@ -122,7 +274,7 @@ describe("campaign import", () => {
 	test("builds stable dry-run jobs without Japanese form keys", async () => {
 		const candidate = filterCampaignRows([row()]).eligible[0];
 		if (!candidate) throw new Error("Expected an eligible candidate");
-		const values = mapRegistrationValues(registration);
+		const values = mapRegistrationValues(registration, silent);
 		const resolution = {
 			finalUrl: "https://acme.co.jp/contact",
 			allowedHosts: ["acme.co.jp"],
@@ -154,7 +306,7 @@ describe("campaign import", () => {
 		if (!candidate) throw new Error("Expected an eligible candidate");
 		const job = await buildCampaignJob(
 			candidate,
-			mapRegistrationValues(registration),
+			mapRegistrationValues(registration, silent),
 			"agb-shaken-dryrun-v1",
 			{
 				finalUrl: "https://acme.co.jp/contact",
@@ -175,7 +327,7 @@ describe("campaign import", () => {
 			finalUrl: "https://acme.co.jp/contact",
 			allowedHosts: ["acme.co.jp"],
 		};
-		const values = mapRegistrationValues(registration);
+		const values = mapRegistrationValues(registration, silent);
 		const build = (choices: Record<string, readonly string[]>) =>
 			buildCampaignJob(
 				candidate,
@@ -491,7 +643,7 @@ describe("campaign import", () => {
 		if (!candidate) throw new Error("Expected an eligible candidate");
 		const job = await buildCampaignJob(
 			candidate,
-			mapRegistrationValues(registration),
+			mapRegistrationValues(registration, silent),
 			"agb-shaken-send-v1",
 			{
 				finalUrl: "https://acme.co.jp/contact",
@@ -512,7 +664,7 @@ describe("campaign import", () => {
 		if (!candidate) throw new Error("Expected an eligible candidate");
 		const job = await buildCampaignJob(
 			candidate,
-			mapRegistrationValues(registration),
+			mapRegistrationValues(registration, silent),
 			"agb-shaken-dryrun-v1",
 			{
 				finalUrl: "https://acme.co.jp/contact",
@@ -535,7 +687,7 @@ describe("campaign import", () => {
 		const build = (mode: Record<string, unknown>) =>
 			buildCampaignJob(
 				candidate,
-				mapRegistrationValues(registration),
+				mapRegistrationValues(registration, silent),
 				"agb-shaken-send-v1",
 				resolution,
 				{},
@@ -857,6 +1009,46 @@ function storedSendJobResponse(job: JobInput): Response {
 			attemptCount: 0,
 		},
 	});
+}
+
+/** The three-column layout: no company columns and no NG check columns. */
+function simpleRow(overrides: CampaignCsvRow = {}): CampaignCsvRow {
+	return {
+		問い合わせリンク: "https://contact.acme.co.jp/form",
+		件名: "Subject",
+		本文: "Message",
+		...overrides,
+	};
+}
+
+/**
+ * A registration file in the wording of the second source: aliases instead of
+ * the canonical labels, one phone entry, and the added fields.
+ */
+function aliasRegistration(): RegistrationEntry[] {
+	return [
+		{ label: "会社名", value: "sender-company" },
+		{ label: "部署名", value: "department" },
+		{ label: "役職", value: "job-title" },
+		{ label: "苗字", value: "last" },
+		{ label: "名前", value: "first" },
+		{ label: "氏名（フルネーム漢字）", value: "full" },
+		{ label: "苗字（カタカナ）", value: "last-k" },
+		{ label: "名前（カタカナ）", value: "first-k" },
+		{ label: "氏名（フルネームカタカナ）", value: "full-k" },
+		{ label: "フリガナ", value: "ignored-alias" },
+		{ label: "氏名（フルネームひらがな）", value: "full-h" },
+		{ label: "ふりがな", value: "ignored-alias" },
+		{ label: "年齢", value: "age" },
+		{ label: "メールアドレス", value: "email" },
+		{ label: "電話番号", value: "phone" },
+		{ label: "電話1", value: "phone-1" },
+		{ label: "電話2", value: "phone-2" },
+		{ label: "電話3", value: "phone-3" },
+		{ label: "郵便番号", value: "postal" },
+		{ label: "住所", value: "address" },
+		{ label: "会社HP", value: "website" },
+	];
 }
 
 function row(overrides: CampaignCsvRow = {}): CampaignCsvRow {
