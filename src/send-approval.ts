@@ -7,6 +7,23 @@ import { JOB_ID_PATTERN } from "./job";
  */
 export const SEND_APPROVAL_KEY = "_formAgentSendApproval";
 
+/**
+ * Payload key the API stamps on a job whose target domain is on
+ * `REAL_SEND_GUARD_EXEMPT_DOMAINS`. It is written by the API alone: whatever
+ * the caller sent under this key is discarded first, because the key is what
+ * keeps a job out of the daily real-send count. It exists so that the managed
+ * test system -- a real submission with no dry-run to approve against -- can
+ * be exercised without spending the day's cap for real customers.
+ */
+export const REAL_SEND_GUARD_EXEMPT_KEY = "_formAgentRealSendGuardExempt";
+
+/** Whether the API accepted this job through the test-system exemption. */
+export function isRealSendGuardExemptPayload(
+	payload: Record<string, unknown>,
+): boolean {
+	return payload[REAL_SEND_GUARD_EXEMPT_KEY] === true;
+}
+
 export interface SendApproval {
 	/** Person who approved the send; free text the operator supplies. */
 	approvedBy: string;

@@ -19,9 +19,15 @@ import {
 	assertAllowedTargetUrl,
 	isTrustedFormValue,
 	normalizeAllowedHosts,
+	normalizeTargetDomain,
 	PAYLOAD_KEY_PATTERN,
 } from "./restricted-browser";
-import { isSendApproval, SEND_APPROVAL_KEY } from "./send-approval";
+import {
+	isRealSendGuardExemptPayload,
+	isSendApproval,
+	REAL_SEND_GUARD_EXEMPT_KEY,
+	SEND_APPROVAL_KEY,
+} from "./send-approval";
 import { R2EvidenceObjectStore } from "./submission-evidence";
 
 export interface JobMessage {
@@ -46,6 +52,15 @@ export interface Env {
 	 * path again.
 	 */
 	REAL_SEND_DAILY_CAP?: string;
+	/**
+	 * Comma-separated registrable domains whose jobs skip the real-send guard.
+	 * It exists for the managed test system only: those submissions are real by
+	 * nature, have no dry-run to approve against, and must not spend the day's
+	 * cap. Unset or empty means no exemption. A customer domain must never be
+	 * listed here -- anything on this list can be sent to with no human
+	 * approval record at all.
+	 */
+	REAL_SEND_GUARD_EXEMPT_DOMAINS?: string;
 }
 
 export interface RegisterJobResult {
@@ -114,7 +129,10 @@ export async function registerJob(
 }
 
 function isRealSendJob(job: Job): boolean {
-	return job.payload._formAgentEffectiveDryRun === false;
+	return (
+		job.payload._formAgentEffectiveDryRun === false &&
+		!isRealSendGuardExemptPayload(job.payload)
+	);
 }
 
 /** Compares two ISO timestamps by UTC day; an unparsable value is never equal. */
@@ -158,9 +176,12 @@ export async function handleHttpRequest(
 
 		let input: JobInput;
 		try {
-			input = freezeDryRunMode(
-				await parseJobInput(request),
-				isAgentDryRun(env.AGENT_DRY_RUN),
+			input = markRealSendGuardExemption(
+				freezeDryRunMode(
+					await parseJobInput(request),
+					isAgentDryRun(env.AGENT_DRY_RUN),
+				),
+				realSendGuardExemptDomains(env.REAL_SEND_GUARD_EXEMPT_DOMAINS),
 			);
 		} catch (error) {
 			if (error instanceof InvalidJobRequestError) {
@@ -234,6 +255,9 @@ async function refuseUnapprovedRealSend(
 	now: Date,
 ): Promise<Response | null> {
 	if (input.payload._formAgentEffectiveDryRun !== false) return null;
+	// The exemption was decided from the env when the payload was stamped, so
+	// the caller cannot reach it: a supplied value is discarded there.
+	if (input.payload[REAL_SEND_GUARD_EXEMPT_KEY] === true) return null;
 
 	const approval = input.payload[SEND_APPROVAL_KEY];
 	if (!isSendApproval(approval)) {
@@ -287,6 +311,67 @@ async function refuseUnapprovedRealSend(
 export function realSendDailyCap(value: string | undefined): number {
 	const trimmed = value?.trim() ?? "";
 	return /^\d{1,3}$/.test(trimmed) ? Number(trimmed) : 0;
+}
+
+/**
+ * Reads the domains whose jobs skip the real-send guard. Each entry must be a
+ * registrable domain; an entry that is not one is dropped, so a typo removes
+ * an exemption rather than granting a wider one. Unset or empty means no
+ * exemption at all, which is the state a plain deploy leaves behind.
+ *
+ * This list is for the managed test system only. A customer domain listed here
+ * could be sent to with no approval record and without spending the day's cap.
+ */
+export function realSendGuardExemptDomains(
+	value: string | undefined,
+): string[] {
+	const exempt: string[] = [];
+	for (const entry of (value ?? "").split(",")) {
+		const trimmed = entry.trim();
+		if (!trimmed) continue;
+		try {
+			exempt.push(normalizeTargetDomain(trimmed));
+		} catch {
+			// Not a registrable domain, so it can never match a job's domain.
+		}
+	}
+	return exempt;
+}
+
+/**
+ * Whether the job's target domain is one of the exempt domains, or below it.
+ * The job domain is only case-folded here rather than reduced to a registrable
+ * domain, so that a host under an exempt domain also matches; every entry it
+ * is compared against is already a registrable domain.
+ */
+export function isRealSendGuardExempt(
+	targetDomain: string,
+	exemptDomains: readonly string[],
+): boolean {
+	const normalized = targetDomain.trim().toLowerCase().replace(/\.$/, "");
+	if (!normalized) return false;
+	return exemptDomains.some(
+		(domain) => normalized === domain || normalized.endsWith(`.${domain}`),
+	);
+}
+
+/**
+ * Stamps the exemption the API decided from its own configuration. The key is
+ * always removed first: it is what keeps a job out of the daily real-send
+ * count, so a caller must never be able to set it. A job that is not exempt
+ * keeps exactly the payload it arrived with.
+ */
+function markRealSendGuardExemption(
+	input: JobInput,
+	exemptDomains: readonly string[],
+): JobInput {
+	const { [REAL_SEND_GUARD_EXEMPT_KEY]: _supplied, ...payload } = input.payload;
+	return {
+		...input,
+		payload: isRealSendGuardExempt(input.targetDomain, exemptDomains)
+			? { ...payload, [REAL_SEND_GUARD_EXEMPT_KEY]: true }
+			: payload,
+	};
 }
 
 function freezeDryRunMode(

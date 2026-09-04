@@ -11,7 +11,11 @@
 	"vars": {
 		"AGENT_EXECUTOR_ENABLED": "true",
 		"AGENT_MODEL": "gpt-5.6-luna",
-		"AGENT_DRY_RUN": "false"
+		"AGENT_DRY_RUN": "false",
+		// Managed test system only. Never add a real customer domain: a job
+		// whose target domain is listed here is registered without an approval
+		// record and does not count against REAL_SEND_DAILY_CAP.
+		"REAL_SEND_GUARD_EXEMPT_DOMAINS": "form-agent.workers.dev"
 	},
 	"migrations": [
 		{

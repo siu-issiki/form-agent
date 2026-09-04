@@ -47,8 +47,10 @@ import worker, {
 	consumeJobBatch,
 	handleHttpRequest,
 	isAgentDryRun,
+	isRealSendGuardExempt,
 	type JobMessage,
 	realSendDailyCap,
+	realSendGuardExemptDomains,
 	registerJob,
 } from "../src/worker";
 
@@ -940,6 +942,17 @@ describe("Real-send guard", () => {
 		} as unknown as Queue<JobMessage>,
 	};
 
+	const exemptDomain = "form-agent.workers.dev";
+	/** A job against the managed test system, which is a real send by nature. */
+	const testSystemInput: JobInput = {
+		...input,
+		id: "job-test-system",
+		companyId: "test-system",
+		companyName: "Form Agent test system",
+		targetUrl: `https://form-agent-test-system.${exemptDomain}/contact`,
+		targetDomain: exemptDomain,
+	};
+
 	beforeEach(() => {
 		queued.length = 0;
 	});
@@ -954,6 +967,135 @@ describe("Real-send guard", () => {
 		expect(realSendDailyCap("-1")).toBe(0);
 		expect(realSendDailyCap("2.5")).toBe(0);
 		expect(realSendDailyCap("1e3")).toBe(0);
+	});
+
+	test("reads the exempt domains and drops anything but a registrable domain", () => {
+		expect(realSendGuardExemptDomains("form-agent.workers.dev")).toEqual([
+			"form-agent.workers.dev",
+		]);
+		expect(
+			realSendGuardExemptDomains(" form-agent.workers.dev , acme.co.jp "),
+		).toEqual(["form-agent.workers.dev", "acme.co.jp"]);
+		expect(realSendGuardExemptDomains(undefined)).toEqual([]);
+		expect(realSendGuardExemptDomains("")).toEqual([]);
+		expect(realSendGuardExemptDomains(",,")).toEqual([]);
+		// A host, a bare suffix, and a URL are all dropped, so a typo removes an
+		// exemption instead of widening one.
+		expect(
+			realSendGuardExemptDomains(
+				"form-agent-test-system.form-agent.workers.dev,workers.dev,https://acme.co.jp",
+			),
+		).toEqual([]);
+	});
+
+	test("matches an exempt domain and the hosts below it only", () => {
+		const exempt = ["form-agent.workers.dev"];
+		expect(isRealSendGuardExempt("form-agent.workers.dev", exempt)).toBe(true);
+		expect(
+			isRealSendGuardExempt(
+				"form-agent-test-system.form-agent.workers.dev",
+				exempt,
+			),
+		).toBe(true);
+		expect(isRealSendGuardExempt("FORM-AGENT.WORKERS.DEV.", exempt)).toBe(true);
+		expect(isRealSendGuardExempt("workers.dev", exempt)).toBe(false);
+		expect(isRealSendGuardExempt("notform-agent.workers.dev", exempt)).toBe(
+			false,
+		);
+		expect(isRealSendGuardExempt("acme.co.jp", exempt)).toBe(false);
+		expect(isRealSendGuardExempt("form-agent.workers.dev", [])).toBe(false);
+	});
+
+	test("accepts a test-system send without an approval record or a cap", async () => {
+		const { REAL_SEND_DAILY_CAP: _cap, ...closed } = sendEnv;
+
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", testSystemInput, apiToken),
+			{ ...closed, REAL_SEND_GUARD_EXEMPT_DOMAINS: exemptDomain },
+		);
+
+		expect(response.status).toBe(201);
+		expect(queued).toEqual([{ jobId: testSystemInput.id }]);
+		const stored = await new D1JobStore(env.DB).find(testSystemInput.id);
+		expect(stored?.payload).toMatchObject({
+			_formAgentEffectiveDryRun: false,
+			_formAgentRealSendGuardExempt: true,
+		});
+		// The exemption never turns the job into a dry-run: it still submits.
+		expect(stored?.payload._formAgentSendApproval).toBeUndefined();
+	});
+
+	test("keeps the guard closed for a domain the exemption does not name", async () => {
+		const refused = await handleHttpRequest(
+			jobRequest("POST", "/jobs", input, apiToken),
+			{ ...sendEnv, REAL_SEND_GUARD_EXEMPT_DOMAINS: exemptDomain },
+		);
+
+		expect(refused.status).toBe(400);
+		expect(await refused.json()).toEqual({ error: "SEND_APPROVAL_REQUIRED" });
+
+		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
+		await createRealSend("job-send-earlier", new Date().toISOString());
+		const capped = await handleHttpRequest(
+			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
+			{
+				...sendEnv,
+				REAL_SEND_DAILY_CAP: "1",
+				REAL_SEND_GUARD_EXEMPT_DOMAINS: exemptDomain,
+			},
+		);
+
+		expect(capped.status).toBe(429);
+		expect(await capped.json()).toEqual({ error: "REAL_SEND_CAP_REACHED" });
+		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
+	});
+
+	test("does not count an exempt send against the daily cap", async () => {
+		const capOfOne = {
+			...sendEnv,
+			REAL_SEND_DAILY_CAP: "1",
+			REAL_SEND_GUARD_EXEMPT_DOMAINS: exemptDomain,
+		};
+		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
+
+		const exempted = await handleHttpRequest(
+			jobRequest("POST", "/jobs", testSystemInput, apiToken),
+			capOfOne,
+		);
+		const approved = await handleHttpRequest(
+			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
+			capOfOne,
+		);
+
+		expect(exempted.status).toBe(201);
+		expect(approved.status).toBe(201);
+		const row = await env.DB.prepare("SELECT real_send FROM jobs WHERE id = ?")
+			.bind(testSystemInput.id)
+			.first<{ real_send: number }>();
+		expect(row?.real_send).toBe(0);
+	});
+
+	test("discards an exemption the caller put in the payload", async () => {
+		const response = await handleHttpRequest(
+			jobRequest(
+				"POST",
+				"/jobs",
+				{
+					...input,
+					payload: {
+						...input.payload,
+						_formAgentRealSendGuardExempt: true,
+					},
+				},
+				apiToken,
+			),
+			{ ...sendEnv, REAL_SEND_GUARD_EXEMPT_DOMAINS: exemptDomain },
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({ error: "SEND_APPROVAL_REQUIRED" });
+		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
+		expect(queued).toEqual([]);
 	});
 
 	test("refuses a real send that carries no approval record", async () => {
