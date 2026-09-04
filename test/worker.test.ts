@@ -24,7 +24,8 @@ import {
 } from "../src/browser-use-cdp";
 import { BrowserUseApiError } from "../src/browser-use-client";
 import { D1JobStore } from "../src/d1-job-store";
-import type { AgentRunMetrics, JobInput } from "../src/job";
+import type { JobMessage } from "../src/env";
+import { type AgentRunMetrics, JOB_STATUSES, type JobInput } from "../src/job";
 import {
 	computeRetryDelaySeconds,
 	consumeJobBatch,
@@ -47,7 +48,6 @@ import worker, {
 	handleHttpRequest,
 	isAgentDryRun,
 	isRealSendGuardExempt,
-	type JobMessage,
 	realSendDailyCap,
 	realSendGuardExemptDomains,
 	registerJob,
@@ -142,6 +142,34 @@ beforeEach(async () => {
 		env.DB.prepare("DELETE FROM results"),
 		env.DB.prepare("DELETE FROM jobs"),
 	]);
+});
+
+describe("job status contract", () => {
+	test("the jobs.status CHECK constraint lists exactly JOB_STATUSES", () => {
+		// `TEST_MIGRATIONS` is the same migration set the Worker runs against,
+		// so reading the constraint back here is what keeps `JOB_STATUSES` --
+		// and the SQL status sets built from it -- honest about the schema.
+		const checkPattern =
+			/status\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\(\s*status\s+IN\s*\(([^)]*)\)/i;
+		let constraintBody: string | null = null;
+		for (const migration of env.TEST_MIGRATIONS) {
+			for (const query of migration.queries) {
+				const match = checkPattern.exec(query);
+				// Later migrations win, so a redefinition is what gets checked.
+				if (match?.[1]) {
+					constraintBody = match[1];
+				}
+			}
+		}
+
+		expect(constraintBody).not.toBeNull();
+		const declared = [...(constraintBody ?? "").matchAll(/'([^']*)'/g)].map(
+			(match) => match[1],
+		);
+
+		expect(new Set(declared)).toEqual(new Set(JOB_STATUSES));
+		expect(declared).toHaveLength(JOB_STATUSES.length);
+	});
 });
 
 describe("D1JobStore", () => {

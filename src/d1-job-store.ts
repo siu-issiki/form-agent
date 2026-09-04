@@ -19,6 +19,57 @@ import { normalizeAllowedHosts } from "./restricted-browser";
 import { isRealSendPayload } from "./send-approval";
 import { EVIDENCE_CONTENT_TYPE } from "./submission-evidence";
 
+/**
+ * Statuses a claimed run may still be working under: `running` is the ordinary
+ * case, and `submitting` is a two-step form whose confirmation screen the
+ * model still has to act on. Guards that must only touch a live run use this.
+ */
+const ACTIVE_RUN_STATUSES: readonly JobStatus[] = ["running", "submitting"];
+
+/**
+ * Statuses under which a run's metrics row may still be written. The metrics
+ * land after the run finished, so every outcome the agent itself can reach is
+ * accepted on top of the live ones; only `pending` and `dead_lettered` -- which
+ * no agent run produced -- stay out.
+ */
+const RUN_METRICS_RECORDABLE_STATUSES: readonly JobStatus[] = [
+	"running",
+	"submitting",
+	"sent",
+	"uncertain",
+	"prohibited",
+	"failed",
+];
+
+/**
+ * Statuses under which a tool diagnostic may still be recorded: the live ones
+ * plus the two outcomes a tool failure is diagnosed against.
+ */
+const TOOL_DIAGNOSTIC_RECORDABLE_STATUSES: readonly JobStatus[] = [
+	"running",
+	"submitting",
+	"sent",
+	"uncertain",
+];
+
+/**
+ * Statuses a job may be dead-lettered from. A job that already reached a real
+ * outcome keeps it, so only the ones the queue can still redeliver are listed.
+ */
+const DEAD_LETTERABLE_STATUSES: readonly JobStatus[] = [
+	"pending",
+	"running",
+	"failed",
+];
+
+/**
+ * Renders one `?` per status so a set stays bound rather than interpolated
+ * into the SQL text.
+ */
+function statusPlaceholders(statuses: readonly JobStatus[]): string {
+	return statuses.map(() => "?").join(", ");
+}
+
 interface StoredJobRow {
 	id: string;
 	company_id: string;
@@ -169,10 +220,11 @@ export class D1JobStore implements JobStore {
 				`UPDATE jobs
          SET provider_request_count = provider_request_count + 1,
              updated_at = ?
-         WHERE id = ? AND status IN ('running', 'submitting') AND run_token = ?
+         WHERE id = ? AND status IN (${statusPlaceholders(ACTIVE_RUN_STATUSES)})
+           AND run_token = ?
            AND provider_request_count < ?`,
 			)
-			.bind(now, id, runToken, maxRequests)
+			.bind(now, id, ...ACTIVE_RUN_STATUSES, runToken, maxRequests)
 			.run();
 
 		return result.meta.changes === 1;
@@ -332,9 +384,7 @@ export class D1JobStore implements JobStore {
         ), ?
         FROM jobs
         WHERE id = ?
-          AND status IN (
-            'running', 'submitting', 'sent', 'uncertain', 'prohibited', 'failed'
-          )
+          AND status IN (${statusPlaceholders(RUN_METRICS_RECORDABLE_STATUSES)})
           AND run_token = ?`,
 			)
 			.bind(
@@ -355,6 +405,7 @@ export class D1JobStore implements JobStore {
 				metrics.outcome,
 				now,
 				id,
+				...RUN_METRICS_RECORDABLE_STATUSES,
 				runToken,
 			)
 			.run();
@@ -412,7 +463,9 @@ export class D1JobStore implements JobStore {
         ), ?
         FROM jobs
         WHERE id = ?
-          AND status IN ('running', 'submitting', 'sent', 'uncertain')
+          AND status IN (${statusPlaceholders(
+						TOOL_DIAGNOSTIC_RECORDABLE_STATUSES,
+					)})
           AND run_token = ?`,
 			)
 			.bind(
@@ -423,6 +476,7 @@ export class D1JobStore implements JobStore {
 				resultCode,
 				now,
 				id,
+				...TOOL_DIAGNOSTIC_RECORDABLE_STATUSES,
 				runToken,
 			)
 			.run();
@@ -455,11 +509,21 @@ export class D1JobStore implements JobStore {
         ), ?
 		FROM jobs
 		WHERE id = ?
-		  AND status IN ('running', 'submitting')
+		  AND status IN (${statusPlaceholders(ACTIVE_RUN_STATUSES)})
 		  AND run_token = ?
 		  AND attempt_count = ?`,
 			)
-			.bind(eventId, attempt, stage, objectKey, now, id, runToken, attempt)
+			.bind(
+				eventId,
+				attempt,
+				stage,
+				objectKey,
+				now,
+				id,
+				...ACTIVE_RUN_STATUSES,
+				runToken,
+				attempt,
+			)
 			.run();
 
 		return result.meta.changes === 1;
@@ -496,7 +560,7 @@ export class D1JobStore implements JobStore {
 		   AND EXISTS (
 		     SELECT 1 FROM jobs
 		     WHERE jobs.id = events.job_id
-		       AND jobs.status IN ('running', 'submitting')
+		       AND jobs.status IN (${statusPlaceholders(ACTIVE_RUN_STATUSES)})
 		       AND jobs.run_token = ?
 		       AND jobs.attempt_count = ?
 		   )`,
@@ -511,6 +575,7 @@ export class D1JobStore implements JobStore {
 				eventId,
 				id,
 				attempt,
+				...ACTIVE_RUN_STATUSES,
 				runToken,
 				attempt,
 			)
@@ -591,7 +656,7 @@ export class D1JobStore implements JobStore {
 		), ?
 		FROM jobs
 		WHERE id = ?
-		  AND status IN ('running', 'submitting')
+		  AND status IN (${statusPlaceholders(ACTIVE_RUN_STATUSES)})
 		  AND run_token = ?
 		  AND attempt_count = ?
 		  AND NOT EXISTS (SELECT 1 FROM events WHERE events.id = ?)`,
@@ -603,6 +668,7 @@ export class D1JobStore implements JobStore {
 					failureCode,
 					now,
 					id,
+					...ACTIVE_RUN_STATUSES,
 					runToken,
 					attempt,
 					eventId,
@@ -688,9 +754,11 @@ export class D1JobStore implements JobStore {
 				.prepare(
 					`UPDATE jobs
            SET status = 'dead_lettered', updated_at = ?
-           WHERE id = ? AND status IN ('pending', 'running', 'failed')`,
+           WHERE id = ? AND status IN (${statusPlaceholders(
+							DEAD_LETTERABLE_STATUSES,
+						)})`,
 				)
-				.bind(now, id),
+				.bind(now, id, ...DEAD_LETTERABLE_STATUSES),
 			session
 				.prepare(
 					`INSERT INTO events (
@@ -725,13 +793,14 @@ export class D1JobStore implements JobStore {
 		result: JobResult,
 	): Promise<Job | null> {
 		const session = this.db.withSession("first-primary");
-		const statusPlaceholders = expectedStatuses.map(() => "?").join(", ");
 		const batchResult = await session.batch([
 			session
 				.prepare(
 					`UPDATE jobs
            SET status = ?, updated_at = ?
-           WHERE id = ? AND status IN (${statusPlaceholders}) AND run_token = ?`,
+           WHERE id = ? AND status IN (${statusPlaceholders(
+							expectedStatuses,
+						)}) AND run_token = ?`,
 				)
 				.bind(result.outcome, now, id, ...expectedStatuses, runToken),
 			session

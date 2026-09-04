@@ -1,5 +1,6 @@
 import type { AgentExecutor } from "./agent-executor";
 import { D1JobStore } from "./d1-job-store";
+import type { Env, JobMessage } from "./env";
 import {
 	DRY_RUN_KEY,
 	DuplicateJobError,
@@ -27,39 +28,6 @@ import {
 	SEND_APPROVAL_KEY,
 } from "./send-approval";
 import { R2EvidenceObjectStore } from "./submission-evidence";
-
-export interface JobMessage {
-	jobId: string;
-}
-
-export interface Env {
-	DB: D1Database;
-	JOB_QUEUE: Queue<JobMessage>;
-	EVIDENCE_BUCKET: R2Bucket;
-	AGENT_EXECUTOR_ENABLED?: string;
-	AGENT_MODEL?: string;
-	AGENT_SUBMIT_REVIEW_MODEL?: string;
-	AGENT_DRY_RUN?: string;
-	OPENAI_API_KEY?: string;
-	BROWSER_USE_API_KEY?: string;
-	JOB_API_TOKEN?: string;
-	/**
-	 * How many real-send jobs may be registered in one UTC day. Unset, empty,
-	 * or unparsable means 0: the API then accepts no real-send job at all, so a
-	 * plain deploy that carries only the values in `wrangler.jsonc` closes the
-	 * path again.
-	 */
-	REAL_SEND_DAILY_CAP?: string;
-	/**
-	 * Comma-separated registrable domains whose jobs skip the real-send guard.
-	 * It exists for the managed test system only: those submissions are real by
-	 * nature, have no dry-run to approve against, and must not spend the day's
-	 * cap. Unset or empty means no exemption. A customer domain must never be
-	 * listed here -- anything on this list can be sent to with no human
-	 * approval record at all.
-	 */
-	REAL_SEND_GUARD_EXEMPT_DOMAINS?: string;
-}
 
 export interface RegisterJobResult {
 	created: boolean;
