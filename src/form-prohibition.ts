@@ -1,5 +1,4 @@
-import { isRecord } from "./json-record";
-import type { BrowserObservation } from "./restricted-browser";
+import type { ObservedForm } from "./observed-form";
 
 export type ProhibitedReasonCode =
 	| "NO_FORM_PRESENT"
@@ -17,9 +16,10 @@ export type ProhibitionVerification =
 	| "REASON_CODES"
 	| "PROHIBITION_EVIDENCE_VERIFIED";
 
-export function detectProhibitedReasonCodes(
-	observation: Pick<BrowserObservation, "forms" | "pageText">,
-): ProhibitedReasonCode[] {
+export function detectProhibitedReasonCodes(observation: {
+	forms: readonly ObservedForm[];
+	pageText?: string;
+}): ProhibitedReasonCode[] {
 	const codes: ProhibitedReasonCode[] = [];
 	if (observation.forms.length === 0) return ["NO_FORM_PRESENT"];
 	const pageCodes = detectProhibitedTextReasonCodes(observation.pageText ?? "");
@@ -251,15 +251,15 @@ export function logProhibitionEvidence(
 	);
 }
 
-function hasTrustedFormProhibitionMetadata(form: unknown): boolean {
-	return isRecord(form) && Array.isArray(form.prohibitedReasonCodes);
+/** A form carries trusted metadata once the observation reported an array. */
+function hasTrustedFormProhibitionMetadata(form: ObservedForm): boolean {
+	return form.prohibitedReasonCodes !== null;
 }
 
 export function readProhibitedReasonCodes(
-	form: unknown,
+	form: ObservedForm,
 ): ProhibitedReasonCode[] {
-	if (!isRecord(form) || !Array.isArray(form.prohibitedReasonCodes)) return [];
-	return form.prohibitedReasonCodes.filter(isProhibitedReasonCode);
+	return form.prohibitedReasonCodes?.filter(isProhibitedReasonCode) ?? [];
 }
 
 export function isProhibitedReasonCode(

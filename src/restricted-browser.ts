@@ -14,6 +14,11 @@ import {
 import type { Job, JobStore } from "./job";
 import { isRecord } from "./json-record";
 import {
+	type ObservedField,
+	type ObservedForm,
+	parseObservedForms,
+} from "./observed-form";
+import {
 	EVIDENCE_CONTENT_TYPE,
 	type EvidenceCaptureResult,
 	type EvidenceObjectStore,
@@ -113,32 +118,25 @@ export interface DryRunEvidenceFieldMap {
  * password value is never carried, matching the driver's own observation.
  */
 export function dryRunFieldMap(
-	observation: BrowserObservation | undefined,
+	forms: readonly ObservedForm[],
 	review: SubmitReviewDecision,
 	targetUrl: string,
 	capturedAt: string,
 ): DryRunEvidenceFieldMap {
 	const fields: DryRunEvidenceField[] = [];
-	for (const form of observation?.forms ?? []) {
-		if (!isRecord(form) || !Array.isArray(form.fields)) continue;
-		for (const field of form.fields) {
-			if (!isRecord(field)) continue;
+	for (const form of forms) {
+		for (const field of form.fields ?? []) {
 			if (!isReviewComparableField(field.tag, field.type)) continue;
-			if (typeof field.elementId !== "string") continue;
-			const type = typeof field.type === "string" ? field.type : null;
+			if (field.elementId === undefined) continue;
+			const type = field.type ?? null;
 			fields.push({
 				elementId: field.elementId,
-				label: typeof field.label === "string" ? field.label : null,
-				name: typeof field.name === "string" ? field.name : null,
+				label: field.label ?? null,
+				name: field.name ?? null,
 				type,
-				required: typeof field.required === "boolean" ? field.required : null,
-				value:
-					type === "password" || typeof field.value !== "string"
-						? ""
-						: field.value,
-				...(typeof field.checked === "boolean"
-					? { checked: field.checked }
-					: {}),
+				required: field.required ?? null,
+				value: type === "password" ? "" : (field.value ?? ""),
+				...(field.checked === undefined ? {} : { checked: field.checked }),
 			});
 		}
 	}
@@ -156,37 +154,36 @@ export function dryRunFieldMap(
  * re-render which only renumbers elements does not read as a correction.
  */
 export function observationFingerprint(
-	observation: BrowserObservation,
+	observedForms: readonly ObservedForm[],
 ): string {
 	const forms: unknown[] = [];
-	for (const form of observation.forms) {
-		if (!isRecord(form) || !Array.isArray(form.fields)) {
+	for (const form of observedForms) {
+		// A form the page did not describe with a field array is recorded as
+		// null, which stays distinct from a form that reported no fields.
+		if (!form.fields) {
 			forms.push(null);
 			continue;
 		}
 		const fields: unknown[] = [];
 		for (const field of form.fields) {
-			if (!isRecord(field)) continue;
 			if (!isReviewComparableField(field.tag, field.type)) continue;
+			// Parsing already narrowed every property to the type its readers
+			// expect, so anything else the page reported reads as null here,
+			// the way the scalar reduction did before it. The one shape that
+			// differs is a boolean in a string-typed property or the reverse,
+			// which no driver produces.
 			fields.push([
-				fingerprintValue(field.tag),
-				fingerprintValue(field.type),
-				fingerprintValue(field.name),
-				fingerprintValue(field.label),
-				fingerprintValue(field.value),
-				fingerprintValue(field.checked),
+				field.tag ?? null,
+				field.type ?? null,
+				field.name ?? null,
+				field.label ?? null,
+				field.value ?? null,
+				field.checked ?? null,
 			]);
 		}
 		forms.push(fields);
 	}
 	return JSON.stringify(forms);
-}
-
-/** Keeps the fingerprint canonical by reducing page data to scalars. */
-function fingerprintValue(value: unknown): string | boolean | null {
-	if (typeof value === "string") return value;
-	if (typeof value === "boolean") return value;
-	return null;
 }
 
 /**
@@ -583,6 +580,12 @@ export class RestrictedBrowserTools {
 	readonly #successfulInputElementIds = new Set<string>();
 	readonly #allowedNavigationUrls = new Set<string>();
 	#latestObservation: BrowserObservation | undefined;
+	/**
+	 * `#latestObservation.forms`, typed once by `parseObservedForms`. It is
+	 * written and cleared with the observation itself, so it never describes a
+	 * page that observation does not.
+	 */
+	#latestObservedForms: ObservedForm[] = [];
 	#inputRevision = 0;
 	#observationRevision = -1;
 	/** Bounds the handler's own re-observation to one per input revision. */
@@ -704,7 +707,7 @@ export class RestrictedBrowserTools {
 		const fieldMap = await this.recorder.captureJson(
 			"dry_run_field_map",
 			dryRunFieldMap(
-				this.#latestObservation,
+				this.#latestObservedForms,
 				review,
 				this.#targetUrl,
 				this.now(),
@@ -733,6 +736,7 @@ export class RestrictedBrowserTools {
 		// re-observation `validateProhibited` is allowed per input revision.
 		this.#successfulInputElementIds.clear();
 		this.#latestObservation = undefined;
+		this.#latestObservedForms = [];
 		this.#allowedNavigationUrls.clear();
 		this.#inputRevision += 1;
 		// Deliberately kept: `#enteredValues` is what this run typed anywhere on
@@ -756,18 +760,22 @@ export class RestrictedBrowserTools {
 			}
 		});
 		const trustedForms = trustObservedForms(observation.forms);
+		// The one place page-supplied form data is typed. `forms` itself stays
+		// the observed JSON, because that is what the model is shown.
+		const observedForms = parseObservedForms(trustedForms);
 		const trustedObservation: BrowserObservation = {
 			...observation,
 			forms: trustedForms,
 			...(navigationLinks ? { navigationLinks } : {}),
 			prohibitedReasonCodes: detectProhibitedReasonCodes({
-				forms: trustedForms,
+				forms: observedForms,
 				...(observation.pageText === undefined
 					? {}
 					: { pageText: observation.pageText }),
 			}),
 		};
 		this.#latestObservation = trustedObservation;
+		this.#latestObservedForms = observedForms;
 		this.#observationRevision = this.#inputRevision;
 		this.#allowedNavigationUrls.clear();
 		this.#allowedNavigationUrls.add(
@@ -823,7 +831,7 @@ export class RestrictedBrowserTools {
 			throw new ObservationStaleError();
 		}
 		const formReasonCodes = prohibitedReasonCodesForElement(
-			this.#latestObservation,
+			this.#latestObservedForms,
 			elementId,
 		);
 		if (formReasonCodes.length > 0) {
@@ -1104,7 +1112,7 @@ export class RestrictedBrowserTools {
 			// The fingerprint makes a re-entry of the same values visible as
 			// the non-correction it is.
 			this.#deniedFingerprint = observationFingerprint(
-				this.#latestObservation ?? { url: this.#targetUrl, forms: [] },
+				this.#latestObservedForms,
 			);
 			this.#correctionInputApplied = false;
 			this.#inputRevision += 1;
@@ -1491,7 +1499,10 @@ export class RestrictedBrowserTools {
 	#hasCorrectedInputs(): boolean {
 		const observation = this.#latestObservation;
 		if (!observation || !this.#correctionInputApplied) return false;
-		return observationFingerprint(observation) !== this.#deniedFingerprint;
+		return (
+			observationFingerprint(this.#latestObservedForms) !==
+			this.#deniedFingerprint
+		);
 	}
 
 	async #assertCurrentUrlAllowed(): Promise<void> {
@@ -1521,7 +1532,7 @@ export class RestrictedBrowserTools {
 			unchanged =
 				canonicalNavigationPermissionUrl(currentUrl) ===
 					canonicalNavigationPermissionUrl(observation.url) &&
-				hasSameObservedFieldStates(observation, states) &&
+				hasSameObservedFieldStates(this.#latestObservedForms, states) &&
 				snapshotAfter === snapshotBefore;
 		} catch (error) {
 			if (error instanceof NavigationPolicyError) throw error;
@@ -1553,6 +1564,13 @@ export class RestrictedBrowserTools {
 	}
 }
 
+/**
+ * Strips the prohibition text a page carried and replaces it with the reason
+ * codes it implies, so the model is never shown text it could be steered by.
+ * It stays a raw-to-raw transform: its result is both what `observe` returns
+ * and what `parseObservedForms` then types, and everything a form reported
+ * beyond these three properties has to survive it untouched.
+ */
 function trustObservedForms(forms: unknown[]): unknown[] {
 	return forms.map((form) => {
 		if (!isRecord(form)) return form;
@@ -1603,13 +1621,12 @@ function trustObservedForms(forms: unknown[]): unknown[] {
 }
 
 function prohibitedReasonCodesForElement(
-	observation: BrowserObservation | undefined,
+	forms: readonly ObservedForm[],
 	elementId: string,
 ): ProhibitedReasonCode[] {
-	for (const form of observation?.forms ?? []) {
-		if (!isRecord(form) || !Array.isArray(form.fields)) continue;
-		const ownsElement = form.fields.some(
-			(field) => isRecord(field) && field.elementId === elementId,
+	for (const form of forms) {
+		const ownsElement = (form.fields ?? []).some(
+			(field) => field.elementId === elementId,
 		);
 		if (ownsElement) return readProhibitedReasonCodes(form);
 	}
@@ -1648,14 +1665,13 @@ function submitReviewDeniedReason(
  * the observation reported one.
  */
 function hasSameObservedFieldStates(
-	observation: BrowserObservation,
+	forms: readonly ObservedForm[],
 	states: readonly ObservedFieldState[],
 ): boolean {
-	const observed = new Map<string, Record<string, unknown>>();
-	for (const form of observation.forms) {
-		if (!isRecord(form) || !Array.isArray(form.fields)) continue;
-		for (const field of form.fields) {
-			if (!isRecord(field) || typeof field.elementId !== "string") continue;
+	const observed = new Map<string, ObservedField>();
+	for (const form of forms) {
+		for (const field of form.fields ?? []) {
+			if (field.elementId === undefined) continue;
 			if (!isReviewComparableField(field.tag, field.type)) continue;
 			observed.set(field.elementId, field);
 		}
@@ -1664,10 +1680,8 @@ function hasSameObservedFieldStates(
 	for (const state of states) {
 		const field = observed.get(state.elementId);
 		if (!field) return false;
-		if (typeof field.value === "string" && field.value !== state.value) {
-			return false;
-		}
-		if (typeof field.checked === "boolean" && field.checked !== state.checked) {
+		if (field.value !== undefined && field.value !== state.value) return false;
+		if (field.checked !== undefined && field.checked !== state.checked) {
 			return false;
 		}
 	}
