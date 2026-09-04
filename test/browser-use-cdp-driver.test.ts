@@ -87,6 +87,7 @@ import {
 	type BrowserSubmitResult,
 	isReviewComparableField,
 } from "../src/restricted-browser";
+import { captureLogs, captureWarnings, logEvents } from "./helpers/logs";
 
 describe("BrowserUse CDP payload and DOM discovery", () => {
 	test("reads preceding warnings and form text without including a footer", () => {
@@ -2733,24 +2734,6 @@ function asClient(client: FakeBrowserUseClient): BrowserUseClient {
 	return client as unknown as BrowserUseClient;
 }
 
-function captureLogs(): { logs: string[]; restore: () => void } {
-	const logs: string[] = [];
-	const originalLog = console.log;
-	console.log = (message: unknown) => {
-		logs.push(String(message));
-	};
-	return {
-		logs,
-		restore: () => {
-			console.log = originalLog;
-		},
-	};
-}
-
-function logEvents(logs: readonly string[]): unknown[] {
-	return logs.map((entry) => JSON.parse(entry));
-}
-
 /**
  * The commands one frame session received, in order. A detach is addressed to
  * the browser session and names the frame in its params, so it is counted for
@@ -2897,20 +2880,6 @@ function fakeCdpResponse(method: string): unknown {
 
 function asConnection(connection: FakeCdpConnection): BrowserUseCdpConnection {
 	return connection as unknown as BrowserUseCdpConnection;
-}
-
-function captureWarnings(): { warnings: string[]; restore: () => void } {
-	const warnings: string[] = [];
-	const originalWarn = console.warn;
-	console.warn = (message: unknown) => {
-		warnings.push(String(message));
-	};
-	return {
-		warnings,
-		restore: () => {
-			console.warn = originalWarn;
-		},
-	};
 }
 
 function stubUpgradeFetch(webSocket: FakeWebSocket): typeof fetch {
@@ -6098,6 +6067,382 @@ describe("BrowserUseCdpDriver submission network policy", () => {
 		await closeQuietly(driver);
 	});
 });
+
+/**
+ * The submission window is made of counters and flags no caller can read, so
+ * every transition below is driven until it shows in the requests that were
+ * continued or failed, in the activation log, or in the uncertain reason code.
+ */
+describe("BrowserUseCdpDriver submission window state", () => {
+	test("refuses a same-domain post that arrives after the submission ended", async () => {
+		const { driver, connection } = await submissionDriver([
+			{
+				requestId: "post-1",
+				resourceType: "XHR",
+				frameId: "frame-1",
+				request: { url: "https://acme.co.jp/send", method: "POST" },
+			},
+		]);
+
+		await submitFixtureForm(driver);
+		// The page keeps posting after the activation window closed. Only a new
+		// pre-submit review may open another one, so this one is refused.
+		connection.emit("Fetch.requestPaused", {
+			requestId: "late-1",
+			resourceType: "XHR",
+			frameId: "frame-1",
+			request: { url: "https://acme.co.jp/send", method: "POST" },
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(continuedRequestIds(connection)).toEqual(["post-1"]);
+		expect(failedRequestIds(connection)).toEqual(["late-1"]);
+		await closeQuietly(driver);
+	});
+
+	test("resets the per-activation count while the per-run budget stays spent", async () => {
+		const { driver, connection } = await submissionDriver([], (scripted) => {
+			scripted.respond = submitFixtureResponsePerActivation(scripted, [
+				Array.from({ length: MAX_SUBMISSION_REQUESTS }, (_, index) => ({
+					requestId: `post-${index + 1}`,
+					resourceType: "XHR",
+					frameId: "frame-1",
+					request: {
+						url: `https://acme.co.jp/api/step-${index + 1}`,
+						method: "POST",
+					},
+				})),
+				[
+					{
+						requestId: "post-6",
+						resourceType: "XHR",
+						frameId: "frame-1",
+						request: { url: "https://acme.co.jp/api/step-6", method: "POST" },
+					},
+				],
+			]);
+		});
+
+		const captured = captureLogs();
+		let first: BrowserSubmitResult;
+		let second: BrowserSubmitResult;
+		try {
+			first = await driver.submit(BUTTON_ELEMENT_ID, "dom");
+			second = await driver.submit(BUTTON_ELEMENT_ID, "dom");
+		} finally {
+			captured.restore();
+		}
+
+		// The count starts again at zero for the second activation, so the five
+		// requests of the first one are not what the second one reports.
+		expect(submitActivationRequestObserved(captured.logs)).toEqual([
+			true,
+			false,
+		]);
+		// The budget is spent across the whole run, so the second activation has
+		// nothing left even though its own count was reset.
+		expect(continuedRequestIds(connection)).toEqual([
+			"post-1",
+			"post-2",
+			"post-3",
+			"post-4",
+			"post-5",
+		]);
+		expect(failedRequestIds(connection)).toEqual(["post-6"]);
+		expect(first).toMatchObject({
+			outcome: "uncertain",
+			reasonCode: "SUBMIT_CONFIRMATION_NOT_OBSERVED",
+		});
+		expect(second).toMatchObject({
+			outcome: "uncertain",
+			reasonCode: "SUBMIT_REQUEST_LIMIT_REACHED",
+		});
+		await closeQuietly(driver);
+	});
+
+	test("blocks a second expected GET while the claimed one is still in flight", async () => {
+		let releaseContinue: () => void = () => undefined;
+		const pendingContinue = new Promise<unknown>((resolve) => {
+			releaseContinue = () => resolve({});
+		});
+		const { driver, connection } = await submissionDriver([], (scripted) => {
+			const fixture = getSubmitFixtureResponse(scripted, () => {
+				scripted.emit("Fetch.requestPaused", expectedGetSubmission("get-1"));
+				// `get-1` is still awaiting its `Fetch.continueRequest`, so the
+				// duplicate meets the claim with the in-flight flag raised.
+				scripted.emit("Fetch.requestPaused", expectedGetSubmission("get-2"));
+				setTimeout(releaseContinue, 0);
+			});
+			scripted.respond = (method, params) =>
+				method === "Fetch.continueRequest" && params.requestId === "get-1"
+					? pendingContinue
+					: fixture(method, params);
+		});
+
+		const result = await submitFixtureForm(driver);
+
+		expect(continuedRequestIds(connection)).toEqual(["get-1"]);
+		expect(failedRequestIds(connection)).toEqual(["get-2"]);
+		expect(result).toMatchObject({ outcome: "uncertain" });
+		await closeQuietly(driver);
+	});
+
+	test("does not count a submission request whose continue failed", async () => {
+		const { driver, connection } = await submissionDriver(
+			[
+				{
+					requestId: "post-1",
+					resourceType: "XHR",
+					frameId: "frame-1",
+					request: { url: "https://acme.co.jp/send", method: "POST" },
+				},
+			],
+			(scripted) => {
+				scripted.fail = (method, params) =>
+					method === "Fetch.continueRequest" && params.requestId === "post-1"
+						? cdpCommandFailed()
+						: null;
+			},
+		);
+
+		const captured = captureLogs();
+		let result: BrowserSubmitResult;
+		try {
+			result = await driver.submit(BUTTON_ELEMENT_ID, "dom");
+		} finally {
+			captured.restore();
+		}
+
+		// The continue never happened, so the request was never observed and the
+		// paused request ends refused rather than half-continued.
+		expect(submitActivationRequestObserved(captured.logs)).toEqual([false]);
+		expect(failedRequestIds(connection)).toEqual(["post-1"]);
+		expect(result).toMatchObject({
+			outcome: "uncertain",
+			reasonCode: "SUBMIT_NETWORK_POLICY_BLOCKED",
+		});
+		await closeQuietly(driver);
+	});
+
+	test("lets the expected GET be claimed again after a failed continue", async () => {
+		const { driver, connection } = await submissionDriver([], (scripted) => {
+			scripted.respond = getSubmitFixtureResponse(scripted, () => {
+				scripted.emit("Fetch.requestPaused", expectedGetSubmission("get-1"));
+				// Delivered once `get-1` has failed, so the retry only gets through
+				// when the claim released both the count and the in-flight flag.
+				setTimeout(
+					() =>
+						scripted.emit(
+							"Fetch.requestPaused",
+							expectedGetSubmission("get-2"),
+						),
+					0,
+				);
+			});
+			scripted.fail = (method, params) =>
+				method === "Fetch.continueRequest" && params.requestId === "get-1"
+					? cdpCommandFailed()
+					: null;
+		});
+
+		const result = await submitFixtureForm(driver);
+
+		expect(continuedRequestIds(connection)).toEqual(["get-1", "get-2"]);
+		expect(failedRequestIds(connection)).toEqual(["get-1"]);
+		expect(result).toMatchObject({ outcome: "uncertain" });
+		await closeQuietly(driver);
+	});
+
+	test("continues the redirect of a claimed request without spending the budget", async () => {
+		const { driver, connection } = await submissionDriver([
+			...Array.from({ length: 4 }, (_, index) => ({
+				requestId: `post-${index + 1}`,
+				resourceType: "XHR",
+				frameId: "frame-1",
+				request: {
+					url: `https://acme.co.jp/api/step-${index + 1}`,
+					method: "POST",
+				},
+			})),
+			{
+				requestId: "redirect-1",
+				redirectedRequestId: "post-4",
+				resourceType: "Document",
+				frameId: "frame-1",
+				request: { url: "https://acme.co.jp/thanks", method: "GET" },
+			},
+			{
+				requestId: "post-5",
+				resourceType: "XHR",
+				frameId: "frame-1",
+				request: { url: "https://acme.co.jp/api/step-5", method: "POST" },
+			},
+			{
+				requestId: "post-6",
+				resourceType: "XHR",
+				frameId: "frame-1",
+				request: { url: "https://acme.co.jp/api/step-6", method: "POST" },
+			},
+		]);
+
+		const result = await submitFixtureForm(driver);
+
+		// The redirect is let through between the fourth and the fifth claim, and
+		// the fifth still fits, so following a claim costs nothing.
+		expect(continuedRequestIds(connection)).toEqual([
+			"post-1",
+			"post-2",
+			"post-3",
+			"post-4",
+			"redirect-1",
+			"post-5",
+		]);
+		expect(failedRequestIds(connection)).toEqual(["post-6"]);
+		expect(result).toMatchObject({
+			outcome: "uncertain",
+			reasonCode: "SUBMIT_REQUEST_LIMIT_REACHED",
+		});
+		await closeQuietly(driver);
+	});
+
+	test("keeps the block stage of the first refused request of the attempt", async () => {
+		const { driver, connection } = await submissionDriver(
+			Array.from({ length: MAX_SUBMISSION_REQUESTS + 1 }, (_, index) => ({
+				requestId: `post-${index + 1}`,
+				resourceType: "XHR",
+				frameId: "frame-1",
+				request: {
+					url: `https://acme.co.jp/api/step-${index + 1}`,
+					method: "POST",
+				},
+			})),
+			(scripted) => {
+				const fixture = scripted.respond;
+				let activated = false;
+				let lateRequestSent = false;
+				scripted.respond = (method, params) => {
+					const answer = fixture(method, params);
+					if (
+						method === "Runtime.callFunctionOn" &&
+						params.functionDeclaration === ACTIVATE_SUBMIT_FUNCTION
+					) {
+						activated = true;
+					} else if (
+						activated &&
+						!lateRequestSent &&
+						method === "DOM.getDocument"
+					) {
+						lateRequestSent = true;
+						// The confirmation is still being waited for, so this request
+						// is refused by the domain rule and still names a block stage.
+						scripted.emit("Fetch.requestPaused", {
+							requestId: "offsite-1",
+							resourceType: "XHR",
+							frameId: "frame-1",
+							request: {
+								url: "https://forms.other.test/collect",
+								method: "POST",
+							},
+						});
+					}
+					return answer;
+				};
+			},
+		);
+
+		const result = await submitFixtureForm(driver);
+
+		expect(failedRequestIds(connection)).toEqual(["post-6", "offsite-1"]);
+		// The budget refusal came first, so the later network-policy refusal does
+		// not rename what the operator is told.
+		expect(result).toMatchObject({
+			outcome: "uncertain",
+			reasonCode: "SUBMIT_REQUEST_LIMIT_REACHED",
+		});
+		await closeQuietly(driver);
+	});
+});
+
+/** The `requestObserved` each submit activation reported, in order. */
+function submitActivationRequestObserved(logs: readonly string[]): boolean[] {
+	return logEvents(logs)
+		.filter(
+			(entry) =>
+				(entry as { event?: string }).event === "browser_submit_activation",
+		)
+		.map((entry) => (entry as { requestObserved: boolean }).requestObserved);
+}
+
+/**
+ * Answers like {@link submitFixtureResponse}, except that each activation
+ * delivers its own batch of paused requests, so one driver can be submitted
+ * more than once.
+ */
+function submitFixtureResponsePerActivation(
+	connection: ScriptedCdpConnection,
+	batches: readonly (readonly Record<string, unknown>[])[],
+): (method: string, params: Record<string, unknown>) => unknown {
+	const fixture = submitFixtureResponse(connection, []);
+	let activation = 0;
+	return (method, params) => {
+		if (
+			method === "Runtime.callFunctionOn" &&
+			params.functionDeclaration === ACTIVATE_SUBMIT_FUNCTION
+		) {
+			for (const paused of batches[activation] ?? []) {
+				connection.emit("Fetch.requestPaused", paused);
+			}
+			activation += 1;
+			return { result: { value: true } };
+		}
+		return fixture(method, params);
+	};
+}
+
+/**
+ * Answers like {@link submitFixtureResponse} with a GET form, which is the only
+ * shape that arms the expected-request guard, and hands the activation back to
+ * the test so it can time the paused requests itself.
+ */
+function getSubmitFixtureResponse(
+	connection: ScriptedCdpConnection,
+	onActivate: () => void,
+): (method: string, params: Record<string, unknown>) => unknown {
+	const fixture = submitFixtureResponse(connection, []);
+	return (method, params) => {
+		if (
+			method === "Runtime.callFunctionOn" &&
+			params.functionDeclaration === ACTIVATE_SUBMIT_FUNCTION
+		) {
+			onActivate();
+			return { result: { value: true } };
+		}
+		const answer = fixture(method, params);
+		const value = (answer as { result?: { value?: unknown } }).result?.value;
+		if (
+			method === "Runtime.callFunctionOn" &&
+			value !== null &&
+			typeof value === "object" &&
+			(value as { submitLike?: unknown }).submitLike === true
+		) {
+			return { result: { value: { ...value, formMethod: "get" } } };
+		}
+		return answer;
+	};
+}
+
+/** A paused request shaped like the GET submission `validateSubmit` recorded. */
+function expectedGetSubmission(requestId: string): Record<string, unknown> {
+	return {
+		requestId,
+		resourceType: "Document",
+		frameId: "frame-1",
+		request: {
+			url: `https://${SUBMISSION_TARGET_DOMAIN}/send`,
+			method: "GET",
+		},
+	};
+}
 
 const SUBMISSION_BODY_BACKEND_NODE_ID = 8;
 

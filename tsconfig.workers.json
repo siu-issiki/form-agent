@@ -21,6 +21,7 @@
     "test/browser-use-smoke.test.ts",
     "test/e2e-worker.ts",
     "test/worker.test.ts",
-    "test/submit-reviewer.test.ts"
+    "test/submit-reviewer.test.ts",
+    "test/tool-diagnostic.test.ts"
   ]
 }

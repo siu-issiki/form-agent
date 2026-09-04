@@ -34,10 +34,7 @@ import {
 	BrowserElementError,
 	BrowserElementOperationError,
 	BrowserFormInvalidError,
-	type BrowserSubmitResult,
 	type ObservedFieldState,
-	type RestrictedBrowserDriver,
-	type SubmitActivationStrategy,
 	SubmitProhibitedError,
 	type SubmitReviewer,
 } from "../src/restricted-browser";
@@ -53,6 +50,8 @@ import worker, {
 	realSendGuardExemptDomains,
 	registerJob,
 } from "../src/worker";
+import { FakeBrowserDriver } from "./helpers/fake-browser-driver";
+import { logEventsNamed } from "./helpers/logs";
 
 /** Allows every submission so a test can focus on the surrounding behavior. */
 function allowSubmitReviewer(): SubmitReviewer {
@@ -1841,162 +1840,13 @@ async function runDryRunSubmit(
 	);
 }
 
-class WorkerFakeBrowserDriver implements RestrictedBrowserDriver {
-	url = input.targetUrl;
-	restrictedDomain: string | undefined;
-	closed = false;
-	observed = false;
-	requireObservationForSubmit = false;
-	validateSubmitCount = 0;
-	submitCount = 0;
-	screenshotCount = 0;
-	screenshotError: Error | null = null;
-	submitActivationStrategies: SubmitActivationStrategy[] = [];
-	filledValues: string[] = [];
-	observeCount = 0;
-	clickCount = 0;
-	/** Thrown by the first click only, so a retry can succeed. */
-	firstClickError: Error | null = null;
-	observationForms: unknown[] = workerObservedForms();
-	/** Replayed per observe call when set; the last entry repeats. */
-	observationFormsSequence: unknown[][] | null = null;
-	fieldStates: ObservedFieldState[] = workerFieldStates();
-	/** Values each choice control offers, by elementId. */
-	selectOptions: Record<string, string[]> = {};
-	selectedCandidates: string[] = [];
-	/** Replayed in order; the last entry repeats. */
-	formSnapshots: string[] = ['["form"]'];
-	pageText: string | undefined;
-	pageTextTruncated = false;
-	validateSubmitError: Error | null = null;
-	/** Replayed per submit call when set; the last entry repeats. */
-	submitResults: BrowserSubmitResult[] | null = null;
-	/** What each submit call was told about the fields this run filled. */
-	submitRequireEnteredInput: boolean[] = [];
-	/** Runs after each submit, so a test can move the page on. */
-	onSubmit: ((count: number) => void) | null = null;
-	/** Runs before each observe, so a test can move the page on. */
-	onObserve: ((count: number) => void) | null = null;
-
-	async close(): Promise<void> {
-		this.closed = true;
-		this.#releaseNavigate?.();
-	}
-	async restrictToDomain(targetDomain: string): Promise<void> {
-		this.restrictedDomain = targetDomain;
-	}
-	async currentUrl(): Promise<string> {
-		return this.url;
-	}
-	/** Blocks the bootstrap navigate until close(), like a page that never loads. */
-	blockNavigateUntilClose = false;
-	#enteredNavigate: (() => void) | undefined;
-	#releaseNavigate: (() => void) | undefined;
-	readonly navigateEntered = new Promise<void>((resolve) => {
-		this.#enteredNavigate = resolve;
-	});
-	async navigate(url: string): Promise<void> {
-		this.url = url;
-		if (!this.blockNavigateUntilClose) return;
-		this.#enteredNavigate?.();
-		await new Promise<void>((resolve) => {
-			this.#releaseNavigate = resolve;
+class WorkerFakeBrowserDriver extends FakeBrowserDriver {
+	constructor() {
+		super({
+			url: input.targetUrl,
+			forms: workerObservedForms(),
+			fieldStates: workerFieldStates(),
 		});
-		throw new Error("Browser Use CDP connection is closed");
-	}
-	async observe() {
-		this.observed = true;
-		this.observeCount += 1;
-		this.onObserve?.(this.observeCount);
-		const sequence = this.observationFormsSequence;
-		const forms = sequence
-			? (sequence[Math.min(this.observeCount - 1, sequence.length - 1)] ?? [])
-			: this.observationForms;
-		return {
-			url: this.url,
-			// A real observation is a snapshot, not a live view of the page.
-			forms: structuredClone(forms),
-			...(this.pageText ? { pageText: this.pageText } : {}),
-			...(this.pageTextTruncated ? { pageTextTruncated: true } : {}),
-		};
-	}
-	async clickNonSubmit(): Promise<void> {
-		this.clickCount += 1;
-		const error = this.firstClickError;
-		this.firstClickError = null;
-		if (error) throw error;
-	}
-	async fill(elementId: string, value: string): Promise<void> {
-		this.filledValues.push(value);
-		this.#applyValue(elementId, value);
-	}
-	async select(
-		elementId: string,
-		candidates: readonly string[],
-	): Promise<void> {
-		const offered = this.selectOptions[elementId];
-		const chosen = offered
-			? candidates.find((candidate) => offered.includes(candidate))
-			: candidates[0];
-		if (chosen === undefined) throw new BrowserElementError();
-		this.selectedCandidates.push(chosen);
-		this.#applyValue(elementId, chosen);
-	}
-	/** Mirrors what a real browser shows on the next observation. */
-	#applyValue(elementId: string, value: string): void {
-		for (const form of this.observationForms) {
-			if (typeof form !== "object" || form === null) continue;
-			const fields = (form as { fields?: unknown }).fields;
-			if (!Array.isArray(fields)) continue;
-			for (const field of fields) {
-				const record = field as { elementId?: string; value?: string };
-				if (record.elementId === elementId) record.value = value;
-			}
-		}
-		for (const state of this.fieldStates) {
-			if (state.elementId === elementId) state.value = value;
-		}
-	}
-	async validateSubmit(): Promise<void> {
-		this.validateSubmitCount += 1;
-		if (this.validateSubmitError) throw this.validateSubmitError;
-		if (this.requireObservationForSubmit && !this.observed) {
-			throw new BrowserElementError();
-		}
-	}
-	async readObservedFieldStates(): Promise<ObservedFieldState[]> {
-		return this.fieldStates;
-	}
-	async readPageText(): Promise<string> {
-		return this.pageText ?? "";
-	}
-	async readFormSnapshot(): Promise<string> {
-		return this.formSnapshots.length > 1
-			? (this.formSnapshots.shift() as string)
-			: (this.formSnapshots[0] as string);
-	}
-	async captureScreenshot(): Promise<Uint8Array> {
-		this.screenshotCount += 1;
-		if (this.screenshotError) throw this.screenshotError;
-		return new Uint8Array([this.screenshotCount, 2, 3]);
-	}
-	async submit(
-		_elementId: string,
-		activationStrategy: SubmitActivationStrategy,
-		requireEnteredInput = true,
-	): Promise<BrowserSubmitResult> {
-		this.submitCount += 1;
-		this.submitActivationStrategies.push(activationStrategy);
-		this.submitRequireEnteredInput.push(requireEnteredInput);
-		const sequence = this.submitResults;
-		const result = sequence
-			? (sequence[Math.min(this.submitCount - 1, sequence.length - 1)] ?? {
-					outcome: "sent" as const,
-					formUrl: this.url,
-				})
-			: { outcome: "sent" as const, formUrl: this.url };
-		this.onSubmit?.(this.submitCount);
-		return result;
 	}
 }
 
@@ -2279,7 +2129,7 @@ describe("ResponsesAgentExecutor", () => {
 		});
 		expect(driver.submitCount).toBe(2);
 		// Only the first stage ties the control to a field this run filled.
-		expect(driver.submitRequireEnteredInput).toEqual([true, false]);
+		expect(driver.submitRequiredEnteredInput).toEqual([true, false]);
 		expect((await store.find(twoStepInput.id))?.status).toBe("sent");
 		expect(await readSubmitStageEvents(twoStepInput.id)).toEqual([
 			{ stage: 2, requestObserved: true },
@@ -2613,9 +2463,7 @@ describe("ResponsesAgentExecutor", () => {
 
 		expect(error).toBeInstanceOf(AgentExecutionError);
 		expect(error.reasonCode).toBe("BROWSER_TOOL_UNAVAILABLE");
-		const setupFailures = logs
-			.filter((entry) => entry.includes('"browser_setup_failed"'))
-			.map((entry) => JSON.parse(entry) as Record<string, unknown>);
+		const setupFailures = logEventsNamed(logs, "browser_setup_failed");
 		// Fixed values only: no URL, session id, or provider message.
 		expect(setupFailures).toEqual([
 			{
@@ -2670,9 +2518,7 @@ describe("ResponsesAgentExecutor", () => {
 		expect(error.reasonCode).toBe("BROWSER_TOOL_UNAVAILABLE");
 		expect(error.cdpMethod).toBe("DOM.getDocument");
 		expect(error.cdpKind).toBe("NODE_NOT_FOUND");
-		const setupFailures = logs
-			.filter((entry) => entry.includes('"browser_setup_failed"'))
-			.map((entry) => JSON.parse(entry) as Record<string, unknown>);
+		const setupFailures = logEventsNamed(logs, "browser_setup_failed");
 		// Fixed values only: no URL, session id, or provider message.
 		expect(setupFailures).toEqual([
 			{
@@ -3721,11 +3567,7 @@ describe("ResponsesAgentExecutor", () => {
 		for (const entry of logs) {
 			expect(entry).not.toContain(quote);
 		}
-		expect(
-			logs
-				.filter((entry) => entry.includes('"browser_prohibition_evidence"'))
-				.map((entry) => JSON.parse(entry) as Record<string, unknown>),
-		).toEqual([
+		expect(logEventsNamed(logs, "browser_prohibition_evidence")).toEqual([
 			{
 				event: "browser_prohibition_evidence",
 				outcome: "PROHIBITION_EVIDENCE_VERIFIED",
@@ -5440,9 +5282,7 @@ describe("ResponsesAgentExecutor", () => {
 			spy.mockRestore();
 		}
 
-		const errors = logs
-			.filter((entry) => entry.includes('"browser_tool_error"'))
-			.map((entry) => JSON.parse(entry) as Record<string, unknown>);
+		const errors = logEventsNamed(logs, "browser_tool_error");
 		expect(errors).toHaveLength(1);
 		// Fixed fields only: no elementId, payloadKey, value, or URL.
 		expect(errors[0]).toEqual({
@@ -5498,9 +5338,7 @@ describe("ResponsesAgentExecutor", () => {
 			outcome: "failed",
 			reasonCode: "AGENT_TURN_LIMIT",
 		});
-		const limits = logs
-			.filter((entry) => entry.includes('"agent_turn_limit_reached"'))
-			.map((entry) => JSON.parse(entry) as Record<string, unknown>);
+		const limits = logEventsNamed(logs, "agent_turn_limit_reached");
 		// Counts only: no job ID, URL, or page text.
 		expect(limits).toEqual([
 			{

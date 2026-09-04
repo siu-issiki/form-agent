@@ -21,6 +21,7 @@ import {
 	SUBMIT_REVIEW_INSTRUCTIONS,
 	toBase64,
 } from "../src/submit-reviewer";
+import { logEventsNamed } from "./helpers/logs";
 
 const input: JobInput = {
 	id: "job-review-001",
@@ -118,9 +119,7 @@ describe("ResponsesSubmitReviewer", () => {
 			spy.mockRestore();
 		}
 
-		const built = logs
-			.filter((entry) => entry.includes('"submit_review_request_built"'))
-			.map((entry) => JSON.parse(entry) as Record<string, unknown>);
+		const built = logEventsNamed(logs, "submit_review_request_built");
 		expect(built).toHaveLength(1);
 		const entry = built[0] ?? {};
 		expect(entry.event).toBe("submit_review_request_built");
