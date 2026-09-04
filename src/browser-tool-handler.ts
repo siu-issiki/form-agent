@@ -21,6 +21,10 @@ import {
 	logDryRunEvidenceCaptureFailed,
 	recordEvidenceCaptureFailure,
 } from "./submission-evidence";
+import {
+	ELEMENT_ID_PATTERN,
+	SUBMIT_ACTIVATION_STRATEGIES,
+} from "./tool-input-patterns";
 
 export type BrowserToolName =
 	| "navigate"
@@ -111,14 +115,7 @@ export class BrowserToolCoordinator {
 		tool: BrowserToolName,
 		params: BrowserToolParams,
 	): Promise<{ result: unknown } | { job: Omit<Job, "runToken"> }> {
-		const operation = this.#operationTail.then(() =>
-			this.#execute(jobId, runToken, tool, params),
-		);
-		this.#operationTail = operation.then(
-			() => undefined,
-			() => undefined,
-		);
-		return operation;
+		return this.#serialize(() => this.#execute(jobId, runToken, tool, params));
 	}
 
 	/**
@@ -132,18 +129,13 @@ export class BrowserToolCoordinator {
 		runToken: string,
 		params: BrowserToolParams,
 	): Promise<SubmitReviewDecision> {
-		const operation = this.#operationTail.then(async () => {
+		return this.#serialize(async () => {
 			if (this.#closed) throw new BrowserToolInputError();
 			const { tools } = await this.#getToolsAndJob(jobId, runToken);
 			readSubmitActivationStrategy(params);
 			const elementId = readElementId(params);
 			return tools.reviewDryRunSubmit(elementId);
 		});
-		this.#operationTail = operation.then(
-			() => undefined,
-			() => undefined,
-		);
-		return operation;
 	}
 
 	async validateProhibited(
@@ -153,16 +145,11 @@ export class BrowserToolCoordinator {
 		formUrl: string | null,
 		evidence?: string | null,
 	): Promise<ProhibitionVerification> {
-		const operation = this.#operationTail.then(async () => {
+		return this.#serialize(async () => {
 			if (this.#closed) throw new BrowserToolInputError();
 			const { tools } = await this.#getToolsAndJob(jobId, runToken);
 			return tools.validateProhibited(reasonCode, formUrl, evidence);
 		});
-		this.#operationTail = operation.then(
-			() => undefined,
-			() => undefined,
-		);
-		return operation;
 	}
 
 	/**
@@ -174,14 +161,9 @@ export class BrowserToolCoordinator {
 		runToken: string,
 		stage: "prohibited",
 	): Promise<void> {
-		const operation = this.#operationTail.then(() =>
+		await this.#serialize(() =>
 			this.#captureEvidence(jobId, runToken, stage),
-		);
-		this.#operationTail = operation.then(
-			() => undefined,
-			() => undefined,
-		);
-		await operation.catch(() => undefined);
+		).catch(() => undefined);
 	}
 
 	/**
@@ -194,14 +176,24 @@ export class BrowserToolCoordinator {
 		runToken: string,
 		review: SubmitReviewDecision,
 	): Promise<void> {
-		const operation = this.#operationTail.then(() =>
+		await this.#serialize(() =>
 			this.#captureDryRunFieldMap(jobId, runToken, review),
-		);
+		).catch(() => undefined);
+	}
+
+	/**
+	 * Runs `run` after every operation queued before it and leaves the queue
+	 * ready for the next one. Browser operations share one page, so they are
+	 * strictly serialized; a rejection is absorbed here so that one failure
+	 * does not poison the queue, and is still delivered to this caller.
+	 */
+	#serialize<T>(run: () => Promise<T>): Promise<T> {
+		const operation = this.#operationTail.then(run);
 		this.#operationTail = operation.then(
 			() => undefined,
 			() => undefined,
 		);
-		await operation.catch(() => undefined);
+		return operation;
 	}
 
 	async #captureEvidence(
@@ -430,8 +422,11 @@ function readSubmitActivationStrategy(
 	params: BrowserToolParams,
 ): SubmitActivationStrategy {
 	const value = params.activationStrategy;
-	if (value === "dom" || value === "mouse" || value === "enter") return value;
-	throw new BrowserToolInputError();
+	const strategy = SUBMIT_ACTIVATION_STRATEGIES.find(
+		(candidate) => candidate === value,
+	);
+	if (!strategy) throw new BrowserToolInputError();
+	return strategy;
 }
 
 function readPayloadValue(
@@ -459,7 +454,7 @@ function readPayloadValue(
 
 function readElementId(params: BrowserToolParams): string {
 	const value = readString(params, "elementId", 64);
-	if (!/^fa-[a-z0-9-]+$/.test(value)) {
+	if (!ELEMENT_ID_PATTERN.test(value)) {
 		throw new BrowserToolInputError();
 	}
 	return value;

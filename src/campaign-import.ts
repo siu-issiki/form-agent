@@ -1,6 +1,14 @@
 import { parse } from "tldts";
-import { JOB_ID_PATTERN, type JobInput } from "./job";
+import { sha256Hex } from "./digest";
+import {
+	DRY_RUN_KEY,
+	EFFECTIVE_DRY_RUN_KEY,
+	JOB_ID_PATTERN,
+	type JobInput,
+	MAX_ATTEMPTS_KEY,
+} from "./job";
 import { jobContentFingerprint, jobInputFingerprint } from "./job-fingerprint";
+import { isRecord } from "./json-record";
 import {
 	isTrustedCandidateList,
 	normalizeAllowedHosts,
@@ -410,16 +418,16 @@ export async function confirmJobRegistration(
 	} catch {
 		return "unknown";
 	}
-	if (!isPlainRecord(body) || !isPlainRecord(body.job)) return "unknown";
+	if (!isRecord(body) || !isRecord(body.job)) return "unknown";
 	const stored = body.job;
-	const realSend = job.payload._formAgentDryRun === false;
+	const realSend = job.payload[DRY_RUN_KEY] === false;
 	// Only the stored side carries the effective mode, so it is checked here
 	// rather than inside the digest. A dry-run job under the same id is not
 	// this registration: the queued run would send nothing.
 	if (
 		realSend &&
-		(!isPlainRecord(stored.payload) ||
-			stored.payload._formAgentEffectiveDryRun !== false)
+		(!isRecord(stored.payload) ||
+			stored.payload[EFFECTIVE_DRY_RUN_KEY] !== false)
 	) {
 		return "mismatched";
 	}
@@ -430,10 +438,6 @@ export async function confirmJobRegistration(
 	return expected === actual ? "registered" : "mismatched";
 }
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 /**
  * Last check before a job leaves the tool. A dry-run registration refuses any
  * job that could submit, and a real-send registration refuses any job that is
@@ -441,12 +445,12 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  */
 function assertRegisterableJob(job: JobInput, realSend: boolean): void {
 	if (!realSend) {
-		if (job.payload._formAgentDryRun !== true) {
+		if (job.payload[DRY_RUN_KEY] !== true) {
 			throw new Error("Job-level dry-run guard is missing");
 		}
 		return;
 	}
-	if (job.payload._formAgentDryRun !== false) {
+	if (job.payload[DRY_RUN_KEY] !== false) {
 		throw new Error("Real-send job must set the dry-run flag to false");
 	}
 	if (!isSendApproval(job.payload[SEND_APPROVAL_KEY])) {
@@ -482,7 +486,7 @@ export function readSendApprovalFile(
 	value: unknown,
 	maxEntries: number,
 ): SendApprovalFile {
-	if (!isPlainRecord(value)) {
+	if (!isRecord(value)) {
 		throw new Error("Approval JSON must be an object");
 	}
 	const { approvedBy, approvedAt, entries } = value;
@@ -509,7 +513,7 @@ export function readSendApprovalFile(
 	const dryRunJobIds = new Set<string>();
 	const validated: SendApprovalEntry[] = [];
 	for (const entry of entries) {
-		if (!isPlainRecord(entry)) {
+		if (!isRecord(entry)) {
 			throw new Error("Approval JSON holds an entry that is not an object");
 		}
 		const { sourceRow, dryRunJobId, note } = entry;
@@ -699,8 +703,8 @@ export async function buildCampaignJob(
 		formValues[key] = candidates;
 	}
 	const identity = `${candidate.companyDomain}\n${candidate.targetUrl}`;
-	const companyId = `company-${(await sha256(candidate.companyDomain)).slice(0, 24)}`;
-	const id = `${safeCampaignName(campaign)}-${(await sha256(`${campaign}\n${identity}`)).slice(0, 32)}`;
+	const companyId = `company-${(await sha256Hex(candidate.companyDomain)).slice(0, 24)}`;
+	const id = `${safeCampaignName(campaign)}-${(await sha256Hex(`${campaign}\n${identity}`)).slice(0, 32)}`;
 
 	return {
 		id,
@@ -710,8 +714,8 @@ export async function buildCampaignJob(
 		targetDomain: candidate.companyDomain,
 		allowedHosts: normalizeAllowedHosts(resolution.allowedHosts),
 		payload: {
-			_formAgentDryRun: dryRun,
-			_formAgentMaxAttempts: 1,
+			[DRY_RUN_KEY]: dryRun,
+			[MAX_ATTEMPTS_KEY]: 1,
 			...(mode.approval ? { [SEND_APPROVAL_KEY]: mode.approval } : {}),
 			campaign,
 			sourceRow: candidate.rowNumber,
@@ -877,14 +881,4 @@ function safeCampaignName(value: string): string {
 		throw new Error("Campaign name must be a safe ASCII identifier");
 	}
 	return value;
-}
-
-async function sha256(value: string): Promise<string> {
-	const digest = await crypto.subtle.digest(
-		"SHA-256",
-		new TextEncoder().encode(value),
-	);
-	return [...new Uint8Array(digest)]
-		.map((byte) => byte.toString(16).padStart(2, "0"))
-		.join("");
 }

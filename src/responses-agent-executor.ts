@@ -17,6 +17,7 @@ import {
 	TOOL_ERROR_GUIDANCE,
 	UNCERTAIN_REASON_CODES,
 } from "./agent-tool-schema";
+import { BROWSER_ERROR } from "./browser-error-messages";
 import {
 	type BrowserDriverFactory,
 	BrowserToolCoordinator,
@@ -43,9 +44,15 @@ import {
 	MIN_PROHIBITION_EVIDENCE_LENGTH,
 	type ProhibitedReasonCode,
 } from "./form-prohibition";
-import type { AgentRunMetrics, AgentRunOutcome, Job } from "./job";
 import {
-	isRecord,
+	type AgentRunMetrics,
+	type AgentRunOutcome,
+	DRY_RUN_KEY,
+	EFFECTIVE_DRY_RUN_KEY,
+	type Job,
+} from "./job";
+import { isRecord } from "./json-record";
+import {
 	type JsonObject,
 	type ProviderUsage,
 	providerRequestByteLength,
@@ -68,6 +75,7 @@ import {
 	SubmissionEvidenceError,
 	SubmissionNotAuthorizedError,
 	SubmissionResultUncertainError,
+	type SubmitActivationStrategy,
 	SubmitProhibitedError,
 	SubmitReviewDeniedError,
 	type SubmitReviewer,
@@ -77,6 +85,10 @@ import {
 import { SEND_APPROVAL_KEY } from "./send-approval";
 import type { EvidenceObjectStore } from "./submission-evidence";
 import { ResponsesSubmitReviewer } from "./submit-reviewer";
+import {
+	ELEMENT_ID_PATTERN,
+	SUBMIT_ACTIVATION_STRATEGIES,
+} from "./tool-input-patterns";
 
 const RUN_METRICS_WRITE_TIMEOUT_MS = 2_000;
 const MAX_PROVIDER_OUTPUT_TOKENS = 4_096;
@@ -465,10 +477,10 @@ export function isJobDryRun(
 	payload: Record<string, unknown>,
 	legacyDryRun: boolean,
 ): boolean {
-	const effectiveDryRun = payload._formAgentEffectiveDryRun;
+	const effectiveDryRun = payload[EFFECTIVE_DRY_RUN_KEY];
 	return (
 		effectiveDryRun === true ||
-		payload._formAgentDryRun === true ||
+		payload[DRY_RUN_KEY] === true ||
 		(effectiveDryRun === undefined && legacyDryRun)
 	);
 }
@@ -1050,34 +1062,34 @@ export function classifyToolDiagnostic(
 	if (!(error instanceof Error)) return "UNKNOWN";
 
 	switch (error.message) {
-		case "Browser Use CDP connection failed":
+		case BROWSER_ERROR.CDP_CONNECTION_FAILED:
 			return "CDP_CONNECTION_FAILED";
-		case "Browser Use CDP connection is closed":
-		case "Browser Use CDP connection closed":
+		case BROWSER_ERROR.CDP_CONNECTION_IS_CLOSED:
+		case BROWSER_ERROR.CDP_CONNECTION_CLOSED:
 			return "CDP_CONNECTION_CLOSED";
-		case "Browser Use CDP command timed out":
+		case BROWSER_ERROR.CDP_COMMAND_TIMED_OUT:
 			return "CDP_COMMAND_TIMEOUT";
-		case "Browser Use CDP command could not be sent":
+		case BROWSER_ERROR.CDP_COMMAND_NOT_SENT:
 			return "CDP_COMMAND_SEND_FAILED";
-		case "Browser Use CDP command failed":
+		case BROWSER_ERROR.CDP_COMMAND_FAILED:
 			return "CDP_COMMAND_FAILED";
-		case "Invalid Browser Use CDP endpoint":
+		case BROWSER_ERROR.CDP_ENDPOINT_INVALID:
 			return "CDP_ENDPOINT_INVALID";
-		case "Browser Use API key is required":
+		case BROWSER_ERROR.API_KEY_REQUIRED:
 			return "BROWSER_CREDENTIALS_MISSING";
-		case "Browser domain scope cannot be changed":
-		case "Browser host scope cannot be changed":
-		case "Browser domain scope is not configured":
+		case BROWSER_ERROR.DOMAIN_SCOPE_CANNOT_CHANGE:
+		case BROWSER_ERROR.HOST_SCOPE_CANNOT_CHANGE:
+		case BROWSER_ERROR.DOMAIN_SCOPE_NOT_CONFIGURED:
 			return "SCOPE_CONFIGURATION_FAILED";
-		case "Browser navigation failed":
+		case BROWSER_ERROR.NAVIGATION_FAILED:
 			return "NAVIGATION_FAILED";
-		case "Browser page did not become ready":
+		case BROWSER_ERROR.PAGE_NOT_READY:
 			return "PAGE_NOT_READY";
-		case "Browser DOM discovery failed":
+		case BROWSER_ERROR.DOM_DISCOVERY_FAILED:
 			return "DOM_DISCOVERY_FAILED";
-		case "Browser page evaluation failed":
+		case BROWSER_ERROR.PAGE_EVALUATION_FAILED:
 			return "PAGE_EVALUATION_FAILED";
-		case "Browser screenshot failed":
+		case BROWSER_ERROR.SCREENSHOT_FAILED:
 			return "SCREENSHOT_FAILED";
 		default:
 			return "UNKNOWN";
@@ -1223,14 +1235,14 @@ function isElementId(value: unknown): value is string {
 	return (
 		typeof value === "string" &&
 		value.length <= 64 &&
-		/^fa-[a-z0-9-]+$/.test(value)
+		ELEMENT_ID_PATTERN.test(value)
 	);
 }
 
 function isSubmitActivationStrategy(
 	value: unknown,
-): value is "dom" | "mouse" | "enter" {
-	return value === "dom" || value === "mouse" || value === "enter";
+): value is SubmitActivationStrategy {
+	return SUBMIT_ACTIVATION_STRATEGIES.some((strategy) => strategy === value);
 }
 
 function isFunctionCall(value: JsonObject): value is JsonObject & FunctionCall {

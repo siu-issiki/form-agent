@@ -16,7 +16,7 @@ import {
 	type JobStore,
 } from "./job";
 import { normalizeAllowedHosts } from "./restricted-browser";
-import { isRealSendGuardExemptPayload } from "./send-approval";
+import { isRealSendPayload } from "./send-approval";
 import { EVIDENCE_CONTENT_TYPE } from "./submission-evidence";
 
 interface StoredJobRow {
@@ -30,6 +30,10 @@ interface StoredJobRow {
 	status: JobStatus;
 	attempt_count: number;
 	submit_review_denial_count: number;
+	/** Provider requests already claimed by this job (migrations/0002). */
+	provider_request_count: number;
+	/** 1 when the row counts against the daily real-send cap (migrations/0007). */
+	real_send: number;
 	run_token: string | null;
 	created_at: string;
 	updated_at: string;
@@ -811,20 +815,6 @@ function mapJob(row: JobRow): Job {
 				}
 			: null,
 	};
-}
-
-/**
- * The stored column mirrors the effective mode the API froze onto the payload,
- * so the daily cap counts exactly the jobs that can reach a real submission.
- * A job the API accepted through the test-system exemption is left out: it
- * never passed the approval and cap checks, so counting it would spend the
- * day's budget on the managed test system.
- */
-function isRealSendPayload(payload: Record<string, unknown>): boolean {
-	return (
-		payload._formAgentEffectiveDryRun === false &&
-		!isRealSendGuardExemptPayload(payload)
-	);
 }
 
 function mapStoredJob(row: StoredJobRow): Job {

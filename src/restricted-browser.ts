@@ -1,4 +1,5 @@
 import { parse } from "tldts";
+import { BROWSER_ERROR } from "./browser-error-messages";
 import {
 	checkProhibitionEvidence,
 	detectProhibitedReasonCodes,
@@ -11,6 +12,7 @@ import {
 	readProhibitedReasonCodes,
 } from "./form-prohibition";
 import type { Job, JobStore } from "./job";
+import { isRecord } from "./json-record";
 import {
 	EVIDENCE_CONTENT_TYPE,
 	type EvidenceCaptureResult,
@@ -18,6 +20,7 @@ import {
 	logDryRunEvidenceCaptureFailed,
 	SubmissionEvidenceRecorder,
 } from "./submission-evidence";
+import type { SUBMIT_ACTIVATION_STRATEGIES } from "./tool-input-patterns";
 
 /** A denial only allows one correction; the second denial ends the job. */
 const MAX_SUBMIT_REVIEW_DENIALS = 2;
@@ -276,7 +279,7 @@ export function readTrustedFormValues(
 	// A null prototype keeps inherited members such as `constructor` out of the
 	// result, so a payloadKey can only ever resolve to a job-supplied value.
 	const trusted: Record<string, TrustedFormValue> = Object.create(null);
-	if (!isRecord(formValues) || Array.isArray(formValues)) return trusted;
+	if (!isRecord(formValues)) return trusted;
 	for (const [key, value] of Object.entries(formValues)) {
 		if (!PAYLOAD_KEY_PATTERN.test(key)) continue;
 		if (isTrustedPayloadString(value)) {
@@ -333,7 +336,8 @@ export function submitRequestObserved(result: BrowserSubmitResult): boolean {
 	);
 }
 
-export type SubmitActivationStrategy = "dom" | "mouse" | "enter";
+export type SubmitActivationStrategy =
+	(typeof SUBMIT_ACTIVATION_STRATEGIES)[number];
 
 /** Which part of the page a screenshot covers. */
 export type ScreenshotMode = "viewport" | "full_page";
@@ -1450,10 +1454,6 @@ function prohibitedReasonCodesForElement(
 	throw new BrowserElementError();
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
-
 function canonicalNavigationUrl(rawUrl: string): string {
 	const url = new URL(rawUrl);
 	url.hash = "";
@@ -1524,16 +1524,16 @@ function classifyBrowserFailure(error: unknown): BrowserSubmitFailureCode {
 		return "CDP_PAYLOAD_TOO_LARGE";
 	}
 	switch (error.message) {
-		case "Browser Use CDP connection is closed":
-		case "Browser Use CDP connection closed":
+		case BROWSER_ERROR.CDP_CONNECTION_IS_CLOSED:
+		case BROWSER_ERROR.CDP_CONNECTION_CLOSED:
 			return "CDP_CONNECTION_CLOSED";
-		case "Browser Use CDP command timed out":
+		case BROWSER_ERROR.CDP_COMMAND_TIMED_OUT:
 			return "CDP_COMMAND_TIMEOUT";
-		case "Browser Use CDP command could not be sent":
+		case BROWSER_ERROR.CDP_COMMAND_NOT_SENT:
 			return "CDP_COMMAND_SEND_FAILED";
-		case "Browser Use CDP command failed":
+		case BROWSER_ERROR.CDP_COMMAND_FAILED:
 			return "CDP_COMMAND_FAILED";
-		case "Browser page evaluation failed":
+		case BROWSER_ERROR.PAGE_EVALUATION_FAILED:
 			return "PAGE_EVALUATION_FAILED";
 		default:
 			return "UNKNOWN";

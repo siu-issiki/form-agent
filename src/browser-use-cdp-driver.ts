@@ -1,3 +1,4 @@
+import { BROWSER_ERROR } from "./browser-error-messages";
 import {
 	assertAllowedBrowserRequest,
 	isVerificationProviderRequest,
@@ -107,8 +108,6 @@ const READY_STATE_TIMEOUT_MS = 10_000;
  * is a signal the model should act on instead of waiting out.
  */
 const BOOTSTRAP_READY_STATE_TIMEOUT_MS = 25_000;
-/** The CDP connection reports a per-command error response with this message. */
-const CDP_COMMAND_FAILED_MESSAGE = "Browser Use CDP command failed";
 const CONNECT_RETRY_DELAYS_MS = [10_000, 20_000, 30_000];
 /**
  * The run deadline is 10 minutes and the termination grace is 30 seconds, so a
@@ -117,11 +116,11 @@ const CONNECT_RETRY_DELAYS_MS = [10_000, 20_000, 30_000];
  */
 const SESSION_TIMEOUT_MINUTES = 12;
 
-const RETRYABLE_CONNECT_ERROR_MESSAGES = new Set([
-	"Browser Use CDP connection failed",
-	"Browser Use CDP connection closed",
-	"Browser Use CDP connection is closed",
-	"Browser Use CDP command timed out",
+const RETRYABLE_CONNECT_ERROR_MESSAGES = new Set<string>([
+	BROWSER_ERROR.CDP_CONNECTION_FAILED,
+	BROWSER_ERROR.CDP_CONNECTION_CLOSED,
+	BROWSER_ERROR.CDP_CONNECTION_IS_CLOSED,
+	BROWSER_ERROR.CDP_COMMAND_TIMED_OUT,
 ]);
 
 export interface BrowserUseConnectOptions {
@@ -165,7 +164,7 @@ function isRetryableConnectError(error: unknown): boolean {
 }
 
 function connectAbortedError(): Error {
-	return new Error("Browser Use CDP connection aborted");
+	return new Error(BROWSER_ERROR.CDP_CONNECTION_ABORTED);
 }
 
 function assertConnectNotAborted(signal: AbortSignal | undefined): void {
@@ -193,12 +192,12 @@ export function connectFailureDetail(error: unknown): {
 	}
 	if (!(error instanceof Error)) return { reason: "UNKNOWN" };
 	switch (error.message) {
-		case "Browser Use CDP connection failed":
+		case BROWSER_ERROR.CDP_CONNECTION_FAILED:
 			return { reason: "CDP_CONNECTION_FAILED" };
-		case "Browser Use CDP connection is closed":
-		case "Browser Use CDP connection closed":
+		case BROWSER_ERROR.CDP_CONNECTION_IS_CLOSED:
+		case BROWSER_ERROR.CDP_CONNECTION_CLOSED:
 			return { reason: "CDP_CONNECTION_CLOSED" };
-		case "Browser Use CDP command timed out":
+		case BROWSER_ERROR.CDP_COMMAND_TIMED_OUT:
 			return { reason: "CDP_COMMAND_TIMEOUT" };
 		default:
 			return { reason: "UNKNOWN" };
@@ -412,7 +411,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		dryRun = false,
 		options: BrowserUseConnectOptions = {},
 	): Promise<BrowserUseCdpDriver> {
-		if (!apiKey) throw new Error("Browser Use API key is required");
+		if (!apiKey) throw new Error(BROWSER_ERROR.API_KEY_REQUIRED);
 		const client = options.client ?? new BrowserUseClient(apiKey, fetch);
 		const fetcher = options.fetcher ?? fetch;
 		const retryDelaysMs = options.retryDelaysMs ?? CONNECT_RETRY_DELAYS_MS;
@@ -523,7 +522,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			const cdpUrl = session.cdpUrl;
 			if (!cdpUrl) {
 				throw new BrowserUseResponseError(
-					"Browser Use did not return an active session with a CDP URL",
+					BROWSER_ERROR.SESSION_WITHOUT_CDP_URL,
 				);
 			}
 			const cdpScheme = cdpUrl.startsWith("wss:") ? "wss" : "https";
@@ -641,7 +640,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		allowedHosts: readonly string[],
 	): Promise<void> {
 		if (this.#targetDomain && this.#targetDomain !== targetDomain) {
-			throw new Error("Browser domain scope cannot be changed");
+			throw new Error(BROWSER_ERROR.DOMAIN_SCOPE_CANNOT_CHANGE);
 		}
 		const normalizedAllowedHosts = normalizeAllowedHosts(allowedHosts);
 		if (
@@ -649,7 +648,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			JSON.stringify(this.#allowedHosts) !==
 				JSON.stringify(normalizedAllowedHosts)
 		) {
-			throw new Error("Browser host scope cannot be changed");
+			throw new Error(BROWSER_ERROR.HOST_SCOPE_CANNOT_CHANGE);
 		}
 		this.#targetDomain ??= targetDomain;
 		this.#allowedHosts = normalizedAllowedHosts;
@@ -726,7 +725,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			const result = await this.#send<{ errorText?: string }>("Page.navigate", {
 				url,
 			});
-			if (result.errorText) throw new Error("Browser navigation failed");
+			if (result.errorText) throw new Error(BROWSER_ERROR.NAVIGATION_FAILED);
 			await this.#waitForReadyState(readyStateTimeoutMs);
 		} finally {
 			this.#expectedNavigationRequest = undefined;
@@ -1068,7 +1067,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		} catch (error) {
 			if (
 				!(error instanceof Error) ||
-				error.message !== CDP_COMMAND_FAILED_MESSAGE
+				error.message !== BROWSER_ERROR.CDP_COMMAND_FAILED
 			) {
 				throw error;
 			}
@@ -1342,7 +1341,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			unsafeRequest && !verificationProviderRequest;
 		try {
 			if (!this.#targetDomain) {
-				throw new Error("Browser domain scope is not configured");
+				throw new Error(BROWSER_ERROR.DOMAIN_SCOPE_NOT_CONFIGURED);
 			}
 			const canContinueSubmissionRedirect =
 				this.#submissionAttemptInProgress &&
@@ -1476,7 +1475,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			if (readyState === "interactive" || readyState === "complete") return;
 			await delay(100);
 		}
-		throw new Error("Browser page did not become ready");
+		throw new Error(BROWSER_ERROR.PAGE_NOT_READY);
 	}
 
 	async #bodyText(): Promise<{ text: string; truncated: boolean }> {
@@ -1579,7 +1578,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			}
 			await delay(DOM_DISCOVERY_RETRY_DELAY_MS);
 		}
-		throw new Error("Browser DOM discovery failed");
+		throw new Error(BROWSER_ERROR.DOM_DISCOVERY_FAILED);
 	}
 
 	async #inspectElement(backendNodeId: number): Promise<ElementState> {
@@ -2154,7 +2153,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			awaitPromise: true,
 		});
 		if (result.exceptionDetails) {
-			throw new Error("Browser page evaluation failed");
+			throw new Error(BROWSER_ERROR.PAGE_EVALUATION_FAILED);
 		}
 		return result.result.value as TResult;
 	}
@@ -2519,16 +2518,15 @@ export function desiredCheckboxState(
 export function isCdpConnectionUnusableError(error: unknown): boolean {
 	return (
 		error instanceof Error &&
-		(error.message === "Browser Use CDP connection is closed" ||
-			error.message === "Browser Use CDP connection closed" ||
-			error.message === "Browser Use CDP command could not be sent")
+		(error.message === BROWSER_ERROR.CDP_CONNECTION_IS_CLOSED ||
+			error.message === BROWSER_ERROR.CDP_CONNECTION_CLOSED ||
+			error.message === BROWSER_ERROR.CDP_COMMAND_NOT_SENT)
 	);
 }
 
 export function isPageNotReadyError(error: unknown): boolean {
 	return (
-		error instanceof Error &&
-		error.message === "Browser page did not become ready"
+		error instanceof Error && error.message === BROWSER_ERROR.PAGE_NOT_READY
 	);
 }
 

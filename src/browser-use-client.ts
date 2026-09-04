@@ -1,3 +1,6 @@
+import { BROWSER_ERROR } from "./browser-error-messages";
+import { isRecord } from "./json-record";
+
 export interface BrowserSession {
 	id: string;
 	status: "active" | "stopped";
@@ -53,7 +56,7 @@ export class BrowserUseApiError extends Error {
  */
 export class BrowserUseRequestError extends Error {
 	constructor() {
-		super("Browser Use request failed");
+		super(BROWSER_ERROR.API_REQUEST_FAILED);
 		this.name = "BrowserUseRequestError";
 	}
 }
@@ -86,7 +89,7 @@ export class BrowserUseClient {
 		// Workers throws "Illegal invocation" when `this` is not the global scope.
 		this.#fetcher = (url, init) => fetcher(url, init);
 		if (!apiKey) {
-			throw new Error("Browser Use API key is required");
+			throw new Error(BROWSER_ERROR.API_KEY_REQUIRED);
 		}
 		this.#baseUrl = baseUrl.replace(/\/$/, "");
 	}
@@ -117,7 +120,7 @@ export class BrowserUseClient {
 		const session = parseSession(await readJson(response));
 		if (session.status !== "active" || !session.cdpUrl) {
 			throw new BrowserUseResponseError(
-				"Browser Use did not return an active session with a CDP URL",
+				BROWSER_ERROR.SESSION_WITHOUT_CDP_URL,
 				session.id,
 			);
 		}
@@ -129,7 +132,7 @@ export class BrowserUseClient {
 		signal?: AbortSignal,
 	): Promise<BrowserSession> {
 		if (!sessionId) {
-			throw new Error("Browser session ID is required");
+			throw new Error(BROWSER_ERROR.SESSION_ID_REQUIRED);
 		}
 
 		const response = await this.#request(
@@ -319,7 +322,7 @@ function parseBrowserUseUrl(value: string): URL {
 }
 
 function invalidCdpEndpoint(): Error {
-	return new Error("Invalid Browser Use CDP endpoint");
+	return new Error(BROWSER_ERROR.CDP_ENDPOINT_INVALID);
 }
 
 async function readJson(response: Response): Promise<unknown> {
@@ -424,8 +427,4 @@ function optionalString(value: unknown, field: string): string | null {
 		return null;
 	}
 	return requireString(value, field);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
 }

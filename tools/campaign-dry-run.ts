@@ -1,56 +1,41 @@
-import { parse } from "csv-parse/sync";
 import {
 	buildCampaignJob,
-	type CampaignCsvRow,
-	campaignApiHeaders,
-	DEFAULT_CHOICE_CANDIDATES,
-	filterCampaignRows,
 	mapRegistrationValues,
-	mergeChoiceCandidates,
 	type RedirectResolution,
-	type RegistrationEntry,
-	readChoiceCandidates,
 	registerCampaignJobs,
 	resolveRedirectHosts,
 	selectCampaignCandidates,
 } from "../src/campaign-import";
-import type { JobInput } from "../src/job";
+import { type JobInput, TERMINAL_JOB_STATUSES } from "../src/job";
 import type { TrustedFormValue } from "../src/restricted-browser";
+import {
+	loadChoiceCandidates,
+	PRODUCTION_BASE_URL,
+	pollJobsUntilTerminal,
+	readCampaignRows,
+	readRegistration,
+	requiredOption,
+} from "./campaign-common";
 
-const PRODUCTION_BASE_URL = "https://form-agent.form-agent.workers.dev";
-/** Mirrors the Queue consumer max_concurrency in wrangler.jsonc. */
-const QUEUE_MAX_CONCURRENCY = 20;
-const POLL_INTERVAL_MS = 2_000;
-const TERMINAL_STATUSES = [
-	"prohibited",
-	"uncertain",
-	"failed",
-	"dead_lettered",
-];
+/** Log event prefix; the shared poller derives every job event name from it. */
+const EVENT_PREFIX = "campaign_job";
+/**
+ * A dry-run never reaches `sent`: it is refused as an unsafe status before the
+ * terminal check, so waiting for it would only mean waiting for a status this
+ * tool has already rejected.
+ */
+const DRY_RUN_TERMINAL_STATUSES = TERMINAL_JOB_STATUSES.filter(
+	(status) => status !== "sent",
+);
 
 const options = parseOptions(Bun.argv.slice(2));
 const registration = await readRegistration(options.registrationPath);
-const choices = mergeChoiceCandidates(
-	options.defaultChoices ? DEFAULT_CHOICE_CANDIDATES : {},
-	options.choicesPath
-		? readChoiceCandidates(await Bun.file(options.choicesPath).json())
-		: {},
-);
-console.log(
-	JSON.stringify({
-		event: "campaign_choice_summary",
-		defaultChoices: options.defaultChoices,
-		overrideFile: options.choicesPath !== undefined,
-		// Only the keys are logged; the candidate labels are payload data.
-		choiceKeys: Object.keys(choices).sort(),
-	}),
-);
-const csvText = await Bun.file(options.csvPath).text();
-const rows = parse(csvText, {
-	columns: true,
-	skip_empty_lines: true,
-}) as CampaignCsvRow[];
-const filtered = filterCampaignRows(rows);
+const choices = await loadChoiceCandidates({
+	eventPrefix: "campaign",
+	defaultChoices: options.defaultChoices,
+	choicesPath: options.choicesPath,
+});
+const { rows, filtered } = await readCampaignRows(options.csvPath);
 const registrationValues = mapRegistrationValues(registration);
 const selected = selectCampaignCandidates(
 	filtered.eligible,
@@ -222,60 +207,28 @@ function parseOptions(args: string[]): Options {
 	};
 }
 
-async function readRegistration(path: string): Promise<RegistrationEntry[]> {
-	const value: unknown = await Bun.file(path).json();
-	if (
-		!Array.isArray(value) ||
-		!value.every(
-			(entry) =>
-				typeof entry === "object" &&
-				entry !== null &&
-				typeof (entry as RegistrationEntry).label === "string" &&
-				typeof (entry as RegistrationEntry).value === "string",
-		)
-	) {
-		throw new Error("Registration JSON must contain label/value entries");
-	}
-	return value as RegistrationEntry[];
-}
-
 /**
- * Polls every registered job each round instead of draining them one by one.
- * The budget keeps the original four minutes per concurrent batch, because a
- * job queued behind a full batch only starts once one of those finishes.
+ * Waits for every registered job and counts the ones that reached the dry-run
+ * boundary on their first attempt. A status that could mean a submission ends
+ * the whole run.
  */
 async function waitForAll(
 	jobs: readonly JobInput[],
 	apiToken: string,
 	byReasonCode: Record<string, number>,
 ): Promise<number> {
-	if (jobs.length === 0) return 0;
-	const pending = new Map(jobs.map((job) => [job.id, ""]));
-	const deadline =
-		Date.now() +
-		4 * 60 * 1_000 * Math.ceil(jobs.length / QUEUE_MAX_CONCURRENCY);
 	let completed = 0;
-	while (pending.size > 0 && Date.now() < deadline) {
-		for (const [jobId, lastStatus] of [...pending]) {
-			const state = await readJobState(jobId, apiToken);
-			// A lookup failure is transient here; the job stays pending and is read
-			// again next round, and the deadline still bounds the wait.
-			if (!state) continue;
-			if (state.status !== lastStatus) {
-				pending.set(jobId, state.status);
-				console.log(
-					JSON.stringify({
-						event: "campaign_job_status",
-						jobId,
-						status: state.status,
-						attemptCount: state.attemptCount,
-					}),
-				);
-			}
+	await pollJobsUntilTerminal({
+		jobs,
+		apiToken,
+		eventPrefix: EVENT_PREFIX,
+		terminalStatuses: DRY_RUN_TERMINAL_STATUSES,
+		onObserved: (_jobId, state) => {
 			if (state.status === "submitting" || state.status === "sent") {
 				throw new Error(`Dry-run entered unsafe status ${state.status}`);
 			}
-			if (!TERMINAL_STATUSES.includes(state.status)) continue;
+		},
+		onTerminal: (_jobId, state) => {
 			const reasonCode = state.result?.reasonCode ?? "NO_REASON";
 			const jobCompleted =
 				state.status === "prohibited" &&
@@ -283,82 +236,13 @@ async function waitForAll(
 				state.attemptCount === 1;
 			if (jobCompleted) completed += 1;
 			byReasonCode[reasonCode] = (byReasonCode[reasonCode] ?? 0) + 1;
-			pending.delete(jobId);
-			console.log(
-				JSON.stringify({
-					event: "campaign_job_result",
-					jobId,
-					completed: jobCompleted,
-					status: state.status,
-					reasonCode,
-					attemptCount: state.attemptCount,
-				}),
-			);
-		}
-		if (pending.size > 0) await Bun.sleep(POLL_INTERVAL_MS);
-	}
-	for (const [jobId, lastStatus] of pending) {
-		byReasonCode.DRY_RUN_TIMED_OUT = (byReasonCode.DRY_RUN_TIMED_OUT ?? 0) + 1;
-		console.log(
-			JSON.stringify({
-				event: "campaign_job_result",
-				jobId,
-				completed: false,
-				status: lastStatus || "unknown",
-				reasonCode: "DRY_RUN_TIMED_OUT",
-				attemptCount: 0,
-			}),
-		);
-	}
+			return { reasonCode, extra: { completed: jobCompleted } };
+		},
+		onTimedOut: () => {
+			byReasonCode.DRY_RUN_TIMED_OUT =
+				(byReasonCode.DRY_RUN_TIMED_OUT ?? 0) + 1;
+			return { reasonCode: "DRY_RUN_TIMED_OUT", extra: { completed: false } };
+		},
+	});
 	return completed;
-}
-
-interface JobState {
-	status: string;
-	attemptCount: number;
-	result: { reasonCode: string | null } | null;
-}
-
-async function readJobState(
-	jobId: string,
-	apiToken: string,
-): Promise<JobState | null> {
-	try {
-		const response = await fetch(`${PRODUCTION_BASE_URL}/jobs/${jobId}`, {
-			headers: campaignApiHeaders(apiToken),
-			redirect: "manual",
-		});
-		if (!response.ok) {
-			await response.body?.cancel();
-			console.log(
-				JSON.stringify({
-					event: "campaign_job_lookup_failed",
-					jobId,
-					status: response.status,
-				}),
-			);
-			return null;
-		}
-		const body = (await response.json()) as { job: JobState };
-		return body.job;
-	} catch {
-		// A lookup failure here — including a fetch that throws or a response
-		// body that fails to parse — is transient; the job stays pending and is
-		// read again next round. Fixed values only: the failure reason may carry
-		// a URL or a host.
-		console.log(
-			JSON.stringify({
-				event: "campaign_job_lookup_failed",
-				jobId,
-				reason: "REQUEST_FAILED",
-			}),
-		);
-		return null;
-	}
-}
-
-function requiredOption(values: Map<string, string>, name: string): string {
-	const value = values.get(name);
-	if (!value) throw new Error(`--${name} is required`);
-	return value;
 }

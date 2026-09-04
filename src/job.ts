@@ -14,6 +14,35 @@ export type JobStatus =
 	| "failed"
 	| "dead_lettered";
 
+/**
+ * Statuses a job never leaves. Everything else is still in flight, so a poller
+ * that sees one of these can stop reading the job.
+ */
+export const TERMINAL_JOB_STATUSES: readonly JobStatus[] = [
+	"sent",
+	"prohibited",
+	"uncertain",
+	"failed",
+	"dead_lettered",
+];
+
+/**
+ * Payload key the caller sets to ask for a dry-run. It is a request only: the
+ * API freezes the decision onto `EFFECTIVE_DRY_RUN_KEY`, and every guard reads
+ * that one instead.
+ */
+export const DRY_RUN_KEY = "_formAgentDryRun";
+
+/**
+ * Payload key the API stamps with the mode the run will actually use, taken
+ * from the environment default and the requested `DRY_RUN_KEY`. This is the
+ * key that decides whether a submission may leave the browser.
+ */
+export const EFFECTIVE_DRY_RUN_KEY = "_formAgentEffectiveDryRun";
+
+/** Payload key bounding how many attempts one job may spend. */
+export const MAX_ATTEMPTS_KEY = "_formAgentMaxAttempts";
+
 export interface JobInput {
 	id: string;
 	companyId: string;
@@ -89,6 +118,14 @@ export interface AgentRunMetrics {
 	outcome: AgentRunOutcome;
 }
 
+/**
+ * The narrow consumer-side view of the job store that the browser layer and
+ * the evidence layer need. It is deliberately smaller than `D1JobStore`: the
+ * seven operational methods that only the Worker calls (`claimProviderRequest`
+ * and the rest) are left out so that a test double for the agent layer has to
+ * implement only what that layer actually uses. The Worker itself holds the
+ * concrete `D1JobStore` and reaches those methods directly.
+ */
 export interface JobStore {
 	create(input: JobInput, now: string): Promise<Job>;
 	find(id: string): Promise<Job | null>;

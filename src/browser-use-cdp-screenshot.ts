@@ -3,6 +3,7 @@
  * keeps a capture under the CDP message limit, and the base64 decoding of
  * both.
  */
+import { BROWSER_ERROR } from "./browser-error-messages";
 
 export interface CdpScreenshotResult {
 	data?: string;
@@ -28,7 +29,7 @@ export async function captureCdpScreenshot(
 	try {
 		result = await send({ ...SCREENSHOT_PARAMS });
 	} catch {
-		throw new Error("Browser screenshot failed");
+		throw new Error(BROWSER_ERROR.SCREENSHOT_FAILED);
 	}
 	return decodeCdpScreenshot(result);
 }
@@ -38,10 +39,10 @@ function decodeCdpScreenshot(result: CdpScreenshotResult): Uint8Array {
 	try {
 		bytes = decodeBase64(result.data ?? "");
 	} catch {
-		throw new Error("Browser screenshot failed");
+		throw new Error(BROWSER_ERROR.SCREENSHOT_FAILED);
 	}
 	if (bytes.byteLength === 0) {
-		throw new Error("Browser screenshot failed");
+		throw new Error(BROWSER_ERROR.SCREENSHOT_FAILED);
 	}
 	return bytes;
 }
@@ -162,14 +163,14 @@ export async function captureCdpFullPageScreenshot(
 	try {
 		metrics = await getLayoutMetrics();
 	} catch {
-		throw new Error("Browser screenshot failed");
+		throw new Error(BROWSER_ERROR.SCREENSHOT_FAILED);
 	}
 	const plan = planFullPageScreenshot(
 		metrics?.cssContentSize?.width,
 		metrics?.cssContentSize?.height,
 	);
 	if (!plan) {
-		throw new Error("Browser screenshot failed");
+		throw new Error(BROWSER_ERROR.SCREENSHOT_FAILED);
 	}
 
 	let result: CdpScreenshotResult;
@@ -180,7 +181,7 @@ export async function captureCdpFullPageScreenshot(
 			clip: plan.clip,
 		});
 	} catch {
-		throw new Error("Browser screenshot failed");
+		throw new Error(BROWSER_ERROR.SCREENSHOT_FAILED);
 	}
 	return decodeCdpScreenshot(result);
 }
