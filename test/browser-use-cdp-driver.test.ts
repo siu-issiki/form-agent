@@ -1,6 +1,9 @@
 import { describe, expect, setSystemTime, test } from "bun:test";
 import { runInNewContext } from "node:vm";
-import { hasNewSubmissionConfirmation } from "../src/browser-submit-confirmation";
+import {
+	hasNewSubmissionConfirmation,
+	hasSubmissionConfirmationText,
+} from "../src/browser-submit-confirmation";
 import {
 	assertCdpMessageWithinLimit,
 	BrowserUseCdpClosedError,
@@ -6049,3 +6052,31 @@ async function closeQuietly(driver: BrowserUseCdpDriver): Promise<void> {
 		captured.restore();
 	}
 }
+
+describe("submission confirmation text", () => {
+	test("does not read a review-before-send screen as a completion", () => {
+		expect(
+			hasSubmissionConfirmationText(
+				"入力内容の確認\nまだ送信は完了していません。内容をご確認のうえ、送信してください。\nこの内容で送信する",
+			),
+		).toBe(false);
+		expect(
+			hasSubmissionConfirmationText("確認画面\n送信完了までもう少しです"),
+		).toBe(false);
+	});
+
+	test("still reads a real completion", () => {
+		expect(
+			hasSubmissionConfirmationText("お問い合わせの送信が完了しました。"),
+		).toBe(true);
+		expect(hasSubmissionConfirmationText("Thank you for your inquiry")).toBe(
+			true,
+		);
+		expect(
+			hasNewSubmissionConfirmation(
+				"お問い合わせフォーム",
+				"送信ありがとうございました",
+			),
+		).toBe(true);
+	});
+});
