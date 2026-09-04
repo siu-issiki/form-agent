@@ -38,11 +38,3 @@ export interface AgentTools {
 		activationStrategy: SubmitActivationStrategy,
 	): Promise<Job | SubmitStagePending>;
 }
-
-export interface AgentRuntime {
-	run(
-		input: AgentRunInput,
-		tools: AgentTools,
-		signal?: AbortSignal,
-	): Promise<AgentRunResult>;
-}

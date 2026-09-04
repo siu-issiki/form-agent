@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { AgentExecutionError } from "../src/agent-executor";
+import type { AgentToolDiagnosticCode } from "../src/agent-tool-diagnostic";
 import { BrowserToolInputError } from "../src/browser-tool-handler";
 import {
 	BrowserUseCdpPayloadTooLargeError,
@@ -10,7 +11,6 @@ import {
 	BrowserUseRequestError,
 	BrowserUseResponseError,
 } from "../src/browser-use-client";
-import type { AgentToolDiagnosticCode } from "../src/d1-job-store";
 import { classifyToolDiagnostic } from "../src/responses-agent-executor";
 import {
 	BrowserElementError,

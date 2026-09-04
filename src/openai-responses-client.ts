@@ -2,22 +2,6 @@ import { AgentExecutionError } from "./agent-executor";
 
 export const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 
-export const MAX_TURNS = 40;
-
-/**
- * Extra turns granted once, after a denied pre-submit review, so the agent can
- * still fill, observe, and submit even when the denial lands on a late turn.
- */
-export const CORRECTION_TURNS = 3;
-
-/**
- * One provider request per agent turn, plus the correction turns, plus at most
- * two pre-submit reviews (the first denial allows exactly one correction). The
- * counter is shared by the executor and the reviewer through D1, so both
- * consume the same budget.
- */
-export const MAX_PROVIDER_REQUESTS = MAX_TURNS + CORRECTION_TURNS + 2;
-
 export const MAX_PROVIDER_RESPONSE_BYTES = 256 * 1_024;
 
 export type JsonObject = Record<string, unknown>;
@@ -169,4 +153,39 @@ export function invalidProviderResponse(detail?: string): AgentExecutionError {
 
 export function isRecord(value: unknown): value is JsonObject {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Reduces a provider-supplied string to a fixed-shape token so a status or
+ * incompleteness reason can be logged without carrying free text.
+ */
+function sanitiseDetailToken(value: string): string {
+	const token = value
+		.toLowerCase()
+		.replace(/[^a-z0-9_]/g, "")
+		.slice(0, 32);
+	return token.length > 0 ? token : "other";
+}
+
+export function readResponseOutput(value: JsonObject): JsonObject[] {
+	if (value.status !== "completed") {
+		const incompleteReason =
+			value.status === "incomplete" &&
+			isRecord(value.incomplete_details) &&
+			typeof value.incomplete_details.reason === "string"
+				? value.incomplete_details.reason
+				: undefined;
+		throw invalidProviderResponse(
+			incompleteReason !== undefined
+				? `incomplete_${sanitiseDetailToken(incompleteReason)}`
+				: `status_${sanitiseDetailToken(String(value.status))}`,
+		);
+	}
+	if (!Array.isArray(value.output)) {
+		throw invalidProviderResponse("output_missing");
+	}
+	if (!value.output.every(isRecord)) {
+		throw invalidProviderResponse("output_item_invalid");
+	}
+	return value.output;
 }

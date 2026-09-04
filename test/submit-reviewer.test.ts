@@ -1,12 +1,10 @@
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, test, vi } from "vitest";
+import { MAX_PROVIDER_REQUESTS } from "../src/agent-budget";
 import { AgentExecutionError } from "../src/agent-executor";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobInput } from "../src/job";
-import {
-	MAX_PROVIDER_REQUESTS,
-	type ProviderUsage,
-} from "../src/openai-responses-client";
+import type { ProviderUsage } from "../src/openai-responses-client";
 import type {
 	SubmitReviewInput,
 	SubmitReviewReasonCode,

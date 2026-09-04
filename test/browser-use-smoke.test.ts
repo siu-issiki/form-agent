@@ -1,12 +1,13 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, test } from "vitest";
 import { BrowserUseCdpDriver } from "../src/browser-use-cdp-driver";
-import { InMemoryJobStore, type Job } from "../src/job";
+import type { Job } from "../src/job";
 import {
 	NavigationPolicyError,
 	RestrictedBrowserTools,
 } from "../src/restricted-browser";
 import { InMemoryEvidenceObjectStore } from "../src/submission-evidence";
+import { InMemoryJobStore } from "./helpers/in-memory-job-store";
 
 const targetUrl = "https://www.selenium.dev/selenium/web/web-form.html";
 const job: Job = {

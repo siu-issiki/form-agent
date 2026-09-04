@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 import {
 	type AgentRunMetrics,
 	DuplicateJobError,
-	InMemoryJobStore,
 	type JobInput,
 } from "../src/job";
+import { InMemoryJobStore } from "./helpers/in-memory-job-store";
 
 const input: JobInput = {
 	id: "job-001",

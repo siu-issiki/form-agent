@@ -113,7 +113,7 @@ PoC のローカル実行では Wrangler / Miniflare 上の D1 と Queue、外�
 - `AGENT_DRY_RUN`とbooleanの`_formAgentDryRun`から実効モードをジョブ登録時に保存する。旧形式のジョブは常にdry-runとし、deployment切替で既存ジョブの意味を変えない。dry-runでは`submit`をモデルへ公開したまま、送信対象と同じフォームへの入力成功、現在のsubmit要素、`form.checkValidity()`の成功を実ブラウザで検証し、送信権取得とブラウザsubmitより前に終了する。送信前レビューが`allow`の場合だけ`prohibited` / `DRY_RUN_COMPLETE`とし、`deny`の場合は`uncertain` / `DRY_RUN_REVIEW_DENIED`とする。
 - 最大 40 turn、ジョブ prompt 最大 64,000 文字とする。1 項目の入力が 1 turn を消費するため、実サイトの入力項目数の多いフォームでは 16 turn では submit へ到達できず `AGENT_TURN_LIMIT` になっていた。turn 上限に達した run は Worker ログの `agent_turn_limit_reached`（観察回数、tool 呼び出し回数、tool エラー回数の件数だけ）で内訳を追う。
 - `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返す。
-- `prohibited`のreason codeは`NO_FORM_PRESENT`、`SALES_PROHIBITED`、`FORM_PURPOSE_INCOMPATIBLE`だけを許可し、旧aliasは保存前に正規化する。
+- `prohibited`のreason codeは`NO_FORM_PRESENT`、`SALES_PROHIBITED`、`FORM_PURPOSE_INCOMPATIBLE`だけを許可し、集合外は`FINISH_FIELDS_INVALID`として拒否する。
 - `finish_uncertain`のreason codeも固定集合だけを許可し、集合外はtool schemaのenumとhandler側の検証の両方で`INVALID_TOOL_INPUT`として拒否する。自由文字列を許していた時期はモデルが毎回異なる語を作り、`uncertain`の内訳を集計できなかったためである。`finish_failed`は技術失敗の内訳が多様であるため自由文字列のままとする。
 
 | `uncertain` reason code | 意味 |

@@ -1,8 +1,8 @@
 import { describe, expect, setSystemTime, test } from "bun:test";
 import { runInNewContext } from "node:vm";
 import {
-	hasNewSubmissionConfirmation,
-	hasSubmissionConfirmationText,
+	SUBMISSION_CONFIRMATION_PATTERN,
+	SUBMISSION_PENDING_PATTERN,
 } from "../src/browser-submit-confirmation";
 import {
 	assertCdpMessageWithinLimit,
@@ -23,55 +23,60 @@ import {
 	findCdpFrameOwnerBackendNodeId,
 } from "../src/browser-use-cdp-dom";
 import {
-	ACTIVATE_SUBMIT_FUNCTION,
 	assertDryRunNavigationAllowed,
-	BLOCK_BROWSER_ESCAPE_EXPRESSION,
 	BrowserUseCdpDriver,
-	type CdpScreenshotResult,
-	CHECK_FORM_VALIDITY_FUNCTION,
 	ConfirmationReadPendingError,
-	captureCdpFullPageScreenshot,
-	captureCdpScreenshot,
 	centerOfQuad,
-	chooseFullPageScreenshotQuality,
 	collectCdpFrameParentIds,
 	continueSubmissionRequest,
 	createExpectedSubmissionRequest,
 	createSubmitActivationFailureLog,
-	denyRelatedBrowserTargets,
 	desiredCheckboxState,
 	ENTER_KEY_DOWN_EVENT,
-	FULL_PAGE_SCREENSHOT_QUALITY,
-	FULL_PAGE_SCREENSHOT_REDUCED_QUALITY,
 	getSubmissionRequestDisposition,
-	HAS_SAME_FORM_OWNER_FUNCTION,
 	hasExpectedFrameNavigated,
-	IS_COMPOSED_DESCENDANT_FUNCTION,
-	IS_ELEMENT_FOCUSED_FUNCTION,
-	IS_SUBMIT_UNOBSCURED_FUNCTION,
 	isAuthorizedSubmissionRedirect,
 	isExpectedNavigationDocumentRequest,
 	isPayloadIndependentClickTarget,
 	isRetryableClickPreparationError,
 	isTransientConfirmationReadError,
-	MATCHES_CHOICE_CANDIDATE_FUNCTION,
 	MAX_SUBMISSION_REQUESTS,
-	planFullPageScreenshot,
-	READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
 	readPageText,
 	readRadioSelectionOutcome,
 	readSubmissionConfirmation,
 	retrySubmitMousePreparation,
 	runSubmissionActivationWithinPermissionWindow,
-	SELECT_OPTION_BY_CANDIDATE_FUNCTION,
-	SELECT_RADIO_BY_CANDIDATE_FUNCTION,
-	SET_CHECKED_VALUE_FUNCTION,
 	shouldBlockNonSubmitRequest,
 	submitUncertainReasonCode,
 	toFormSnapshot,
 	toObservedFieldState,
 	waitForSubmissionConfirmation,
 } from "../src/browser-use-cdp-driver";
+import {
+	ACTIVATE_SUBMIT_FUNCTION,
+	BLOCK_BROWSER_ESCAPE_EXPRESSION,
+	CHECK_FORM_VALIDITY_FUNCTION,
+	HAS_CONFIRMATION_TEXT_FUNCTION,
+	HAS_SAME_FORM_OWNER_FUNCTION,
+	IS_COMPOSED_DESCENDANT_FUNCTION,
+	IS_ELEMENT_FOCUSED_FUNCTION,
+	IS_SUBMIT_UNOBSCURED_FUNCTION,
+	MATCHES_CHOICE_CANDIDATE_FUNCTION,
+	READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
+	SELECT_OPTION_BY_CANDIDATE_FUNCTION,
+	SELECT_RADIO_BY_CANDIDATE_FUNCTION,
+	SET_CHECKED_VALUE_FUNCTION,
+} from "../src/browser-use-cdp-page-scripts";
+import { denyRelatedBrowserTargets } from "../src/browser-use-cdp-related-targets";
+import {
+	type CdpScreenshotResult,
+	captureCdpFullPageScreenshot,
+	captureCdpScreenshot,
+	chooseFullPageScreenshotQuality,
+	FULL_PAGE_SCREENSHOT_QUALITY,
+	FULL_PAGE_SCREENSHOT_REDUCED_QUALITY,
+	planFullPageScreenshot,
+} from "../src/browser-use-cdp-screenshot";
 import {
 	BrowserUseApiError,
 	type BrowserUseClient,
@@ -1722,6 +1727,43 @@ describe("BrowserUseCdpDriver child target policy", () => {
 	});
 });
 
+/**
+ * Runs the in-page confirmation reader the driver injects over one body's
+ * text, with the same two patterns the driver passes it.
+ */
+function readsAsConfirmation(text: string): boolean {
+	const hasConfirmationText = runInNewContext(
+		`(${HAS_CONFIRMATION_TEXT_FUNCTION})`,
+	) as (
+		this: { innerText: string },
+		pattern: string,
+		pendingPattern: string,
+	) => boolean;
+	return hasConfirmationText.call(
+		{ innerText: text },
+		SUBMISSION_CONFIRMATION_PATTERN,
+		SUBMISSION_PENDING_PATTERN,
+	);
+}
+
+/**
+ * The production combination: the driver counts the bodies the in-page reader
+ * matched before and after the submit, and `readSubmissionConfirmation` reports
+ * a send only when the count grew.
+ */
+async function readsAsNewConfirmation(
+	beforeText: string,
+	afterText: string,
+): Promise<boolean> {
+	const confirmation = await readSubmissionConfirmation(
+		readsAsConfirmation(beforeText) ? 1 : 0,
+		true,
+		async () => (readsAsConfirmation(afterText) ? 1 : 0),
+		async () => "https://example.com/contact",
+	);
+	return confirmation !== null;
+}
+
 describe("BrowserUseCdpDriver submission confirmation", () => {
 	test("waits beyond the former five-second window for a late confirmation", async () => {
 		let elapsed = 0;
@@ -2183,27 +2225,27 @@ describe("BrowserUseCdpDriver submission confirmation", () => {
 		});
 	});
 
-	test("accepts a confirmation that appears after submit", () => {
+	test("accepts a confirmation that appears after submit", async () => {
 		expect(
-			hasNewSubmissionConfirmation(
+			await readsAsNewConfirmation(
 				"お問い合わせフォーム",
 				"送信が完了しました。ありがとうございました。",
 			),
 		).toBe(true);
 	});
 
-	test("does not accept confirmation text that already existed", () => {
+	test("does not accept confirmation text that already existed", async () => {
 		expect(
-			hasNewSubmissionConfirmation(
+			await readsAsNewConfirmation(
 				"Thank you for visiting our website.",
 				"Thank you for visiting our website.",
 			),
 		).toBe(false);
 	});
 
-	test("does not accept a negative submitted message", () => {
+	test("does not accept a negative submitted message", async () => {
 		expect(
-			hasNewSubmissionConfirmation(
+			await readsAsNewConfirmation(
 				"Contact form",
 				"The form was not submitted. Please correct the errors.",
 			),
@@ -6638,24 +6680,22 @@ async function closeQuietly(driver: BrowserUseCdpDriver): Promise<void> {
 describe("submission confirmation text", () => {
 	test("does not read a review-before-send screen as a completion", () => {
 		expect(
-			hasSubmissionConfirmationText(
+			readsAsConfirmation(
 				"入力内容の確認\nまだ送信は完了していません。内容をご確認のうえ、送信してください。\nこの内容で送信する",
 			),
 		).toBe(false);
-		expect(
-			hasSubmissionConfirmationText("確認画面\n送信完了までもう少しです"),
-		).toBe(false);
+		expect(readsAsConfirmation("確認画面\n送信完了までもう少しです")).toBe(
+			false,
+		);
 	});
 
-	test("still reads a real completion", () => {
-		expect(
-			hasSubmissionConfirmationText("お問い合わせの送信が完了しました。"),
-		).toBe(true);
-		expect(hasSubmissionConfirmationText("Thank you for your inquiry")).toBe(
+	test("still reads a real completion", async () => {
+		expect(readsAsConfirmation("お問い合わせの送信が完了しました。")).toBe(
 			true,
 		);
+		expect(readsAsConfirmation("Thank you for your inquiry")).toBe(true);
 		expect(
-			hasNewSubmissionConfirmation(
+			await readsAsNewConfirmation(
 				"お問い合わせフォーム",
 				"送信ありがとうございました",
 			),

@@ -9,20 +9,3 @@ export const SUBMISSION_CONFIRMATION_PATTERN =
  */
 export const SUBMISSION_PENDING_PATTERN =
 	"完了(して|しており)?(い)?ません|完了していない|まだ送信|送信は(まだ|完了)|入力内容(の|を)(ご)?確認|確認画面|この内容で送信|上記の内容で送信|内容をご確認";
-
-export function hasSubmissionConfirmationText(text: string): boolean {
-	return (
-		new RegExp(SUBMISSION_CONFIRMATION_PATTERN, "i").test(text) &&
-		!new RegExp(SUBMISSION_PENDING_PATTERN, "i").test(text)
-	);
-}
-
-export function hasNewSubmissionConfirmation(
-	beforeText: string,
-	afterText: string,
-): boolean {
-	return (
-		!hasSubmissionConfirmationText(beforeText) &&
-		hasSubmissionConfirmationText(afterText)
-	);
-}
