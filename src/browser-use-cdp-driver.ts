@@ -88,20 +88,6 @@ import {
 	type SubmitActivationStrategy,
 } from "./restricted-browser";
 
-// Re-exported so callers keep reaching the submission request policy through
-// the driver module they already import.
-export {
-	createExpectedSubmissionRequest,
-	type ExpectedSubmissionRequest,
-	getSubmissionRequestDisposition,
-	isAuthorizedSubmissionRedirect,
-	isExpectedNavigationDocumentRequest,
-	isExpectedSubmissionRequest,
-	MAX_SUBMISSION_REQUESTS,
-	type PausedRequest,
-	shouldBlockNonSubmitRequest,
-} from "./browser-use-cdp-submission-policy";
-
 const MAX_PAGE_TEXT = 20_000;
 const MAX_OBSERVED_FORMS = 10;
 const MAX_OBSERVED_FIELDS = 100;

@@ -12,8 +12,8 @@ import {
 	BrowserUseCdpCommandError,
 	type BrowserUseCdpConnection,
 } from "./browser-use-cdp";
-import type { PausedRequest } from "./browser-use-cdp-driver";
 import { BLOCK_BROWSER_ESCAPE_EXPRESSION } from "./browser-use-cdp-page-scripts";
+import type { PausedRequest } from "./browser-use-cdp-submission-policy";
 
 export interface TargetInfo {
 	targetId: string;
