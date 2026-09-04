@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { AgentExecutionError } from "../src/agent-executor";
+import { describeToolFailure, type ToolFailure } from "../src/agent-tool-call";
 import type { AgentToolDiagnosticCode } from "../src/agent-tool-diagnostic";
 import {
 	BROWSER_ERROR,
@@ -7,6 +8,8 @@ import {
 } from "../src/browser-error-messages";
 import { BrowserToolInputError } from "../src/browser-tool-handler";
 import {
+	BrowserUseCdpClosedError,
+	BrowserUseCdpCommandError,
 	BrowserUseCdpPayloadTooLargeError,
 	BrowserUseCdpUpgradeRejectedError,
 } from "../src/browser-use-cdp";
@@ -20,7 +23,11 @@ import {
 	BrowserElementError,
 	BrowserElementOperationError,
 	BrowserFormInvalidError,
+	CorrectionRequiredError,
+	FormStateChangedError,
 	NavigationPolicyError,
+	ObservationStaleError,
+	ProhibitionEvidenceError,
 	SubmissionEvidenceError,
 	SubmissionNotAuthorizedError,
 	SubmissionResultUncertainError,
@@ -258,3 +265,325 @@ describe("classifyToolDiagnostic - fallback", () => {
 // closed-set test pins which of them the classifier still recognises. A
 // constant renamed or removed at its throw site therefore fails here instead
 // of silently degrading to UNKNOWN in production.
+
+// describeToolFailure (src/responses-agent-executor.ts) decides what a failed
+// tool call becomes, from the error alone: the diagnostic code that is written
+// to D1, and one of five dispositions the caller carries out. Before this
+// function existed the two decisions were made by separate `instanceof`
+// chains, so an error type could be added to one and forgotten in the other
+// without a type error. The table below is the contract for both halves at
+// once: every row states the code AND the disposition for one error, so a
+// branch that is removed, reordered behind a superclass, or given a new
+// disposition fails here rather than in an executor test that only covers the
+// handful of errors its fixtures happen to raise.
+describe("describeToolFailure - error to disposition table", () => {
+	const cases: Array<[label: string, error: unknown, failure: ToolFailure]> = [
+		[
+			"AgentExecutionError is re-raised so the reviewer's own failure survives",
+			new AgentExecutionError("SOME_REASON", "boom", false),
+			{ diagnosticCode: "SUBMIT_REVIEW_UNAVAILABLE", disposition: "rethrow" },
+		],
+		[
+			"SubmitReviewDeniedError buys a correction turn",
+			new SubmitReviewDeniedError("WRONG_FORM"),
+			{
+				diagnosticCode: "SUBMIT_REVIEW_DENIED",
+				disposition: "soft",
+				errorCode: "SUBMIT_REVIEW_DENIED",
+				details: { reasonCode: "WRONG_FORM" },
+				reviewDenied: true,
+			},
+		],
+		[
+			"SubmitReviewUnavailableError",
+			new SubmitReviewUnavailableError(),
+			{
+				diagnosticCode: "SUBMIT_REVIEW_UNAVAILABLE",
+				disposition: "hard",
+				reasonCode: "SUBMIT_REVIEW_UNAVAILABLE",
+				message: "The pre-submit review could not be completed.",
+				retryable: true,
+			},
+		],
+		[
+			"SubmissionEvidenceError",
+			new SubmissionEvidenceError(),
+			{
+				diagnosticCode: "EVIDENCE_CAPTURE_FAILED",
+				disposition: "hard",
+				reasonCode: "SUBMISSION_EVIDENCE_UNAVAILABLE",
+				message:
+					"The submission evidence could not be captured before submission.",
+				retryable: true,
+			},
+		],
+		[
+			"BrowserUseCdpPayloadTooLargeError is not retryable",
+			new BrowserUseCdpPayloadTooLargeError(),
+			{
+				diagnosticCode: "PAYLOAD_TOO_LARGE",
+				disposition: "hard",
+				reasonCode: "BROWSER_PAYLOAD_TOO_LARGE",
+				message: "The browser document exceeded the safe processing limit.",
+				retryable: false,
+			},
+		],
+		[
+			"SubmissionResultUncertainError re-reads the job",
+			new SubmissionResultUncertainError(),
+			{
+				diagnosticCode: "SUBMISSION_RESULT_UNCERTAIN",
+				disposition: "persisted",
+			},
+		],
+		[
+			"SubmissionNotAuthorizedError re-reads the job",
+			new SubmissionNotAuthorizedError(),
+			{
+				diagnosticCode: "SUBMISSION_NOT_AUTHORIZED",
+				disposition: "persisted",
+			},
+		],
+		[
+			"NavigationPolicyError",
+			new NavigationPolicyError(),
+			{
+				diagnosticCode: "NAVIGATION_POLICY",
+				disposition: "soft",
+				errorCode: "NAVIGATION_NOT_ALLOWED",
+			},
+		],
+		[
+			"CorrectionRequiredError keeps its own tool error under a shared code",
+			new CorrectionRequiredError(),
+			{
+				diagnosticCode: "ELEMENT_UNAVAILABLE",
+				disposition: "soft",
+				errorCode: "CORRECTION_REQUIRED",
+			},
+		],
+		[
+			"FormStateChangedError keeps its own tool error under a shared code",
+			new FormStateChangedError(),
+			{
+				diagnosticCode: "ELEMENT_UNAVAILABLE",
+				disposition: "soft",
+				errorCode: "FORM_STATE_CHANGED",
+			},
+		],
+		[
+			"ObservationStaleError keeps its own tool error under a shared code",
+			new ObservationStaleError(),
+			{
+				diagnosticCode: "ELEMENT_UNAVAILABLE",
+				disposition: "soft",
+				errorCode: "OBSERVATION_STALE",
+			},
+		],
+		[
+			"SubmitStageUnverifiedError",
+			new SubmitStageUnverifiedError(),
+			{
+				diagnosticCode: "SUBMIT_STAGE_UNVERIFIED",
+				disposition: "soft",
+				errorCode: "SUBMIT_STAGE_UNVERIFIED",
+			},
+		],
+		[
+			"SubmitProhibitedError carries the reason codes back to the model",
+			new SubmitProhibitedError(["SALES_PROHIBITED"], true),
+			{
+				diagnosticCode: "SUBMIT_PROHIBITED",
+				disposition: "soft",
+				errorCode: "SUBMIT_PROHIBITED",
+				details: {
+					prohibitedReasonCodes: ["SALES_PROHIBITED"],
+					pageProhibited: true,
+				},
+			},
+		],
+		[
+			"BrowserElementOperationError is diagnosed apart from its superclass but disposed of with it",
+			new BrowserElementOperationError("click"),
+			{
+				diagnosticCode: "ELEMENT_OPERATION_CDP_FAILED",
+				disposition: "soft",
+				errorCode: "ELEMENT_UNAVAILABLE",
+			},
+		],
+		[
+			"BrowserFormInvalidError",
+			new BrowserFormInvalidError(),
+			{
+				diagnosticCode: "FORM_INVALID",
+				disposition: "soft",
+				errorCode: "FORM_INVALID",
+			},
+		],
+		[
+			"ProhibitionEvidenceError falls back to its superclass",
+			new ProhibitionEvidenceError("PROHIBITION_EVIDENCE_NOT_FOUND"),
+			{
+				diagnosticCode: "ELEMENT_UNAVAILABLE",
+				disposition: "soft",
+				errorCode: "ELEMENT_UNAVAILABLE",
+			},
+		],
+		[
+			"BrowserElementError",
+			new BrowserElementError(),
+			{
+				diagnosticCode: "ELEMENT_UNAVAILABLE",
+				disposition: "soft",
+				errorCode: "ELEMENT_UNAVAILABLE",
+			},
+		],
+		[
+			"BrowserToolInputError",
+			new BrowserToolInputError("bad input"),
+			{
+				diagnosticCode: "TOOL_INPUT_INVALID",
+				disposition: "soft",
+				errorCode: "INVALID_TOOL_INPUT",
+			},
+		],
+		[
+			"SyntaxError",
+			new SyntaxError("bad json"),
+			{
+				diagnosticCode: "TOOL_INPUT_INVALID",
+				disposition: "soft",
+				errorCode: "INVALID_TOOL_INPUT",
+			},
+		],
+		[
+			"BrowserUseCdpUpgradeRejectedError (403, not retryable) ends the run",
+			new BrowserUseCdpUpgradeRejectedError(403),
+			{
+				diagnosticCode: "CDP_UPGRADE_REJECTED",
+				disposition: "hard",
+				reasonCode: "BROWSER_UPGRADE_REJECTED",
+				message: "The browser provider rejected the connection.",
+				retryable: false,
+			},
+		],
+		[
+			"BrowserUseCdpUpgradeRejectedError (503, retryable) falls through to the retryable failure",
+			new BrowserUseCdpUpgradeRejectedError(503),
+			{ diagnosticCode: "CDP_UPGRADE_REJECTED", disposition: "unavailable" },
+		],
+		[
+			"BrowserUseCdpClosedError (1008, not retryable) ends the run",
+			new BrowserUseCdpClosedError(1008, "NONE"),
+			{
+				diagnosticCode: "CDP_CONNECTION_CLOSED",
+				disposition: "hard",
+				reasonCode: "BROWSER_CONNECTION_REJECTED",
+				message: "The browser provider rejected the connection.",
+				retryable: false,
+			},
+		],
+		[
+			"BrowserUseCdpClosedError (AUTH hint, not retryable) ends the run",
+			new BrowserUseCdpClosedError(1006, "AUTH"),
+			{
+				diagnosticCode: "CDP_CONNECTION_CLOSED",
+				disposition: "hard",
+				reasonCode: "BROWSER_CONNECTION_REJECTED",
+				message: "The browser provider rejected the connection.",
+				retryable: false,
+			},
+		],
+		[
+			"BrowserUseCdpClosedError (1006, retryable) falls through to the retryable failure",
+			new BrowserUseCdpClosedError(1006, "OTHER"),
+			{ diagnosticCode: "CDP_CONNECTION_CLOSED", disposition: "unavailable" },
+		],
+		[
+			"BrowserUseApiError (403, not retryable) ends the run",
+			new BrowserUseApiError("create", 403),
+			{
+				diagnosticCode: "BROWSER_SESSION_API_FAILED",
+				disposition: "hard",
+				reasonCode: "BROWSER_SESSION_REJECTED",
+				message: "The browser provider rejected the session request.",
+				retryable: false,
+			},
+		],
+		[
+			"BrowserUseApiError (429, retryable) keeps the session-limit code and retries",
+			new BrowserUseApiError("create", 429),
+			{ diagnosticCode: "BROWSER_SESSION_LIMIT", disposition: "unavailable" },
+		],
+		[
+			"BrowserUseApiError (500, retryable)",
+			new BrowserUseApiError("create", 500),
+			{
+				diagnosticCode: "BROWSER_SESSION_API_FAILED",
+				disposition: "unavailable",
+			},
+		],
+		[
+			"BrowserUseRequestError",
+			new BrowserUseRequestError(),
+			{
+				diagnosticCode: "BROWSER_SESSION_API_FAILED",
+				disposition: "unavailable",
+			},
+		],
+		[
+			"BrowserUseResponseError",
+			new BrowserUseResponseError("bad response"),
+			{
+				diagnosticCode: "BROWSER_SESSION_API_FAILED",
+				disposition: "unavailable",
+			},
+		],
+		[
+			"BrowserUseCdpCommandError carries its breakdown into the run failure",
+			new BrowserUseCdpCommandError("DOM.focus", -32000, "NODE_NOT_FOUND"),
+			{
+				diagnosticCode: "CDP_COMMAND_FAILED",
+				disposition: "unavailable",
+				cdpDetail: {
+					method: "DOM.focus",
+					kind: "NODE_NOT_FOUND",
+					cdpCode: -32000,
+				},
+			},
+		],
+		[
+			"BrowserUseCdpCommandError without a CDP code omits the field",
+			new BrowserUseCdpCommandError("DOM.focus", null, "OTHER"),
+			{
+				diagnosticCode: "CDP_COMMAND_FAILED",
+				disposition: "unavailable",
+				cdpDetail: { method: "DOM.focus", kind: "OTHER" },
+			},
+		],
+		[
+			"an unrecognised Error",
+			new Error("something else"),
+			{ diagnosticCode: "UNKNOWN", disposition: "unavailable" },
+		],
+		[
+			"a non-Error value",
+			"not an error",
+			{ diagnosticCode: "UNKNOWN", disposition: "unavailable" },
+		],
+	];
+
+	for (const [label, error, failure] of cases) {
+		test(label, () => {
+			expect(describeToolFailure(error)).toEqual(failure);
+		});
+	}
+
+	test("the diagnostic code always agrees with classifyToolDiagnostic", () => {
+		// The two used to be independent chains. Pinning the equality here means
+		// the wrapper cannot drift back apart without failing.
+		for (const [, error, failure] of cases) {
+			expect(classifyToolDiagnostic(error)).toBe(failure.diagnosticCode);
+		}
+	});
+});
