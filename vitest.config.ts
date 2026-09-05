@@ -20,6 +20,7 @@ export default defineConfig({
 	test: {
 		include: [
 			"test/worker.test.ts",
+			"test/admin.test.ts",
 			"test/submit-reviewer.test.ts",
 			"test/tool-diagnostic.test.ts",
 		],

@@ -28,6 +28,7 @@
 	},
 	"dependencies": {
 		"csv-parse": "^6.1.0",
+		"jose": "^6.2.12",
 		"tldts": "^7.4.11"
 	}
 }
