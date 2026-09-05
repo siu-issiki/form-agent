@@ -1,3 +1,4 @@
+import { handleAdminRequest } from "./admin-handler";
 import type { AgentExecutor } from "./agent-executor";
 import { D1JobStore } from "./d1-job-store";
 import type { Env, JobMessage } from "./env";
@@ -91,6 +92,9 @@ export async function handleHttpRequest(
 	env: Env,
 ): Promise<Response> {
 	const url = new URL(request.url);
+	if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
+		return handleAdminRequest(request, env);
+	}
 	if (request.method === "GET" && url.pathname === "/health") {
 		return Response.json({ status: "ok" });
 	}

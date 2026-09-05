@@ -43,6 +43,7 @@
 		"tools/continuous-state.ts",
 		"test/continuous-state.test.ts",
 		"tools/continuous-evidence.ts",
+		"tools/admin-preview.ts",
 		"test/continuous-evidence.test.ts"
 	]
 }

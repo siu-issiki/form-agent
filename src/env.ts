@@ -23,6 +23,10 @@ export interface Env {
 	OPENAI_API_KEY?: string;
 	BROWSER_USE_API_KEY?: string;
 	JOB_API_TOKEN?: string;
+	/** Dashboard owner and Cloudflare Access application. Unset denies all access. */
+	ADMIN_EMAIL?: string;
+	ADMIN_ACCESS_ISSUER?: string;
+	ADMIN_ACCESS_AUDIENCE?: string;
 	/**
 	 * Comma-separated registrable domains whose jobs skip the real-send guard.
 	 * It exists for the managed test system only: those submissions are real by

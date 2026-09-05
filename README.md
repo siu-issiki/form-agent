@@ -139,3 +139,9 @@ production executorは`AGENT_EXECUTOR_ENABLED=true`、`AGENT_MODEL`、`OPENAI_AP
 `AGENT_DRY_RUN`が明示的な`false`以外の場合は`submit`ツール自体をモデルへ公開したまま、信頼済みWorker handlerが送信権取得・ブラウザsubmitより前にearly-returnします。productionは実送信を有効にしています。実効モードはジョブ登録時に保存され、後のdeployでは変わりません。旧形式のジョブは常にdry-runとして扱います。送信なし検証ではジョブpayloadへbooleanの`_formAgentDryRun: true`を指定すると、production設定より優先してdry-runを強制できます。
 
 executor は `sent` / `prohibited` / `uncertain` / `failed` の構造化結果だけを返します。`sent` は制限付き `submit` ツールが D1 へ結果を保存済みの場合だけ確定し、送信権取得後の切断や矛盾した結果は `uncertain` として自動再試行を止めます。
+
+## 管理画面
+
+送信一覧・ジョブ詳細と証跡・日本時間の日別実績を `/admin` で閲覧できます。本人のCloudflare Access認証が必要です。[設定と集計の定義](docs/admin-dashboard.md)を参照してください。
+
+ローカルの架空データプレビューは `bun tools/admin-preview.ts` で起動します。
