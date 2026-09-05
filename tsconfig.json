@@ -41,6 +41,8 @@
 		"test/run-agent-e2e.ts",
 		"tools/campaign-continuous.ts",
 		"tools/continuous-state.ts",
-		"test/continuous-state.test.ts"
+		"test/continuous-state.test.ts",
+		"tools/continuous-evidence.ts",
+		"test/continuous-evidence.test.ts"
 	]
 }

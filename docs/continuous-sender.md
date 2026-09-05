@@ -69,3 +69,22 @@ manifestの除外行には同じjobIdが現れる場合があるが、登録対�
 `bun test test/continuous-state.test.ts`は外部APIを呼ばず、slot補充、unknown保持、intent/crash再開、pause競合、release gate、domain除外、timeout/halt、durable journal、single writer、API応答の内容照合を検証する。
 
 clear-haltはactive照会の前に一度だけ適用し、その照会で発見した不整合やtimeoutは再度停止します。release確認を以前のrevisionから使い回しません。
+
+## 非同期の証跡照合
+
+`tools/continuous-evidence.ts` は sender と別プロセスで動かす。journal の終端ジョブを最大 4 件並列で読み、D1・Job API・journal の結果と証跡集合を照合し、R2 の各オブジェクトを SHA-256 と byte 数で検証する。pending/running/submitting は終端として扱わず、dead_lettered も収集対象に含む。
+
+```sh
+bun --env-file=.env.e2e tools/continuous-evidence.ts \
+  --repo /absolute/path/to/form-agent \
+  --journal /absolute/path/to/sender-state/journal.jsonl \
+  --output /absolute/path/to/collector-state
+```
+
+`FORM_AGENT_JOB_API_TOKEN` と、指定 repo の Wrangler から D1/R2 を読める認証が必要。API は固定の本番エンドポイントを使う。`--repo` は対応する本番 D1/R2 binding を持つ checkout を指定する。初期値が過去の運用ディレクトリなので、別キャンペーンでは上記の全パスを明示する。認証値はログや Git に保存しない。
+
+collector は `summary.json`、ジョブごとの `verified/` checkpoint、`evidence/` の検証済み bytes と `tracker-candidates.json` を保存する。証跡には送信内容が写る場合があるため出力先を共有 Git の外に置く。ディレクトリは mode 700、保存ファイルは mode 600 とし、API の生 payload は checkpoint に保存しない。`tracker-candidates.json` の理由別集計は診断候補であり、ツール起因の確定結果ではない。
+
+`--once` は 1 周照合して終了する。`--job-ids id1,id2 --output /absolute/path/to/new-audit` は journal の代わりに指定終端 ID を API で読み、同様に 1 周照合する。新しい独立監査には空の出力先を使う。既存 checkpoint の再開は以前の照合記録を再利用するため、全 R2 bytes を毎回読み直した証明にはならない。`summary.json` の terminal/verified/pending、journalError、failures と各 checkpoint の captureFailures を確認し、件数が揃い captureFailures も 0 の場合に証跡完備と判断する。
+
+PID lock `collector.pid` は同じ出力先での二重起動を拒否する。停止時はその PID に SIGTERM を送り、進行中の最大 4 件を終え、プロセス終了と PID lock 削除を確認する。sender の登録・再送は行わない。
