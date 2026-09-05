@@ -42,7 +42,7 @@
 ./node_modules/.bin/wrangler versions view <ACTIVE_VERSION_ID>
 ```
 
-deploymentが1つのversionへ100%配信されていること、そのactive versionで`AGENT_DRY_RUN ("true")`であることを確認してから配送を再開する。確認できない場合はpauseのまま停止する。
+deploymentが1つのversionへ100%配信されていること、そのactive versionで`AGENT_DRY_RUN ("true")`であることを確認する。この設定は登録済みジョブをdry-runに変更しない。配送を再開するのは、残存する`pending`ジョブの実効モードと対象を確認し、その実行を続行する場合だけにする。確認できない場合はpauseのまま停止する。
 
 ```bash
 ./node_modules/.bin/wrangler queues resume-delivery form-agent-jobs
@@ -77,26 +77,25 @@ deploymentが1つのversionへ100%配信されていること、そのactive ver
 
 実送信ジョブを作れる経路は`tools/campaign-send.ts`だけである。`tools/campaign-dry-run.ts`は`_formAgentDryRun: true`固定のままで、実送信できない。
 
-Worker側は`POST /jobs`で実送信ジョブ（`_formAgentEffectiveDryRun`が`false`）になる場合だけ次の4つを検証する。1つでも満たさなければジョブを作らない。
+Worker側は`POST /jobs`で実送信ジョブ（`_formAgentEffectiveDryRun`が`false`）になる場合だけ次の3つを検証する。1つでも満たさなければジョブを作らない。
 
 | 検証 | 失敗時 |
 | --- | --- |
 | payloadに承認記録`_formAgentSendApproval`があること | 400 `SEND_APPROVAL_REQUIRED` |
 | `dryRunJobId`のジョブが存在し、同じ`targetUrl`のdry-runで、`prohibited` / `DRY_RUN_COMPLETE`で終わっていること | 400 `DRY_RUN_NOT_COMPLETED` |
 | そのdry-runと実送信の内容フィンガープリント（`targetUrl` + `companyId` + `payload.formValues`のSHA-256）が一致すること | 400 `DRY_RUN_CONTENT_MISMATCH` |
-| 当日（UTC）に作成済みの実送信ジョブ数が`REAL_SEND_DAILY_CAP`未満であること | 429 `REAL_SEND_CAP_REACHED` |
 
 承認記録はpayloadへそのまま保存し、`GET /jobs/:id`とD1で「誰がいつどのdry-runに対して承認したか」を後から追える。承認記録はモデルにも送信前レビューにも渡さない。
 
-すでに`pending`で存在する実送信ジョブの再登録は、`created_at`が当日UTCの場合だけ再queueする。日を跨いでいた場合は再queueせず409 `REAL_SEND_STALE`を返す。日次上限は作成時にしか数えないため、翌日に再queueするとその日の枠を消費せずに送信されてしまうためである。
+`pending`の実送信ジョブは日を跨いでも同じ内容で再登録できる。再登録時も承認記録とdry-runの内容一致を確認し、既存ジョブを再queueする。日次の送信件数上限は設けない。
 
 ### 管理下テストシステムの免除
 
-上の4つのうち、承認記録・dry-run突合・日次上限の3つは、ジョブの`targetDomain`が`REAL_SEND_GUARD_EXEMPT_DOMAINS`（カンマ区切りの登録可能ドメイン）のいずれかと一致するか、その配下のホストである場合だけ免除する。管理下テストシステムへの送信は性質上すべて実送信であり、承認すべきdry-runも無く、回帰確認のたびに実サイト向けの日次枠を消費させないためである。
+上の3つの検証は、ジョブの`targetDomain`が`REAL_SEND_GUARD_EXEMPT_DOMAINS`（カンマ区切りの登録可能ドメイン）のいずれかと一致するか、その配下のホストである場合だけ免除する。管理下テストシステムへの送信には承認対象のdry-runがないためである。
 
-**この変数は管理下テストシステム専用である。実サイトのドメインを入れてはいけない。**載せたドメインへは、人間の承認記録なしに、日次上限も消費せずに実送信できる。
+**この変数は管理下テストシステム専用である。実サイトのドメインを入れてはいけない。**載せたドメインへは、人間の承認記録なしに実送信できる。
 
-`wrangler.jsonc`の`vars`に`REAL_SEND_GUARD_EXEMPT_DOMAINS: "form-agent.workers.dev"`を置いている。テストシステムは自分たちのWorkerドメイン配下（`form-agent-test-system.form-agent.workers.dev` / `form-agent-test-external.form-agent.workers.dev`）にあるため、この1件で足りる。免除で受理したジョブはpayloadに`_formAgentRealSendGuardExempt: true`を持ち、D1の`real_send`列は0になるので、日次上限のカウントにも「実送信件数」の集計にも入らない。
+`wrangler.jsonc`の`vars`に`REAL_SEND_GUARD_EXEMPT_DOMAINS: "form-agent.workers.dev"`を置いている。テストシステムは自分たちのWorkerドメイン配下（`form-agent-test-system.form-agent.workers.dev` / `form-agent-test-external.form-agent.workers.dev`）にあるため、この1件で足りる。免除で受理したジョブはpayloadに`_formAgentRealSendGuardExempt: true`を持ち、D1の`real_send`列は0になるので、通常の「実送信件数」の集計には入らない。
 
 免除ジョブと通常の実送信ジョブを区別して数えるときは`real_send`列で切り分ける。
 
@@ -105,35 +104,11 @@ Worker側は`POST /jobs`で実送信ジョブ（`_formAgentEffectiveDryRun`が`f
   "SELECT real_send,COUNT(*) AS count FROM jobs WHERE created_at >= date('now') GROUP BY real_send;"
 ```
 
-### 日次上限の設定
+### 送信件数の指定
 
-`REAL_SEND_DAILY_CAP`は`wrangler.jsonc`に置かない。未設定・空・整数以外はすべて0として扱い、実送信ジョブを一切受け付けない。上限を開くのはdeploy時の`--var`だけである。免除ドメイン向けのジョブはこの上限の対象外なので、管理下テストシステムの回帰確認に`--var`は要らない。
+日次の送信件数上限はない。`REAL_SEND_DAILY_CAP`は使用せず、送信前後のdeployも不要である。各回の対象は承認ファイルのentriesで指定し、`campaign-send`の`--max-sends`で意図しないバッチ拡大を防ぐ（既定5件、最大50件）。
 
-`--var`を使うdeployでは通常設定の変数もすべて明示する。1つでも落とすとそのdeployから消えるおそれがある。
-
-```bash
-./node_modules/.bin/wrangler deploy \
-  --var AGENT_EXECUTOR_ENABLED:true \
-  --var AGENT_MODEL:gpt-5.6-luna \
-  --var AGENT_DRY_RUN:false \
-  --var REAL_SEND_GUARD_EXEMPT_DOMAINS:form-agent.workers.dev \
-  --var REAL_SEND_DAILY_CAP:5
-./node_modules/.bin/wrangler deployments status --json
-./node_modules/.bin/wrangler versions view <ACTIVE_VERSION_ID>
-```
-
-active versionが1つ・100%で、`AGENT_DRY_RUN ("false")`と`REAL_SEND_DAILY_CAP ("5")`の両方が見えることを確認してから実行する。`REAL_SEND_GUARD_EXEMPT_DOMAINS`が`form-agent.workers.dev`だけであることも同時に確認する。ここに実サイトのドメインが混ざっていれば、そのdeployは中止する。
-
-### 日次上限の解除
-
-引数なしのdeployは`wrangler.jsonc`のvarsだけを配るため、`REAL_SEND_DAILY_CAP`が消えて上限0に戻る。実送信の枠を閉じる操作はこれで足りる。
-
-```bash
-./node_modules/.bin/wrangler deploy
-./node_modules/.bin/wrangler versions view <ACTIVE_VERSION_ID>
-```
-
-active versionの環境変数一覧に`REAL_SEND_DAILY_CAP`が無いことを確認する。
+実行前はactive versionが1つ・100%で、`AGENT_DRY_RUN ("false")`、`REAL_SEND_GUARD_EXEMPT_DOMAINS`が管理下テストシステムのドメインだけであることを確認する。通常のWorker deploy後も同じ手順で送信できる。
 
 ### 承認ファイルの作り方
 
@@ -160,7 +135,7 @@ active versionの環境変数一覧に`REAL_SEND_DAILY_CAP`が無いことを確
 1. migration `0007_real_send.sql`をremote D1へ適用済みであることを確認する（「D1 schema migrationを含むデプロイ」の手順に従う）。
 2. 対象行のdry-runを完了させ、結果を目視で確認する。
 3. 承認ファイルを作る。
-4. `REAL_SEND_DAILY_CAP`を今回の件数以上にしてdeployし、active versionを確認する。
+4. active versionと実送信モードを確認する。送信枠を変更するdeployは不要である。
 5. Queue配送がresumeされていることを確認する。
 6. 送信を実行する。campaign名はdry-runと必ず別にする。同じ名前にするとジョブIDが衝突し、409 `JOB_ID_CONFLICT`になる。
 
@@ -205,19 +180,15 @@ JOB_API_TOKEN=... bun run campaign:send \
 
 ### 実送信の緊急停止
 
-実送信を止める操作は2つある。両方行う。
+実送信の配送を停止する。
 
 ```bash
-./node_modules/.bin/wrangler deploy
 ./node_modules/.bin/wrangler queues pause-delivery form-agent-jobs
 ```
 
-1つ目のdeployで`REAL_SEND_DAILY_CAP`が消え、新しい実送信ジョブは429で拒否される。2つ目のpauseで、すでにQueueへ載っているジョブの配送が止まる。実行中のConsumerは取り消されないため、「緊急停止」の手順で`running` / `submitting`が0件になるまで確認する。
+実行中のConsumerは取り消されないため、対象ジョブとBrowserUse sessionを確認する。単なるWorker deployは停止操作ではない。日次上限はなく、`AGENT_DRY_RUN`の変更も登録済みジョブの実効モードを変えないため、停止中はQueueのpauseを維持する。
 
-停止中に`pending`のまま日を跨いだ実送信ジョブは、resume後に同じ内容で再登録しても409 `REAL_SEND_STALE`になる。承認と上限判定をやり直す設計であるためで、再開時は次のいずれかを選ぶ。
-
-- そのまま配送をresumeして既存の`pending`を流す。Queueのメッセージは残っているため再登録は不要である。
-- 流さない場合は、対象を確認したうえで新しいcampaign名でdry-runからやり直し、承認ファイルを作り直す。既存ジョブを手作業で`pending`へ戻したり削除したりしない。
+再開時は残っている`pending`ジョブを確認し、それらの送信を続行する場合だけ配送をresumeする。日を跨いでも既存Queueメッセージは配送対象となる。登録応答やQueue投入の失敗を復旧する場合は、同じID・同じ内容で再登録する。`submitting` / `sent` / `uncertain`は再送しない。
 
 ```bash
 ./node_modules/.bin/wrangler d1 execute form-agent --remote --command \

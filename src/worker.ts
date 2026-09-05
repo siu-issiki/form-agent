@@ -22,7 +22,6 @@ import {
 	PAYLOAD_KEY_PATTERN,
 } from "./restricted-browser";
 import {
-	isRealSendPayload,
 	isSendApproval,
 	REAL_SEND_GUARD_EXEMPT_KEY,
 	SEND_APPROVAL_KEY,
@@ -69,30 +68,10 @@ export async function registerJob(
 	}
 
 	if (job.status === "pending") {
-		// A real send that has sat pending across a UTC day boundary no longer
-		// sits under the cap it was accepted against, and its approval was made
-		// against a dry-run of another day. Re-queueing it would send without
-		// either check being current, so the operator has to re-approve.
-		if (isRealSendPayload(job.payload) && !isSameUtcDay(job.createdAt, now)) {
-			throw new StaleRealSendError(job.id);
-		}
 		await queue.send({ jobId: job.id });
 	}
 
 	return { created, job };
-}
-
-/** Compares two ISO timestamps by UTC day; an unparsable value is never equal. */
-function isSameUtcDay(left: string, right: string): boolean {
-	const leftDay = utcDay(left);
-	return leftDay !== null && leftDay === utcDay(right);
-}
-
-function utcDay(value: string): string | null {
-	const time = Date.parse(value);
-	return Number.isFinite(time)
-		? new Date(time).toISOString().slice(0, 10)
-		: null;
 }
 
 const worker: ExportedHandler<Env, JobMessage> = {
@@ -138,7 +117,7 @@ export async function handleHttpRequest(
 		}
 
 		const now = new Date();
-		const refused = await refuseUnapprovedRealSend(env, input, now);
+		const refused = await refuseUnapprovedRealSend(env, input);
 		if (refused) return refused;
 
 		let registered: RegisterJobResult;
@@ -152,9 +131,6 @@ export async function handleHttpRequest(
 		} catch (error) {
 			if (error instanceof ConflictingJobError) {
 				return apiJson({ error: "JOB_ID_CONFLICT" }, 409);
-			}
-			if (error instanceof StaleRealSendError) {
-				return apiJson({ error: "REAL_SEND_STALE" }, 409);
 			}
 			throw error;
 		}
@@ -189,7 +165,6 @@ const REAL_SEND_REFUSAL_STATUS: Record<RealSendRefusal, number> = {
 	SEND_APPROVAL_REQUIRED: 400,
 	DRY_RUN_NOT_COMPLETED: 400,
 	DRY_RUN_CONTENT_MISMATCH: 400,
-	REAL_SEND_CAP_REACHED: 429,
 };
 
 /**
@@ -200,14 +175,8 @@ const REAL_SEND_REFUSAL_STATUS: Record<RealSendRefusal, number> = {
 async function refuseUnapprovedRealSend(
 	env: Env,
 	input: JobInput,
-	now: Date,
 ): Promise<Response | null> {
-	const decision = await checkRealSendGuard(
-		input,
-		now,
-		realSendDailyCap(env.REAL_SEND_DAILY_CAP),
-		new D1JobStore(env.DB),
-	);
+	const decision = await checkRealSendGuard(input, new D1JobStore(env.DB));
 	if (decision.allowed) return null;
 	return apiJson(
 		{ error: decision.refusal },
@@ -216,23 +185,13 @@ async function refuseUnapprovedRealSend(
 }
 
 /**
- * Reads the daily real-send cap. Anything that is not a plain non-negative
- * integer is 0, so a typo in a deploy flag closes the path instead of opening
- * an unintended one.
- */
-export function realSendDailyCap(value: string | undefined): number {
-	const trimmed = value?.trim() ?? "";
-	return /^\d{1,3}$/.test(trimmed) ? Number(trimmed) : 0;
-}
-
-/**
  * Reads the domains whose jobs skip the real-send guard. Each entry must be a
  * registrable domain; an entry that is not one is dropped, so a typo removes
  * an exemption rather than granting a wider one. Unset or empty means no
- * exemption at all, which is the state a plain deploy leaves behind.
+ * exemption at all.
  *
  * This list is for the managed test system only. A customer domain listed here
- * could be sent to with no approval record and without spending the day's cap.
+ * could be sent to with no approval record.
  */
 export function realSendGuardExemptDomains(
 	value: string | undefined,
@@ -269,7 +228,7 @@ export function isRealSendGuardExempt(
 
 /**
  * Stamps the exemption the API decided from its own configuration. The key is
- * always removed first: it is what keeps a job out of the daily real-send
+ * always removed first: it is what keeps a job out of the real-send
  * count, so a caller must never be able to set it. A job that is not exempt
  * keeps exactly the payload it arrived with.
  */
@@ -486,12 +445,6 @@ class InvalidJobRequestError extends Error {
 class ConflictingJobError extends Error {
 	constructor(id: string) {
 		super(`Job input conflicts with the existing job: ${id}`);
-	}
-}
-
-class StaleRealSendError extends Error {
-	constructor(id: string) {
-		super(`Pending real-send job is from an earlier UTC day: ${id}`);
 	}
 }
 

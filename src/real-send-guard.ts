@@ -9,8 +9,6 @@ import {
 /** Reason code a job carries once it stopped at the dry-run boundary. */
 export const DRY_RUN_COMPLETE_REASON_CODE = "DRY_RUN_COMPLETE";
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-
 /**
  * The part of a stored job the guard reads. It is the intersection of the
  * Worker's own `Job` and the `JobState` the operator tool reads back over the
@@ -30,8 +28,7 @@ export interface DryRunRecord {
 export type RealSendRefusal =
 	| "SEND_APPROVAL_REQUIRED"
 	| "DRY_RUN_NOT_COMPLETED"
-	| "DRY_RUN_CONTENT_MISMATCH"
-	| "REAL_SEND_CAP_REACHED";
+	| "DRY_RUN_CONTENT_MISMATCH";
 
 export type RealSendDecision =
 	| { allowed: true }
@@ -40,11 +37,6 @@ export type RealSendDecision =
 /** The job reads the guard needs; `D1JobStore` satisfies it as it stands. */
 export interface RealSendGuardStore {
 	find(id: string): Promise<DryRunRecord | null>;
-	countRealSendJobsCreatedBetween(
-		startAt: string,
-		endAt: string,
-		excludeId: string,
-	): Promise<number>;
 }
 
 /**
@@ -83,35 +75,12 @@ export async function matchesDryRunContent(
 	return approved === requested;
 }
 
-/** The UTC day `now` falls in, as the half-open ISO range the count uses. */
-export function utcDayRange(now: Date): { from: string; to: string } {
-	const dayStart = Date.UTC(
-		now.getUTCFullYear(),
-		now.getUTCMonth(),
-		now.getUTCDate(),
-	);
-	return {
-		from: new Date(dayStart).toISOString(),
-		to: new Date(dayStart + DAY_MS).toISOString(),
-	};
-}
-
 /**
- * Gate every job that would reach a real submission. A dry-run job is not
- * touched. A real-send job must carry a human approval record, must name a
- * dry-run that already reached the dry-run boundary carrying the same content,
- * and must fit inside the day's cap. The cap defaults to 0, so the path stays
- * shut unless a deploy explicitly opens it.
- *
- * The count and the insert are not one transaction. Real sends are registered
- * by a single operator-run tool, so the window is narrow, and overshooting it
- * would take two concurrent runs; the approval record and the per-row dry-run
- * check still hold in that case.
+ * Gate every real submission on a human approval record and a completed
+ * dry-run carrying the same content. Registration has no daily volume limit.
  */
 export async function checkRealSendGuard(
 	input: JobInput,
-	now: Date,
-	dailyCap: number,
 	store: RealSendGuardStore,
 ): Promise<RealSendDecision> {
 	if (input.payload[EFFECTIVE_DRY_RUN_KEY] !== false) return { allowed: true };
@@ -134,13 +103,5 @@ export async function checkRealSendGuard(
 		return { allowed: false, refusal: "DRY_RUN_CONTENT_MISMATCH" };
 	}
 
-	if (dailyCap < 1) {
-		return { allowed: false, refusal: "REAL_SEND_CAP_REACHED" };
-	}
-	const { from, to } = utcDayRange(now);
-	const used = await store.countRealSendJobsCreatedBetween(from, to, input.id);
-	if (used >= dailyCap) {
-		return { allowed: false, refusal: "REAL_SEND_CAP_REACHED" };
-	}
 	return { allowed: true };
 }

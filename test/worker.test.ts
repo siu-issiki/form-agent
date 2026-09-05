@@ -48,7 +48,6 @@ import worker, {
 	handleHttpRequest,
 	isAgentDryRun,
 	isRealSendGuardExempt,
-	realSendDailyCap,
 	realSendGuardExemptDomains,
 	registerJob,
 } from "../src/worker";
@@ -713,7 +712,7 @@ describe("Job HTTP API", () => {
 		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
 		const realSubmit = await handleHttpRequest(
 			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
-			{ ...apiEnv, AGENT_DRY_RUN: "false", REAL_SEND_DAILY_CAP: "5" },
+			{ ...apiEnv, AGENT_DRY_RUN: "false" },
 		);
 		expect(realSubmit.status).toBe(201);
 		expect(
@@ -1028,7 +1027,6 @@ describe("Real-send guard", () => {
 		EVIDENCE_BUCKET: env.EVIDENCE_BUCKET,
 		JOB_API_TOKEN: apiToken,
 		AGENT_DRY_RUN: "false",
-		REAL_SEND_DAILY_CAP: "2",
 		JOB_QUEUE: {
 			async send(message: JobMessage) {
 				queued.push(message);
@@ -1049,18 +1047,6 @@ describe("Real-send guard", () => {
 
 	beforeEach(() => {
 		queued.length = 0;
-	});
-
-	test("reads the daily cap and closes it for anything unparsable", () => {
-		expect(realSendDailyCap("5")).toBe(5);
-		expect(realSendDailyCap(" 5 ")).toBe(5);
-		expect(realSendDailyCap("0")).toBe(0);
-		expect(realSendDailyCap(undefined)).toBe(0);
-		expect(realSendDailyCap("")).toBe(0);
-		expect(realSendDailyCap("five")).toBe(0);
-		expect(realSendDailyCap("-1")).toBe(0);
-		expect(realSendDailyCap("2.5")).toBe(0);
-		expect(realSendDailyCap("1e3")).toBe(0);
 	});
 
 	test("reads the exempt domains and drops anything but a registrable domain", () => {
@@ -1100,12 +1086,10 @@ describe("Real-send guard", () => {
 		expect(isRealSendGuardExempt("form-agent.workers.dev", [])).toBe(false);
 	});
 
-	test("accepts a test-system send without an approval record or a cap", async () => {
-		const { REAL_SEND_DAILY_CAP: _cap, ...closed } = sendEnv;
-
+	test("accepts a test-system send without an approval record", async () => {
 		const response = await handleHttpRequest(
 			jobRequest("POST", "/jobs", testSystemInput, apiToken),
-			{ ...closed, REAL_SEND_GUARD_EXEMPT_DOMAINS: exemptDomain },
+			{ ...sendEnv, REAL_SEND_GUARD_EXEMPT_DOMAINS: exemptDomain },
 		);
 
 		expect(response.status).toBe(201);
@@ -1127,38 +1111,22 @@ describe("Real-send guard", () => {
 
 		expect(refused.status).toBe(400);
 		expect(await refused.json()).toEqual({ error: "SEND_APPROVAL_REQUIRED" });
-
-		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
-		await createRealSend("job-send-earlier", new Date().toISOString());
-		const capped = await handleHttpRequest(
-			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
-			{
-				...sendEnv,
-				REAL_SEND_DAILY_CAP: "1",
-				REAL_SEND_GUARD_EXEMPT_DOMAINS: exemptDomain,
-			},
-		);
-
-		expect(capped.status).toBe(429);
-		expect(await capped.json()).toEqual({ error: "REAL_SEND_CAP_REACHED" });
-		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
 	});
 
-	test("does not count an exempt send against the daily cap", async () => {
-		const capOfOne = {
+	test("keeps exempt test sends out of real-send reporting", async () => {
+		const exemptEnv = {
 			...sendEnv,
-			REAL_SEND_DAILY_CAP: "1",
 			REAL_SEND_GUARD_EXEMPT_DOMAINS: exemptDomain,
 		};
 		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
 
 		const exempted = await handleHttpRequest(
 			jobRequest("POST", "/jobs", testSystemInput, apiToken),
-			capOfOne,
+			exemptEnv,
 		);
 		const approved = await handleHttpRequest(
 			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
-			capOfOne,
+			exemptEnv,
 		);
 
 		expect(exempted.status).toBe(201);
@@ -1329,50 +1297,18 @@ describe("Real-send guard", () => {
 		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
 	});
 
-	test("refuses every real send while the daily cap is unset", async () => {
-		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
-		const { REAL_SEND_DAILY_CAP: _cap, ...closed } = sendEnv;
-
-		const response = await handleHttpRequest(
-			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
-			closed,
-		);
-
-		expect(response.status).toBe(429);
-		expect(await response.json()).toEqual({ error: "REAL_SEND_CAP_REACHED" });
-		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
-		expect(queued).toEqual([]);
-	});
-
-	test("refuses a real send once the daily cap is reached", async () => {
+	test("accepts approved real sends without a daily cap setting or remaining quota", async () => {
 		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
 		await createRealSend("job-send-earlier", new Date().toISOString());
-
-		const response = await handleHttpRequest(
-			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
-			{ ...sendEnv, REAL_SEND_DAILY_CAP: "1" },
-		);
-
-		expect(response.status).toBe(429);
-		expect(await response.json()).toEqual({ error: "REAL_SEND_CAP_REACHED" });
-		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
-		expect(queued).toEqual([]);
-	});
-
-	test("counts only the real sends created on the same UTC day", async () => {
-		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
-		await createRealSend(
-			"job-send-yesterday",
-			new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
-		);
-
-		const response = await handleHttpRequest(
-			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
-			{ ...sendEnv, REAL_SEND_DAILY_CAP: "1" },
-		);
-
-		expect(response.status).toBe(201);
-		expect(queued).toEqual([{ jobId: input.id }]);
+		for (let index = 0; index < 3; index += 1) {
+			const id = `job-unlimited-${index}`;
+			const response = await handleHttpRequest(
+				jobRequest("POST", "/jobs", approvedSend(id), apiToken),
+				sendEnv,
+			);
+			expect(response.status).toBe(201);
+		}
+		expect(queued).toHaveLength(3);
 	});
 
 	test("keeps the approval record on an accepted real send", async () => {
@@ -1398,17 +1334,16 @@ describe("Real-send guard", () => {
 		});
 	});
 
-	test("does not count a repeated registration of the same real send", async () => {
+	test("keeps repeated real-send registration idempotent", async () => {
 		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
-		const capOfOne = { ...sendEnv, REAL_SEND_DAILY_CAP: "1" };
 
 		const created = await handleHttpRequest(
 			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
-			capOfOne,
+			sendEnv,
 		);
 		const repeated = await handleHttpRequest(
 			jobRequest("POST", "/jobs", approvedSend(input.id), apiToken),
-			capOfOne,
+			sendEnv,
 		);
 
 		expect(created.status).toBe(201);
@@ -1448,7 +1383,7 @@ describe("Real-send guard", () => {
 		expect(queued).toEqual([{ jobId: input.id }]);
 	});
 
-	test("refuses to re-queue a pending real send from an earlier day", async () => {
+	test("re-queues an approved pending real send from an earlier day", async () => {
 		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
 		const pending = approvedSend(input.id);
 		await new D1JobStore(env.DB).create(
@@ -1464,9 +1399,9 @@ describe("Real-send guard", () => {
 			sendEnv,
 		);
 
-		expect(response.status).toBe(409);
-		expect(await response.json()).toEqual({ error: "REAL_SEND_STALE" });
-		expect(queued).toEqual([]);
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({ created: false });
+		expect(queued).toEqual([{ jobId: input.id }]);
 	});
 
 	test("re-queues a pending real send created on the same day", async () => {
@@ -1491,7 +1426,6 @@ describe("Real-send guard", () => {
 	});
 
 	test("re-queues a pending dry-run job from an earlier day", async () => {
-		const { REAL_SEND_DAILY_CAP: _cap, ...closed } = sendEnv;
 		const dryRunInput = {
 			...input,
 			payload: { ...input.payload, _formAgentDryRun: true },
@@ -1506,7 +1440,7 @@ describe("Real-send guard", () => {
 
 		const response = await handleHttpRequest(
 			jobRequest("POST", "/jobs", dryRunInput, apiToken),
-			closed,
+			sendEnv,
 		);
 
 		expect(response.status).toBe(200);
@@ -1514,7 +1448,6 @@ describe("Real-send guard", () => {
 	});
 
 	test("leaves a dry-run job outside the real-send guard", async () => {
-		const { REAL_SEND_DAILY_CAP: _cap, ...closed } = sendEnv;
 		const dryRunInput = {
 			...input,
 			payload: { ...input.payload, _formAgentDryRun: true },
@@ -1522,7 +1455,7 @@ describe("Real-send guard", () => {
 
 		const response = await handleHttpRequest(
 			jobRequest("POST", "/jobs", dryRunInput, apiToken),
-			closed,
+			sendEnv,
 		);
 
 		expect(response.status).toBe(201);
@@ -1575,7 +1508,7 @@ async function completeDryRun(
 	);
 }
 
-/** Seeds a job that already consumed one slot of the daily real-send cap. */
+/** Seeds an earlier real-send job for registration tests. */
 async function createRealSend(id: string, createdAt: string): Promise<void> {
 	await new D1JobStore(env.DB).create(
 		{
