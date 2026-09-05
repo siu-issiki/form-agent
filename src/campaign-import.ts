@@ -3,7 +3,6 @@ import { sha256Hex } from "./digest";
 import {
 	DRY_RUN_KEY,
 	EFFECTIVE_DRY_RUN_KEY,
-	JOB_ID_PATTERN,
 	type JobInput,
 	MAX_ATTEMPTS_KEY,
 } from "./job";
@@ -42,11 +41,7 @@ export interface CampaignCandidate {
 export interface CampaignFilterResult {
 	eligible: CampaignCandidate[];
 	excluded: Record<string, number>;
-	/**
-	 * Simple-layout rows whose link was `http://` and got rewritten to
-	 * `https://` before validation. 0 when the file has no such rows, and
-	 * always 0 for the full 30-column layout, which never rewrites its URL.
-	 */
+	/** Compatibility metric: explicit source schemes are preserved, so always 0. */
 	upgradedToHttps: number;
 }
 
@@ -109,7 +104,7 @@ const SIMPLE_LINK_COLUMNS = [
  */
 const SIMPLE_TEXT_COLUMNS = ["件名", "本文"] as const;
 
-/** Carried twice in a registration file: as written, then digits only. */
+/** May be repeated with the same number in a different spelling. */
 const PHONE_LABEL = "電話番号";
 
 /**
@@ -119,8 +114,7 @@ const PHONE_LABEL = "電話番号";
  * label rather than on position, and an alias never wins over the canonical
  * label when both are present.
  *
- * `phoneDigits` has no label of its own: it is the second "電話番号" entry, the
- * digits-only spelling of the same number.
+ * Repeated "電話番号" entries also specify phoneDigits and must agree.
  */
 const REGISTRATION_LABELS: Array<[string, readonly string[]]> = [
 	["lastName", ["苗字"]],
@@ -143,14 +137,18 @@ const REGISTRATION_LABELS: Array<[string, readonly string[]]> = [
 	["addressPart2", ["住所2"]],
 	["addressPart3", ["住所3"]],
 	["phone", [PHONE_LABEL]],
+	["phoneDigits", ["電話番号（数字のみ）"]],
 	["phonePart1", ["電話番号1", "電話1"]],
 	["phonePart2", ["電話番号2", "電話2"]],
 	["phonePart3", ["電話番号3", "電話3"]],
 	["postalCode", ["郵便番号"]],
+	["postalCodeDigits", ["郵便番号（数字のみ）"]],
 	["postalCodePart1", ["郵便番号1"]],
 	["postalCodePart2", ["郵便番号2"]],
 	["companyWebsite", ["会社HP", "サービスページ"]],
 	["email", ["メールアドレス"]],
+	["emailLocalPart", ["メールアドレス（@より前）"]],
+	["emailDomain", ["メールアドレス（@より後）"]],
 	["companyName", ["会社名"]],
 	["department", ["部署", "部署名"]],
 	["jobTitle", ["役職"]],
@@ -216,11 +214,6 @@ export function mapRegistrationValues(
 			}
 		}
 	}
-	const phones = byLabel.get(PHONE_LABEL) ?? [];
-	// The second "電話番号" is the digits-only spelling. A file that carries one
-	// number uses it for both keys rather than leaving the digits-only key out.
-	const phoneDigits = phones[1] ?? phones[0];
-	if (phoneDigits) values.phoneDigits = phoneDigits;
 
 	const missing = REQUIRED_REGISTRATION_KEYS.filter((key) => !values[key]);
 	if (missing.length > 0) {
@@ -230,12 +223,143 @@ export function mapRegistrationValues(
 		);
 	}
 
+	deriveRegistrationValues(values, byLabel);
+
 	log({
 		event: "campaign_registration_summary",
 		mappedKeys: Object.keys(values).length,
 		unknownLabels,
 	});
 	return values;
+}
+
+/** Derive before building a job, so approval hashes cover every permitted value. */
+function deriveRegistrationValues(
+	values: Record<string, string>,
+	byLabel: ReadonlyMap<string, string[]>,
+): void {
+	const provided = (key: string): string[] =>
+		(REGISTRATION_LABELS.find(([name]) => name === key)?.[1] ?? []).flatMap(
+			(label) => byLabel.get(label) ?? [],
+		);
+	const conflict = (key: string): never => {
+		// Never include input values, labels or contact details in errors/logs.
+		throw new Error(
+			`Registration data has invalid or conflicting fields: ${key}`,
+		);
+	};
+	const domesticPhone = (value: string): string | undefined => {
+		if (!/^[0-9]+(?:[- ][0-9]+)*$/.test(value)) return undefined;
+		const digits = value.replace(/[- ]/g, "");
+		return /^0[0-9]{9,10}$/.test(digits) ? digits : undefined;
+	};
+	let phone = domesticPhone(values.phone ?? "");
+	const phoneParts = [values.phonePart1, values.phonePart2, values.phonePart3];
+	if (phone) {
+		if (phoneParts.some((part) => part !== undefined && !/^[0-9]+$/.test(part)))
+			conflict("phoneDigits");
+		if (phoneParts.every((part) => part !== undefined)) {
+			if (phoneParts.join("") !== phone) conflict("phoneDigits");
+		} else {
+			if (values.phonePart1 && !phone.startsWith(values.phonePart1))
+				conflict("phoneDigits");
+			if (values.phonePart3 && !phone.endsWith(values.phonePart3))
+				conflict("phoneDigits");
+			// Without all boundaries a middle part cannot be verified safely.
+			if (values.phonePart2) phone = undefined;
+		}
+	}
+	const explicitPhones = [
+		...provided("phoneDigits"),
+		...(byLabel.get(PHONE_LABEL)?.slice(1) ?? []),
+	];
+	for (const explicit of explicitPhones) {
+		if (!phone || domesticPhone(explicit) !== phone) conflict("phoneDigits");
+	}
+	if (phone) values.phoneDigits = phone;
+	else delete values.phoneDigits;
+
+	const compactName = (value: string): string => value.replace(/[ 　]/g, "");
+	const last = values.lastNameHiragana;
+	const first = values.firstNameHiragana;
+	if (
+		last &&
+		first &&
+		/^[ぁ-ゖー]+$/.test(last) &&
+		/^[ぁ-ゖー]+$/.test(first)
+	) {
+		const full = last + first;
+		for (const explicit of provided("fullNameHiragana")) {
+			if (compactName(explicit) !== full) conflict("fullNameHiragana");
+		}
+		values.fullNameHiragana ??= full;
+	}
+
+	// Only the ordinary unquoted ASCII addr-spec can be split unambiguously.
+	const email = values.email ?? "";
+	const emailMatch =
+		/^([A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*)@([A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)$/.exec(
+			email,
+		);
+	if (emailMatch) {
+		for (const [key, part] of [
+			["emailLocalPart", emailMatch[1]],
+			["emailDomain", emailMatch[2]],
+		] as const) {
+			if (!part) continue;
+			for (const explicit of provided(key)) {
+				if (explicit !== part) conflict(key);
+			}
+			values[key] = part;
+		}
+	} else if (
+		provided("emailLocalPart").length ||
+		provided("emailDomain").length
+	) {
+		conflict("emailLocalPart/emailDomain");
+	}
+
+	const postalDigits = (value: string): string | undefined =>
+		/^[0-9]{3}-?[0-9]{4}$/.test(value) ? value.replace("-", "") : undefined;
+	const postal = values.postalCode
+		? postalDigits(values.postalCode)
+		: undefined;
+	const postalParts =
+		values.postalCodePart1 && values.postalCodePart2
+			? /^[0-9]{3}$/.test(values.postalCodePart1) &&
+				/^[0-9]{4}$/.test(values.postalCodePart2)
+				? values.postalCodePart1 + values.postalCodePart2
+				: undefined
+			: undefined;
+	const comparablePostal =
+		postal ??
+		(!values.postalCode ? provided("postalCodeDigits")[0] : undefined);
+	if (comparablePostal) {
+		if (
+			values.postalCodePart1 &&
+			values.postalCodePart1 !== comparablePostal.slice(0, 3)
+		)
+			conflict("postalCodeDigits");
+		if (
+			values.postalCodePart2 &&
+			values.postalCodePart2 !== comparablePostal.slice(3)
+		)
+			conflict("postalCodeDigits");
+	}
+	// An unsupported combined spelling is not silently replaced by its parts.
+	const derivedPostal = values.postalCode ? postal : postalParts;
+	for (const explicit of provided("postalCodeDigits")) {
+		if (
+			!/^[0-9]{7}$/.test(explicit) ||
+			(derivedPostal && explicit !== derivedPostal) ||
+			(values.postalCode && !postal)
+		)
+			conflict("postalCodeDigits");
+	}
+	const explicitPostal = provided("postalCodeDigits");
+	if (explicitPostal.some((value) => value !== explicitPostal[0]))
+		conflict("postalCodeDigits");
+	if (derivedPostal) values.postalCodeDigits = derivedPostal;
 }
 
 export function filterCampaignRows(
@@ -246,7 +370,6 @@ export function filterCampaignRows(
 	if (rows.length > 0 && !simple) assertRequiredColumns(header);
 	const eligible: CampaignCandidate[] = [];
 	const excluded: Record<string, number> = {};
-	let upgradedToHttps = 0;
 
 	for (let index = 0; index < rows.length; index += 1) {
 		const row = rows[index] ?? {};
@@ -261,10 +384,9 @@ export function filterCampaignRows(
 			continue;
 		}
 		eligible.push(outcome.candidate);
-		if (outcome.upgradedToHttps) upgradedToHttps += 1;
 	}
 
-	return { eligible, excluded, upgradedToHttps };
+	return { eligible, excluded, upgradedToHttps: 0 };
 }
 
 /**
@@ -290,7 +412,7 @@ export async function resolveRedirectHosts(
 	startUrl: string,
 	fetcher: typeof fetch = fetch,
 ): Promise<RedirectResolution> {
-	let current = validatedHttpsUrl(startUrl);
+	let current = validatedHttpUrl(startUrl);
 	const hosts = [current.hostname];
 
 	for (let redirect = 0; redirect < 7; redirect += 1) {
@@ -317,7 +439,12 @@ export async function resolveRedirectHosts(
 			};
 		}
 
-		current = validatedHttpsUrl(new URL(location, current).toString());
+		const next = validatedHttpUrl(new URL(location, current).toString());
+		// Preserving an explicit HTTP source must not enable HTTPS downgrades.
+		if (current.protocol === "https:" && next.protocol === "http:") {
+			throw new Error("HTTPS redirects must not downgrade to HTTP");
+		}
+		current = next;
 		hosts.push(current.hostname);
 	}
 
@@ -458,13 +585,13 @@ function assertRegisterableJob(job: JobInput, realSend: boolean): void {
 	}
 }
 
-/** One approved CSV row, naming the dry-run it already passed. */
-export interface SendApprovalEntry {
-	/** `sourceRow` of the dry-run job: the 1-based CSV line, header included. */
+/** One approved CSV row, bound to a dry-run or a frozen content digest. */
+export type SendApprovalEntry = Pick<SendApproval, "note"> & {
 	sourceRow: number;
-	dryRunJobId: string;
-	note?: string;
-}
+} & (
+		| { dryRunJobId: string; mode?: never; contentFingerprint?: never }
+		| { mode: "direct"; contentFingerprint: string; dryRunJobId?: never }
+	);
 
 export interface SendApprovalFile {
 	approvedBy: string;
@@ -477,8 +604,8 @@ const MAX_NOTE_LENGTH = 200;
 
 /**
  * Validates the approval file the send tool is given. Every entry has to name
- * both a CSV row and the dry-run job that row already passed, and the file may
- * not hold more entries than the run's own send limit. Duplicate rows and
+ * a CSV row and either its completed dry-run or a direct content digest. The
+ * file may not hold more entries than the run's send limit. Duplicate rows and
  * duplicate dry-run jobs are refused, because either would let one approval
  * stand for a second send.
  */
@@ -516,12 +643,29 @@ export function readSendApprovalFile(
 		if (!isRecord(entry)) {
 			throw new Error("Approval JSON holds an entry that is not an object");
 		}
-		const { sourceRow, dryRunJobId, note } = entry;
+		if (
+			Object.keys(entry).some(
+				(key) =>
+					![
+						"sourceRow",
+						"dryRunJobId",
+						"mode",
+						"contentFingerprint",
+						"note",
+					].includes(key),
+			)
+		) {
+			throw new Error("Approval entry holds an unknown key");
+		}
+		const { sourceRow, ...approvalFields } = entry;
+		const { dryRunJobId, note } = entry;
 		if (!Number.isInteger(sourceRow) || (sourceRow as number) < 2) {
 			throw new Error("Approval entry needs a sourceRow of 2 or more");
 		}
-		if (typeof dryRunJobId !== "string" || !JOB_ID_PATTERN.test(dryRunJobId)) {
-			throw new Error("Approval entry needs a valid dryRunJobId");
+		if (!isSendApproval({ approvedBy, approvedAt, ...approvalFields })) {
+			throw new Error(
+				"Approval entry needs a valid dryRunJobId or direct contentFingerprint approval",
+			);
 		}
 		if (
 			note !== undefined &&
@@ -532,16 +676,15 @@ export function readSendApprovalFile(
 		if (rows.has(sourceRow as number)) {
 			throw new Error("Approval JSON holds a duplicate sourceRow");
 		}
-		if (dryRunJobIds.has(dryRunJobId)) {
+		if (typeof dryRunJobId === "string" && dryRunJobIds.has(dryRunJobId)) {
 			throw new Error("Approval JSON holds a duplicate dryRunJobId");
 		}
 		rows.add(sourceRow as number);
-		dryRunJobIds.add(dryRunJobId);
+		if (typeof dryRunJobId === "string") dryRunJobIds.add(dryRunJobId);
 		validated.push({
 			sourceRow: sourceRow as number,
-			dryRunJobId,
-			...(note === undefined ? {} : { note }),
-		});
+			...approvalFields,
+		} as SendApprovalEntry);
 	}
 
 	return { approvedBy, approvedAt, entries: validated };
@@ -630,9 +773,11 @@ export const DEFAULT_CHOICE_CANDIDATES: Record<string, readonly string[]> = {
 		"その他",
 		"その他のお問い合わせ",
 		"その他お問い合わせ",
+		"その他問い合わせ",
 		"ご意見・ご要望",
 		"お問い合わせ",
 		"一般のお問い合わせ",
+		"一般的なお問い合わせ",
 		"その他のご相談",
 	],
 	contactMethod: [
@@ -662,8 +807,8 @@ export function mergeChoiceCandidates(
 export interface CampaignJobMode {
 	/**
 	 * Defaults to a dry-run job. A real-send job is only ever built from the
-	 * send tool, and only with the approval record that names the dry-run the
-	 * same row already passed.
+	 * send tool, with an approval bound directly to the content or to a
+	 * completed dry-run.
 	 */
 	dryRun?: boolean;
 	approval?: SendApproval;
@@ -725,9 +870,7 @@ export async function buildCampaignJob(
 	};
 }
 
-type RowOutcome =
-	| { candidate: CampaignCandidate; upgradedToHttps?: true }
-	| { reason: string };
+type RowOutcome = { candidate: CampaignCandidate } | { reason: string };
 
 function isSimpleLayout(row: CampaignCsvRow): boolean {
 	return (
@@ -753,29 +896,15 @@ function simpleLinkValue(row: CampaignCsvRow): string | undefined {
  * review columns, so the company is taken from the form URL itself and the NG
  * checks of the full layout are not applied.
  *
- * An `http://` link is rewritten to `https://` before validation rather than
- * rejected outright: this layout has no review step to catch a link that was
- * only ever copied as http, and the https variant usually answers anyway.
- * The rewrite is not itself verified here — that is what the redirect
- * preflight (`resolveRedirectHosts`, run per candidate by the dry-run tool)
- * is for. A host that only serves http fails that preflight and the row is
- * skipped there (`REDIRECT_PREFLIGHT_FAILED`), never registered as a job.
+ * Explicit HTTP and HTTPS schemes are preserved. Reachability is checked
+ * later by redirect preflight; this importer does not guess another scheme.
  */
 function simpleRowOutcome(row: CampaignCsvRow, rowNumber: number): RowOutcome {
-	const rawTargetUrl = simpleLinkValue(row);
-	if (!rawTargetUrl) return { reason: "missing_form_url" };
-	let parsedUrl: URL;
-	try {
-		parsedUrl = new URL(rawTargetUrl);
-	} catch {
-		return { reason: "invalid_or_insecure_form_url" };
-	}
-	const upgradedToHttps = parsedUrl.protocol === "http:";
-	if (upgradedToHttps) parsedUrl.protocol = "https:";
-	const targetUrl = upgradedToHttps ? parsedUrl.toString() : rawTargetUrl;
+	const targetUrl = simpleLinkValue(row);
+	if (!targetUrl) return { reason: "missing_form_url" };
 	let url: URL;
 	try {
-		url = validatedHttpsUrl(targetUrl);
+		url = validatedHttpUrl(targetUrl);
 	} catch {
 		return { reason: "invalid_or_insecure_form_url" };
 	}
@@ -799,7 +928,6 @@ function simpleRowOutcome(row: CampaignCsvRow, rowNumber: number): RowOutcome {
 			subject,
 			message,
 		},
-		...(upgradedToHttps ? { upgradedToHttps: true as const } : {}),
 	};
 }
 
@@ -830,7 +958,7 @@ function exclusionReason(row: CampaignCsvRow): string | null {
 	const url = row.問い合わせフォームURL?.trim();
 	if (!url) return "missing_form_url";
 	try {
-		validatedHttpsUrl(url);
+		validatedHttpUrl(url);
 	} catch {
 		return "invalid_or_insecure_form_url";
 	}
@@ -867,10 +995,14 @@ function required(row: CampaignCsvRow, column: string): string {
 	return value;
 }
 
-function validatedHttpsUrl(raw: string): URL {
+function validatedHttpUrl(raw: string): URL {
 	const url = new URL(raw);
-	if (url.protocol !== "https:" || url.username || url.password) {
-		throw new Error("Only public HTTPS form URLs are allowed");
+	if (
+		!["http:", "https:"].includes(url.protocol) ||
+		url.username ||
+		url.password
+	) {
+		throw new Error("Only public HTTP(S) form URLs are allowed");
 	}
 	normalizeAllowedHosts([url.hostname]);
 	return url;

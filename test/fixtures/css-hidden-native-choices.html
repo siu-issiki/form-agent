@@ -1,0 +1,20 @@
+<!doctype html><html lang="ja"><meta charset="utf-8"><title>CSS-hidden native choices</title>
+<style>
+body { font: 16px sans-serif; margin: 40px; } fieldset { margin: 24px 0; }
+label { display: inline-block; margin: 12px; cursor: pointer; }
+.none { display: none; } .transparent { opacity: 0; visibility: hidden; position: absolute; }
+input + span::before { content: '○ '; } input:checked + span::before { content: '● '; }
+.invisible { opacity: 0; }
+</style>
+<form onsubmit="event.preventDefault()">
+<fieldset><legend>お問い合わせ区分</legend>
+<label><input class="none" type="radio" name="category" value="物件の問い合わせ" checked><span>物件の問い合わせ</span></label>
+<label><input class="none" type="radio" name="category" value="その他"><span>その他</span></label>
+</fieldset>
+<label><input class="none" type="checkbox" name="privacy"><span>個人情報保護方針に同意する</span></label>
+<label><input class="transparent" type="checkbox" name="agreement"><span>利用条件に同意する</span></label>
+<div class="invisible"><label><input class="none" type="checkbox" name="hidden-section"><span>不可視の項目</span></label></div>
+<input class="none" name="hidden-text" aria-label="不可視テキスト">
+<label hidden><input class="none" type="radio" name="category" value="資料請求"><span>資料請求</span></label>
+<button type="submit">送信</button>
+</form></html>

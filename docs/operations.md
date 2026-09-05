@@ -77,17 +77,18 @@ deploymentが1つのversionへ100%配信されていること、そのactive ver
 
 実送信ジョブを作れる経路は`tools/campaign-send.ts`だけである。`tools/campaign-dry-run.ts`は`_formAgentDryRun: true`固定のままで、実送信できない。
 
-Worker側は`POST /jobs`で実送信ジョブ（`_formAgentEffectiveDryRun`が`false`）になる場合だけ次の3つを検証する。1つでも満たさなければジョブを作らない。
+Worker側は`POST /jobs`で実送信ジョブ（`_formAgentEffectiveDryRun`が`false`）になる場合だけ承認記録を検証する。direct承認では内容ダイジェストを、従来方式ではdry-runの完了と内容一致を検証する。
 
 | 検証 | 失敗時 |
 | --- | --- |
 | payloadに承認記録`_formAgentSendApproval`があること | 400 `SEND_APPROVAL_REQUIRED` |
-| `dryRunJobId`のジョブが存在し、同じ`targetUrl`のdry-runで、`prohibited` / `DRY_RUN_COMPLETE`で終わっていること | 400 `DRY_RUN_NOT_COMPLETED` |
-| そのdry-runと実送信の内容フィンガープリント（`targetUrl` + `companyId` + `payload.formValues`のSHA-256）が一致すること | 400 `DRY_RUN_CONTENT_MISMATCH` |
+| 従来方式: `dryRunJobId`のジョブが存在し、同じ`targetUrl`のdry-runで、`prohibited` / `DRY_RUN_COMPLETE`で終わっていること | 400 `DRY_RUN_NOT_COMPLETED` |
+| 従来方式: そのdry-runと実送信の内容フィンガープリント（`targetUrl` + `companyId` + `payload.formValues`のSHA-256）が一致すること | 400 `DRY_RUN_CONTENT_MISMATCH` |
+| direct方式: `mode: "direct"`と`contentFingerprint`があり、送信内容のSHA-256と一致すること | 400 `SEND_APPROVAL_CONTENT_MISMATCH` |
 
-承認記録はpayloadへそのまま保存し、`GET /jobs/:id`とD1で「誰がいつどのdry-runに対して承認したか」を後から追える。承認記録はモデルにも送信前レビューにも渡さない。
+承認記録はpayloadへそのまま保存し、`GET /jobs/:id`とD1で「誰がいつどの内容またはdry-runに対して承認したか」を後から追える。承認記録はモデルにも送信前レビューにも渡さない。
 
-`pending`の実送信ジョブは日を跨いでも同じ内容で再登録できる。再登録時も承認記録とdry-runの内容一致を確認し、既存ジョブを再queueする。日次の送信件数上限は設けない。
+`pending`の実送信ジョブは日を跨いでも同じ内容で再登録できる。再登録時も承認方式に応じた内容一致を確認し、既存ジョブを再queueする。日次の送信件数上限は設けない。
 
 ### 管理下テストシステムの免除
 
@@ -110,9 +111,19 @@ Worker側は`POST /jobs`で実送信ジョブ（`_formAgentEffectiveDryRun`が`f
 
 実行前はactive versionが1つ・100%で、`AGENT_DRY_RUN ("false")`、`REAL_SEND_GUARD_EXEMPT_DOMAINS`が管理下テストシステムのドメインだけであることを確認する。通常のWorker deploy後も同じ手順で送信できる。
 
+### 独立dry-runを省くdirect承認
+
+承認ファイルのentryを`{ "sourceRow": 89, "mode": "direct", "contentFingerprint": "<64桁のSHA-256>", "note": "送信内容承認済み" }`とする。top-levelの`approvedBy`と`approvedAt`は従来と同じ。`dryRunJobId`は併記しない。
+
+同じCSV・登録情報・choicesを固定し、`buildCampaignJob`でローカル構築して`jobContentFingerprint(job.targetUrl, job.companyId, job.payload)`を計算する。ローカル構築したdry-runモードのオブジェクトは登録せず、ダイジェストの計算だけに使う。フィンガープリントの対象は`targetUrl`、`companyId`、全`formValues`であり、候補リストは順序も含める。送信CLIの呼び出しは従来と同じで、`--max-sends 20 --confirm-real-send`を使える。
+
+CLIとWorkerが同じダイジェストを再照合する。送信ジョブ内の入力・画像・用途の独立審査と送信直前の状態確認は引き続き必要。管理下テスト免除は使用せず、通常の`real_send=1`として記録する。direct承認は別途のブラウザdry-runが完了した記録ではない。
+
+各バッチでは登録前に本番D1の`real_send=1`のドメインと照合し、既送信先とバッチ内重複を除外する。ドメイン全体の再送をDBで禁止しているわけではない。完了未確認・失敗した実送信の自動再登録はしない。
+
 ### 承認ファイルの作り方
 
-対象行はすべて、同じCSV・同じ登録情報でdry-runを通し、`prohibited` / `DRY_RUN_COMPLETE`になっていなければならない。dry-runの`campaign_job_result`ログに出る`jobId`が、そのまま承認ファイルの`dryRunJobId`になる。
+従来のdry-run方式では対象行を同じCSV・同じ登録情報でdry-runに通し、`prohibited` / `DRY_RUN_COMPLETE`になっていなければならない。dry-runの`campaign_job_result`ログに出る`jobId`が、そのまま承認ファイルの`dryRunJobId`になる。
 
 ```json
 {
@@ -133,8 +144,8 @@ Worker側は`POST /jobs`で実送信ジョブ（`_formAgentEffectiveDryRun`が`f
 ### 実行手順
 
 1. migration `0007_real_send.sql`をremote D1へ適用済みであることを確認する（「D1 schema migrationを含むデプロイ」の手順に従う）。
-2. 対象行のdry-runを完了させ、結果を目視で確認する。
-3. 承認ファイルを作る。
+2. 対象行のCSV・登録情報・choicesを固定する。従来方式ではdry-runを完了させ、結果を目視で確認する。direct方式ではローカル構築した内容のダイジェストを確認する。
+3. 既存実送信先とバッチ内重複を除外し、承認ファイルを作る。
 4. active versionと実送信モードを確認する。送信枠を変更するdeployは不要である。
 5. Queue配送がresumeされていることを確認する。
 6. 送信を実行する。campaign名はdry-runと必ず別にする。同じ名前にするとジョブIDが衝突し、409 `JOB_ID_CONFLICT`になる。
@@ -159,7 +170,7 @@ JOB_API_TOKEN=... bun run campaign:send \
 | --- | --- |
 | `SENT` | 送信完了 |
 | `ROW_NOT_ELIGIBLE` | 承認された`sourceRow`がCSVの適格行に無い |
-| `APPROVAL_MISMATCH` | `dryRunJobId`のジョブがフォームURL・dry-run・`DRY_RUN_COMPLETE`・内容フィンガープリントのいずれかを満たさない、または照会できない |
+| `APPROVAL_MISMATCH` | direct承認の内容ダイジェスト不一致、または`dryRunJobId`のジョブがフォームURL・dry-run・`DRY_RUN_COMPLETE`・内容フィンガープリントのいずれかを満たさない、または照会できない |
 | `REDIRECT_PREFLIGHT_FAILED` | redirect preflightに失敗し、登録しなかった |
 | `REGISTRATION_FAILED` / `REGISTRATION_UNKNOWN` | dry-runツールと同じ登録失敗・確認不能 |
 | `SEND_TIMED_OUT` | 期限内に終端状態へ到達しなかった |

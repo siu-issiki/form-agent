@@ -32,7 +32,7 @@ const registrationPairs: Array<[string, string]> = [
 	["住所1", "address-1"],
 	["住所2", "address-2"],
 	["住所3", "address-3"],
-	["電話番号", "phone"],
+	["電話番号", "090-0123-4567"],
 	["郵便番号", "postal"],
 	["郵便番号1", "postal-1"],
 	["郵便番号2", "postal-2"],
@@ -40,10 +40,10 @@ const registrationPairs: Array<[string, string]> = [
 	["メールアドレス", "email"],
 	["部署", "department"],
 	["会社名", "sender-company"],
-	["電話番号1", "phone-1"],
-	["電話番号2", "phone-2"],
-	["電話番号3", "phone-3"],
-	["電話番号", "phone-digits"],
+	["電話番号1", "090"],
+	["電話番号2", "0123"],
+	["電話番号3", "4567"],
+	["電話番号", "09001234567"],
 ];
 const registration: RegistrationEntry[] = registrationPairs.map(
 	([label, value]) => ({ label, value }),
@@ -55,8 +55,8 @@ describe("campaign import", () => {
 	test("maps expected registration labels to safe ASCII keys", () => {
 		const values = mapRegistrationValues(registration, silent);
 
-		expect(values.phone).toBe("phone");
-		expect(values.phoneDigits).toBe("phone-digits");
+		expect(values.phone).toBe("090-0123-4567");
+		expect(values.phoneDigits).toBe("09001234567");
 		expect(Object.keys(values)).toHaveLength(25);
 		expect(
 			Object.keys(values).every((key) => /^[A-Za-z][A-Za-z0-9_]*$/.test(key)),
@@ -90,8 +90,8 @@ describe("campaign import", () => {
 		expect(values.fullNameHiragana).toBe("full-h");
 		expect(values.lastNameKatakana).toBe("last-k");
 		expect(values.firstNameKatakana).toBe("first-k");
-		expect(values.phonePart1).toBe("phone-1");
-		expect(values.phonePart3).toBe("phone-3");
+		expect(values.phonePart1).toBe("090");
+		expect(values.phonePart3).toBe("4567");
 		expect(values.department).toBe("department");
 		expect(values.jobTitle).toBe("job-title");
 		expect(values.age).toBe("age");
@@ -139,18 +139,18 @@ describe("campaign import", () => {
 	test("uses one phone entry for both phone keys", () => {
 		const values = mapRegistrationValues(aliasRegistration(), silent);
 
-		expect(values.phone).toBe("phone");
-		expect(values.phoneDigits).toBe("phone");
+		expect(values.phone).toBe("090-0123-4567");
+		expect(values.phoneDigits).toBe("09001234567");
 	});
 
 	test("reads the second phone entry as the digits-only spelling", () => {
 		const values = mapRegistrationValues(
-			[...aliasRegistration(), { label: "電話番号", value: "phone-digits" }],
+			[...aliasRegistration(), { label: "電話番号", value: "09001234567" }],
 			silent,
 		);
 
-		expect(values.phone).toBe("phone");
-		expect(values.phoneDigits).toBe("phone-digits");
+		expect(values.phone).toBe("090-0123-4567");
+		expect(values.phoneDigits).toBe("09001234567");
 	});
 
 	test("ignores unknown labels and reports only their count", () => {
@@ -224,8 +224,7 @@ describe("campaign import", () => {
 			simpleRow({ 問い合わせリンク: "https://192.0.2.10/form" }),
 		]);
 
-		// The http:// link is rewritten to https:// and becomes eligible; only
-		// the invalid host (an IP address) is still excluded.
+		// Explicit HTTP stays eligible; the invalid host (an IP address) is excluded.
 		expect(result.eligible).toHaveLength(2);
 		expect(result.excluded).toEqual({
 			empty_message: 2,
@@ -234,7 +233,7 @@ describe("campaign import", () => {
 		});
 	});
 
-	test("upgrades an http:// simple-layout link to https:// and counts the rewrite", () => {
+	test("keeps an http:// simple-layout link and reports no rewrite", () => {
 		const result = filterCampaignRows([
 			simpleRow({
 				問い合わせリンク: "http://contact.acme.co.jp/form?campaign=1",
@@ -243,9 +242,9 @@ describe("campaign import", () => {
 		]);
 
 		expect(result.excluded).toEqual({});
-		expect(result.upgradedToHttps).toBe(1);
+		expect(result.upgradedToHttps).toBe(0);
 		expect(result.eligible[0]?.targetUrl).toBe(
-			"https://contact.acme.co.jp/form?campaign=1",
+			"http://contact.acme.co.jp/form?campaign=1",
 		);
 		// The already-https row is left untouched and not counted.
 		expect(result.eligible[1]?.targetUrl).toBe(
@@ -319,14 +318,14 @@ describe("campaign import", () => {
 		]);
 	});
 
-	test("filters sent, blocked, missing, and insecure rows", () => {
+	test("filters sent, blocked, missing, and unsupported rows", () => {
 		const valid = row();
 		const result = filterCampaignRows([
 			valid,
 			row({ フォーム送信ステータス: "送信済" }),
 			row({ エラー確認: "要確認" }),
 			row({ 問い合わせフォームURL: "" }),
-			row({ 問い合わせフォームURL: "http://acme.co.jp/contact" }),
+			row({ 問い合わせフォームURL: "ftp://acme.co.jp/contact" }),
 		]);
 
 		expect(result.eligible).toHaveLength(1);
@@ -1142,10 +1141,10 @@ function aliasRegistration(): RegistrationEntry[] {
 		{ label: "ふりがな", value: "ignored-alias" },
 		{ label: "年齢", value: "age" },
 		{ label: "メールアドレス", value: "email" },
-		{ label: "電話番号", value: "phone" },
-		{ label: "電話1", value: "phone-1" },
-		{ label: "電話2", value: "phone-2" },
-		{ label: "電話3", value: "phone-3" },
+		{ label: "電話番号", value: "090-0123-4567" },
+		{ label: "電話1", value: "090" },
+		{ label: "電話2", value: "0123" },
+		{ label: "電話3", value: "4567" },
 		{ label: "郵便番号", value: "postal" },
 		{ label: "住所", value: "address" },
 		{ label: "会社HP", value: "website" },
@@ -1187,3 +1186,467 @@ function row(overrides: CampaignCsvRow = {}): CampaignCsvRow {
 		...overrides,
 	};
 }
+
+describe("direct campaign approvals", () => {
+	test("reads frozen content approvals without a dry-run id", () => {
+		const entry = {
+			sourceRow: 89,
+			mode: "direct" as const,
+			contentFingerprint: "a".repeat(64),
+			note: "承認済み",
+		};
+		const result = readSendApprovalFile(
+			{
+				approvedBy: "operator",
+				approvedAt: "2026-09-05T00:00:00Z",
+				entries: [entry],
+			},
+			20,
+		);
+		expect(result.entries).toEqual([entry]);
+	});
+	test("rejects mixing dry-run and direct approval in one entry", () => {
+		expect(() =>
+			readSendApprovalFile(
+				{
+					approvedBy: "operator",
+					approvedAt: "2026-09-05T00:00:00Z",
+					entries: [
+						{
+							sourceRow: 89,
+							mode: "direct" as const,
+							contentFingerprint: "a".repeat(64),
+							dryRunJobId: "dry-1",
+						},
+					],
+				},
+				20,
+			),
+		).toThrow();
+	});
+});
+
+test("direct approval entries cannot override file-level approver metadata", () => {
+	expect(() =>
+		readSendApprovalFile(
+			{
+				approvedBy: "operator",
+				approvedAt: "2026-09-05T00:00:00Z",
+				entries: [
+					{
+						sourceRow: 89,
+						mode: "direct",
+						contentFingerprint: "a".repeat(64),
+						approvedBy: "other",
+					},
+				],
+			},
+			20,
+		),
+	).toThrow("unknown key");
+});
+
+// Reproduce explicit source schemes without contacting any real destination.
+describe("source URL scheme preservation", () => {
+	test.each(["http", "https"])("simple CSV keeps explicit %s", (scheme) => {
+		const url = `${scheme}://contact.acme.co.jp/form?campaign=1#contact`;
+		const result = filterCampaignRows([simpleRow({ 問い合わせリンク: url })]);
+		expect(result.eligible[0]?.targetUrl).toBe(url);
+		expect(result.excluded).toEqual({});
+		expect(result.upgradedToHttps).toBe(0);
+	});
+	test.each(["http", "https"])("full CSV keeps explicit %s", (scheme) => {
+		const url = `${scheme}://acme.co.jp/contact?campaign=1#contact`;
+		const result = filterCampaignRows([row({ 問い合わせフォームURL: url })]);
+		expect(result.eligible[0]?.targetUrl).toBe(url);
+		expect(result.excluded).toEqual({});
+		expect(result.upgradedToHttps).toBe(0);
+	});
+	test.each([
+		"contact.acme.co.jp/form",
+		"//contact.acme.co.jp/form",
+		"ftp://acme.co.jp/form",
+		"javascript:alert(1)",
+		"http://user:secret@acme.co.jp/form",
+		"https://user@acme.co.jp/form",
+		"http://127.0.0.1/form",
+		"http://192.168.1.1/form",
+		"http://localhost/form",
+		"http://[::1]/form",
+	])("rejects unsupported or unsafe source URL: %s", (url) => {
+		for (const input of [
+			simpleRow({ 問い合わせリンク: url }),
+			row({ 問い合わせフォームURL: url }),
+		]) {
+			const result = filterCampaignRows([input]);
+			expect(result.eligible).toHaveLength(0);
+			expect(result.excluded).toEqual({ invalid_or_insecure_form_url: 1 });
+		}
+	});
+	test("HTTP job identities and fingerprints keep the source scheme", async () => {
+		const source = "http://contact.acme.co.jp/form";
+		const candidate = filterCampaignRows([
+			simpleRow({ 問い合わせリンク: source }),
+		]).eligible[0];
+		if (!candidate) throw new Error("Expected HTTP candidate");
+		const values = mapRegistrationValues(registration, silent);
+		const http = await buildCampaignJob(
+			candidate,
+			values,
+			"scheme-preservation",
+			{ finalUrl: source, allowedHosts: ["contact.acme.co.jp"] },
+		);
+		const httpsUrl = source.replace("http:", "https:");
+		const https = await buildCampaignJob(
+			{ ...candidate, targetUrl: httpsUrl },
+			values,
+			"scheme-preservation",
+			{ finalUrl: httpsUrl, allowedHosts: ["contact.acme.co.jp"] },
+		);
+		expect(http.targetUrl).toBe(source);
+		expect(http.id).not.toBe(https.id);
+		expect(await jobInputFingerprint(http.targetUrl, http.payload)).not.toBe(
+			await jobInputFingerprint(https.targetUrl, https.payload),
+		);
+	});
+	test("HTTP redirect loops keep the existing seven-request bound", async () => {
+		let calls = 0;
+		const fetcher = (async (_resource: URL | RequestInfo) => {
+			calls++;
+			return new Response(null, {
+				status: 302,
+				headers: { location: "/loop" },
+			});
+		}) as typeof fetch;
+		await expect(
+			resolveRedirectHosts("http://acme.co.jp/form", fetcher),
+		).rejects.toThrow("Redirect chain exceeds");
+		expect(calls).toBe(7);
+	});
+
+	test("preflight preserves HTTP and follows only safe upgrades", async () => {
+		const calls: string[] = [];
+		const fetcher = (async (resource: URL | RequestInfo) => {
+			const url = resource.toString();
+			calls.push(url);
+			const location =
+				url === "http://acme.co.jp/form"
+					? "http://www.acme.co.jp/form"
+					: url === "http://www.acme.co.jp/form"
+						? "https://www.acme.co.jp/form"
+						: null;
+			return new Response(null, {
+				status: location ? 302 : 200,
+				...(location ? { headers: { location } } : {}),
+			});
+		}) as typeof fetch;
+		const result = await resolveRedirectHosts(
+			"http://acme.co.jp/form",
+			fetcher,
+		);
+		expect(calls).toEqual([
+			"http://acme.co.jp/form",
+			"http://www.acme.co.jp/form",
+			"https://www.acme.co.jp/form",
+		]);
+		expect(result.finalUrl).toBe("https://www.acme.co.jp/form");
+		expect(result.allowedHosts).toEqual(["acme.co.jp", "www.acme.co.jp"]);
+	});
+	test("HTTP HEAD fallback stays HTTP", async () => {
+		const calls: Array<{ url: string; method: string | undefined }> = [];
+		const fetcher = (async (
+			resource: URL | RequestInfo,
+			init?: RequestInit,
+		) => {
+			calls.push({ url: resource.toString(), method: init?.method });
+			return new Response(null, {
+				status: init?.method === "HEAD" ? 405 : 200,
+			});
+		}) as typeof fetch;
+		const result = await resolveRedirectHosts(
+			"http://acme.co.jp/form",
+			fetcher,
+		);
+		expect(result.finalUrl).toBe("http://acme.co.jp/form");
+		expect(calls).toEqual([
+			{ url: "http://acme.co.jp/form", method: "HEAD" },
+			{ url: "http://acme.co.jp/form", method: "GET" },
+		]);
+	});
+	test.each(["https://acme.co.jp/form", "http://acme.co.jp/form"])(
+		"rejects HTTPS downgrade after starting at %s",
+		async (start) => {
+			const calls: string[] = [];
+			const fetcher = (async (resource: URL | RequestInfo) => {
+				const url = resource.toString();
+				calls.push(url);
+				return new Response(null, {
+					status: 302,
+					headers: {
+						location: url.startsWith("http:")
+							? "https://acme.co.jp/form"
+							: "http://acme.co.jp/down",
+					},
+				});
+			}) as typeof fetch;
+			await expect(resolveRedirectHosts(start, fetcher)).rejects.toThrow();
+			expect(calls).toEqual(
+				start.startsWith("http:")
+					? [start, "https://acme.co.jp/form"]
+					: [start],
+			);
+		},
+	);
+	test.each([
+		"http://user:secret@acme.co.jp/form",
+		"http://127.0.0.1/form",
+		"ftp://acme.co.jp/form",
+	])(
+		"HTTP preflight rejects redirect boundary before fetching: %s",
+		async (location) => {
+			let calls = 0;
+			const fetcher = (async (_resource: URL | RequestInfo) => {
+				calls++;
+				return new Response(null, { status: 302, headers: { location } });
+			}) as typeof fetch;
+			await expect(
+				resolveRedirectHosts("http://acme.co.jp/form", fetcher),
+			).rejects.toThrow();
+			expect(calls).toBe(1);
+		},
+	);
+});
+
+describe("registration derived values", () => {
+	const base: RegistrationEntry[] = [
+		{ label: "苗字", value: "山田" },
+		{ label: "名前", value: "花子" },
+		{ label: "フルネーム漢字", value: "山田 花子" },
+		{ label: "会社名", value: "試験会社" },
+		{ label: "苗字（かな）", value: "やまだ" },
+		{ label: "名前（かな）", value: "はなこ" },
+		{ label: "電話番号", value: "090-0123-4567" },
+		{ label: "電話番号1", value: "090" },
+		{ label: "電話番号2", value: "0123" },
+		{ label: "電話番号3", value: "4567" },
+		{ label: "メールアドレス", value: "Example+tag@example.test" },
+		{ label: "郵便番号", value: "001-0002" },
+		{ label: "郵便番号1", value: "001" },
+		{ label: "郵便番号2", value: "0002" },
+	];
+	const map = (extras: RegistrationEntry[] = []) =>
+		mapRegistrationValues([...base, ...extras], silent);
+	const replace = (label: string, value: string) =>
+		base.map((entry) => (entry.label === label ? { label, value } : entry));
+
+	test("derives only existing facts without changing the source or original values", () => {
+		const before = JSON.stringify(base);
+		expect(map()).toMatchObject({
+			phone: "090-0123-4567",
+			phoneDigits: "09001234567",
+			fullNameHiragana: "やまだはなこ",
+			email: "Example+tag@example.test",
+			emailLocalPart: "Example+tag",
+			emailDomain: "example.test",
+			postalCode: "001-0002",
+			postalCodeDigits: "0010002",
+		});
+		expect(map().companyNameReading).toBeUndefined();
+		expect(JSON.stringify(base)).toBe(before);
+	});
+
+	test("normalizes a repeated formatted phone entry after checking it agrees", () => {
+		expect(
+			map([{ label: "電話番号", value: "090 0123 4567" }]).phoneDigits,
+		).toBe("09001234567");
+	});
+
+	test.each([
+		["電話番号", "09099994567", "phoneDigits"],
+		["電話番号（数字のみ）", "09099994567", "phoneDigits"],
+		["フルネームひらがな", "すずきはなこ", "fullNameHiragana"],
+		["メールアドレス（@より前）", "Different", "emailLocalPart"],
+		["メールアドレス（@より後）", "different.test", "emailDomain"],
+		["郵便番号（数字のみ）", "9990002", "postalCodeDigits"],
+	])(
+		"rejects a conflicting explicit %s without leaking its value",
+		(label, value, key) => {
+			let message = "";
+			try {
+				map([{ label, value }]);
+			} catch (error) {
+				message = String(error);
+			}
+			expect(message).toContain(key);
+			expect(message).not.toContain(value);
+		},
+	);
+
+	test.each(["電話番号2", "郵便番号2"])(
+		"rejects conflicting split values for %s",
+		(label) => {
+			expect(() =>
+				mapRegistrationValues(replace(label, "9999"), silent),
+			).toThrow("conflicting");
+		},
+	);
+
+	test.each([
+		["電話番号1", "080", "phoneDigits"],
+		["電話番号3", "9999", "phoneDigits"],
+		["郵便番号1", "999", "postalCodeDigits"],
+		["郵便番号2", "9999", "postalCodeDigits"],
+	])("rejects a conflicting partial %s", (label, value, key) => {
+		const entries = base.filter(
+			(entry) => !/^(電話番号|郵便番号)[123]$/.test(entry.label),
+		);
+		expect(() =>
+			mapRegistrationValues([...entries, { label, value }], silent),
+		).toThrow(key);
+	});
+
+	test("does not derive phoneDigits from an unverified middle part without boundaries", () => {
+		const entries = base.filter(
+			(entry) => entry.label !== "電話番号1" && entry.label !== "電話番号3",
+		);
+		expect(mapRegistrationValues(entries, silent).phoneDigits).toBeUndefined();
+		expect(() =>
+			mapRegistrationValues(
+				[...entries, { label: "電話番号（数字のみ）", value: "09001234567" }],
+				silent,
+			),
+		).toThrow("phoneDigits");
+	});
+
+	test("permits matching known prefix and suffix without inventing missing parts", () => {
+		const entries = base.filter(
+			(entry) => entry.label !== "電話番号2" && entry.label !== "郵便番号2",
+		);
+		const values = mapRegistrationValues(entries, silent);
+		expect(values.phoneDigits).toBe("09001234567");
+		expect(values.postalCodeDigits).toBe("0010002");
+		expect(values.phonePart2).toBeUndefined();
+		expect(values.postalCodePart2).toBeUndefined();
+	});
+
+	test("keeps an explicitly supplied full hiragana spelling including its space", () => {
+		expect(
+			map([{ label: "ふりがな", value: "やまだ　はなこ" }]).fullNameHiragana,
+		).toBe("やまだ　はなこ");
+	});
+
+	test.each(["+81-90-0123-4567", "090-0123-4567 内線123", "unknown", "phone"])(
+		"does not guess a domestic number from %s",
+		(phone) => {
+			const values = mapRegistrationValues(replace("電話番号", phone), silent);
+			expect(values.phone).toBe(phone);
+			expect(values.phoneDigits).toBeUndefined();
+		},
+	);
+
+	test.each(["+81-90-0123-4567", "09001234567 内線123", "phone-digits"])(
+		"rejects an unsupported explicit digits value %s",
+		(value) => {
+			expect(() => map([{ label: "電話番号", value }])).toThrow("phoneDigits");
+		},
+	);
+
+	test("does not invent readings, split invalid email or zero-pad postal codes", () => {
+		const values = mapRegistrationValues(
+			base
+				.map((entry) => {
+					if (entry.label === "苗字（かな）")
+						return { ...entry, value: "山田" };
+					if (entry.label === "メールアドレス")
+						return { ...entry, value: "a@@example.test" };
+					if (entry.label === "郵便番号") return { ...entry, value: "10002" };
+					return entry;
+				})
+				.filter(
+					(entry) =>
+						!entry.label.startsWith("郵便番号1") &&
+						!entry.label.startsWith("郵便番号2"),
+				),
+			silent,
+		);
+		expect(values.fullNameHiragana).toBeUndefined();
+		expect(values.emailLocalPart).toBeUndefined();
+		expect(values.emailDomain).toBeUndefined();
+		expect(values.postalCodeDigits).toBeUndefined();
+	});
+
+	test("can join postal parts when a combined postal value was not provided", () => {
+		const values = mapRegistrationValues(
+			base.filter((entry) => entry.label !== "郵便番号"),
+			silent,
+		);
+		expect(values.postalCodeDigits).toBe("0010002");
+		expect(values.postalCode).toBeUndefined();
+	});
+
+	test("validates multiple explicit candidates instead of silently taking the first", () => {
+		expect(() =>
+			map([
+				{ label: "電話番号", value: "09001234567" },
+				{ label: "電話番号", value: "09099994567" },
+			]),
+		).toThrow("phoneDigits");
+		expect(() =>
+			map([
+				{ label: "ふりがな", value: "やまだはなこ" },
+				{ label: "フルネームひらがな", value: "すずきはなこ" },
+			]),
+		).toThrow("fullNameHiragana");
+	});
+
+	test("binds derived values to new approval fingerprints without mutating an old payload", async () => {
+		const candidate = filterCampaignRows([row()]).eligible[0];
+		if (!candidate) throw new Error("Missing fixture");
+		const resolution = {
+			finalUrl: candidate.targetUrl,
+			allowedHosts: [candidate.companyDomain],
+		};
+		const values = map();
+		const oldValues = { ...values };
+		for (const key of [
+			"fullNameHiragana",
+			"emailLocalPart",
+			"emailDomain",
+			"postalCodeDigits",
+		])
+			delete oldValues[key];
+		oldValues.phoneDigits = oldValues.phone ?? "";
+		const oldJob = await buildCampaignJob(
+			candidate,
+			oldValues,
+			"old-campaign",
+			resolution,
+		);
+		const snapshot = JSON.stringify(oldJob);
+		const newJob = await buildCampaignJob(
+			candidate,
+			values,
+			"new-campaign",
+			resolution,
+		);
+		expect(
+			await jobContentFingerprint(
+				newJob.targetUrl,
+				newJob.companyId,
+				newJob.payload,
+			),
+		).not.toBe(
+			await jobContentFingerprint(
+				oldJob.targetUrl,
+				oldJob.companyId,
+				oldJob.payload,
+			),
+		);
+		expect(newJob.id).not.toBe(oldJob.id);
+		expect(newJob.payload.formValues).toMatchObject({
+			emailLocalPart: "Example+tag",
+			postalCodeDigits: "0010002",
+		});
+		expect(JSON.stringify(oldJob)).toBe(snapshot);
+	});
+});

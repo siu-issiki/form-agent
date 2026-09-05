@@ -21,6 +21,7 @@
 		"src/campaign-import.ts",
 		"src/real-send-guard.ts",
 		"src/agent-tool-schema.ts",
+		"test/campaign-choice-profile.test.ts",
 		"test/job.test.ts",
 		"test/agent-executor.test.ts",
 		"test/browser-use-client.test.ts",

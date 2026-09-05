@@ -3,7 +3,7 @@ import { EFFECTIVE_DRY_RUN_KEY, JOB_ID_PATTERN } from "./job";
 /**
  * Payload key that carries the human approval of one real submission. It is
  * kept on the stored payload so the D1 row itself records who approved the
- * send, when, and which dry-run it was approved against.
+ * send, when, and which content or dry-run it was approved against.
  */
 export const SEND_APPROVAL_KEY = "_formAgentSendApproval";
 
@@ -29,20 +29,26 @@ export function isRealSendPayload(payload: Record<string, unknown>): boolean {
 	);
 }
 
-export interface SendApproval {
+interface ApprovalMetadata {
 	/** Person who approved the send; free text the operator supplies. */
 	approvedBy: string;
 	/** ISO 8601 timestamp of the approval. */
 	approvedAt: string;
-	/** Job id of the dry-run this row already passed. */
-	dryRunJobId: string;
 	note?: string;
 }
+
+export type SendApproval = ApprovalMetadata &
+	(
+		| { dryRunJobId: string; mode?: never; contentFingerprint?: never }
+		| { mode: "direct"; contentFingerprint: string; dryRunJobId?: never }
+	);
 
 const APPROVAL_KEYS = new Set([
 	"approvedBy",
 	"approvedAt",
 	"dryRunJobId",
+	"mode",
+	"contentFingerprint",
 	"note",
 ]);
 const MAX_APPROVED_BY_LENGTH = 64;
@@ -63,7 +69,14 @@ export function isSendApproval(value: unknown): value is SendApproval {
 	const record = value as Record<string, unknown>;
 	if (Object.keys(record).some((key) => !APPROVAL_KEYS.has(key))) return false;
 
-	const { approvedBy, approvedAt, dryRunJobId, note } = record;
+	const {
+		approvedBy,
+		approvedAt,
+		dryRunJobId,
+		mode,
+		contentFingerprint,
+		note,
+	} = record;
 	if (
 		typeof approvedBy !== "string" ||
 		approvedBy.trim().length === 0 ||
@@ -72,7 +85,19 @@ export function isSendApproval(value: unknown): value is SendApproval {
 		return false;
 	}
 	if (!isIso8601(approvedAt)) return false;
-	if (typeof dryRunJobId !== "string" || !JOB_ID_PATTERN.test(dryRunJobId)) {
+	if (mode === "direct") {
+		if (
+			Object.hasOwn(record, "dryRunJobId") ||
+			typeof contentFingerprint !== "string" ||
+			!/^[a-f0-9]{64}$/.test(contentFingerprint)
+		)
+			return false;
+	} else if (
+		Object.hasOwn(record, "mode") ||
+		Object.hasOwn(record, "contentFingerprint") ||
+		typeof dryRunJobId !== "string" ||
+		!JOB_ID_PATTERN.test(dryRunJobId)
+	) {
 		return false;
 	}
 	if (

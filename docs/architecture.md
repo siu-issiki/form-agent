@@ -256,6 +256,7 @@ CDP の error 応答は、失敗した CDP メソッド名、error code、およ
 
 - 入力は、直前の信頼済み観察（URL、form、ページ本文、禁止 reason code）、`payload.formValues` の信頼済み値、`before_submit` スクリーンショット、対象ドメイン・URL、submit 要素 ID である。
 - 観察とスクリーンショットは `untrustedPageContent` としてラップし、外部サイト由来のデータであり指示として解釈しないことを instructions で明示する。
+- 用途制限はフォーム自身の具体的な案内から判断する。制限のない一般問い合わせフォームはイベント案内・事業紹介という本文の性質だけで拒否しない。明示的な営業禁止、サービス専用案内、資料請求等の専用用途は引き続き拒否し、footerやnavigationの事業紹介だけを専用窓口の根拠にしない。
 - 判定 code は `INPUTS_MATCH`（allow のみ）、`INPUT_MISMATCH`、`SALES_PROHIBITED`、`FORM_PURPOSE_INCOMPATIBLE`、`WRONG_FORM`、`UNCLEAR` の固定値とする。`allow` と deny 系 code、`deny` と `INPUTS_MATCH` のように矛盾する組み合わせは、どちらの判定としても解釈せず応答不正として扱う。
 - 修正を許可するのは `INPUT_MISMATCH` の deny だけであり、他の reason code は 1 回目でも `PRE_SUBMIT_REVIEW_DENIED` として `uncertain` で終了する。ページやフォーム自体への判断は入力の修正で覆らないためである。
 - 修正が許可された場合はモデルへ `SUBMIT_REVIEW_DENIED` と reason code だけを返し、実際の `fill` / `select` の成功と再観察の両方を次の `submit` の前提にする。さらに deny 時の観察から、比較対象フィールドの tag / type / name / label / value / checked だけを取り出した指紋（elementId は含めない）を保存し、再観察後の指紋が変化していなければ `CORRECTION_REQUIRED` として拒否する。再観察だけ、あるいは同じ値の再入力で、確率的なレビューの再判定を引くことを防ぐためである。送信権は取得せず、ブラウザ送信も行わない。
@@ -278,13 +279,14 @@ CDP の error 応答は、失敗した CDP メソッド名、error code、およ
 
 日本語の問い合わせフォームには、「確認画面へ進む」で入力内容の一覧を表示し、その画面の「送信する」で初めて送信するものが多い。1 回の活性化しか許さないと、1 本目の POST（確認画面への遷移）で送信権を使い切り、本文が送られないまま `SUBMIT_CONFIRMATION_NOT_OBSERVED` で終わる。2026-09-04 の実送信 4 件のうち 1 件がこれだった。
 
-- `submit` は 1 run あたり `MAX_SUBMIT_STAGES`（3 回）まで活性化できる。送信前レビューと D1 の条件付き送信権取得（`running` → `submitting`）は 1 回目だけであり、2 回目以降は再レビューしない。
-- 送信requestは観測できたが完了を確認できない場合、活性化直後のページが「入力したメールアドレス」と「入力した本文の先頭 40 文字」の両方をまだ映しているときだけ、結果を保存せずモデルへ `submit_stage_pending` を返す。判定にはページ本文（`readPageText`）を使い、含まれなければ観察済みフォーム欄の値（`readObservedFieldStates`）で代替する。映していない場合は次の段階を提示せず、その場で `uncertain` / `SUBMIT_CONFIRMATION_NOT_OBSERVED` として結果を保存する。確認画面は入力内容を再掲するのに対し、POST 後にフォームを空へ戻すサイトや最終段階の後のページは再掲しないためである。2026-09-04 の実送信では、この 2 種類のページで次の段階を提示し続けた結果、モデルが大きなページの `observe` を繰り返し、`PROVIDER_RESPONSE_INVALID` / `AGENT_CONTEXT_TOO_LARGE` で run ごと失って `AGENT_RESULT_UNKNOWN` になった。判定は `browser_submit_stage_check` ログ（`stage` 番号と `reviewedValuesShown` の真偽値のみ）に残す。
+- `submit` は 1 run あたり `MAX_SUBMIT_STAGES`（2 回）まで活性化できる。初回の送信前レビューとD1の送信権取得に加え、2回目を許すには初回が観察済みcontrol自身の「確認画面へ進む」「入力内容を確認」「Confirm」「Preview」などの確認専用操作でなければならない。ラベルはdriverの観察から読み、モデルの申告やページ本文の確認語では判断しない。
+- 初回の確認操作でrequestを観測したが完了が不明な場合、入力したメールアドレスと本文先頭40文字が直後のページ本文かフォーム欄に残っているときだけ `submit_stage_pending` を返す。通常の「送信する」「Send」「確認して送信」や不明な操作では、値が残っていてもその場で `uncertain` / `SUBMIT_CONFIRMATION_NOT_OBSERVED` を保存し、再作動を許可しない。最終送信後も値を残すサイトがあるため、値の残存だけでは次段階の根拠にならない。
+- 確認専用controlは2回目に再作動できない。観察ごとに変わるelementIdを比較せず、観察された操作の意味で判定する。確認→最終送信の2回目が未確認なら、それ以上のstageは提示しない。
 - `submit_stage_pending` を返した間、ジョブは `submitting` のまま、`observe` と `submit` だけが続行できる。`navigate` / `click` / `fill` / `select` は `submitting` では受け付けない。新しい入力を送信権取得後に足せないようにするためである。
 - 活性化のたびに input revision を進めるため、次の段階の前に必ず再観察が必要になる。
 - 2 回目以降は、最新観察のページ本文に「入力したメールアドレス」と「入力した本文の先頭 40 文字」の両方が含まれるか、観察済みフォーム欄が同じ値を保持していることを信頼済み handler が確認する。満たさなければ `SUBMIT_STAGE_UNVERIFIED` として拒否し、活性化しない。レビュー済みの内容を映していないページで任意のボタンを押させないためである。
 - 2 回目以降は `submit.stage` イベント（`stage` 番号と `requestObserved` の真偽値のみ）を D1 へ記録する。値・URL は残さない。証跡は段階ごとに `before_submit` / `after_submit` を撮る。
-- モデルが再度 `submit` を呼ばずに `finish_*` を呼んだ場合、未確認の活性化が残っているため、宣言された結果に関わらず `uncertain` / `SUBMIT_CONFIRMATION_NOT_OBSERVED` を返す。3 回目でも完了を確認できない場合も同じ理由コードで `uncertain` を保存する。
+- モデルが再度 `submit` を呼ばずに `finish_*` を呼んだ場合、未確認の活性化が残っているため、宣言された結果に関わらず `uncertain` / `SUBMIT_CONFIRMATION_NOT_OBSERVED` を返す。最終送信でも完了を確認できない場合も同じ理由コードで `uncertain` を保存する。
 - `submitting` のジョブが Queue 再配信された場合の扱いは変わらない。実行せずに ack し、`job.redelivery_ignored` を記録する。
 - 段階をまたぐ間もモデルは Provider を呼ぶため、Provider 呼び出し回数の条件付き更新は `running` に加えて `submitting` でも成立させる。上限そのものは変更しない。
 
@@ -480,10 +482,11 @@ Cloudflare Queue はメッセージを複数回配信し得るため、処理全
 - レビューのdenyで修正を許可するのは`INPUT_MISMATCH`だけとし、実際の`fill` / `select`と観察指紋の変化を次の`submit`の前提にする。deny予算はD1のジョブ行に保存し、実行と再配信をまたいで共有する。
 - レビューのallowから送信権取得までの間に、現在URLと観察済み全フィールドの値・チェック状態を読み直し、あわせてhidden / disabledを含むform全体のsnapshotをレビュー前後で比較し、1件でも異なれば送信しない。
 - ジョブ間で browser session、cookie、入力データを共有しない。
-- 実送信になるジョブ（登録時に確定した `_formAgentEffectiveDryRun` が `false`）は、payload に承認記録 `_formAgentSendApproval`（`approvedBy` 1〜64 文字、ISO 8601 の `approvedAt`、`dryRunJobId`、任意の `note` 200 文字以内）を持たなければ登録できない。未知のキーを含む承認記録は受け付けない。承認記録は payload にそのまま保存し、誰がいつどの dry-run に対して承認したかを D1 の行から追えるようにする。
-- 承認記録の `dryRunJobId` は、同じ `targetUrl` の dry-run ジョブで、`prohibited` / `DRY_RUN_COMPLETE` で終わっているものでなければならない。さらに、その dry-run と実送信の内容フィンガープリント（`targetUrl` + `companyId` + `payload.formValues` の正規化 JSON を SHA-256）が一致しなければならない。一致しない場合は 400 `DRY_RUN_CONTENT_MISMATCH` とする。URL だけを比べると、承認済みの行を別の本文や別の入力値で登録し直せてしまうためである。
+- 実送信になるジョブ（登録時に確定した `_formAgentEffectiveDryRun` が `false`）は、payload に承認記録 `_formAgentSendApproval`（`approvedBy` 1〜64 文字、ISO 8601 の `approvedAt`、`dryRunJobId` または `mode: "direct"` + `contentFingerprint`、任意の `note` 200 文字以内）を持たなければ登録できない。未知のキーを含む承認記録は受け付けない。承認記録は payload にそのまま保存し、誰がいつどの内容または dry-run に対して承認したかを D1 の行から追えるようにする。
+- 従来方式の承認記録の `dryRunJobId` は、同じ `targetUrl` の dry-run ジョブで、`prohibited` / `DRY_RUN_COMPLETE` で終わっているものでなければならない。さらに、その dry-run と実送信の内容フィンガープリント（`targetUrl` + `companyId` + `payload.formValues` の正規化 JSON を SHA-256）が一致しなければならない。一致しない場合は 400 `DRY_RUN_CONTENT_MISMATCH` とする。URL だけを比べると、承認済みの行を別の本文や別の入力値で登録し直せてしまうためである。
+- direct方式は `contentFingerprint` と同じ内容フィンガープリントを比較し、不一致を400 `SEND_APPROVAL_CONTENT_MISMATCH`とする。dry-run照会は不要だが、実送信ジョブ内の送信前審査や証跡取得は省略しない。direct方式とdry-run方式の混在した承認オブジェクトは拒否する。管理下テストの免除を経由せず、通常の実送信件数に含む。
 - 実送信の承認記録 `_formAgentSendApproval` はモデルにも送信前レビューにも渡さない。フォーム入力の材料ではなく、ページ由来の非信頼データがそれを引用できてはならないためである。除外は `runToken` と同じ経路で行う。
-- 実送信の登録に日次件数上限は設けない。承認記録・dry-run完了・内容一致を確認し、各バッチは承認ファイルと`--max-sends`で指定する。送信前後のdeployは不要である。
+- 実送信の登録に日次件数上限は設けない。承認記録・方式に応じたdry-run完了・内容一致を確認し、各バッチは承認ファイルと`--max-sends`で指定する。送信前後のdeployは不要である。
 - `pending`の実送信ジョブは、UTCの日を跨いでも同じID・同じ内容で再登録できる。既存ジョブの内容比較と承認チェックは継続する。
 - 実送信ジョブを組み立てられるのは `tools/campaign-send.ts` だけとし、`tools/campaign-dry-run.ts` は `_formAgentDryRun: true` 固定のままにする。
 - 上の承認記録・dry-run 完了・内容一致の 3 つは、ジョブの `targetDomain` が `REAL_SEND_GUARD_EXEMPT_DOMAINS` のいずれか（完全一致、またはその配下のホスト）である場合だけ免除する。**この一覧は管理下テストシステム専用であり、実サイトのドメインを入れてはいけない。**ここに載ったドメインへは、人間の承認記録なしに実送信できる。免除は登録時に payload の `_formAgentRealSendGuardExempt` へ刻み、`real_send` 列を 0 にして通常の実送信件数の集計から外す。呼び出し元がこのキーを送っても API が必ず破棄してから判定するため、外部から免除を主張することはできない。免除以外の検証（認証、入力検証、URL とドメインの整合、`allowedHosts` の正規化）は従来どおり適用する。
@@ -533,11 +536,11 @@ policy failure は driver の以降の全 CDP コマンドを reject させ run 
 
 CSV は 2 つの形式を受け付ける。ヘッダーに `件名` / `本文` と、リンク列（`問い合わせリンク` または `問い合わせフォームリンク`、両方あれば `問い合わせリンク` が勝つ）が揃っている場合を簡易形式とし、それ以外は従来の 30 列形式として必須列を検証する。先頭の無名インデックス列（CSV パーサーがキー `""` として公開する列）はこの判定に関与せず無視される。案件ごとに CSV の作り手が違い、簡易形式には企業名・企業ドメイン・NG チェックの各列が無いためである。簡易形式では企業ドメインをフォーム URL のホストから `normalizeCompanyDomain` で導出し、企業名にはホスト名を入れる。`buildCampaignJob` の `companyId` は登録可能ドメインから決まるので、企業名が表示用の値になっても重複判定は変わらない。チェック列が存在しない以上、その列による除外は行わない。
 
-簡易形式のみ、リンクが `http://` の場合は検証前に `https://` へ書き換える（`simpleRowOutcome`）。この書き換え自体はここでは検証しない。検証しているのは後段の `resolveRedirectHosts`（`campaign-dry-run` が候補ごとに実行するリダイレクトプリフライト）で、https で応答しないホストはそこで失敗し（`REDIRECT_PREFLIGHT_FAILED`）、その行は登録されずスキップされる。書き換えた行数は `filterCampaignRows` の返り値 `upgradedToHttps` としてカウントされ、`campaign_filter_summary`（`campaign-dry-run`）・`campaign_send_filter_summary`（`campaign-send`）のログにも含まれる。従来の 30 列形式ではこの書き換えを行わず、`upgradedToHttps` は常に 0 である。
+簡易形式・従来の30列形式とも、CSVに明示された `http://` / `https://` を保持する。明示HTTPをHTTPSへ強制変換しない。scheme省略は従来どおり無効で、provider等の別モジュールの既定値は変更しない。`resolveRedirectHosts` はHTTP開始のHTTP継続・HTTPS昇格を許可し、一度HTTPSになった後のHTTP降格は従来の制約を維持して拒否する。HEAD、405/501時のGET代替、最大7回の遷移、公衆host/認証情報なしの境界は維持する。接続等の失敗は登録前に `REDIRECT_PREFLIGHT_FAILED` としてスキップされる。`upgradedToHttps` は出力互換のため残し、常に0となる。
 
-除外理由は本文または件名が空なら `empty_message`、URL が空なら `missing_form_url`、https（簡易形式は書き換え後の値で判定）でない・ホストが許可形式でないなら従来と同じ `invalid_or_insecure_form_url`、ホストは有効でも登録可能ドメインを導出できない（public suffix そのものなど）場合は `invalid_company_domain` である。`sourceRow`（ヘッダーを 1 行目とする CSV の行番号）の定義は両形式で同じで、承認ファイルの `sourceRow` もそのまま使える。
+除外理由は本文または件名が空なら `empty_message`、URL が空なら `missing_form_url`、HTTP(S)でない・認証情報付き・ホストが許可形式でないなら従来と同じ `invalid_or_insecure_form_url`、ホストは有効でも登録可能ドメインを導出できない（public suffix そのものなど）場合は `invalid_company_domain` である。`sourceRow`（ヘッダーを 1 行目とする CSV の行番号）の定義は両形式で同じで、承認ファイルの `sourceRow` もそのまま使える。
 
-登録値 JSON は順序と件数の完全一致から label 名での照合へ変えた。同じ項目が案件によって別の書き方（「氏名（フルネーム漢字）」/「フルネーム漢字」、「電話1」/「電話番号1」、「部署名」/「部署」、「フリガナ」/「フルネームカタカナ」、「サービスページ」/「会社HP」など）で届くためである。key ごとに label を優先順に並べ、正規の label が別名より先に一致する。`役職`（jobTitle）と `年齢`（age）を key に追加した。`電話番号` は同じ label が 2 件並ぶ想定を維持し、1 件目を `phone`、2 件目を数字のみの `phoneDigits` とする。1 件しか無い場合は両方へ同じ値を入れる。値が空の項目と未知の label は無視する。登録値ファイルは今後も項目が増えるため、未知の label でファイル全体を拒否すると運用が止まるからである。ただし無視した件数は `campaign_registration_summary` の `unknownLabels` として出し、label 名や値は出さない。`fullName` / `lastName` / `firstName` / `email` / `phone` / `companyName` が揃わない場合はエラーで停止する。フォームを埋められない値で dry-run を回しても意味がないためである。
+登録値 JSON は順序と件数の完全一致から label 名での照合へ変えた。同じ項目が案件によって別の書き方（「氏名（フルネーム漢字）」/「フルネーム漢字」、「電話1」/「電話番号1」、「部署名」/「部署」、「フリガナ」/「フルネームカタカナ」、「サービスページ」/「会社HP」など）で届くためである。key ごとに label を優先順に並べ、正規の label が別名より先に一致する。`役職`（jobTitle）と `年齢`（age）を key に追加した。`phone` は元表記を保持し、対応する国内番号から数字のみの `phoneDigits` を生成する。複数の電話値や分割値・明示digitsとの矛盾は承認前に拒否し、不明形式や境界不足は推測変換しない。ひらがな姓名の結合、メールの分割、郵便番号7桁化も `mapRegistrationValues` 内で行い、派生値を含むjobと承認fingerprintを作る。詳細は[登録値派生の仕様](derived-registration-2026-09-05.md)を参照。既存jobを後から書き換える経路は追加しない。値が空の項目と未知の label は無視する。登録値ファイルは今後も項目が増えるため、未知の label でファイル全体を拒否すると運用が止まるからである。ただし無視した件数は `campaign_registration_summary` の `unknownLabels` として出し、label 名や値は出さない。`fullName` / `lastName` / `firstName` / `email` / `phone` / `companyName` が揃わない場合はエラーで停止する。フォームを埋められない値で dry-run を回しても意味がないためである。
 
 `tools/campaign-dry-run.ts` は CSV と登録値 JSON からジョブを組み立てる。選択肢が必要なサイト向けに `--choices <path>` を追加した。JSON は `Record<string, string[]>` で、キーは payload key の書式、値は候補リストの契約（1〜10 要素、各要素 1〜256 文字、合計 2,048 文字以下）で検証する。登録値・件名・本文とキーが衝突した場合は優先順位を設けずエラーにする。サンプルは `docs/examples/campaign-choices.example.json` にある。
 
@@ -551,15 +554,15 @@ CSV は 2 つの形式を受け付ける。ヘッダーに `件名` / `本文` �
 
 `tools/campaign-send.ts` は dry-run ツールと同じ入力（`--registration` / `--csv` / `--campaign`、既定候補と `--choices` / `--no-default-choices`）に加えて `--approved <path>` と `--confirm-real-send` を要求する。`--confirm-real-send` が無い場合は CSV も承認ファイルも読まずに exit 1 で終了する。`--max-sends` の既定は 5、上限は 50 で、承認ファイルの entries がこれを超えても exit 1 になる。
 
-承認ファイルは `{ approvedBy, approvedAt, entries: [{ sourceRow, dryRunJobId, note? }] }` である。`sourceRow` は `buildCampaignJob` が payload へ入れる `sourceRow`（CSV の行番号）と同じ定義で、`filterCampaignRows` の適格行にその行が無ければ `ROW_NOT_ELIGIBLE` として登録しない。`sourceRow` と `dryRunJobId` の重複は拒否する。1 つの承認が 2 件の送信に使われることを防ぐためである。
+承認ファイルは `{ approvedBy, approvedAt, entries: [{ sourceRow, dryRunJobId, note? }] }`、またはentryに`mode: "direct"`と`contentFingerprint`を持つ。`sourceRow` は `buildCampaignJob` が payload へ入れる `sourceRow`（CSV の行番号）と同じ定義で、`filterCampaignRows` の適格行にその行が無ければ `ROW_NOT_ELIGIBLE` として登録しない。`sourceRow` と `dryRunJobId` の重複は拒否する。1 つの承認が 2 件の送信に使われることを防ぐためである。
 
-各行は登録前に `GET /jobs/<dryRunJobId>` を引き、フォーム URL の一致、そのジョブ自体が dry-run であること、`prohibited` / `DRY_RUN_COMPLETE` で終わっていること、そして内容フィンガープリントの一致を確認する。照会自体に失敗した場合も含め、満たさない行は `APPROVAL_MISMATCH` として登録しない。API へ届かないことが送信につながらないようにするためである。Worker 側も同じ比較を行うので、ツールの確認は 400 を待たずにバッチから外すためのものである。登録は dry-run ツールと同じく全件を先に `POST /jobs` へ送ってから全体をポーリングし、`registerCampaignJobs` は実送信登録では `_formAgentDryRun: false` と有効な承認記録の両方を要求する。dry-run 登録では従来どおり `_formAgentDryRun: true` が無いジョブを拒否するため、dry-run ツールから実送信ジョブが出ることはない。
+従来方式の各行は登録前に `GET /jobs/<dryRunJobId>` を引き、フォーム URL の一致、そのジョブ自体が dry-run であること、`prohibited` / `DRY_RUN_COMPLETE` で終わっていること、そして内容フィンガープリントの一致を確認する。照会自体に失敗した場合も含め、満たさない行は `APPROVAL_MISMATCH` として登録しない。API へ届かないことが送信につながらないようにするためである。Worker 側も同じ比較を行うので、ツールの確認は 400 を待たずにバッチから外すためのものである。登録は dry-run ツールと同じく全件を先に `POST /jobs` へ送ってから全体をポーリングし、`registerCampaignJobs` は実送信登録では `_formAgentDryRun: false` と有効な承認記録の両方を要求する。dry-run 登録では従来どおり `_formAgentDryRun: true` が無いジョブを拒否するため、dry-run ツールから実送信ジョブが出ることはない。
 
-登録レスポンスが失われた際の存在確認も実送信ではモードと承認込みで行う。ジョブ ID は campaign 名から決まるため、同じ ID に前回の dry-run が入っていることがあり、実効モードが `false` でないジョブや承認記録（`approvedBy` / `approvedAt` / `dryRunJobId`）が一致しないジョブは「登録済み」と認めない。
+登録レスポンスが失われた際の存在確認も実送信ではモードと承認込みで行う。ジョブ ID は campaign 名から決まるため、同じ ID に前回の dry-run が入っていることがあり、実効モードが `false` でないジョブや承認記録（`approvedBy` / `approvedAt` / 承認方式ごとの `dryRunJobId` または `mode` + `contentFingerprint`）が一致しないジョブは「登録済み」と認めない。
 
 実送信ジョブの `instruction` は dry-run 用と別にし、「1 回だけ送信する」ことと「営業禁止なら送信せずに止まる」ことを明示する。`_formAgentMaxAttempts` は dry-run と同じく 1 で、再試行はしない。exit code は、承認された entries がすべて `sent` または `prohibited` で終わった場合だけ 0 である。`prohibited` は実サイト側の判断による正常な終了なので送信失敗として扱わない。
 
-Worker 側の 3 つのガード（承認記録、dry-run 完了、内容一致）は `POST /jobs` にあり、ツールを経由しない登録にも掛かる。判定そのものは `src/real-send-guard.ts` の純粋関数に置き、Worker はその結果を HTTP ステータスへ移すだけ、ツールの事前確認は同じ関数を `GET /jobs/<dryRunJobId>` の結果へ適用する。両者が条件を別々に書いて食い違うことを防ぐためである。日次上限は設けず、件数制御は承認ファイルのentriesと`--max-sends`で各バッチに対して行う。
+Worker 側のガード（承認記録、方式に応じたdry-run 完了、内容一致）は `POST /jobs` にあり、ツールを経由しない登録にも掛かる。判定そのものは `src/real-send-guard.ts` の純粋関数に置き、Worker はその結果を HTTP ステータスへ移すだけ、ツールの事前確認は同じ関数を `GET /jobs/<dryRunJobId>` の結果へ適用する。両者が条件を別々に書いて食い違うことを防ぐためである。日次上限は設けず、件数制御は承認ファイルのentriesと`--max-sends`で各バッチに対して行う。
 
 ### Agent への安全指示
 

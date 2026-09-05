@@ -4,6 +4,7 @@
  * is compiled in the page's own realm.
  */
 
+import { SUBMISSION_INCOMPLETE_PATTERN } from "./browser-submit-confirmation";
 import { PROHIBITION_TEXT_PATTERN_SOURCES } from "./form-prohibition";
 
 export const BLOCK_BROWSER_ESCAPE_EXPRESSION = `(() => {
@@ -32,14 +33,66 @@ export const BLOCK_BROWSER_ESCAPE_EXPRESSION = `(() => {
   } catch {}
 })()`;
 
+// Custom choices are scoped by the control's explicit ARIA relationship. A
+// document-wide option search could select another field's answer.
+const ARIA_LISTBOX_HELPERS = String.raw`
+  const isListboxChoice = (element) => element.getAttribute("aria-haspopup") === "listbox" && (
+    (element.tagName === "INPUT" && ["text", "search", ""].includes(element.type) && element.readOnly) ||
+    (element.tagName === "BUTTON" && element.type === "button" && element.getAttribute("role") === "combobox")
+  );
+  const isChoiceVisible = (element) => {
+    if (element.closest('[hidden], [inert], [aria-hidden="true"]')) return false;
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    for (let current = element; current; current = current.parentElement) {
+      const style = getComputedStyle(current);
+      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+    }
+    return true;
+  };
+  const listboxOptions = (element) => {
+    if (!isListboxChoice(element)) return [];
+    const ids = (element.getAttribute("aria-controls") || element.getAttribute("aria-owns") || "").trim().split(/\s+/).filter(Boolean);
+    if (ids.length !== 1) return [];
+    const listbox = element.getRootNode().getElementById?.(ids[0]);
+    if (!listbox || listbox.getAttribute("role") !== "listbox" || !isChoiceVisible(listbox)) return [];
+    const options = Array.from(listbox.querySelectorAll('[role="option"]')).filter((option) =>
+      option.closest('[role="listbox"]') === listbox && !option.disabled && option.getAttribute("aria-disabled") !== "true" && isChoiceVisible(option)
+    );
+    return options.length <= 100 ? options : [];
+  };
+  const choiceText = (element) => String(element.innerText ?? element.textContent ?? "").trim();
+`;
+
 export const INSPECT_ELEMENT_FUNCTION = String.raw`function() {
   const element = this;
+  ${ARIA_LISTBOX_HELPERS}
   if (!element || typeof element.tagName !== "string") return { ok: false };
   const tag = element.tagName.toLowerCase();
   const type = typeof element.type === "string" ? element.type.toLowerCase() : "";
+  const listboxChoice = isListboxChoice(element);
   const rect = element.getBoundingClientRect();
   const style = getComputedStyle(element);
-  const visible = rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
+  // Native choice inputs are often hidden while an associated label paints the
+  // control. Only a real, visible label may expose such an input; arbitrary
+  // hidden inputs and hidden/inert form sections remain unavailable.
+  const visibleChoiceLabel = tag === "input" && ["checkbox", "radio"].includes(type)
+    && element.isConnected && !element.closest('[hidden], [inert], [aria-hidden="true"]')
+    && Array.from(element.labels ?? []).some((label) => {
+      if (label.control !== element || label.closest('[hidden], [inert], [aria-hidden="true"]')) return false;
+      const labelRect = label.getBoundingClientRect();
+      if (labelRect.width <= 0 || labelRect.height <= 0) return false;
+      for (let current = label; current; current = current.parentElement) {
+        const currentStyle = getComputedStyle(current);
+        if (currentStyle.display === "none" || currentStyle.visibility === "hidden" || currentStyle.opacity === "0") return false;
+      }
+      for (let current = element.parentElement; current; current = current.parentElement) {
+        const currentStyle = getComputedStyle(current);
+        if (currentStyle.display === "none" || currentStyle.visibility === "hidden" || currentStyle.opacity === "0") return false;
+      }
+      return true;
+    });
+  const visible = !element.closest('[hidden], [inert], [aria-hidden="true"]') && ((rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0") || visibleChoiceLabel);
   const labels = Array.from(element.labels ?? []).map((label) => label.textContent?.trim() ?? "").filter(Boolean).join(" ");
   const labelledBy = (element.getAttribute("aria-labelledby") ?? "").split(/\s+/).filter(Boolean).map((id) => element.getRootNode().getElementById?.(id)?.textContent?.trim() ?? "").filter(Boolean).join(" ");
   const label = (element.getAttribute("aria-label") || labelledBy || labels || element.closest("label")?.textContent?.trim() || "").slice(0, 500);
@@ -50,30 +103,59 @@ export const INSPECT_ELEMENT_FUNCTION = String.raw`function() {
   return {
     ok: true,
     visible,
-    tag,
-    type,
+    tag: listboxChoice ? "select" : tag,
+    type: listboxChoice ? "aria-listbox" : type,
     name: typeof element.name === "string" && element.name ? element.name.slice(0, 500) : null,
     label,
     placeholder: typeof element.placeholder === "string" && element.placeholder ? element.placeholder.slice(0, 500) : null,
     required: Boolean(element.required),
-    value: typeof element.value === "string" ? element.value.slice(0, 8192) : "",
-    options: tag === "select" ? Array.from(element.options).slice(0, 100).map((option) => ({ value: option.value.slice(0, 2048), label: option.text.slice(0, 500) })) : [],
+    value: listboxChoice && tag === "button" ? choiceText(element).slice(0, 8192) : (typeof element.value === "string" ? element.value.slice(0, 8192) : ""),
+    options: tag === "select" ? Array.from(element.options).slice(0, 100).map((option) => ({ value: option.value.slice(0, 2048), label: option.text.slice(0, 500) })) : (listboxChoice ? listboxOptions(element).map((option) => ({ value: choiceText(option).slice(0, 2048), label: choiceText(option).slice(0, 500) })) : []),
     submitLike,
     target,
     formAction: typeof formAction === "string" ? formAction.slice(0, 2048) : "",
     formMethod: typeof formMethod === "string" ? formMethod.slice(0, 20) : "",
-    disabled: Boolean(element.disabled),
+    disabled: Boolean(element.disabled) || (listboxChoice && element.getAttribute("aria-disabled") === "true"),
     readOnly: Boolean(element.readOnly),
     checked: Boolean(element.checked)
   };
 }`;
 
-export const HAS_CONFIRMATION_TEXT_FUNCTION = `function(pattern, pendingPattern) {
+/** Read the exact matched text in the same snapshot used for the decision. */
+export const READ_SUBMISSION_MESSAGES_FUNCTION = `function(pattern, pendingPattern, failurePattern, previous) {
   const text = String(this.innerText || "");
-  // A review-before-send screen ("まだ送信は完了していません", "この内容で送信")
-  // mentions completion without being one, so it never counts.
-  if (new RegExp(pendingPattern, "i").test(text)) return false;
-  return new RegExp(pattern, "i").test(text);
+  // Exclude a result message quoted immediately after an explicit display-example label.
+  // Do not reject a page merely for having a FAQ elsewhere or mask a later real result.
+  const exampleIntroduction = /(?:^|[\\r\\n])[ \\t]*(?:(?:次|以下)の(?:メッセージ|文言)が表示された場合[^。\\r\\n]{0,80}。|表示例[:：]?)[ \\t]*$/;
+  const messages = (pattern) => Array.from(text.matchAll(new RegExp(pattern, "gi"))).filter((match) =>
+    !exampleIntroduction.test(text.slice(Math.max(0, match.index - 160), match.index).trimEnd())).map((match) => match[0]);
+  const confirmationCandidates = Array.from(new Set(messages(pattern)));
+  const candidate = confirmationCandidates[0] ?? "";
+  // Formatting changes cannot turn an old receipt into a new submission result.
+  // Normalize only identity comparisons; keep exact matches for evidence.
+  const candidateIdentity = (value) => value.replace(/\\s+/g, "").toLowerCase();
+  const pendingLines = Array.from(new Set(Array.from(text.matchAll(new RegExp(pendingPattern, "gi")), (match) => {
+    const start = text.lastIndexOf("\\n", match.index - 1) + 1;
+    const end = text.indexOf("\\n", match.index);
+    return text.slice(start, end === -1 ? text.length : end).trim();
+  })));
+  const pendingGuidance = confirmationCandidates.length <= 20 && pendingLines.length <= 20 && pendingLines.every((line) => line.length <= 500) ? pendingLines : [];
+  // Only the same body's pre-submit lines may be treated as static instructions.
+  // A remaining form (even hidden), control, receipt already present before,
+  // or explicit non-completion keeps the original pending veto.
+  const staticGuidanceOnly = previous && Array.isArray(previous.pendingGuidance)
+    && pendingGuidance.length > 0 && pendingGuidance.every((line) => previous.pendingGuidance.includes(line))
+    && candidate !== "" && Array.isArray(previous.confirmationCandidates) && !previous.confirmationCandidates.some((old) => candidateIdentity(old) === candidateIdentity(candidate))
+    && !new RegExp(${JSON.stringify(SUBMISSION_INCOMPLETE_PATTERN)}, "i").test(text)
+    && typeof this.querySelector === "function" && typeof this.querySelectorAll === "function"
+    && !Array.from(this.querySelectorAll('[contenteditable]')).some((element) =>
+      String(element.getAttribute("contenteditable")).toLowerCase() !== "false")
+    && !this.querySelector('a[href], area[href], [tabindex], iframe, frame, form, input:not([type="hidden"]), textarea, select, button, [role="button"], [role="combobox"], [role="checkbox"], [role="radio"], [contenteditable="true"], [onclick]');
+  const confirmation = pendingLines.length > 0 && !staticGuidanceOnly ? "" : candidate;
+  const failure = messages(failurePattern)[0] ?? "";
+  return { confirmation: confirmation.trim().slice(0, 500), failure: failure.trim().slice(0, 500),
+    ...(previous ? { pendingGuidance, confirmationCandidates: confirmationCandidates.slice(0, 20) } : {}) };
+
 }`;
 
 /**
@@ -142,6 +224,24 @@ export const SELECT_OPTION_BY_CANDIDATE_FUNCTION = `function(candidates) {
   return false;
 }`;
 
+/** Select only an exact label in the currently visible, explicitly owned listbox. */
+export const SELECT_ARIA_LISTBOX_BY_CANDIDATE_FUNCTION = `function(candidates) {
+  ${ARIA_LISTBOX_HELPERS}
+  if (!isListboxChoice(this) || !Array.isArray(candidates) || this.disabled || this.getAttribute("aria-disabled") === "true" || !isChoiceVisible(this)) return null;
+  const options = listboxOptions(this);
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" || !candidate.trim()) continue;
+    const matches = options.filter((option) => choiceText(option).toLowerCase() === candidate.trim().toLowerCase());
+    if (matches.length > 1) return null;
+    if (!matches.length) continue;
+    const match = matches[0];
+    const selectedLabel = choiceText(match);
+    HTMLElement.prototype.click.call(match);
+    return selectedLabel;
+  }
+  return null;
+}`;
+
 /**
  * Checks the radio only when no other enabled radio of the same group matches
  * an earlier candidate, so the registrant's order decides which one is used
@@ -175,7 +275,9 @@ export const ACTIVATE_SUBMIT_FUNCTION = `function(input, expectedAction, expecte
   const tag = typeof this.tagName === "string" ? this.tagName.toLowerCase() : "";
   const type = typeof this.type === "string" ? this.type.toLowerCase() : "";
   const submitLike = (tag === "button" && (!type || type === "submit")) || (tag === "input" && ["submit", "image"].includes(type));
-  if (!submitLike) return false;
+  // Script-driven send buttons still require the reviewed form owner,
+  // visible state, action and method checked below.
+  if (!submitLike && !(["button", "input"].includes(tag) && type === "button")) return false;
   const rect = this.getBoundingClientRect();
   const style = getComputedStyle(this);
   if (rect.width <= 0 || rect.height <= 0 || style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
@@ -222,8 +324,17 @@ export const IS_ELEMENT_FOCUSED_FUNCTION = `function() {
   return Boolean(this.isConnected && root && root.activeElement === this);
 }`;
 
+/** Commit native change/blur handlers before the next observation and review. */
+export const COMMIT_TEXT_INPUT_FUNCTION = `function() {
+  HTMLElement.prototype.blur.call(this);
+}`;
+
 export const CHECK_FORM_VALIDITY_FUNCTION = `function() {
-  return Boolean(this.form && typeof this.form.checkValidity === "function" && this.form.checkValidity());
+  if (!this.form) return false;
+  // Match native submit semantics. CF7 and similar forms use novalidate to
+  // leave conditional-field validation to their own submit handler.
+  if (this.form.noValidate === true || this.formNoValidate === true) return true;
+  return Boolean(typeof this.form.checkValidity === "function" && this.form.checkValidity());
 }`;
 
 export const READ_FORM_PROHIBITION_REASON_CODES_FUNCTION = `function() {

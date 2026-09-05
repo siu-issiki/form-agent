@@ -13,10 +13,7 @@ import {
 	type JobStatus,
 	TERMINAL_JOB_STATUSES,
 } from "../src/job";
-import {
-	isCompletedDryRunFor,
-	matchesDryRunContent,
-} from "../src/real-send-guard";
+import { checkRealSendGuard } from "../src/real-send-guard";
 import {
 	loadChoiceCandidates,
 	PRODUCTION_BASE_URL,
@@ -132,7 +129,7 @@ async function buildApprovedJob(
 			approval: approvalRecord(approval, entry),
 		},
 	);
-	if (!(await hasCompletedDryRun(entry, job))) {
+	if (!(await matchesApproval(job))) {
 		count("APPROVAL_MISMATCH", entry.sourceRow);
 		return null;
 	}
@@ -142,7 +139,9 @@ async function buildApprovedJob(
 			jobId: job.id,
 			companyId: job.companyId,
 			sourceRow: entry.sourceRow,
-			dryRunJobId: entry.dryRunJobId,
+			...(entry.mode === "direct"
+				? { mode: entry.mode, contentFingerprint: entry.contentFingerprint }
+				: { dryRunJobId: entry.dryRunJobId }),
 			formValueCount: Object.keys(job.payload.formValues as object).length,
 			allowedHostCount: job.allowedHosts.length,
 		}),
@@ -151,31 +150,26 @@ async function buildApprovedJob(
 }
 
 /**
- * Confirms the approved dry-run job really covers this send: the same content
- * fingerprint (form URL, company, and every form value), a run that was itself
- * a dry-run, and a result that reached the dry-run boundary. The Worker repeats
- * the same comparison; this one keeps a mismatched row out of the batch instead
- * of turning it into a 400. A lookup that cannot be completed counts as a
- * mismatch, so an unreachable API never turns into a send.
+ * Apply the same guard as the Worker before registration. Direct approvals
+ * compare the frozen content digest; legacy approvals also read the dry-run.
  */
-async function hasCompletedDryRun(
-	entry: SendApprovalEntry,
-	job: JobInput,
-): Promise<boolean> {
-	const state = await readJobState(
-		entry.dryRunJobId,
-		options.apiToken,
-		EVENT_PREFIX,
+async function matchesApproval(job: JobInput): Promise<boolean> {
+	const decision = await checkRealSendGuard(
+		{ ...job, payload: { ...job.payload, _formAgentEffectiveDryRun: false } },
+		{
+			find: (id) => readJobState(id, options.apiToken, EVENT_PREFIX),
+		},
 	);
-	if (!isCompletedDryRunFor(state, job)) return false;
-	return matchesDryRunContent(state, job);
+	return decision.allowed;
 }
 
 function approvalRecord(file: SendApprovalFile, entry: SendApprovalEntry) {
 	return {
 		approvedBy: file.approvedBy,
 		approvedAt: file.approvedAt,
-		dryRunJobId: entry.dryRunJobId,
+		...(entry.mode === "direct"
+			? { mode: entry.mode, contentFingerprint: entry.contentFingerprint }
+			: { dryRunJobId: entry.dryRunJobId }),
 		...(entry.note === undefined ? {} : { note: entry.note }),
 	};
 }

@@ -42,7 +42,7 @@ Content-Type: application/json
 
 `targetDomain`は企業の登録可能ドメインです。フォームが外部サービスにある場合だけ、CSVのフォームURLと事前に解決したredirect先の**完全一致hostname**をジョブ固有の`allowedHosts`へ設定します。許可は他ジョブへ共有されず、`google.com`のような上位ドメインへ自動拡張しません。
 
-登録成功は`201`、同じID・同じ内容のジョブが既に存在する場合は`200`を返します。既存ジョブが`pending`なら、作成後のQueue投入失敗から復旧できるよう再度Queueへ投入します。同じIDで内容が異なる場合は、既存情報を返さず`409`とします。実送信になるジョブ（`AGENT_DRY_RUN=false`かつpayloadに`_formAgentDryRun: true`が無い）は、承認記録`_formAgentSendApproval`が無ければ`400 SEND_APPROVAL_REQUIRED`、承認が指すdry-runが同じフォームURLで完了していなければ`400 DRY_RUN_NOT_COMPLETED`、そのdry-runと内容が一致しなければ`400 DRY_RUN_CONTENT_MISMATCH`で拒否します。日次の送信件数上限はありません。`pending`ジョブは日を跨いでも同じ内容で再登録できます。承認記録・dry-run突合は、`targetDomain`が`REAL_SEND_GUARD_EXEMPT_DOMAINS`（カンマ区切りの登録可能ドメイン）と一致するか、その配下のホストである場合だけ免除します。**この免除は管理下テストシステム専用です。実サイトのドメインを入れてはいけません。**`GET /jobs/:id`は同じBearer認証で現在状態を返します。いずれのレスポンスにも実行権を表す`runToken`は含めません。一覧・キャンセルAPIは未実装です。
+登録成功は`201`、同じID・同じ内容のジョブが既に存在する場合は`200`を返します。既存ジョブが`pending`なら、作成後のQueue投入失敗から復旧できるよう再度Queueへ投入します。同じIDで内容が異なる場合は、既存情報を返さず`409`とします。実送信になるジョブ（`AGENT_DRY_RUN=false`かつpayloadに`_formAgentDryRun: true`が無い）は、承認記録`_formAgentSendApproval`が無ければ`400 SEND_APPROVAL_REQUIRED`、direct承認の内容フィンガープリントが一致しなければ`400 SEND_APPROVAL_CONTENT_MISMATCH`、従来方式の承認が指すdry-runが同じフォームURLで完了していなければ`400 DRY_RUN_NOT_COMPLETED`、そのdry-runと内容が一致しなければ`400 DRY_RUN_CONTENT_MISMATCH`で拒否します。日次の送信件数上限はありません。`pending`ジョブは日を跨いでも同じ内容で再登録できます。承認記録・dry-run突合は、`targetDomain`が`REAL_SEND_GUARD_EXEMPT_DOMAINS`（カンマ区切りの登録可能ドメイン）と一致するか、その配下のホストである場合だけ免除します。**この免除は管理下テストシステム専用です。実サイトのドメインを入れてはいけません。**`GET /jobs/:id`は同じBearer認証で現在状態を返します。いずれのレスポンスにも実行権を表す`runToken`は含めません。一覧・キャンセルAPIは未実装です。
 
 BrowserUse は Agent API ではなく standalone browser API だけを使用します。top-level navigationと入力後の通信は対象ドメイン内に制限し、入力前の公開HTTPS read-only subresourceだけを許可します。送信は D1 上で `running` から `submitting` へ遷移できたジョブにだけ許可します。
 
@@ -54,11 +54,13 @@ production Workerを使う送信なしE2Eは、productionの`JOB_API_TOKEN`と�
 
 ## CSVキャンペーンのdry-run
 
-登録情報JSONと送信対象CSVはリポジトリへ追加せず、ローカルパスから読み込みます。インポーターは送信済み・NGチェック該当・HTTPS以外を除外し、登録情報の日本語labelを固定のASCII form keyへ変換します。IDはキャンペーン名・企業ドメイン・フォームURLから安定生成し、previewには値・本文・メールアドレス・電話番号を出しません。
+登録情報JSONと送信対象CSVはリポジトリへ追加せず、ローカルパスから読み込みます。インポーターは送信済み・NGチェック該当・HTTP(S)以外を除外し、登録情報の日本語labelを固定のASCII form keyへ変換します。IDはキャンペーン名・企業ドメイン・フォームURLから安定生成し、previewには値・本文・メールアドレス・電話番号を出しません。
 
-CSVは2つの形式を受け付けます。ヘッダーに`件名` / `本文`と、リンク列（`問い合わせリンク`または`問い合わせフォームリンク`）が揃っている場合は簡易形式として読み、企業ドメインはフォームURLのホストから導出します。リンク列が両方ある場合は`問い合わせリンク`が優先されます。先頭に無名のインデックス列（CSVパーサーがキー`""`として公開する列）があっても無視され、簡易形式として読めます。この形式にはNGチェック列も企業名列も無いため、チェック列による除外は行わず、企業名にはホスト名を入れます（`companyId`は従来どおり登録可能ドメインから決まります）。簡易形式では`http://`のリンクは登録前に`https://`へ書き換えられ、書き換え件数は`filterCampaignRows`の返り値`upgradedToHttps`としてカウントされ、`campaign_filter_summary`（`campaign-dry-run`）・`campaign_send_filter_summary`（`campaign-send`）のログにも出力されます。この書き換え自体はここでは検証されず、httpsで応答しないホストは後段のリダイレクトプリフライトで`REDIRECT_PREFLIGHT_FAILED`として弾かれ、その行はスキップされます。除外理由は本文または件名が空なら`empty_message`、URLが空なら`missing_form_url`、https（書き換え後を含む）でない・ホストが不正なら`invalid_or_insecure_form_url`、ホストは有効でも登録可能ドメインを導出できない（public suffix そのものなど）場合は`invalid_company_domain`です。それ以外のヘッダーは従来の30列形式として扱い、必須列が欠けていればエラーにします（この形式では`http://`の書き換えは行わず`upgradedToHttps`は常に0です）。`sourceRow`はどちらの形式でもヘッダーを1行目としたCSVの行番号です。
+CSVは2つの形式を受け付けます。ヘッダーに`件名` / `本文`と、リンク列（`問い合わせリンク`または`問い合わせフォームリンク`）が揃っている場合は簡易形式として読み、企業ドメインはフォームURLのホストから導出します。リンク列が両方ある場合は`問い合わせリンク`が優先されます。先頭に無名のインデックス列（CSVパーサーがキー`""`として公開する列）があっても無視され、簡易形式として読めます。この形式にはNGチェック列も企業名列も無いため、チェック列による除外は行わず、企業名にはホスト名を入れます（`companyId`は従来どおり登録可能ドメインから決まります）。両形式とも明示された`http://` / `https://`をそのまま保持し、scheme省略は補完せず従来どおり除外します。互換のため`upgradedToHttps`メトリクスは残しますが、強制変換廃止により常に0です。後段のリダイレクトプリフライトはHTTP開始時のHTTP継続とHTTPSへの昇格を許可し、一度HTTPSになった後のHTTP降格は拒否します。接続・TLS・許可境界等で失敗した行は`REDIRECT_PREFLIGHT_FAILED`として登録前にスキップします。除外理由は本文または件名が空なら`empty_message`、URLが空なら`missing_form_url`、HTTP(S)でない・認証情報付き・ホストが不正なら`invalid_or_insecure_form_url`、ホストは有効でも登録可能ドメインを導出できない（public suffix そのものなど）場合は`invalid_company_domain`です。それ以外のヘッダーは従来の30列形式として扱い、必須列が欠けていればエラーにします。`sourceRow`はどちらの形式でもヘッダーを1行目としたCSVの行番号です。
 
-登録情報JSONはlabel名で照合するため、項目の順序と件数は自由です。別名を受け付ける項目は「氏名（フルネーム漢字）」=`フルネーム漢字`、「氏名（フルネームカタカナ）」「フリガナ」=`フルネームカタカナ`、「氏名（フルネームひらがな）」「ふりがな」=`フルネームひらがな`、「苗字（カタカナ）」「名前（カタカナ）」=`苗字（カナ）`「名前（カナ）」、「電話1〜3」=`電話番号1〜3`、「部署名」=`部署`、「サービスページ」=`会社HP`で、正規のlabelと別名が両方ある場合は正規のlabelが勝ちます。`役職`（jobTitle）と`年齢`（age）も取り込みます。`電話番号`が2件ある場合は1件目を`phone`、2件目を数字のみの`phoneDigits`として扱い、1件だけなら両方に同じ値を入れます。値が空の項目と未知のlabelは無視し、`campaign_registration_summary`にはlabel名を出さず件数（`mappedKeys` / `unknownLabels`）だけを出力します。`fullName` / `lastName` / `firstName` / `email` / `phone` / `companyName`が揃わない場合はエラーで停止します。
+登録情報JSONはlabel名で照合するため、項目の順序と件数は自由です。別名を受け付ける項目は「氏名（フルネーム漢字）」=`フルネーム漢字`、「氏名（フルネームカタカナ）」「フリガナ」=`フルネームカタカナ`、「氏名（フルネームひらがな）」「ふりがな」=`フルネームひらがな`、「苗字（カタカナ）」「名前（カタカナ）」=`苗字（カナ）`「名前（カナ）」、「電話1〜3」=`電話番号1〜3`、「部署名」=`部署`、「サービスページ」=`会社HP`で、正規のlabelと別名が両方ある場合は正規のlabelが勝ちます。`役職`（jobTitle）と`年齢`（age）も取り込みます。`phone`は原文を保持し、対応する国内番号から`phoneDigits`を生成します。2件目以降の電話番号や明示された数字専用値・分割値との矛盾は承認前に検出します。既存のひらがな姓名から`fullNameHiragana`、メールから`emailLocalPart` / `emailDomain`、郵便番号から`postalCodeDigits`も生成します。対応外の表記は推測せず、生成条件・明示値との照合は[登録値派生の仕様](docs/derived-registration-2026-09-05.md)を参照してください。値が空の項目と未知のlabelは無視し、`campaign_registration_summary`にはlabel名を出さず件数（`mappedKeys` / `unknownLabels`）だけを出力します。`fullName` / `lastName` / `firstName` / `email` / `phone` / `companyName`が揃わない場合はエラーで停止します。
+
+一般問い合わせの表記違いと「同意する」radio向けの代替候補は[一般問い合わせ用の候補例](docs/examples/campaign-choices.general-outreach.example.json)です。次の新規キャンペーンを準備する際に`--choices`で明示指定し、生成値と候補を含む承認を作成します。既定セットや終了済みキャンペーンは自動変更しません。
 
 ```bash
 bun run campaign:dry-run \
@@ -88,7 +90,7 @@ productionへ登録する場合だけ`JOB_API_TOKEN`を環境変数へ設定し�
 
 実送信ジョブを作れるのは`campaign:send`だけです。`campaign:dry-run`は`_formAgentDryRun: true`固定のままで、実送信できません。
 
-実行前に、対象行がすべてdry-runを通り`prohibited / DRY_RUN_COMPLETE`で終わっていることを確認してください。日次上限の設定や、送信前後のdeployは不要です。手順の全体は[docs/operations.md](docs/operations.md)の「実送信のrunbook」にあります。
+実行前に、対象行の内容フィンガープリントを固定したdirect承認、または完了したdry-runに対する承認を用意してください。direct承認では独立したdry-runジョブを省き、実送信ジョブ内の入力・画像・用途の審査は引き続き実行します。日次上限の設定や、送信前後のdeployは不要です。手順の全体は[docs/operations.md](docs/operations.md)の「実送信のrunbook」にあります。
 
 ```bash
 JOB_API_TOKEN=... bun run campaign:send \
@@ -116,7 +118,11 @@ JOB_API_TOKEN=... bun run campaign:send \
 
 `sourceRow`はCSVの行番号（ヘッダーを1行目とする2以上の整数）で、dry-runジョブのpayloadの`sourceRow`と同じ定義です。`dryRunJobId`はdry-runの`campaign_job_result`ログに出た`jobId`です。`sourceRow`と`dryRunJobId`の重複は拒否します。サンプルは[docs/examples/campaign-send-approval.example.json](docs/examples/campaign-send-approval.example.json)にあります。承認ファイルと登録情報JSONはリポジトリへ追加せず、ローカルパスから読み込みます。
 
-各行は登録前に`GET /jobs/<dryRunJobId>`でdry-runの完了と内容の一致を確認し、満たさない行は登録せず`APPROVAL_MISMATCH`として集計します。内容の比較は`targetUrl` + `companyId` + `payload.formValues`のSHA-256で、承認したdry-runと違う本文や入力値では送信できません。Worker側でも`POST /jobs`が承認記録（400 `SEND_APPROVAL_REQUIRED`）、dry-run完了（400 `DRY_RUN_NOT_COMPLETED`）、内容の一致（400 `DRY_RUN_CONTENT_MISMATCH`）を検証します。日次上限はなく、送信件数は承認ファイルと`--max-sends`で指定します。`REAL_SEND_GUARD_EXEMPT_DOMAINS`に載せたドメイン宛のジョブだけがこの3つの検証を免除され、`real_send`としても数えません。管理下テストシステム（`form-agent.workers.dev`配下）の回帰確認のためのもので、実サイトのドメインを入れると人間の承認なしに送信できてしまいます。承認記録はモデルにも送信前レビューにも渡しません。
+従来方式の各行は登録前に`GET /jobs/<dryRunJobId>`でdry-runの完了と内容の一致を確認し、満たさない行は登録せず`APPROVAL_MISMATCH`として集計します。内容の比較は`targetUrl` + `companyId` + `payload.formValues`のSHA-256で、承認したdry-runと違う本文や入力値では送信できません。Worker側でも`POST /jobs`が承認記録（400 `SEND_APPROVAL_REQUIRED`）、dry-run完了（400 `DRY_RUN_NOT_COMPLETED`）、内容の一致（400 `DRY_RUN_CONTENT_MISMATCH`）を検証します。日次上限はなく、送信件数は承認ファイルと`--max-sends`で指定します。`REAL_SEND_GUARD_EXEMPT_DOMAINS`に載せたドメイン宛のジョブだけがこの3つの検証を免除され、`real_send`としても数えません。管理下テストシステム（`form-agent.workers.dev`配下）の回帰確認のためのもので、実サイトのドメインを入れると人間の承認なしに送信できてしまいます。承認記録はモデルにも送信前レビューにも渡しません。
+
+独立dry-runを省く場合、entryは`{ "sourceRow": 89, "mode": "direct", "contentFingerprint": "<64桁のSHA-256>" }`とします。承認前に同じCSV・登録情報・choicesから`buildCampaignJob`でローカル構築し、`jobContentFingerprint(job.targetUrl, job.companyId, job.payload)`で値を固定します。この構築だけではジョブ登録やブラウザ起動はありません。CLIはdirect承認のダイジェストを照合し、Workerも再照合します。`dryRunJobId`とdirect指定の併記は拒否します。本文・登録値・候補リストの順序を変えた場合は、変更内容を確認して承認を作り直します。実送信内の送信直前画像、独立審査、ページ状態の再確認は省略しません。
+
+既存実送信先との重複は、各バッチの登録前に本番D1の`real_send=1`と宛先ドメインを照合して除外します。別ジョブIDでの同じドメインへの再送をDBが一律禁止する仕組みではありません。完了未確認・失敗した実送信を自動で再登録しないでください。
 
 承認されたentriesがすべて`sent`または`prohibited`で終わった場合だけexit 0になります。`prohibited`は実サイト側の判断による正常な終了です。
 

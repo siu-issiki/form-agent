@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<title>翻訳ウィジェット付きフォームの観測</title>
+<h1>お問い合わせ</h1>
+<form method="post" action="/submit">
+  <label>お名前<input name="fullName" required></label>
+  <label>メール<input name="email" type="email" required></label>
+  <label>お問い合わせ<textarea name="message" required></textarea></label>
+  <button type="submit">送信</button>
+</form>
+<div id="translation"></div>
+<script>
+// biome-ignore lint/correctness/noUnusedVariables: Google Translate calls this through the cb parameter.
+function initializeTranslation() {
+  new google.translate.TranslateElement({pageLanguage: 'ja', autoDisplay: false}, 'translation');
+}
+</script>
+<script src="https://translate.google.com/translate_a/element.js?cb=initializeTranslation"></script>
+</html>

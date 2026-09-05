@@ -85,6 +85,46 @@ function submittedJob(result: Job | SubmitStagePending): Job {
 }
 
 describe("RestrictedBrowserTools", () => {
+	test.each([
+		"https://translate.google.com/translate_a/element.js?cb=initializeTranslation",
+		"https://TRANSLATE.GOOGLE.COM./translate_a/element.js?cb=callback",
+	])(
+		"blocks the optional translation bootstrap before it creates unpaused frames: %s",
+		(url) => {
+			expect(() =>
+				assertAllowedBrowserRequest(
+					url,
+					"form-agent.dev",
+					"GET",
+					false,
+					true,
+					false,
+					[],
+					"Script",
+				),
+			).toThrow(NavigationPolicyError);
+		},
+	);
+
+	test.each([
+		"https://form-agent.dev/contact-form.js",
+		"https://www.gstatic.com/recaptcha/releases/version/recaptcha__ja.js",
+		"https://www.google.com/recaptcha/api.js",
+	])("keeps form scripts and verification widgets available: %s", (url) => {
+		expect(() =>
+			assertAllowedBrowserRequest(
+				url,
+				"form-agent.dev",
+				"GET",
+				false,
+				true,
+				false,
+				[],
+				"Script",
+			),
+		).not.toThrow();
+	});
+
 	test("blocks unsafe requests until submission is authorized", () => {
 		expect(() =>
 			assertAllowedBrowserRequest(
@@ -386,6 +426,56 @@ describe("RestrictedBrowserTools", () => {
 		expect(driver.navigationCount).toBe(1);
 	});
 
+	test.each([
+		"https://acme.co.jp/contact#contact",
+		"https://acme.co.jp/app#/contact",
+	])(
+		"registered fragment target bootstraps exactly once: %s",
+		async (targetUrl) => {
+			const driver = new FakeDriver();
+			driver.url = "about:blank";
+			const tools = await createToolsForInput(driver, { ...input, targetUrl });
+			await tools.navigate(targetUrl);
+			await tools.navigate(targetUrl);
+			expect(driver.url).toBe(targetUrl);
+			expect(driver.navigationCount).toBe(1);
+			expect(driver.submitCount).toBe(0);
+		},
+	);
+	test.each([
+		"https://acme.co.jp/contact#other",
+		"https://acme.co.jp/contact?delete=1#contact",
+		"https://acme.co.jp/contact",
+		"https://evil.test/contact#contact",
+	])(
+		"registered fragment does not authorize an unobserved variant: %s",
+		async (unobserved) => {
+			const driver = new FakeDriver();
+			driver.url = "https://acme.co.jp/landing";
+			const tools = await createToolsForInput(driver, {
+				...input,
+				targetUrl: `${input.targetUrl}#contact`,
+			});
+			await expect(tools.navigate(unobserved)).rejects.toBeInstanceOf(
+				NavigationPolicyError,
+			);
+			expect(driver.navigationCount).toBe(0);
+		},
+	);
+	test("registered fragment can follow a subsequently observed exact anchor", async () => {
+		const driver = new FakeDriver();
+		driver.url = "about:blank";
+		const targetUrl = `${input.targetUrl}#contact`;
+		const next = `${input.targetUrl}#address`;
+		const tools = await createToolsForInput(driver, { ...input, targetUrl });
+		await tools.navigate(targetUrl);
+		driver.navigationLinks = [{ url: next, text: "所在地" }];
+		await tools.observe();
+		await tools.navigate(next);
+		expect(driver.url).toBe(next);
+		expect(driver.navigationCount).toBe(2);
+	});
+
 	test("does not treat another observed hash route as the same navigation", async () => {
 		const driver = new FakeDriver();
 		driver.navigationLinks = [
@@ -497,12 +587,57 @@ describe("RestrictedBrowserTools", () => {
 		expect(driver.submitCount).toBe(1);
 	});
 
-	test("continues a two-step submission after the confirmation screen", async () => {
+	test("local confirmation click leaves submission permission unused until the final send", async () => {
 		const driver = new FakeDriver();
-		driver.submitResults = [
-			notObservedConfirmation(),
-			{ outcome: "sent", formUrl: input.targetUrl },
-		];
+		driver.observationForms = stageObservedForms(
+			"確認画面へ",
+			"fa-0-1",
+			"button",
+		);
+		const store = new InMemoryJobStore();
+		const reviewer = new StubSubmitReviewer();
+		const tools = await createToolsWithEvidence(
+			driver,
+			store,
+			new InMemoryEvidenceObjectStore(),
+			reviewer,
+		);
+		await tools.fill("fa-0-0", STAGE_EMAIL);
+		await tools.fill("fa-0-2", STAGE_BODY);
+		await tools.observe();
+		await tools.click("fa-0-1");
+		expect((await store.find(input.id))?.status).toBe("running");
+		expect(driver.submitCount).toBe(0);
+		expect(driver.clickCount).toBe(1);
+		expect(reviewer.reviewCount).toBe(0);
+		expect(tools.hasUnconfirmedSubmission()).toBe(false);
+		driver.observationForms = stageObservedForms(
+			"送信する",
+			"fa-0-3",
+			"button",
+		);
+		await expect(tools.submit("fa-0-3")).rejects.toBeInstanceOf(
+			ObservationStaleError,
+		);
+		expect((await store.find(input.id))?.status).toBe("running");
+		await tools.observe();
+		expect(submittedJob(await tools.submit("fa-0-3")).status).toBe("sent");
+		expect(driver.submitCount).toBe(1);
+		expect(reviewer.reviewCount).toBe(1);
+	});
+
+	test("a mistaken submit of local confirmation remains terminal even if a final send appears", async () => {
+		const driver = new FakeDriver();
+		driver.observationForms = stageObservedForms(
+			"確認画面へ",
+			"fa-0-1",
+			"button",
+		);
+		driver.submitResult = {
+			outcome: "uncertain",
+			reasonCode: "SUBMIT_DOM_REQUEST_NOT_OBSERVED",
+			reason: "No request was observed.",
+		};
 		const store = new InMemoryJobStore();
 		const tools = await createToolsWithEvidence(
 			driver,
@@ -512,32 +647,72 @@ describe("RestrictedBrowserTools", () => {
 		await tools.fill("fa-0-0", STAGE_EMAIL);
 		await tools.fill("fa-0-2", STAGE_BODY);
 		await tools.observe();
-		// The activation leads to a confirmation screen repeating what was entered.
 		driver.pageText = `${STAGE_EMAIL} ${STAGE_BODY}`;
-
-		const pending = await tools.submit("fa-0-1", "mouse");
-
-		expect(pending).toEqual({ pendingStage: 1 });
-		expect(tools.hasUnconfirmedSubmission()).toBe(true);
-		expect((await store.find(input.id))?.status).toBe("submitting");
-
+		expect(submittedJob(await tools.submit("fa-0-1")).status).toBe("uncertain");
+		driver.observationForms = stageObservedForms(
+			"送信する",
+			"fa-0-3",
+			"button",
+		);
 		await tools.observe();
-		const sent = submittedJob(await tools.submit("fa-0-1", "mouse"));
-
-		expect(sent.status).toBe("sent");
+		await expect(tools.submit("fa-0-3")).rejects.toBeInstanceOf(
+			SubmissionNotAuthorizedError,
+		);
+		expect(driver.submitCount).toBe(1);
 		expect(tools.hasUnconfirmedSubmission()).toBe(false);
-		expect(driver.submitCount).toBe(2);
-		// Only the first stage claims the permission and is reviewed.
-		expect(driver.submitRequiredEnteredInput).toEqual([true, false]);
-		expect(
-			store.events
-				.filter((event) => event.type === "submit.stage")
-				.map((event) => event.data),
-		).toEqual([{ stage: 2, requestObserved: true }]);
 	});
+
+	test.each(["submit", "button"])(
+		"continues a two-step input %s submission after the confirmation screen",
+		async (type) => {
+			const driver = new FakeDriver();
+			driver.observationForms = stageObservedForms(
+				"確認画面へ進む",
+				"fa-0-1",
+				type,
+			);
+			driver.submitResults = [
+				notObservedConfirmation(),
+				{ outcome: "sent", formUrl: input.targetUrl },
+			];
+			const store = new InMemoryJobStore();
+			const tools = await createToolsWithEvidence(
+				driver,
+				store,
+				new InMemoryEvidenceObjectStore(),
+			);
+			await tools.fill("fa-0-0", STAGE_EMAIL);
+			await tools.fill("fa-0-2", STAGE_BODY);
+			await tools.observe();
+			// The activation leads to a confirmation screen repeating what was entered.
+			driver.pageText = `${STAGE_EMAIL} ${STAGE_BODY}`;
+
+			const pending = await tools.submit("fa-0-1", "mouse");
+
+			expect(pending).toEqual({ pendingStage: 1 });
+			expect(tools.hasUnconfirmedSubmission()).toBe(true);
+			expect((await store.find(input.id))?.status).toBe("submitting");
+
+			driver.observationForms = stageObservedForms("送信する", "fa-0-1", type);
+			await tools.observe();
+			const sent = submittedJob(await tools.submit("fa-0-1", "mouse"));
+
+			expect(sent.status).toBe("sent");
+			expect(tools.hasUnconfirmedSubmission()).toBe(false);
+			expect(driver.submitCount).toBe(2);
+			// Only the first stage claims the permission and is reviewed.
+			expect(driver.submitRequiredEnteredInput).toEqual([true, false]);
+			expect(
+				store.events
+					.filter((event) => event.type === "submit.stage")
+					.map((event) => event.data),
+			).toEqual([{ stage: 2, requestObserved: true }]);
+		},
+	);
 
 	test("refuses a later stage on a page that does not repeat the values", async () => {
 		const driver = new FakeDriver();
+		driver.observationForms = stageObservedForms("確認画面へ進む");
 		driver.submitResults = [notObservedConfirmation()];
 		const store = new InMemoryJobStore();
 		const tools = await createToolsWithEvidence(
@@ -550,6 +725,7 @@ describe("RestrictedBrowserTools", () => {
 		await tools.observe();
 		await tools.submit("fa-0-1", "mouse");
 
+		driver.observationForms = stageObservedForms("Send");
 		driver.pageText = "Thank you for your interest.";
 		driver.fieldStates = [];
 		await tools.observe();
@@ -566,6 +742,7 @@ describe("RestrictedBrowserTools", () => {
 
 	test("accepts a later stage from the fields that still hold the values", async () => {
 		const driver = new FakeDriver();
+		driver.observationForms = stageObservedForms("確認画面へ進む");
 		driver.submitResults = [
 			notObservedConfirmation(),
 			{ outcome: "sent", formUrl: input.targetUrl },
@@ -581,6 +758,7 @@ describe("RestrictedBrowserTools", () => {
 		await tools.observe();
 		await tools.submit("fa-0-1", "mouse");
 
+		driver.observationForms = stageObservedForms("Send");
 		// No page text, but the confirmation screen still shows the values in
 		// its own controls.
 		await tools.observe();
@@ -590,38 +768,86 @@ describe("RestrictedBrowserTools", () => {
 		expect(driver.submitCount).toBe(2);
 	});
 
-	test("stops at the third stage and records the unconfirmed submission", async () => {
+	test.each(
+		[
+			"Send",
+			"送信する",
+			"確認して送信",
+			"Confirm and send",
+			"Continue",
+			"",
+		].flatMap((label) =>
+			["submit", "button"].map((type) => [label, type] as const),
+		),
+	)(
+		"never retries a final or unknown control after an unconfirmed request: %s input/%s",
+		async (label, type) => {
+			const driver = new FakeDriver();
+			driver.observationForms = stageObservedForms(label, "fa-0-1", type);
+			driver.submitResults = [notObservedConfirmation()];
+			const store = new InMemoryJobStore();
+			const tools = await createToolsWithEvidence(
+				driver,
+				store,
+				new InMemoryEvidenceObjectStore(),
+			);
+			await tools.fill("fa-0-0", STAGE_EMAIL);
+			await tools.fill("fa-0-2", STAGE_BODY);
+			// Existing page instructions containing confirmation words cannot authorize a second POST.
+			driver.pageText = `入力内容を確認してください ${STAGE_EMAIL} ${STAGE_BODY}`;
+			await tools.observe();
+			const uncertain = submittedJob(await tools.submit("fa-0-1"));
+			expect(uncertain.status).toBe("uncertain");
+			expect(tools.hasUnconfirmedSubmission()).toBe(false);
+			driver.observationForms = stageObservedForms(label, "fa-1-9", type);
+			await tools.observe();
+			await expect(tools.submit("fa-1-9")).rejects.toBeInstanceOf(
+				SubmissionNotAuthorizedError,
+			);
+			expect(driver.submitCount).toBe(1);
+		},
+	);
+
+	test("does not repeat the confirmation operation under a fresh element id", async () => {
 		const driver = new FakeDriver();
+		driver.observationForms = stageObservedForms("確認画面へ進む");
 		driver.submitResults = [notObservedConfirmation()];
-		const store = new InMemoryJobStore();
-		const tools = await createToolsWithEvidence(
-			driver,
-			store,
-			new InMemoryEvidenceObjectStore(),
-		);
+		const tools = await createTools(driver);
 		await tools.fill("fa-0-0", STAGE_EMAIL);
 		await tools.fill("fa-0-2", STAGE_BODY);
 		await tools.observe();
-		driver.pageText = `${STAGE_EMAIL} ${STAGE_BODY}`;
-
-		expect(await tools.submit("fa-0-1", "mouse")).toEqual({ pendingStage: 1 });
+		expect(await tools.submit("fa-0-1")).toEqual({ pendingStage: 1 });
+		driver.observationForms = stageObservedForms("確認画面へ進む", "fa-1-9");
 		await tools.observe();
-		expect(await tools.submit("fa-0-1", "mouse")).toEqual({ pendingStage: 2 });
-		await tools.observe();
-
-		const uncertain = submittedJob(await tools.submit("fa-0-1", "mouse"));
-
-		expect(uncertain.status).toBe("uncertain");
-		expect(uncertain.result?.reasonCode).toBe(
-			"SUBMIT_CONFIRMATION_NOT_OBSERVED",
+		await expect(tools.submit("fa-1-9")).rejects.toBeInstanceOf(
+			SubmitStageUnverifiedError,
 		);
-		expect(driver.submitCount).toBe(3);
-		await tools.observe();
-		await expect(tools.submit("fa-0-1", "mouse")).rejects.toBeInstanceOf(
-			SubmissionNotAuthorizedError,
-		);
-		expect(driver.submitCount).toBe(3);
+		expect(driver.submitCount).toBe(1);
 	});
+
+	test.each(["Confirm", "Preview", "入力内容を確認"])(
+		"allows %s then one final Send but no retry when final values remain",
+		async (label) => {
+			const driver = new FakeDriver();
+			driver.observationForms = stageObservedForms(label);
+			driver.submitResults = [notObservedConfirmation()];
+			const tools = await createTools(driver);
+			await tools.fill("fa-0-0", STAGE_EMAIL);
+			await tools.fill("fa-0-2", STAGE_BODY);
+			await tools.observe();
+			expect(await tools.submit("fa-0-1")).toEqual({ pendingStage: 1 });
+			driver.observationForms = stageObservedForms("Send", "fa-1-9");
+			await tools.observe();
+			const result = submittedJob(await tools.submit("fa-1-9"));
+			expect(result.status).toBe("uncertain");
+			expect(driver.submitCount).toBe(2);
+			await tools.observe();
+			await expect(tools.submit("fa-1-9")).rejects.toBeInstanceOf(
+				SubmissionNotAuthorizedError,
+			);
+			expect(driver.submitCount).toBe(2);
+		},
+	);
 
 	test("ends the submission as uncertain when the page no longer shows the values", async () => {
 		const driver = new FakeDriver();
@@ -654,6 +880,7 @@ describe("RestrictedBrowserTools", () => {
 
 	test("offers the next stage when only the fields still hold the values", async () => {
 		const driver = new FakeDriver();
+		driver.observationForms = stageObservedForms("確認画面へ進む");
 		driver.submitResults = [notObservedConfirmation()];
 		const store = new InMemoryJobStore();
 		const tools = await createToolsWithEvidence(
@@ -672,6 +899,7 @@ describe("RestrictedBrowserTools", () => {
 
 	test("ends a later stage as uncertain when the final page shows nothing", async () => {
 		const driver = new FakeDriver();
+		driver.observationForms = stageObservedForms("確認画面へ進む");
 		driver.submitResults = [
 			notObservedConfirmation(),
 			notObservedConfirmation(),
@@ -690,6 +918,7 @@ describe("RestrictedBrowserTools", () => {
 		driver.pageText = `${STAGE_EMAIL} ${STAGE_BODY}`;
 
 		expect(await tools.submit("fa-0-1", "mouse")).toEqual({ pendingStage: 1 });
+		driver.observationForms = stageObservedForms("Send");
 		await tools.observe();
 
 		const uncertain = submittedJob(await tools.submit("fa-0-1", "mouse"));
@@ -1564,6 +1793,142 @@ describe("RestrictedBrowserTools", () => {
 			expect(event.data.byteLength).toBe(object.body.byteLength);
 			expect(event.data.sha256).toBe(await sha256Hex(object.body));
 		}
+	});
+
+	test("判定時の完了文言をJSON証跡に保存しD1イベントへ本文を出さない", async () => {
+		const driver = new FakeDriver();
+		const detail = {
+			capturedAt: "2026-09-05T00:00:00.000Z",
+			formUrl: input.targetUrl,
+			confirmationText: "お問い合わせを受け付けました",
+			failureText: "",
+		};
+		driver.submitResult = {
+			...driver.submitResult,
+			evidence: detail,
+		} as typeof driver.submitResult;
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const tools = await createToolsWithEvidence(driver, store, evidence);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+		expect(submittedJob(await tools.submit("fa-0-1", "mouse")).status).toBe(
+			"sent",
+		);
+		const object = [...evidence.objects.values()].find(
+			(o) => o.contentType === "application/json",
+		);
+		expect(object).toBeDefined();
+		expect(JSON.parse(new TextDecoder().decode(object?.body))).toEqual({
+			outcome: "sent",
+			...detail,
+		});
+		expect(JSON.stringify(store.events)).not.toContain(detail.confirmationText);
+	});
+
+	test("送信結果JSONの保存失敗で確定結果を変えず再送を許可しない", async () => {
+		const driver = new FakeDriver();
+		driver.submitResult = {
+			outcome: "sent",
+			formUrl: input.targetUrl,
+			evidence: {
+				capturedAt: "2026-09-05T00:00:00.000Z",
+				formUrl: input.targetUrl,
+				confirmationText: "お問い合わせを受け付けました",
+				failureText: "",
+			},
+		};
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const put = evidence.put.bind(evidence);
+		evidence.put = async (key, body, contentType, hash) => {
+			if (contentType === "application/json") throw new Error("R2 unavailable");
+			await put(key, body, contentType, hash);
+		};
+		const tools = await createToolsWithEvidence(driver, store, evidence);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+		expect(submittedJob(await tools.submit("fa-0-1", "mouse")).status).toBe(
+			"sent",
+		);
+		expect(store.events).toContainEqual(
+			expect.objectContaining({
+				type: "evidence.capture_failed",
+				data: expect.objectContaining({
+					stage: "submission_result",
+					failureCode: "OBJECT_STORE_FAILED",
+				}),
+			}),
+		);
+		await expect(tools.submit("fa-0-1", "mouse")).rejects.toThrow();
+		expect(driver.submitCount).toBe(1);
+	});
+
+	test.each([
+		"SUBMIT_NETWORK_POLICY_BLOCKED",
+		"SUBMIT_REQUEST_CONTINUE_FAILED",
+	])(
+		"persists %s as uncertain without another confirmation activation",
+		async (reasonCode) => {
+			const driver = new FakeDriver();
+			driver.observationForms = stageObservedForms("確認画面へ進む");
+			driver.submitResult = {
+				outcome: "uncertain",
+				reasonCode,
+				reason: "Delivery remains uncertain; do not retry automatically.",
+			};
+			const store = new InMemoryJobStore();
+			const tools = await createToolsWithEvidence(
+				driver,
+				store,
+				new InMemoryEvidenceObjectStore(),
+			);
+			await tools.fill("fa-0-0", STAGE_EMAIL);
+			await tools.fill("fa-0-2", STAGE_BODY);
+			await tools.observe();
+			const result = submittedJob(await tools.submit("fa-0-1"));
+			expect(result.status).toBe("uncertain");
+			expect(result.result?.reasonCode).toBe(reasonCode);
+			expect((await store.find(input.id))?.result?.reasonCode).toBe(reasonCode);
+			expect(tools.hasUnconfirmedSubmission()).toBe(false);
+			await tools.observe();
+			await expect(tools.submit("fa-0-1")).rejects.toBeInstanceOf(
+				SubmissionNotAuthorizedError,
+			);
+			expect(driver.submitCount).toBe(1);
+			expect(
+				store.events.filter((event) => event.type === "submit.stage"),
+			).toEqual([]);
+		},
+	);
+
+	test("ページが送信失敗を報告した場合は次の送信段階を許可しない", async () => {
+		const driver = new FakeDriver();
+		driver.submitResult = {
+			outcome: "uncertain",
+			reasonCode: "SUBMIT_PAGE_REPORTED_FAILURE",
+			reason: "Page reported failure",
+			evidence: {
+				capturedAt: "2026-09-05T00:00:00.000Z",
+				formUrl: input.targetUrl,
+				confirmationText: "",
+				failureText: "送信に失敗しました",
+			},
+		};
+		const store = new InMemoryJobStore();
+		const evidence = new InMemoryEvidenceObjectStore();
+		const tools = await createToolsWithEvidence(driver, store, evidence);
+		await tools.fill("fa-0-0", "Hello");
+		await tools.observe();
+		const result = submittedJob(await tools.submit("fa-0-1", "mouse"));
+		expect(result.status).toBe("uncertain");
+		expect(result.result?.reasonCode).toBe("SUBMIT_PAGE_REPORTED_FAILURE");
+		expect(
+			[...evidence.objects.values()].some(
+				(o) => o.contentType === "application/json",
+			),
+		).toBe(true);
+		await expect(tools.submit("fa-0-1", "mouse")).rejects.toThrow();
 	});
 
 	test("does not submit when the evidence before submission fails", async () => {
@@ -2559,6 +2924,23 @@ function defaultObservedForms(prohibitionText?: string): unknown[] {
 				{ elementId: "fa-0-2", tag: "input", type: "text", value: "" },
 			],
 			...(prohibitionText === undefined ? {} : { prohibitionText }),
+		},
+	];
+}
+
+/** Explicitly model the control a two-step form displays at each stage. */
+function stageObservedForms(
+	label: string,
+	elementId = "fa-0-1",
+	type = "submit",
+): unknown[] {
+	return [
+		{
+			fields: [
+				{ elementId: "fa-0-0", tag: "input", type: "text", value: STAGE_EMAIL },
+				{ elementId, tag: "input", type, label, value: label },
+				{ elementId: "fa-0-2", tag: "input", type: "text", value: STAGE_BODY },
+			],
 		},
 	];
 }

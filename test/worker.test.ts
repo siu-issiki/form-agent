@@ -26,6 +26,7 @@ import { BrowserUseApiError } from "../src/browser-use-client";
 import { D1JobStore } from "../src/d1-job-store";
 import type { JobMessage } from "../src/env";
 import { type AgentRunMetrics, JOB_STATUSES, type JobInput } from "../src/job";
+import { jobContentFingerprint } from "../src/job-fingerprint";
 import {
 	computeRetryDelaySeconds,
 	consumeJobBatch,
@@ -1311,6 +1312,67 @@ describe("Real-send guard", () => {
 		expect(queued).toHaveLength(3);
 	});
 
+	test("accepts direct approved content without a dry-run and counts an ordinary real send", async () => {
+		const job = approvedSend(input.id);
+		job.payload._formAgentSendApproval = {
+			approvedBy: "operator",
+			approvedAt: "2026-09-05T00:00:00Z",
+			mode: "direct",
+			contentFingerprint: await jobContentFingerprint(
+				job.targetUrl,
+				job.companyId,
+				job.payload,
+			),
+		};
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", job, apiToken),
+			sendEnv,
+		);
+		expect(response.status).toBe(201);
+		expect(queued).toEqual([{ jobId: input.id }]);
+		const stored = await new D1JobStore(env.DB).find(input.id);
+		expect(stored?.payload._formAgentSendApproval).toEqual(
+			job.payload._formAgentSendApproval,
+		);
+		expect(stored?.payload._formAgentEffectiveDryRun).toBe(false);
+		expect(stored?.payload._formAgentRealSendGuardExempt).not.toBe(true);
+		expect(
+			await env.DB.prepare("SELECT real_send FROM jobs WHERE id = ?")
+				.bind(input.id)
+				.first<{ real_send: number }>(),
+		).toEqual({ real_send: 1 });
+		const repeated = await handleHttpRequest(
+			jobRequest("POST", "/jobs", job, apiToken),
+			sendEnv,
+		);
+		expect(repeated.status).toBe(200);
+	});
+
+	test("rejects a changed direct-approved payload before creating or queuing it", async () => {
+		const job = approvedSend(input.id);
+		job.payload._formAgentSendApproval = {
+			approvedBy: "operator",
+			approvedAt: "2026-09-05T00:00:00Z",
+			mode: "direct",
+			contentFingerprint: await jobContentFingerprint(
+				job.targetUrl,
+				job.companyId,
+				job.payload,
+			),
+		};
+		job.payload.formValues = { message: "Unapproved message" };
+		const response = await handleHttpRequest(
+			jobRequest("POST", "/jobs", job, apiToken),
+			sendEnv,
+		);
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({
+			error: "SEND_APPROVAL_CONTENT_MISMATCH",
+		});
+		expect(await new D1JobStore(env.DB).find(input.id)).toBeNull();
+		expect(queued).toEqual([]);
+	});
+
 	test("keeps the approval record on an accepted real send", async () => {
 		await completeDryRun(sendApproval.dryRunJobId, input.targetUrl);
 
@@ -1895,6 +1957,22 @@ function twoStepExecutor(
 	responses: unknown[],
 	driver: WorkerFakeBrowserDriver,
 ): ResponsesAgentExecutor {
+	// These scenarios explicitly start with a confirmation operation, not Send.
+	const fields = (
+		driver.observationForms[0] as { fields: Array<Record<string, unknown>> }
+	).fields;
+	const control = fields.find((field) => field.elementId === "fa-0-1");
+	if (!control) throw new Error("Expected a submit control");
+	control.label = "確認画面へ進む";
+	control.value = "確認画面へ進む";
+	const previousOnSubmit = driver.onSubmit;
+	driver.onSubmit = (count) => {
+		previousOnSubmit?.(count);
+		if (count === 1) {
+			control.label = "送信する";
+			control.value = "送信する";
+		}
+	};
 	return new ResponsesAgentExecutor({
 		db: env.DB,
 		evidenceStore: new R2EvidenceObjectStore(env.EVIDENCE_BUCKET),

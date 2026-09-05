@@ -1,0 +1,25 @@
+# ポリシー拒否と要求継続処理の失敗を区別する
+
+> 個別実装時点の記録です。統合時点の状態は[信頼性改善の検証記録](reliability-improvements-2026-09.md)を参照してください。
+
+row810はSUBMIT_NETWORK_POLICY_BLOCKEDで終端したが、拒否URLやCDP例外の記録がなく真因を確定できなかった。現実装ではポリシーが許可した要求のFetch.continueRequest処理が失敗しても、ポリシー拒否と同じ理由コードになることを既存のdriverシナリオで確認した。過去jobの理由を推測で書き換えず、実先への入力・再送は行っていない。
+
+## 最小変更
+
+許可判定のactionがcontinueで、その継続処理が例外になった場合は診断段階をcontinue_requestとして記録する。要求が観測されなかった場合の結果はuncertain / SUBMIT_REQUEST_CONTINUE_FAILEDになる。理由は固定文とし「許可した要求の継続を確認できなかった。受信の有無は不明なので自動再送しない」と伝える。
+
+ポリシー自体の拒否は従来のSUBMIT_NETWORK_POLICY_BLOCKEDのまま。最初の失敗段階を採用する順序、要求上限、許可するhost/method/frame、送信許可、claim/release、成功数、既観測要求がある場合のSUBMIT_CONFIRMATION_NOT_OBSERVED優先は変更しない。Fetch.failRequestの後処理も同じであり、継続処理の例外を未受信の証明にはしない。
+
+URL・query・body・request ID・frame ID・例外本文は新たに保存しない。専用理由コードと固定文が既存の結果保存経路でD1/APIへ残る。今回、個別拒否先やmethodなどの追加メタデータは実装しない。既に観測された要求がある場合や複数種類の失敗が混在する場合は、従来の優先順位を保つため、このコードだけですべての後続失敗を列挙できるわけではない。
+
+## 再現と検証
+
+製品変更より先にPOSTと期待されたGETの継続例外シナリオを追加し、旧実装で2件とも期待コードと不一致になるredを確認した。修正後は真の外部ポリシー拒否、要求数上限、既観測要求との優先順位を含む5件がgreen。
+
+- POST/GET継続例外はuncertain、新しい専用コード、成功観測数0。継続コマンドと後処理は各1回。
+- 外部送信拒否は継続コマンド0、SUBMIT_NETWORK_POLICY_BLOCKEDを維持。
+- 例外に機密を模した文字列を含めても結果へ漏れない。
+- 確認ボタンを押した後でも両理由はuncertainとして保存され、値が残っていても追加段階を許可しない。
+- 既存のexpected GET継続失敗後の同一activation内挙動は変更していない。
+
+最終検証: typecheck / lint / unit672件 / Worker248件が成功。ログはartifacts/network-diagnostics-20260905。独立レビュー・統合・本番反映はroot担当であり、未反映。故意のCDP障害は管理下のローカルdriverシナリオで再現し、実サイトを使わない。

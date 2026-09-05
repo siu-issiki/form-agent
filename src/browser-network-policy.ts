@@ -97,6 +97,12 @@ export function assertAllowedBrowserRequest(
 	resourceType?: string,
 	subframe = false,
 ): boolean {
+	// Translation is optional: observe the original form. Its bootstrap creates
+	// unpaused sandboxed srcdoc targets, which cannot take our restrictions
+	// before running and therefore correctly fail the related-target policy.
+	if (isTranslationWidgetScript(url, resourceType)) {
+		throw new NavigationPolicyError();
+	}
 	// Checked before every other rule so a widget keeps working after the
 	// dry-run interaction lock and outside the safe-method window.
 	if (isVerificationProviderRequest(url, method, resourceType, subframe)) {
@@ -113,6 +119,22 @@ export function assertAllowedBrowserRequest(
 		throw new NavigationPolicyError();
 	}
 	return false;
+}
+
+function isTranslationWidgetScript(
+	rawUrl: string,
+	resourceType: string | undefined,
+): boolean {
+	if (resourceType !== "Script") return false;
+	try {
+		const url = new URL(rawUrl);
+		return (
+			url.hostname.toLowerCase().replace(/\.$/, "") ===
+				"translate.google.com" && url.pathname === "/translate_a/element.js"
+		);
+	} catch {
+		return false;
+	}
 }
 
 function assertPublicBrowserResourceUrl(rawUrl: string): void {
