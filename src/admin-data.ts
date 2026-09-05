@@ -40,6 +40,7 @@ export interface AdminDay {
 	day: string;
 	registered: number;
 	sent: number;
+	counts: Record<JobStatus, number>;
 }
 export interface AdminOverview {
 	jobs: AdminJob[];
@@ -167,7 +168,7 @@ export async function loadAdminOverview(
 			.bind(...values),
 		db
 			.prepare(
-				`SELECT date(j.created_at, '+9 hours') AS day, COUNT(*) AS count FROM jobs j WHERE ${cohort} GROUP BY day`,
+				`SELECT date(j.created_at, '+9 hours') AS day, j.status, COUNT(*) AS count FROM jobs j WHERE ${cohort} GROUP BY day, j.status`,
 			)
 			.bind(...values),
 		db
@@ -185,11 +186,21 @@ export async function loadAdminOverview(
 		count: number;
 	}[])
 		counts[row.status] = row.count;
-	const registered = new Map(
-		((registrations?.results ?? []) as { day: string; count: number }[]).map(
-			(r) => [r.day, r.count],
-		),
-	);
+	const dailyCounts = new Map<string, Record<JobStatus, number>>();
+	for (const row of (registrations?.results ?? []) as {
+		day: string;
+		status: JobStatus;
+		count: number;
+	}[]) {
+		const counts =
+			dailyCounts.get(row.day) ??
+			(Object.fromEntries(JOB_STATUSES.map((s) => [s, 0])) as Record<
+				JobStatus,
+				number
+			>);
+		counts[row.status] = row.count;
+		dailyCounts.set(row.day, counts);
+	}
 	const sent = new Map(
 		((completions?.results ?? []) as { day: string; count: number }[]).map(
 			(r) => [r.day, r.count],
@@ -202,9 +213,16 @@ export async function loadAdminOverview(
 		time += DAY
 	) {
 		const day = dateLabel(time);
+		const counts =
+			dailyCounts.get(day) ??
+			(Object.fromEntries(JOB_STATUSES.map((s) => [s, 0])) as Record<
+				JobStatus,
+				number
+			>);
 		daily.push({
 			day,
-			registered: registered.get(day) ?? 0,
+			counts,
+			registered: Object.values(counts).reduce((a, b) => a + b, 0),
 			sent: sent.get(day) ?? 0,
 		});
 	}

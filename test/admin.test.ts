@@ -254,12 +254,26 @@ describe("dashboard read model", () => {
 		expect(day.total).toBe(2);
 		expect(day.counts.sent).toBe(1);
 		expect(day.counts.uncertain).toBe(1);
-		expect(day.daily).toEqual([{ day: "2026-09-05", registered: 2, sent: 0 }]);
+		expect(day.daily).toMatchObject([
+			{
+				day: "2026-09-05",
+				registered: 2,
+				sent: 0,
+				counts: { sent: 1, uncertain: 1, failed: 0 },
+			},
+		]);
 		const next = await loadAdminOverview(
 			env.DB,
 			parseAdminFilters(new URLSearchParams("from=2026-09-06&to=2026-09-06")),
 		);
-		expect(next.daily).toEqual([{ day: "2026-09-06", registered: 1, sent: 2 }]);
+		expect(next.daily).toMatchObject([
+			{
+				day: "2026-09-06",
+				registered: 1,
+				sent: 2,
+				counts: { sent: 1, uncertain: 0 },
+			},
+		]);
 	});
 	test("keeps managed tests, dry runs and unknown history out of ordinary counts", async () => {
 		await seed("ordinary");
@@ -294,6 +308,7 @@ describe("dashboard read model", () => {
 			);
 			expect(data.jobs.map((j) => j.id)).toEqual([id]);
 			expect(data.completedSent).toBe(1);
+			expect(data.daily.reduce((sum, d) => sum + d.counts.sent, 0)).toBe(1);
 		}
 	});
 	test("uses bound literal search, campaign and status filters", async () => {
