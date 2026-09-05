@@ -17,6 +17,8 @@ bun tools/campaign-continuous.ts prepare \
   --release "$FORM_AGENT_RELEASE_VERSION"
 ```
 
+`--start-row` の省略時はヘッダー直後の2行目から準備する。
+
 `--choices`は任意の候補リスト上書きで、元defaultsとマージした結果を固定する。候補には実際の送信目的に合うラベルを指定する。原本は変更せず、mode700のstate内`private/`へmode600でコピーし、CSV・登録値・choicesのSHA-256と行番号・domain・deterministic job ID・内容fingerprintを`manifest.json`に固定する。初期controlはpause状態。全行のremote preflightは行わない。重複domain・資料請求URL・採用URLを除外する。
 
 ## 起動・再開
@@ -87,6 +89,6 @@ bun --env-file=.env.e2e tools/continuous-evidence.ts \
 
 collector は `summary.json`、ジョブごとの `verified/` checkpoint、`evidence/` の検証済み bytes と `tracker-candidates.json` を保存する。証跡には送信内容が写る場合があるため出力先を共有 Git の外に置く。ディレクトリは mode 700、保存ファイルは mode 600 とし、API の生 payload は checkpoint に保存しない。`tracker-candidates.json` の理由別集計は診断候補であり、ツール起因の確定結果ではない。
 
-`--once` は 1 周照合して終了する。`--job-ids id1,id2 --output /absolute/path/to/new-audit` は journal の代わりに指定終端 ID を API で読み、同様に 1 周照合する。新しい独立監査には空の出力先を使う。既存 checkpoint の再開は以前の照合記録を再利用するため、全 R2 bytes を毎回読み直した証明にはならない。`summary.json` の terminal/verified/pending、journalError、failures と各 checkpoint の captureFailures を確認し、件数が揃い captureFailures も 0 の場合に証跡完備と判断する。
+`--once` は 1 周照合して終了し、journal が存在しない場合は失敗する。常駐監視では journal の作成を待つ。`--job-ids id1,id2 --output /absolute/path/to/new-audit` は journal の代わりに指定終端 ID を API で読み、同様に 1 周照合する。新しい独立監査には空の出力先を使う。既存 checkpoint の再開は以前の照合記録を再利用するため、全 R2 bytes を毎回読み直した証明にはならない。`summary.json` の terminal/verified/pending、journalError、failures と各 checkpoint の captureFailures を確認し、件数が揃い captureFailures も 0 の場合に証跡完備と判断する。
 
 PID lock `collector.pid` は同じ出力先での二重起動を拒否する。停止時はその PID に SIGTERM を送り、進行中の最大 4 件を終え、プロセス終了と PID lock 削除を確認する。sender の登録・再送は行わない。

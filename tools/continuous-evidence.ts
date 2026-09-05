@@ -393,8 +393,9 @@ async function main(): Promise<void> {
 					});
 				} else entries = parseTerminalJournal(await readFile(journal, "utf8"));
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT")
-					journalError = "JOURNAL_READ_FAILED";
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+					if (once) journalError = "JOURNAL_NOT_FOUND";
+				} else journalError = "JOURNAL_READ_FAILED";
 			}
 			for (const entry of entries) {
 				const checkpoint = verified.get(entry.jobId);

@@ -6,6 +6,7 @@ import {
 	durableJson,
 	excludedUrl,
 	lookupRegisteredJob,
+	prepareManifest,
 	readJournal,
 } from "../tools/campaign-continuous";
 import {
@@ -474,3 +475,53 @@ test("detects an external deployment change before the next admission", async ()
 	expect(f.posts).toEqual(["job-0"]);
 	expect(f.state.haltReason).toBe("RELEASE_NOT_VERIFIED");
 });
+
+test.each([undefined, 3])(
+	"prepare starts at the requested or first data row: %j",
+	async (startRow) => {
+		const dir = await mkdtemp("/tmp/continuous-prepare-");
+		try {
+			await writeFile(
+				`${dir}/campaign.csv`,
+				"問い合わせリンク,件名,本文\nhttps://contact.acme.co.jp/form,Subject,Message\nhttps://www.beta.co.jp/inquiry,Subject,Message\n",
+			);
+			await writeFile(
+				`${dir}/registration.json`,
+				JSON.stringify(
+					[
+						"苗字",
+						"名前",
+						"フルネーム漢字",
+						"メールアドレス",
+						"電話番号",
+						"会社名",
+					].map((label) => ({ label, value: "test-value" })),
+				),
+			);
+			await prepareManifest(
+				`${dir}/state`,
+				new Map([
+					["csv", `${dir}/campaign.csv`],
+					["registration", `${dir}/registration.json`],
+					["campaign", "unit-prepare"],
+					["approved-by", "test-operator"],
+					["release", "00000000-0000-0000-0000-000000000000"],
+					...(startRow
+						? [["start-row", String(startRow)] as [string, string]]
+						: []),
+				]),
+			);
+			const manifest = await Bun.file(`${dir}/state/manifest.json`).json();
+			expect(manifest.startRow).toBe(startRow ?? 2);
+			expect(
+				manifest.entries.map((entry: { sourceRow: number }) => entry.sourceRow),
+			).toEqual(startRow === 3 ? [3] : [2, 3]);
+			expect(
+				(await Bun.file(`${dir}/state/control.json`).json()).pauseNewAdmissions,
+			).toBe(true);
+			expect(await Bun.file(`${dir}/state/journal.jsonl`).exists()).toBe(false);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	},
+);

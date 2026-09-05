@@ -181,7 +181,7 @@ export function excludedUrl(value: string): string | undefined {
 	return undefined;
 }
 
-async function prepareManifest(
+export async function prepareManifest(
 	stateDir: string,
 	options: Map<string, string>,
 ): Promise<void> {
@@ -191,7 +191,7 @@ async function prepareManifest(
 	try {
 		if (await Bun.file(`${stateDir}/manifest.json`).exists())
 			throw new Error("MANIFEST_ALREADY_EXISTS");
-		const startRow = Number(options.get("start-row") ?? "109");
+		const startRow = Number(options.get("start-row") ?? "2");
 		const campaign = requiredOption(options, "campaign");
 		const approvedBy = requiredOption(options, "approved-by");
 		const releaseVersion = requiredOption(options, "release");

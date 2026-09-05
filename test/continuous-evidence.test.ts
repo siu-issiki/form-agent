@@ -214,3 +214,38 @@ test.each([[], ["--output", "/unused/collector-test-output"]])(
 		expect(stderr).toContain("COLLECTOR_PATHS_REQUIRED");
 	},
 );
+
+test("one-shot collector fails when its journal does not exist", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "collector-missing-journal-"));
+	try {
+		const proc = Bun.spawn(
+			[
+				process.execPath,
+				new URL("../tools/continuous-evidence.ts", import.meta.url).pathname,
+				"--once",
+				"--journal",
+				join(dir, "missing.jsonl"),
+				"--output",
+				join(dir, "output"),
+			],
+			{
+				env: { FORM_AGENT_JOB_API_TOKEN: "unit-test-unused-token" },
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+		]);
+		expect(await proc.exited).toBe(1);
+		const summary = await Bun.file(join(dir, "output", "summary.json")).json();
+		expect(summary.journalError).toBe("JOURNAL_NOT_FOUND");
+		expect(summary.terminal).toBe(0);
+		expect(await Bun.file(join(dir, "output", "collector.pid")).exists()).toBe(
+			false,
+		);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
