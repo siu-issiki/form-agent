@@ -4,18 +4,20 @@
 
 ## 初回準備（外部APIなし）
 
+`FORM_AGENT_RELEASE_VERSION` に、本番で100%稼働しているversionのUUIDを設定する。campaign名と承認者は実際の新規送信に合わせて指定する。
+
 ```sh
 bun tools/campaign-continuous.ts prepare \
   --state /absolute/path/to/sender-state \
   --csv /absolute/path/to/campaign.csv \
   --registration /absolute/path/to/registration.json \
   --choices /absolute/path/to/choices.json \
-  --campaign stripe-20260905-continuous-v1 \
-  --start-row 109 --approved-by siu \
-  --release d30b4ef1-bd74-4e92-b272-68525bcce20c
+  --campaign outreach-YYYYMMDD-v1 \
+  --start-row 2 --approved-by operator \
+  --release "$FORM_AGENT_RELEASE_VERSION"
 ```
 
-`--choices`は任意の候補リスト上書きで、元defaultsとマージした結果を固定する。今回初回は「その他問い合わせ」を含む候補を使う。原本は変更せず、mode700のstate内`private/`へmode600でコピーし、CSV・登録値・choicesのSHA-256と行番号・domain・deterministic job ID・内容fingerprintを`manifest.json`に固定する。初期controlはpause状態。全行のremote preflightは行わない。重複domain・資料請求URL・採用URLを除外する。
+`--choices`は任意の候補リスト上書きで、元defaultsとマージした結果を固定する。候補には実際の送信目的に合うラベルを指定する。原本は変更せず、mode700のstate内`private/`へmode600でコピーし、CSV・登録値・choicesのSHA-256と行番号・domain・deterministic job ID・内容fingerprintを`manifest.json`に固定する。初期controlはpause状態。全行のremote preflightは行わない。重複domain・資料請求URL・採用URLを除外する。
 
 ## 起動・再開
 
@@ -28,7 +30,7 @@ nohup bun --env-file=.env.e2e tools/campaign-continuous.ts run \
 
 bun tools/campaign-continuous.ts resume \
   --state /absolute/path/to/sender-state \
-  --release d30b4ef1-bd74-4e92-b272-68525bcce20c
+  --release "$FORM_AGENT_RELEASE_VERSION"
 ```
 
 再開も同じstateとcampaignを使う。PID lockで複数writerを拒否し、死んだPIDのlockだけを回収する。`registration_intent`をfsyncした後でPOSTするため、応答喪失・crash後も同じIDのGETだけで照合し、POSTを繰り返さない。intent後に実際のPOSTが行われず404が続く場合も、枠を解放せず新規登録を停止する。
@@ -45,7 +47,7 @@ bun tools/campaign-continuous.ts status --state /absolute/path/to/sender-state
 pauseは新規登録だけを止め、activeを監視する。返されたcontrolの`revision`とstatusの`observedControlRevision`が一致し、`drained:true`かつ`activeCount:0`になった場合にだけ本番更新へ進む。過去のstatusにactive0があるだけではdrain確認にならない。controlはrootからatomicに直接置き換えることもできる。
 
 ```json
-{"revision":"unique-revision","pauseNewAdmissions":true,"releaseVersion":"d30b4ef1-bd74-4e92-b272-68525bcce20c"}
+{"revision":"unique-revision","pauseNewAdmissions":true,"releaseVersion":"<本番の稼働version>"}
 ```
 
 deploy・管理下green後、`resume --release <新version>`で新しいrevisionを発行する。runnerは新規投入ごとにそのversionが本番100%であることをread-only確認し、新規行だけに反映する。既登録行はそのまま監視する。
@@ -81,7 +83,7 @@ bun --env-file=.env.e2e tools/continuous-evidence.ts \
   --output /absolute/path/to/collector-state
 ```
 
-`FORM_AGENT_JOB_API_TOKEN` と、指定 repo の Wrangler から D1/R2 を読める認証が必要。API は固定の本番エンドポイントを使う。`--repo` は対応する本番 D1/R2 binding を持つ checkout を指定する。初期値が過去の運用ディレクトリなので、別キャンペーンでは上記の全パスを明示する。認証値はログや Git に保存しない。
+`FORM_AGENT_JOB_API_TOKEN` と、指定 repo の Wrangler から D1/R2 を読める認証が必要。API は固定の本番エンドポイントを使う。`--repo` は対応する本番 D1/R2 binding を持つ checkout を指定する。`--output` と、`--journal` または `--job-ids` の指定は必須で、過去のキャンペーンへの既定パスは持たない。認証値はログや Git に保存しない。
 
 collector は `summary.json`、ジョブごとの `verified/` checkpoint、`evidence/` の検証済み bytes と `tracker-candidates.json` を保存する。証跡には送信内容が写る場合があるため出力先を共有 Git の外に置く。ディレクトリは mode 700、保存ファイルは mode 600 とし、API の生 payload は checkpoint に保存しない。`tracker-candidates.json` の理由別集計は診断候補であり、ツール起因の確定結果ではない。
 

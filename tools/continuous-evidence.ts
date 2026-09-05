@@ -302,14 +302,13 @@ async function main(): Promise<void> {
 		return index >= 0 ? args[index + 1] : undefined;
 	};
 	const repo = resolve(option("--repo") ?? process.cwd());
-	const journal = resolve(
-		option("--journal") ??
-			join(repo, "artifacts/continuous-20260905/sender/journal.jsonl"),
-	);
-	const output = resolve(
-		option("--output") ?? join(repo, "artifacts/continuous-20260905/collector"),
-	);
+	const journalOption = option("--journal");
+	const outputOption = option("--output");
 	const jobIds = option("--job-ids")?.split(",");
+	if (!outputOption || (!journalOption && !jobIds))
+		throw new Error("COLLECTOR_PATHS_REQUIRED");
+	const journal = journalOption ? resolve(journalOption) : "";
+	const output = resolve(outputOption);
 	const once = args.includes("--once") || jobIds !== undefined;
 	if (
 		jobIds &&

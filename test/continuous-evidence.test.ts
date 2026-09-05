@@ -197,3 +197,20 @@ test("verifies a dead-lettered terminal through D1, API, and R2 without storing 
 		await rm(output, { recursive: true, force: true });
 	}
 });
+
+test.each([[], ["--output", "/unused/collector-test-output"]])(
+	"collector requires explicit paths before accessing APIs: %j",
+	async (...args: string[]) => {
+		const proc = Bun.spawn(
+			[
+				process.execPath,
+				new URL("../tools/continuous-evidence.ts", import.meta.url).pathname,
+				...args,
+			],
+			{ env: {}, stdout: "pipe", stderr: "pipe" },
+		);
+		const stderr = await new Response(proc.stderr).text();
+		expect(await proc.exited).toBe(1);
+		expect(stderr).toContain("COLLECTOR_PATHS_REQUIRED");
+	},
+);
