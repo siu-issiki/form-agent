@@ -8,12 +8,9 @@ import { EFFECTIVE_DRY_RUN_KEY, JOB_ID_PATTERN } from "./job";
 export const SEND_APPROVAL_KEY = "_formAgentSendApproval";
 
 /**
- * Payload key the API stamps on a job whose target domain is on
- * `REAL_SEND_GUARD_EXEMPT_DOMAINS`. It is written by the API alone: whatever
- * the caller sent under this key is discarded first, because the key is what
- * keeps a job out of the daily real-send count. It exists so that the managed
- * test system -- a real submission with no dry-run to approve against -- can
- * be exercised without spending the day's cap for real customers.
+ * API-stamped exemption for the managed test system. A caller-supplied value
+ * is discarded so real customer jobs cannot skip approval and dry-run checks.
+ * Exempt jobs are reported separately from ordinary real sends.
  */
 export const REAL_SEND_GUARD_EXEMPT_KEY = "_formAgentRealSendGuardExempt";
 
@@ -24,13 +21,7 @@ export function isRealSendGuardExemptPayload(
 	return payload[REAL_SEND_GUARD_EXEMPT_KEY] === true;
 }
 
-/**
- * Whether this payload can reach a real submission that counts against the
- * daily cap. The effective mode is the frozen decision, and a job the API
- * accepted through the test-system exemption is left out: it never passed the
- * approval and cap checks, so counting it would spend the day's budget on the
- * managed test system.
- */
+/** Whether this is an ordinary real send, excluding managed test jobs. */
 export function isRealSendPayload(payload: Record<string, unknown>): boolean {
 	return (
 		payload[EFFECTIVE_DRY_RUN_KEY] === false &&

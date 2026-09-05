@@ -8,7 +8,6 @@ import {
 	isCompletedDryRunFor,
 	matchesDryRunContent,
 	type RealSendGuardStore,
-	utcDayRange,
 } from "../src/real-send-guard";
 import {
 	REAL_SEND_GUARD_EXEMPT_KEY,
@@ -23,33 +22,14 @@ const APPROVAL = {
 	dryRunJobId: DRY_RUN_JOB_ID,
 };
 
-interface CountCall {
-	startAt: string;
-	endAt: string;
-	excludeId: string;
-}
-
 class FakeStore implements RealSendGuardStore {
-	readonly countCalls: CountCall[] = [];
 	readonly findCalls: string[] = [];
 
-	constructor(
-		private readonly record: DryRunRecord | null,
-		private readonly used = 0,
-	) {}
+	constructor(private readonly record: DryRunRecord | null) {}
 
 	async find(id: string): Promise<DryRunRecord | null> {
 		this.findCalls.push(id);
 		return this.record;
-	}
-
-	async countRealSendJobsCreatedBetween(
-		startAt: string,
-		endAt: string,
-		excludeId: string,
-	): Promise<number> {
-		this.countCalls.push({ startAt, endAt, excludeId });
-		return this.used;
 	}
 }
 
@@ -90,14 +70,13 @@ describe("checkRealSendGuard", () => {
 		const input = sendInput({
 			payload: { formValues: {}, [EFFECTIVE_DRY_RUN_KEY]: true },
 		});
-		expect(await checkRealSendGuard(input, new Date(), 0, store)).toEqual({
+		expect(await checkRealSendGuard(input, store)).toEqual({
 			allowed: true,
 		});
 		expect(store.findCalls).toEqual([]);
-		expect(store.countCalls).toEqual([]);
 	});
 
-	test("lets a job the API stamped as exempt through without a cap", async () => {
+	test("lets a job the API stamped as exempt through without an approval", async () => {
 		const store = new FakeStore(null);
 		const input = sendInput({
 			payload: {
@@ -106,10 +85,9 @@ describe("checkRealSendGuard", () => {
 				[REAL_SEND_GUARD_EXEMPT_KEY]: true,
 			},
 		});
-		expect(await checkRealSendGuard(input, new Date(), 0, store)).toEqual({
+		expect(await checkRealSendGuard(input, store)).toEqual({
 			allowed: true,
 		});
-		expect(store.countCalls).toEqual([]);
 	});
 
 	test("refuses a real send with no approval record", async () => {
@@ -117,7 +95,7 @@ describe("checkRealSendGuard", () => {
 		const input = sendInput({
 			payload: { formValues: {}, [EFFECTIVE_DRY_RUN_KEY]: false },
 		});
-		expect(await checkRealSendGuard(input, new Date(), 5, store)).toEqual({
+		expect(await checkRealSendGuard(input, store)).toEqual({
 			allowed: false,
 			refusal: "SEND_APPROVAL_REQUIRED",
 		});
@@ -133,7 +111,7 @@ describe("checkRealSendGuard", () => {
 				[SEND_APPROVAL_KEY]: { ...APPROVAL, approvedBy: "" },
 			},
 		});
-		expect(await checkRealSendGuard(input, new Date(), 5, store)).toEqual({
+		expect(await checkRealSendGuard(input, store)).toEqual({
 			allowed: false,
 			refusal: "SEND_APPROVAL_REQUIRED",
 		});
@@ -141,9 +119,10 @@ describe("checkRealSendGuard", () => {
 
 	test("refuses a real send whose dry-run cannot be found", async () => {
 		const store = new FakeStore(null);
-		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
-			{ allowed: false, refusal: "DRY_RUN_NOT_COMPLETED" },
-		);
+		expect(await checkRealSendGuard(sendInput(), store)).toEqual({
+			allowed: false,
+			refusal: "DRY_RUN_NOT_COMPLETED",
+		});
 		expect(store.findCalls).toEqual([DRY_RUN_JOB_ID]);
 	});
 
@@ -151,9 +130,10 @@ describe("checkRealSendGuard", () => {
 		const store = new FakeStore(
 			dryRunRecord({ targetUrl: "https://example.com/other" }),
 		);
-		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
-			{ allowed: false, refusal: "DRY_RUN_NOT_COMPLETED" },
-		);
+		expect(await checkRealSendGuard(sendInput(), store)).toEqual({
+			allowed: false,
+			refusal: "DRY_RUN_NOT_COMPLETED",
+		});
 	});
 
 	test("refuses an approval that names a real send", async () => {
@@ -165,25 +145,28 @@ describe("checkRealSendGuard", () => {
 				},
 			}),
 		);
-		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
-			{ allowed: false, refusal: "DRY_RUN_NOT_COMPLETED" },
-		);
+		expect(await checkRealSendGuard(sendInput(), store)).toEqual({
+			allowed: false,
+			refusal: "DRY_RUN_NOT_COMPLETED",
+		});
 	});
 
 	test("refuses a dry-run that did not stop at the dry-run boundary", async () => {
 		const store = new FakeStore(dryRunRecord({ status: "failed" }));
-		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
-			{ allowed: false, refusal: "DRY_RUN_NOT_COMPLETED" },
-		);
+		expect(await checkRealSendGuard(sendInput(), store)).toEqual({
+			allowed: false,
+			refusal: "DRY_RUN_NOT_COMPLETED",
+		});
 	});
 
 	test("refuses a dry-run whose result carries another reason code", async () => {
 		const store = new FakeStore(
 			dryRunRecord({ result: { reasonCode: "FORM_PROHIBITED" } }),
 		);
-		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
-			{ allowed: false, refusal: "DRY_RUN_NOT_COMPLETED" },
-		);
+		expect(await checkRealSendGuard(sendInput(), store)).toEqual({
+			allowed: false,
+			refusal: "DRY_RUN_NOT_COMPLETED",
+		});
 	});
 
 	test("refuses a send whose content differs from the reviewed dry-run", async () => {
@@ -195,79 +178,26 @@ describe("checkRealSendGuard", () => {
 				},
 			}),
 		);
-		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
-			{ allowed: false, refusal: "DRY_RUN_CONTENT_MISMATCH" },
-		);
-		expect(store.countCalls).toEqual([]);
+		expect(await checkRealSendGuard(sendInput(), store)).toEqual({
+			allowed: false,
+			refusal: "DRY_RUN_CONTENT_MISMATCH",
+		});
 	});
 
 	test("refuses a send whose company differs from the reviewed dry-run", async () => {
 		const store = new FakeStore(dryRunRecord({ companyId: "company-002" }));
-		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
-			{ allowed: false, refusal: "DRY_RUN_CONTENT_MISMATCH" },
-		);
+		expect(await checkRealSendGuard(sendInput(), store)).toEqual({
+			allowed: false,
+			refusal: "DRY_RUN_CONTENT_MISMATCH",
+		});
 	});
 
-	test("refuses every real send while the cap is 0, without counting", async () => {
+	test("allows a real send whose content matches its approved dry-run", async () => {
 		const store = new FakeStore(dryRunRecord());
-		expect(await checkRealSendGuard(sendInput(), new Date(), 0, store)).toEqual(
-			{ allowed: false, refusal: "REAL_SEND_CAP_REACHED" },
-		);
-		expect(store.countCalls).toEqual([]);
-	});
-
-	test("refuses the send that would reach the cap", async () => {
-		const store = new FakeStore(dryRunRecord(), 5);
-		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
-			{ allowed: false, refusal: "REAL_SEND_CAP_REACHED" },
-		);
-	});
-
-	test("refuses a send once the day is already over the cap", async () => {
-		const store = new FakeStore(dryRunRecord(), 6);
-		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
-			{ allowed: false, refusal: "REAL_SEND_CAP_REACHED" },
-		);
-	});
-
-	test("allows the last send that still fits inside the cap", async () => {
-		const store = new FakeStore(dryRunRecord(), 4);
-		expect(await checkRealSendGuard(sendInput(), new Date(), 5, store)).toEqual(
-			{ allowed: true },
-		);
-	});
-
-	test("counts the UTC day of the registration and skips the job itself", async () => {
-		const store = new FakeStore(dryRunRecord(), 0);
-		const now = new Date("2026-09-04T23:59:59.999Z");
-		expect(await checkRealSendGuard(sendInput(), now, 5, store)).toEqual({
+		expect(await checkRealSendGuard(sendInput(), store)).toEqual({
 			allowed: true,
 		});
-		expect(store.countCalls).toEqual([
-			{
-				startAt: "2026-09-04T00:00:00.000Z",
-				endAt: "2026-09-05T00:00:00.000Z",
-				excludeId: "job-send-001",
-			},
-		]);
-	});
-});
-
-describe("utcDayRange", () => {
-	test("spans the UTC day the instant falls in", () => {
-		expect(utcDayRange(new Date("2026-09-04T00:00:00.000Z"))).toEqual({
-			from: "2026-09-04T00:00:00.000Z",
-			to: "2026-09-05T00:00:00.000Z",
-		});
-		expect(utcDayRange(new Date("2026-09-04T23:59:59.999Z"))).toEqual({
-			from: "2026-09-04T00:00:00.000Z",
-			to: "2026-09-05T00:00:00.000Z",
-		});
-		// The local day would still be the 4th in a positive-offset zone.
-		expect(utcDayRange(new Date("2026-09-05T00:00:00.000Z"))).toEqual({
-			from: "2026-09-05T00:00:00.000Z",
-			to: "2026-09-06T00:00:00.000Z",
-		});
+		expect(store.findCalls).toEqual([DRY_RUN_JOB_ID]);
 	});
 });
 
