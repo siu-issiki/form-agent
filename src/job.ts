@@ -89,7 +89,8 @@ export type EvidenceStage =
 	| "after_submit"
 	| "prohibited"
 	| "dry_run_before_submit"
-	| "dry_run_field_map";
+	| "dry_run_field_map"
+	| "submission_result";
 
 export type EvidenceFailureCode =
 	| "SCREENSHOT_FAILED"

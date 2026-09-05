@@ -9,7 +9,7 @@ export type { EvidenceFailureCode, EvidenceStage };
 
 export const EVIDENCE_CONTENT_TYPE = "image/jpeg";
 
-/** Content type of the dry-run field map, the only non-image evidence. */
+/** Content type of dry-run field maps and submission result snapshots. */
 export const EVIDENCE_JSON_CONTENT_TYPE = "application/json";
 
 /**

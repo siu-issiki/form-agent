@@ -4,6 +4,7 @@ import {
 	isVerificationProviderRequest,
 } from "./browser-network-policy";
 import { BrowserElementError } from "./restricted-browser";
+import { describeBlockedSubmissionRequest } from "./submission-request-diagnostic";
 
 export interface PausedRequest {
 	requestId: string;
@@ -21,6 +22,7 @@ export interface ExpectedSubmissionRequest {
 export type SubmissionRequestBlockStage =
 	| "expected_request"
 	| "network_policy"
+	| "continue_request"
 	| "request_limit";
 
 type GetSubmissionRequestDisposition = "claim" | "block" | "ignore";
@@ -155,6 +157,8 @@ export interface GetSubmissionGuard {
  * mutate anything on its way to the answer.
  */
 export interface SubmissionRequestPolicySnapshot {
+	readonly postSubmissionUrl: string | undefined;
+	readonly completionNavigationClaimed: boolean;
 	readonly submissionRequestAllowed: boolean;
 	readonly submissionRequestInFlight: boolean;
 	readonly submissionRequestCount: number;
@@ -192,6 +196,7 @@ export interface PausedRequestDecision {
 	readonly claimSubmission: boolean;
 	readonly continueRedirect: boolean;
 	readonly claimNavigation: boolean;
+	readonly claimCompletionNavigation: boolean;
 	readonly allowedByVerificationProvider: boolean;
 	readonly submissionRelated: boolean;
 	readonly blockStage: SubmissionRequestBlockStage;
@@ -228,6 +233,7 @@ export function decidePausedRequest(
 	let blockStage: SubmissionRequestBlockStage = "network_policy";
 	let submissionRelatedRequest = unsafeRequest && !verificationProviderRequest;
 	let claimNavigationRequest = false;
+	let claimCompletionNavigation = false;
 	try {
 		if (!context.targetDomain) {
 			throw new Error(BROWSER_ERROR.DOMAIN_SCOPE_NOT_CONFIGURED);
@@ -239,9 +245,34 @@ export function decidePausedRequest(
 				state.submissionRedirectRequestIds,
 				state.expectedSubmissionFrameId,
 			);
+		const followupUrl = new URL(paused.request.url);
+		// Some forms POST via JavaScript and then change location, rather than
+		// returning an HTTP redirect. Permit one queryless document read in the
+		// same frame and exact origin as the observed POST. This never opens
+		// another submission window or permits background Fetch/XHR requests.
+		claimCompletionNavigation =
+			!canContinueSubmissionRedirect &&
+			state.submissionAttemptInProgress &&
+			!state.completionNavigationClaimed &&
+			state.postSubmissionUrl !== undefined &&
+			state.expectedSubmissionFrameId !== undefined &&
+			paused.frameId === state.expectedSubmissionFrameId &&
+			paused.resourceType === "Document" &&
+			paused.request.method.toUpperCase() === "GET" &&
+			followupUrl.origin === new URL(state.postSubmissionUrl).origin &&
+			followupUrl.pathname !== new URL(state.postSubmissionUrl).pathname &&
+			!isExpectedSubmissionRequest(
+				paused.request,
+				state.getSubmissionGuard?.request,
+			) &&
+			followupUrl.search === "" &&
+			followupUrl.username === "" &&
+			followupUrl.password === "";
 		const getSubmissionGuard = state.getSubmissionGuard;
 		const getSubmissionDisposition =
-			canContinueSubmissionRedirect || verificationProviderRequest
+			canContinueSubmissionRedirect ||
+			claimCompletionNavigation ||
+			verificationProviderRequest
 				? "ignore"
 				: getSubmissionRequestDisposition(
 						paused.request,
@@ -280,7 +311,8 @@ export function decidePausedRequest(
 		}
 		const canClaimSubmissionRequest =
 			getSubmissionDisposition === "claim" || submissionWindowRequest;
-		submissionRelatedRequest ||= canContinueSubmissionRedirect;
+		submissionRelatedRequest ||=
+			canContinueSubmissionRedirect || claimCompletionNavigation;
 		const expectedNavigationRequest = context.expectedNavigationRequest;
 		claimNavigationRequest =
 			expectedNavigationRequest !== undefined &&
@@ -303,7 +335,7 @@ export function decidePausedRequest(
 					context.blockNonSubmitRequests,
 					canClaimSubmissionRequest,
 					claimNavigationRequest,
-					canContinueSubmissionRedirect,
+					canContinueSubmissionRedirect || claimCompletionNavigation,
 				),
 			context.allowedHosts,
 			paused.resourceType,
@@ -315,6 +347,7 @@ export function decidePausedRequest(
 			continueRedirect:
 				!canClaimSubmissionRequest && canContinueSubmissionRedirect,
 			claimNavigation: claimNavigationRequest,
+			claimCompletionNavigation,
 			allowedByVerificationProvider,
 			submissionRelated: submissionRelatedRequest,
 			blockStage,
@@ -325,6 +358,7 @@ export function decidePausedRequest(
 			claimSubmission: false,
 			continueRedirect: false,
 			claimNavigation: claimNavigationRequest,
+			claimCompletionNavigation,
 			allowedByVerificationProvider: false,
 			submissionRelated: submissionRelatedRequest,
 			blockStage,
@@ -345,6 +379,8 @@ export function decidePausedRequest(
  * claim it. Every method here is therefore synchronous and must stay so.
  */
 export class SubmissionRequestPolicy {
+	#postSubmissionUrl: string | undefined;
+	#completionNavigationClaimed = false;
 	#submissionRequestAllowed = false;
 	#submissionRequestInFlight = false;
 	#submissionRequestCount = 0;
@@ -352,6 +388,7 @@ export class SubmissionRequestPolicy {
 	#submissionRequestTotal = 0;
 	#submissionAttemptInProgress = false;
 	#submissionRequestBlockStage: SubmissionRequestBlockStage | undefined;
+	#submissionRequestBlockDiagnostic: string | undefined;
 	/**
 	 * Requests already continued as part of the current submission. A redirect
 	 * names the request it came from, so the set is what lets the follow-up of
@@ -389,6 +426,11 @@ export class SubmissionRequestPolicy {
 		return this.#submissionRequestBlockStage;
 	}
 
+	/** Safe context for the same first block; not proof of why delivery failed. */
+	get blockDiagnostic(): string | undefined {
+		return this.#submissionRequestBlockDiagnostic;
+	}
+
 	/** Drops what a previous `validateSubmit` recorded before inspecting again. */
 	beginValidation(): void {
 		this.#expectedSubmissionRequest = undefined;
@@ -415,6 +457,7 @@ export class SubmissionRequestPolicy {
 	 * guard is armed once per run, so a retry keeps the first one.
 	 */
 	beginSubmit(): void {
+		this.#postSubmissionUrl = undefined;
 		this.#submissionRedirectRequestIds.clear();
 		if (this.#expectedSubmissionRequest?.method === "GET") {
 			this.#getSubmissionGuard ??= {
@@ -430,6 +473,7 @@ export class SubmissionRequestPolicy {
 	beginAttempt(): void {
 		this.#submissionAttemptInProgress = true;
 		this.#submissionRequestBlockStage = undefined;
+		this.#submissionRequestBlockDiagnostic = undefined;
 	}
 
 	/** Closes the attempt and the window, whatever the activation did. */
@@ -482,23 +526,52 @@ export class SubmissionRequestPolicy {
 	}
 
 	/** Counts a claimed request the browser actually continued. */
-	recordContinued(): void {
+	recordContinued(paused?: PausedRequest): void {
+		if (
+			paused?.request.method.toUpperCase() === "POST" &&
+			this.#expectedSubmissionFrameId !== undefined &&
+			paused.frameId === this.#expectedSubmissionFrameId
+		) {
+			this.#postSubmissionUrl ??= paused.request.url;
+		}
 		this.#submissionRequestCount += 1;
 		this.#submissionRequestObserved?.();
+	}
+
+	/** Spends the single follow-up document read synchronously before CDP awaits. */
+	claimCompletionNavigation(): void {
+		this.#completionNavigationClaimed = true;
 	}
 
 	/**
 	 * Keeps the stage that refused the first blocked request of the attempt,
 	 * which is the one the uncertain reason code reports.
 	 */
-	noteBlocked(stage: SubmissionRequestBlockStage): void {
-		if (!this.#submissionAttemptInProgress) return;
-		this.#submissionRequestBlockStage ??= stage;
+	noteBlocked(
+		stage: SubmissionRequestBlockStage,
+		paused?: PausedRequest,
+	): void {
+		if (
+			!this.#submissionAttemptInProgress ||
+			this.#submissionRequestBlockStage !== undefined
+		)
+			return;
+		this.#submissionRequestBlockStage = stage;
+		this.#submissionRequestBlockDiagnostic = paused
+			? describeBlockedSubmissionRequest(
+					stage,
+					paused,
+					this.#expectedSubmissionRequest,
+					this.#expectedSubmissionFrameId,
+				)
+			: undefined;
 	}
 
 	/** The read-only view {@link decidePausedRequest} decides from. */
 	snapshot(): SubmissionRequestPolicySnapshot {
 		return {
+			postSubmissionUrl: this.#postSubmissionUrl,
+			completionNavigationClaimed: this.#completionNavigationClaimed,
 			submissionRequestAllowed: this.#submissionRequestAllowed,
 			submissionRequestInFlight: this.#submissionRequestInFlight,
 			submissionRequestCount: this.#submissionRequestCount,

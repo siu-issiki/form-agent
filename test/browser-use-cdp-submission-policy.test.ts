@@ -7,6 +7,7 @@ import {
 	type PausedRequestContext,
 	SubmissionRequestPolicy,
 } from "../src/browser-use-cdp-submission-policy";
+import { describeBlockedSubmissionRequest } from "../src/submission-request-diagnostic";
 
 const TARGET_DOMAIN = "acme.co.jp";
 const TOP_FRAME_ID = "frame-top";
@@ -194,6 +195,137 @@ describe("SubmissionRequestPolicy block stage", () => {
 	});
 });
 
+describe("submission request diagnostic metadata", () => {
+	test("retains only the first blocked request classification", () => {
+		const policy = activatedPolicy();
+		policy.completeValidation(
+			{
+				url: "https://acme.co.jp/contact?private=BEFORE_SECRET",
+				method: "POST",
+			},
+			FORM_FRAME_ID,
+		);
+		policy.noteBlocked("network_policy", {
+			requestId: "PRIVATE_ID",
+			resourceType: "XHR",
+			frameId: FORM_FRAME_ID,
+			request: {
+				url: "https://outside.test/private?token=AFTER_SECRET",
+				method: "POST",
+			},
+		});
+		const first = policy.blockDiagnostic;
+		expect(first).toBe(
+			"First blocked request: stage=network_policy; method=POST; resource=XHR; origin=other; frame=expected.",
+		);
+		policy.noteBlocked("continue_request", {
+			requestId: "LATER",
+			resourceType: "Document",
+			frameId: "other",
+			request: { url: "https://acme.co.jp/send", method: "GET" },
+		});
+		expect(policy.blockDiagnostic).toBe(first);
+		expect(policy.blockStage).toBe("network_policy");
+		policy.endAttempt();
+		expect(policy.blockDiagnostic).toBe(first);
+		policy.beginAttempt();
+		expect(policy.blockDiagnostic).toBeUndefined();
+	});
+	test("redacts unknown method/resource and all URL and identifier content", () => {
+		const policy = activatedPolicy();
+		policy.completeValidation(
+			{ url: "https://acme.co.jp/user/EXPECTED_SECRET", method: "POST" },
+			"FRAME_SECRET",
+		);
+		policy.noteBlocked("network_policy", {
+			requestId: "ID_SECRET",
+			resourceType: "RESOURCE_SECRET",
+			frameId: "OTHER_FRAME_SECRET",
+			request: {
+				url: "https://user:PASS_SECRET@outside.test/NAME_SECRET?email=EMAIL_SECRET#BODY_SECRET",
+				method: "METHOD_SECRET",
+			},
+		});
+		expect(policy.blockDiagnostic).toBe(
+			"First blocked request: stage=network_policy; method=other; resource=other; origin=other; frame=other.",
+		);
+		expect(policy.blockDiagnostic).not.toContain("SECRET");
+		expect(policy.blockDiagnostic).not.toContain("outside.test");
+	});
+});
+
+describe("bounded submission request classification", () => {
+	const paused = (url: string, frameId?: string): PausedRequest => ({
+		requestId: "SECRET_ID",
+		resourceType: "Document",
+		...(frameId ? { frameId } : {}),
+		request: { url, method: "get" },
+	});
+	test("ignores path/query/fragment contents when comparing origins", () => {
+		const expected = {
+			url: "https://acme.co.jp/private/SECRET_A?name=SECRET_B",
+			method: "GET",
+		};
+		expect(
+			describeBlockedSubmissionRequest(
+				"expected_request",
+				paused("https://acme.co.jp/another/SECRET_C?email=SECRET_D#SECRET_E"),
+				expected,
+				undefined,
+			),
+		).toBe(
+			"First blocked request: stage=expected_request; method=GET; resource=Document; origin=same; frame=unknown.",
+		);
+	});
+	test.each([
+		"INVALID_SECRET",
+		"data:text/plain,SECRET",
+		"file:///SECRET",
+		"javascript:SECRET",
+	])("does not retain malformed or non-HTTP URL %s", (url) => {
+		const result = describeBlockedSubmissionRequest(
+			"network_policy",
+			paused(url),
+			{ url: "https://acme.co.jp/form", method: "POST" },
+			FORM_FRAME_ID,
+		);
+		expect(result).toContain("origin=unknown; frame=unknown");
+		expect(result).not.toContain("SECRET");
+	});
+	test("does not fabricate an origin match without a reviewed request", () => {
+		expect(
+			describeBlockedSubmissionRequest(
+				"continue_request",
+				paused("https://acme.co.jp/SECRET", FORM_FRAME_ID),
+				undefined,
+				FORM_FRAME_ID,
+			),
+		).toContain("origin=unknown; frame=expected");
+	});
+	test("unknown stages are never interpolated into the saved text", () => {
+		expect(
+			describeBlockedSubmissionRequest(
+				"SECRET_STAGE" as never,
+				paused("https://acme.co.jp"),
+				undefined,
+				undefined,
+			),
+		).toContain("stage=unknown;");
+	});
+	test("does not attach a later diagnostic to an earlier stage-only block", () => {
+		const policy = activatedPolicy();
+		policy.noteBlocked("request_limit");
+		policy.noteBlocked("network_policy", paused("https://outside.test/SECRET"));
+		expect(policy.blockStage).toBe("request_limit");
+		expect(policy.blockDiagnostic).toBeUndefined();
+	});
+	test("ignores diagnostic context before an attempt", () => {
+		const policy = new SubmissionRequestPolicy();
+		policy.noteBlocked("network_policy", paused("https://outside.test/SECRET"));
+		expect(policy.blockDiagnostic).toBeUndefined();
+	});
+});
+
 describe("SubmissionRequestPolicy validation state", () => {
 	test("drops the recorded submission when a new validation starts", () => {
 		const policy = new SubmissionRequestPolicy();
@@ -291,6 +423,7 @@ describe("decidePausedRequest", () => {
 			claimSubmission: true,
 			continueRedirect: false,
 			claimNavigation: false,
+			claimCompletionNavigation: false,
 			allowedByVerificationProvider: false,
 			submissionRelated: true,
 			blockStage: "network_policy",
@@ -516,5 +649,139 @@ describe("decidePausedRequest", () => {
 
 		expect(decision.action).toBe("fail");
 		expect(decision.claimNavigation).toBe(false);
+	});
+});
+
+describe("POST followed by a script completion navigation", () => {
+	function submittedPolicy() {
+		const policy = getSubmissionPolicy("https://acme.co.jp/contact");
+		policy.claim("server-action");
+		policy.recordContinued(post("server-action", "https://acme.co.jp/contact"));
+		policy.release();
+		policy.closeActivationWindow();
+		return policy;
+	}
+	test("allows one same-origin queryless completion document after POST, without counting another submission", () => {
+		const policy = submittedPolicy();
+		const request = documentGet(
+			"completion",
+			"https://acme.co.jp/contact-success",
+		);
+		const decision = decidePausedRequest(
+			request,
+			policy.snapshot(),
+			context({ blockNonSubmitRequests: true }),
+		);
+		expect(decision.action).toBe("continue");
+		expect(decision.claimSubmission).toBe(false);
+		expect(decision.claimCompletionNavigation).toBe(true);
+		policy.claimCompletionNavigation();
+		expect(
+			decidePausedRequest(
+				request,
+				policy.snapshot(),
+				context({ blockNonSubmitRequests: true }),
+			).action,
+		).toBe("fail");
+		expect(policy.requestCount).toBe(1);
+	});
+	test.each([
+		[
+			"same POST or GET action",
+			"https://acme.co.jp/contact",
+			"Document",
+			FORM_FRAME_ID,
+		],
+		[
+			"external",
+			"https://other.co.jp/contact-success",
+			"Document",
+			FORM_FRAME_ID,
+		],
+		[
+			"other subdomain",
+			"https://other.acme.co.jp/contact-success",
+			"Document",
+			FORM_FRAME_ID,
+		],
+		[
+			"query",
+			"https://acme.co.jp/contact-success?email=private",
+			"Document",
+			FORM_FRAME_ID,
+		],
+		["fetch", "https://acme.co.jp/contact-success", "Fetch", FORM_FRAME_ID],
+		[
+			"different frame",
+			"https://acme.co.jp/contact-success",
+			"Document",
+			TOP_FRAME_ID,
+		],
+	])("blocks %s after POST", (_name, url, resourceType, frameId) => {
+		const request = {
+			...documentGet("completion", url),
+			resourceType,
+			frameId,
+		};
+		expect(
+			decidePausedRequest(
+				request,
+				submittedPolicy().snapshot(),
+				context({ blockNonSubmitRequests: true }),
+			).action,
+		).toBe("fail");
+	});
+	test.each([
+		"https://acme.co.jp/contact",
+		"https://other.acme.co.jp/leak?email=private",
+		"https://acme.co.jp/complete?email=private",
+		"https://acme.co.jp/second-completion",
+	])("does not let a claimed script completion redirect to %s", (url) => {
+		const policy = submittedPolicy();
+		policy.claimCompletionNavigation();
+		const request = {
+			...documentGet("completion-redirect", url),
+			redirectedRequestId: "completion",
+		};
+		expect(
+			decidePausedRequest(
+				request,
+				policy.snapshot(),
+				context({ blockNonSubmitRequests: true }),
+			).action,
+		).toBe("fail");
+	});
+	test("does not permit a completion page before POST, in dry-run, or after the attempt", () => {
+		const request = documentGet(
+			"completion",
+			"https://acme.co.jp/contact-success",
+		);
+		const policy = submittedPolicy();
+		expect(
+			decidePausedRequest(
+				request,
+				getSubmissionPolicy("https://acme.co.jp/contact").snapshot(),
+				context({ blockNonSubmitRequests: true }),
+			).action,
+		).toBe("fail");
+		expect(
+			decidePausedRequest(
+				request,
+				policy.snapshot(),
+				context({
+					blockNonSubmitRequests: true,
+					dryRun: true,
+					interactionStarted: true,
+				}),
+			).action,
+		).toBe("fail");
+		policy.endAttempt();
+		expect(
+			decidePausedRequest(
+				request,
+				policy.snapshot(),
+				context({ blockNonSubmitRequests: true }),
+			).action,
+		).toBe("fail");
 	});
 });

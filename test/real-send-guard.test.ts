@@ -2,6 +2,10 @@ import { describe, expect, test } from "bun:test";
 import type { Job, JobInput } from "../src/job";
 import { EFFECTIVE_DRY_RUN_KEY } from "../src/job";
 import {
+	jobContentFingerprint,
+	jobInputFingerprint,
+} from "../src/job-fingerprint";
+import {
 	checkRealSendGuard,
 	DRY_RUN_COMPLETE_REASON_CODE,
 	type DryRunRecord,
@@ -10,6 +14,7 @@ import {
 	type RealSendGuardStore,
 } from "../src/real-send-guard";
 import {
+	isSendApproval,
 	REAL_SEND_GUARD_EXEMPT_KEY,
 	SEND_APPROVAL_KEY,
 } from "../src/send-approval";
@@ -262,5 +267,97 @@ describe("matchesDryRunContent", () => {
 		expect(
 			await matchesDryRunContent(dryRunRecord({ payload: null }), sendInput()),
 		).toBe(false);
+	});
+});
+
+describe("direct send approval", () => {
+	async function approvedInput() {
+		const input = sendInput();
+		input.payload[SEND_APPROVAL_KEY] = {
+			approvedBy: APPROVAL.approvedBy,
+			approvedAt: APPROVAL.approvedAt,
+			mode: "direct",
+			contentFingerprint: await jobContentFingerprint(
+				input.targetUrl,
+				input.companyId,
+				input.payload,
+			),
+		};
+		return input;
+	}
+	test("allows frozen direct content without looking up a dry-run", async () => {
+		const input = await approvedInput();
+		const store = new FakeStore(null);
+		expect(await checkRealSendGuard(input, store)).toEqual({ allowed: true });
+		expect(store.findCalls).toEqual([]);
+	});
+	test.each(["message", "company", "url", "candidate order"])(
+		"rejects changed %s after direct approval",
+		async (field) => {
+			const input = await approvedInput();
+			if (field === "candidate order") {
+				input.payload.formValues = {
+					message: "Hello",
+					category: ["first", "second"],
+				};
+				const fingerprint = await jobContentFingerprint(
+					input.targetUrl,
+					input.companyId,
+					input.payload,
+				);
+				input.payload[SEND_APPROVAL_KEY] = {
+					...(input.payload[SEND_APPROVAL_KEY] as object),
+					contentFingerprint: fingerprint,
+				};
+				input.payload.formValues = {
+					message: "Hello",
+					category: ["second", "first"],
+				};
+			}
+			if (field === "message")
+				input.payload.formValues = { message: "changed" };
+			if (field === "company") input.companyId = "other";
+			if (field === "url") input.targetUrl = "https://example.com/other";
+			expect(await checkRealSendGuard(input, new FakeStore(null))).toEqual({
+				allowed: false,
+				refusal: "SEND_APPROVAL_CONTENT_MISMATCH",
+			});
+		},
+	);
+	test("rejects malformed and ambiguous direct approval records", async () => {
+		const input = await approvedInput();
+		const approval = input.payload[SEND_APPROVAL_KEY] as Record<
+			string,
+			unknown
+		>;
+		expect(isSendApproval(approval)).toBe(true);
+		for (const patch of [
+			{ mode: undefined },
+			{ contentFingerprint: "abc" },
+			{ dryRunJobId: "dry-1" },
+			{ approvedBy: "" },
+			{ approvedAt: "today" },
+			{ extra: true },
+		]) {
+			expect(isSendApproval({ ...approval, ...patch })).toBe(false);
+		}
+	});
+	test("registration recovery compares the direct approval fingerprint", async () => {
+		const input = await approvedInput();
+		const first = await jobInputFingerprint(
+			input.targetUrl,
+			input.payload,
+			true,
+		);
+		const changed = {
+			...input.payload,
+			[SEND_APPROVAL_KEY]: {
+				...(input.payload[SEND_APPROVAL_KEY] as object),
+				contentFingerprint: "f".repeat(64),
+			},
+		};
+		expect(await jobInputFingerprint(input.targetUrl, changed, true)).not.toBe(
+			first,
+		);
 	});
 });

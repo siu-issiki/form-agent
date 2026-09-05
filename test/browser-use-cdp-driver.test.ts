@@ -2,6 +2,7 @@ import { describe, expect, setSystemTime, test } from "bun:test";
 import { runInNewContext } from "node:vm";
 import {
 	SUBMISSION_CONFIRMATION_PATTERN,
+	SUBMISSION_FAILURE_PATTERN,
 	SUBMISSION_PENDING_PATTERN,
 } from "../src/browser-submit-confirmation";
 import {
@@ -50,13 +51,15 @@ import {
 	ACTIVATE_SUBMIT_FUNCTION,
 	BLOCK_BROWSER_ESCAPE_EXPRESSION,
 	CHECK_FORM_VALIDITY_FUNCTION,
-	HAS_CONFIRMATION_TEXT_FUNCTION,
 	HAS_SAME_FORM_OWNER_FUNCTION,
+	INSPECT_ELEMENT_FUNCTION,
 	IS_COMPOSED_DESCENDANT_FUNCTION,
 	IS_ELEMENT_FOCUSED_FUNCTION,
 	IS_SUBMIT_UNOBSCURED_FUNCTION,
 	MATCHES_CHOICE_CANDIDATE_FUNCTION,
 	READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
+	READ_SUBMISSION_MESSAGES_FUNCTION,
+	SELECT_ARIA_LISTBOX_BY_CANDIDATE_FUNCTION,
 	SELECT_OPTION_BY_CANDIDATE_FUNCTION,
 	SELECT_RADIO_BY_CANDIDATE_FUNCTION,
 	SET_CHECKED_VALUE_FUNCTION,
@@ -86,6 +89,7 @@ import {
 	BrowserUseResponseError,
 	SESSION_STILL_ACTIVE_MESSAGE,
 } from "../src/browser-use-client";
+import { DEFAULT_CHOICE_CANDIDATES } from "../src/campaign-import";
 import type { Job } from "../src/job";
 import {
 	BrowserElementError,
@@ -781,12 +785,64 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		expect(submitUncertainReasonCode("mouse", false, "network_policy")).toBe(
 			"SUBMIT_NETWORK_POLICY_BLOCKED",
 		);
+		expect(submitUncertainReasonCode("mouse", false, "continue_request")).toBe(
+			"SUBMIT_REQUEST_CONTINUE_FAILED",
+		);
+		expect(submitUncertainReasonCode("mouse", true, "continue_request")).toBe(
+			"SUBMIT_CONFIRMATION_NOT_OBSERVED",
+		);
 		expect(submitUncertainReasonCode("mouse", true, "expected_request")).toBe(
 			"SUBMIT_CONFIRMATION_NOT_OBSERVED",
 		);
 	});
 
-	test("activates only a connected native submit control through the DOM", () => {
+	test.each(["button", "input"])(
+		"validates a script %s button while retaining form ownership and validity checks",
+		async (tag) => {
+			let sameForm = true;
+			let valid = true;
+			const { driver } = await submissionDriver([], (connection) => {
+				const fixture = connection.respond;
+				connection.respond = (method, params) => {
+					if (method === "Runtime.callFunctionOn") {
+						if (params.functionDeclaration === HAS_SAME_FORM_OWNER_FUNCTION) {
+							return { result: { value: sameForm } };
+						}
+						if (params.functionDeclaration === CHECK_FORM_VALIDITY_FUNCTION) {
+							return { result: { value: valid } };
+						}
+					}
+					const answer = fixture(method, params);
+					const value = (
+						answer as { result?: { value?: { submitLike?: boolean } } }
+					)?.result?.value;
+					return value?.submitLike === true
+						? {
+								result: {
+									value: { ...value, tag, type: "button", submitLike: false },
+								},
+							}
+						: answer;
+				};
+			});
+			try {
+				await driver.validateSubmit(BUTTON_ELEMENT_ID);
+				sameForm = false;
+				await expect(
+					driver.validateSubmit(BUTTON_ELEMENT_ID),
+				).rejects.toBeInstanceOf(BrowserElementError);
+				sameForm = true;
+				valid = false;
+				await expect(
+					driver.validateSubmit(BUTTON_ELEMENT_ID),
+				).rejects.toThrow();
+			} finally {
+				await closeQuietly(driver);
+			}
+		},
+	);
+
+	test("activates connected native and script submit buttons through the DOM", () => {
 		let nativeClickCount = 0;
 		class TestHTMLElement {
 			click() {
@@ -855,13 +911,43 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		expect(instanceClickCount).toBe(0);
 		expect(
 			activate(
+				Object.assign(new TestHTMLElement(), submit, { type: "button" }),
+			),
+		).toBe(true);
+		expect(nativeClickCount).toBe(2);
+		expect(
+			activate(
+				Object.assign(new TestHTMLElement(), submit, {
+					tagName: "INPUT",
+					type: "button",
+				}),
+			),
+		).toBe(true);
+		expect(nativeClickCount).toBe(3);
+		for (const override of [
+			{ disabled: true },
+			{ visible: false },
+			{ type: "reset" },
+			{ isConnected: false },
+		]) {
+			expect(
+				activate(
+					Object.assign(
+						new TestHTMLElement(),
+						submit,
+						{ tagName: "INPUT", type: "button" },
+						override,
+					),
+				),
+			).toBe(false);
+		}
+		expect(
+			activate(
 				Object.assign(new TestHTMLElement(), submit, { disabled: true }),
 			),
 		).toBe(false);
 		expect(
-			activate(
-				Object.assign(new TestHTMLElement(), submit, { type: "button" }),
-			),
+			activate(Object.assign(new TestHTMLElement(), submit, { type: "reset" })),
 		).toBe(false);
 		expect(
 			activate(
@@ -957,6 +1043,29 @@ describe("BrowserUseCdpDriver child target policy", () => {
 		expect(checkFormValidity.call({})).toBe(false);
 	});
 
+	test.each(["form", "submitter"])(
+		"honors the %s's explicit native-validation opt-out",
+		(scope) => {
+			const checkFormValidity = runInNewContext(
+				`(${CHECK_FORM_VALIDITY_FUNCTION})`,
+			) as (this: object) => boolean;
+			let nativeChecks = 0;
+			const button = {
+				formNoValidate: scope === "submitter",
+				form: {
+					noValidate: scope === "form",
+					checkValidity: () => {
+						nativeChecks += 1;
+						return false;
+					},
+				},
+			};
+			expect(checkFormValidity.call(button)).toBe(true);
+			expect(nativeChecks).toBe(0);
+			expect(checkFormValidity.call({ formNoValidate: true })).toBe(false);
+		},
+	);
+
 	test("activates checkbox and radio inputs through their DOM click semantics", () => {
 		const events: string[] = [];
 		const setChecked = runInNewContext(`(${SET_CHECKED_VALUE_FUNCTION})`) as (
@@ -1043,10 +1152,14 @@ describe("BrowserUseCdpDriver child target policy", () => {
 
 	test("allows click only for a non-value button control", () => {
 		expect(isPayloadIndependentClickTarget("button", "button")).toBe(true);
+		expect(isPayloadIndependentClickTarget("input", "button")).toBe(true);
+		expect(isPayloadIndependentClickTarget("select", "aria-listbox")).toBe(
+			true,
+		);
 		for (const [tag, type] of [
 			["input", "checkbox"],
 			["input", "radio"],
-			["input", "button"],
+			["input", "reset"],
 			["select", "select-one"],
 			["textarea", "textarea"],
 			["button", "reset"],
@@ -1735,16 +1848,20 @@ describe("BrowserUseCdpDriver child target policy", () => {
  */
 function readsAsConfirmation(text: string): boolean {
 	const hasConfirmationText = runInNewContext(
-		`(${HAS_CONFIRMATION_TEXT_FUNCTION})`,
+		`(${READ_SUBMISSION_MESSAGES_FUNCTION})`,
 	) as (
 		this: { innerText: string },
 		pattern: string,
 		pendingPattern: string,
-	) => boolean;
-	return hasConfirmationText.call(
-		{ innerText: text },
-		SUBMISSION_CONFIRMATION_PATTERN,
-		SUBMISSION_PENDING_PATTERN,
+		failurePattern: string,
+	) => { confirmation: string; failure: string };
+	return Boolean(
+		hasConfirmationText.call(
+			{ innerText: text },
+			SUBMISSION_CONFIRMATION_PATTERN,
+			SUBMISSION_PENDING_PATTERN,
+			SUBMISSION_FAILURE_PATTERN,
+		).confirmation,
 	);
 }
 
@@ -2404,11 +2521,72 @@ describe("captureCdpFullPageScreenshot", () => {
 });
 
 describe("BrowserUseCdpDriver screenshot modes", () => {
+	test.each([false, true])(
+		"captures fixed headers at the origin and restores scroll, capture failure=%s",
+		async (failCapture) => {
+			const connection = new ScriptedCdpConnection();
+			let position = { pageX: 25, pageY: 650 };
+			const capturePositions: (typeof position)[] = [];
+			connection.respond = (method, params) => {
+				if (method === "Page.getLayoutMetrics") {
+					return {
+						cssLayoutViewport: { ...position },
+						cssContentSize: { width: 1920, height: 3000 },
+					};
+				}
+				if (
+					method === "Runtime.evaluate" &&
+					String(params.expression).includes("window.scrollTo(")
+				) {
+					return {
+						result: {
+							value: runInNewContext(String(params.expression), {
+								window: {
+									scrollTo: ({
+										left,
+										top,
+										behavior,
+									}: {
+										left: number;
+										top: number;
+										behavior: string;
+									}) => {
+										expect(behavior).toBe("instant");
+										position = { pageX: left, pageY: top };
+									},
+								},
+								requestAnimationFrame: (callback: () => void) => callback(),
+								setTimeout,
+								clearTimeout,
+							}),
+						},
+					};
+				}
+				if (method === "Page.captureScreenshot") {
+					capturePositions.push({ ...position });
+					if (failCapture && params.clip) throw new Error("capture failed");
+					return { data: btoa("image") };
+				}
+				return scriptedCdpResponse(method, params);
+			};
+			const driver = await scriptedDriver(connection);
+			await driver.captureScreenshot("full_page");
+			expect(capturePositions).toEqual([
+				{ pageX: 0, pageY: 0 },
+				...(failCapture ? [{ pageX: 25, pageY: 650 }] : []),
+			]);
+			expect(position).toEqual({ pageX: 25, pageY: 650 });
+		},
+	);
+
 	test("asks for a clipped full-page capture in full_page mode", async () => {
 		const connection = new ScriptedCdpConnection();
 		connection.respond = (method, params) => {
 			if (method === "Page.getLayoutMetrics") {
-				return { cssContentSize: { width: 1920, height: 9000 } };
+				return {
+					cssContentSize: { width: 1920, height: 9000 },
+					cssLayoutViewport: { pageX: 0, pageY: 0 },
+				};
 			}
 			if (method === "Page.captureScreenshot") {
 				return { data: btoa(String.fromCharCode(3, 4)) };
@@ -2514,7 +2692,10 @@ describe("BrowserUseCdpDriver screenshot modes", () => {
 		};
 		connection.respond = (method, params) =>
 			method === "Page.getLayoutMetrics"
-				? { cssContentSize: { width: 1280, height: 2000 } }
+				? {
+						cssContentSize: { width: 1280, height: 2000 },
+						cssLayoutViewport: { pageX: 0, pageY: 0 },
+					}
 				: scriptedCdpResponse(method, params);
 		const driver = await scriptedDriver(connection);
 
@@ -2564,6 +2745,7 @@ describe("BrowserUseCdpDriver reviewed field comparison", () => {
 		expect(isReviewComparableField("input", "image")).toBe(false);
 		expect(isReviewComparableField("button", null)).toBe(false);
 		expect(isReviewComparableField("button", "button")).toBe(false);
+		expect(isReviewComparableField("input", "button")).toBe(false);
 	});
 
 	test("reads the live value and checked state of a comparable element", () => {
@@ -4613,6 +4795,8 @@ function scriptedCdpResponse(
 			return { nodes: [] };
 		case "DOM.getBoxModel":
 			return { model: { border: [0, 0, 20, 0, 20, 10, 0, 10] } };
+		case "Page.getLayoutMetrics":
+			return { cssLayoutViewport: { pageX: 0, pageY: 0 } };
 		case "DOM.getNodeForLocation":
 			return { backendNodeId: BUTTON_BACKEND_NODE_ID };
 		default:
@@ -4779,6 +4963,51 @@ describe("BrowserUseCdpDriver element operation failures", () => {
 });
 
 describe("click preparation retries", () => {
+	test.each([
+		{ pageX: 0, pageY: 80 },
+		{ pageX: 120, pageY: 80 },
+	])(
+		"uses document coordinates for hit testing a scrolled page: %j",
+		async (viewport) => {
+			const { driver, connection } = await observedElementDriver();
+			const fixture = connection.respond;
+			connection.respond = (method, params) => {
+				if (method === "Page.getLayoutMetrics") {
+					return { cssLayoutViewport: viewport };
+				}
+				if (method === "DOM.getNodeForLocation") {
+					if (
+						params.x !== 10 + viewport.pageX ||
+						params.y !== 5 + viewport.pageY
+					) {
+						throw new BrowserElementError();
+					}
+				}
+				return fixture(method, params);
+			};
+			try {
+				await driver.clickNonSubmit(BUTTON_ELEMENT_ID);
+				const presses = connection.sent.filter(
+					(call) =>
+						call.method === "Input.dispatchMouseEvent" &&
+						call.params.type === "mousePressed",
+				);
+				expect(presses.map((call) => call.params)).toEqual([
+					{
+						type: "mousePressed",
+						x: 10,
+						y: 5,
+						button: "left",
+						buttons: 1,
+						clickCount: 1,
+					},
+				]);
+			} finally {
+				await closeQuietly(driver);
+			}
+		},
+	);
+
 	test("repeats a click preparation that reports no box model and then clicks", async () => {
 		const { driver, connection } = await observedElementDriver();
 		connection.fail = failFirstCalls("DOM.getBoxModel", 2, () =>
@@ -4890,6 +5119,13 @@ describe("click preparation retries", () => {
 				attempt: 2,
 				kind: "NO_BOX_MODEL",
 			},
+			{
+				event: "browser_click_preparation_failed",
+				stage: "box_model",
+				attempt: 3,
+				backendNodeId: BUTTON_BACKEND_NODE_ID,
+				kind: "NO_BOX_MODEL",
+			},
 		]);
 		expect(logEvents(capturedWarnings.warnings)).toEqual([
 			{
@@ -4926,7 +5162,15 @@ describe("click preparation retries", () => {
 
 			expect(caught).toBeInstanceOf(BrowserElementOperationError);
 			expect(countSent(connection, "DOM.getBoxModel")).toBe(1);
-			expect(capturedLogs.logs).toEqual([]);
+			expect(logEvents(capturedLogs.logs)).toEqual([
+				{
+					event: "browser_click_preparation_failed",
+					stage: "box_model",
+					attempt: 1,
+					backendNodeId: BUTTON_BACKEND_NODE_ID,
+					kind,
+				},
+			]);
 			expect(logEvents(capturedWarnings.warnings)).toEqual([
 				{
 					event: "browser_element_operation_failed",
@@ -5372,6 +5616,46 @@ describe("choice candidate matching in the page", () => {
 });
 
 describe("BrowserUseCdpDriver choice controls", () => {
+	test("custom choice selection must survive an independent readback", async () => {
+		for (const retained of [true, false]) {
+			const { driver, connection } = await observedElementDriver();
+			let selected = false;
+			connection.respond = (method, params) => {
+				if (
+					method === "Runtime.callFunctionOn" &&
+					params.functionDeclaration ===
+						SELECT_ARIA_LISTBOX_BY_CANDIDATE_FUNCTION
+				) {
+					selected = true;
+					return { result: { value: "その他" } };
+				}
+				const result = scriptedCdpResponse(method, params);
+				if (
+					method === "Runtime.callFunctionOn" &&
+					params.functionDeclaration === INSPECT_ELEMENT_FUNCTION
+				) {
+					return {
+						result: {
+							value: {
+								...(result as { result: { value: object } }).result.value,
+								tag: "select",
+								type: "aria-listbox",
+								value: selected && retained ? "その他" : "物件の問い合わせ",
+							},
+						},
+					};
+				}
+				return result;
+			};
+			if (retained) await driver.select(SELECT_ELEMENT_ID, ["その他"]);
+			else
+				await expect(
+					driver.select(SELECT_ELEMENT_ID, ["その他"]),
+				).rejects.toBeInstanceOf(BrowserElementError);
+			expect(selected).toBe(true);
+		}
+	});
+
 	test("hands the page the candidate list and keeps page text out of the call", async () => {
 		const { driver, connection } = await observedElementDriver();
 
@@ -6041,7 +6325,10 @@ describe("BrowserUseCdpDriver submission network policy", () => {
 				requestId: "offsite-1",
 				resourceType: "XHR",
 				frameId: "frame-1",
-				request: { url: "https://forms.other.test/collect", method: "POST" },
+				request: {
+					url: "https://forms.other.test/NAME_SECRET?token=QUERY_SECRET#BODY_SECRET",
+					method: "POST",
+				},
 			},
 		]);
 
@@ -6053,6 +6340,11 @@ describe("BrowserUseCdpDriver submission network policy", () => {
 			outcome: "uncertain",
 			reasonCode: "SUBMIT_NETWORK_POLICY_BLOCKED",
 		});
+		expect(result.reason).toContain(
+			"stage=network_policy; method=POST; resource=XHR; origin=other; frame=expected",
+		);
+		expect(JSON.stringify(result)).not.toContain("SECRET");
+		expect(JSON.stringify(result)).not.toContain("forms.other.test");
 		await closeQuietly(driver);
 	});
 
@@ -6257,15 +6549,49 @@ describe("BrowserUseCdpDriver submission window state", () => {
 			captured.restore();
 		}
 
-		// The continue never happened, so the request was never observed and the
-		// paused request ends refused rather than half-continued.
+		// CDP did not acknowledge continuation: it must not count as observed,
+		// and failRequest is attempted without claiming non-delivery.
 		expect(submitActivationRequestObserved(captured.logs)).toEqual([false]);
 		expect(failedRequestIds(connection)).toEqual(["post-1"]);
+		expect(continuedRequestIds(connection)).toEqual(["post-1"]);
 		expect(result).toMatchObject({
 			outcome: "uncertain",
-			reasonCode: "SUBMIT_NETWORK_POLICY_BLOCKED",
+			reasonCode: "SUBMIT_REQUEST_CONTINUE_FAILED",
 		});
+		expect(result.reason).toContain(
+			"stage=continue_request; method=POST; resource=XHR; origin=same; frame=expected",
+		);
 		await closeQuietly(driver);
+	});
+
+	test("distinguishes a failed expected GET continuation from a policy refusal", async () => {
+		const { driver, connection } = await submissionDriver([], (scripted) => {
+			scripted.respond = getSubmitFixtureResponse(scripted, () =>
+				scripted.emit(
+					"Fetch.requestPaused",
+					expectedGetSubmission("get-error"),
+				),
+			);
+			scripted.fail = (method) =>
+				method === "Fetch.continueRequest"
+					? new Error(
+							"untrusted CDP detail https://private.test/?token=SECRET body=PRIVATE",
+						)
+					: null;
+		});
+		try {
+			const result = await submitFixtureForm(driver);
+			expect(result).toMatchObject({
+				outcome: "uncertain",
+				reasonCode: "SUBMIT_REQUEST_CONTINUE_FAILED",
+			});
+			expect(JSON.stringify(result)).not.toContain("SECRET");
+			expect(JSON.stringify(result)).not.toContain("PRIVATE");
+			expect(failedRequestIds(connection)).toEqual(["get-error"]);
+			expect(continuedRequestIds(connection)).toEqual(["get-error"]);
+		} finally {
+			await closeQuietly(driver);
+		}
 	});
 
 	test("lets the expected GET be claimed again after a failed continue", async () => {
@@ -6680,6 +7006,28 @@ async function closeQuietly(driver: BrowserUseCdpDriver): Promise<void> {
 }
 
 describe("submission confirmation text", () => {
+	test.each([
+		"ありがとうございます。メッセージは送信されました。",
+		"お問い合わせを受け付けました。",
+	])("recognizes a new inline completion: %s", async (message) => {
+		expect(await readsAsNewConfirmation("お問い合わせフォーム", message)).toBe(
+			true,
+		);
+		expect(await readsAsNewConfirmation(message, message)).toBe(false);
+	});
+
+	test.each([
+		"お問い合わせフォーム",
+		"メッセージは送信されていません。",
+		"お問い合わせを受け付けていません。",
+		"メッセージは送信されましたか？",
+		"お問い合わせを受け付けましたか？",
+		"メッセージは送信されましたが、エラーが発生しました。",
+		"確認画面\nお問い合わせを受け付けました。\nこの内容で送信",
+	])("does not infer success from a reset or non-completion: %s", (text) => {
+		expect(readsAsConfirmation(text)).toBe(false);
+	});
+
 	test("does not read a review-before-send screen as a completion", () => {
 		expect(
 			readsAsConfirmation(
@@ -6933,3 +7281,1863 @@ function useShadowHitTest(connection: ScriptedCdpConnection): void {
 		return fixture(method, params);
 	};
 }
+
+describe("一般的なお問い合わせの選択シナリオ", () => {
+	test("既定候補で一般問い合わせを選び、資料請求を選ばない", () => {
+		const element = fakeSelect([
+			{ value: "", text: "選択してください" },
+			{ value: "document", text: "資料請求" },
+			{ value: "general", text: "一般的なお問い合わせ" },
+		]);
+		expect(
+			selectOptionByCandidate().call(
+				element,
+				DEFAULT_CHOICE_CANDIDATES.inquiryType ?? [],
+			),
+		).toBe(true);
+		expect(element.options.find((option) => option.selected)?.value).toBe(
+			"general",
+		);
+	});
+});
+
+test("送信結果スナップショットは成功・失敗文言を本文全体から切り離す", () => {
+	const read = runInNewContext(`(${READ_SUBMISSION_MESSAGES_FUNCTION})`);
+	const get = (text: string) =>
+		read.call(
+			{ innerText: text },
+			SUBMISSION_CONFIRMATION_PATTERN,
+			SUBMISSION_PENDING_PATTERN,
+			SUBMISSION_FAILURE_PATTERN,
+		);
+	expect(
+		get(
+			"個人情報 someone@example.com 送信に失敗しました。時間をおいてもう一度お試しください。",
+		),
+	).toEqual({ confirmation: "", failure: "送信に失敗しました" });
+	expect(get("お問い合わせを受け付けました。someone@example.com")).toEqual({
+		confirmation: "お問い合わせを受け付けました",
+		failure: "",
+	});
+	expect(get("入力内容をご確認 この内容で送信 送信完了")).toEqual({
+		confirmation: "",
+		failure: "",
+	});
+	expect(get("入力欄が空になっただけ")).toEqual({
+		confirmation: "",
+		failure: "",
+	});
+});
+
+describe("送信後の判定文言の証跡", () => {
+	for (const scenario of [
+		{
+			name: "新たな失敗表示",
+			before: "",
+			after: "送信に失敗しました",
+			request: true,
+			expected: "SUBMIT_PAGE_REPORTED_FAILURE",
+		},
+		...[
+			{
+				name: "新しい受付拒否",
+				before: "",
+				request: true,
+				expected: "SUBMIT_PAGE_REPORTED_FAILURE",
+			},
+			{
+				name: "元からある受付拒否",
+				before: "送信を受け付けられませんでした。",
+				request: true,
+				expected: "SUBMIT_CONFIRMATION_NOT_OBSERVED",
+			},
+			{
+				name: "通信未観測の受付拒否",
+				before: "",
+				request: false,
+				expected: "SUBMIT_DOM_REQUEST_NOT_OBSERVED",
+			},
+		].map((scenario) => ({
+			...scenario,
+			after: "送信を受け付けられませんでした。",
+		})),
+		...[
+			{
+				name: "新しい人間確認拒否",
+				before: "",
+				request: true,
+				expected: "SUBMIT_PAGE_REPORTED_FAILURE",
+			},
+			{
+				name: "元からある人間確認案内",
+				before: "人間であることを確認してください。",
+				request: true,
+				expected: "SUBMIT_CONFIRMATION_NOT_OBSERVED",
+			},
+			{
+				name: "通信未観測の人間確認案内",
+				before: "",
+				request: false,
+				expected: "SUBMIT_DOM_REQUEST_NOT_OBSERVED",
+			},
+		].map((scenario) => ({
+			...scenario,
+			after: "人間であることを確認してください。",
+		})),
+		{
+			name: "元からある失敗説明",
+			before: "送信に失敗しました",
+			after: "送信に失敗しました",
+			request: true,
+			expected: "SUBMIT_CONFIRMATION_NOT_OBSERVED",
+		},
+		{
+			name: "通信が出ていない失敗表示",
+			before: "",
+			after: "送信に失敗しました",
+			request: false,
+			expected: "SUBMIT_DOM_REQUEST_NOT_OBSERVED",
+		},
+	]) {
+		test(scenario.name, async () => {
+			let activated = false;
+			const { driver } = await submissionDriver(
+				scenario.request
+					? [
+							{
+								requestId: "post-error",
+								resourceType: "XHR",
+								frameId: "frame-1",
+								request: { url: "https://acme.co.jp/send", method: "POST" },
+							},
+						]
+					: [],
+				(connection) => {
+					const scripted = connection.respond;
+					connection.respond = (method, params) => {
+						if (method === "DOM.getDocument")
+							return { root: SUBMISSION_PAGE_DOCUMENT };
+						if (
+							method === "Runtime.callFunctionOn" &&
+							params.functionDeclaration === READ_SUBMISSION_MESSAGES_FUNCTION
+						)
+							return {
+								result: {
+									value: runInNewContext(
+										`(${READ_SUBMISSION_MESSAGES_FUNCTION})`,
+									).call(
+										{ innerText: activated ? scenario.after : scenario.before },
+										SUBMISSION_CONFIRMATION_PATTERN,
+										SUBMISSION_PENDING_PATTERN,
+										SUBMISSION_FAILURE_PATTERN,
+									),
+								},
+							};
+						if (
+							method === "Runtime.callFunctionOn" &&
+							params.functionDeclaration === ACTIVATE_SUBMIT_FUNCTION
+						)
+							activated = true;
+						return scripted(method, params);
+					};
+				},
+			);
+			try {
+				const result = await submitFixtureForm(driver);
+				expect(result).toMatchObject({
+					outcome: "uncertain",
+					reasonCode: scenario.expected,
+				});
+				if (scenario.expected === "SUBMIT_PAGE_REPORTED_FAILURE")
+					expect(result.evidence).toMatchObject({
+						confirmationText: "",
+						failureText: scenario.after,
+						formUrl: SUBMISSION_PAGE_URL,
+					});
+				else expect(result.evidence).toBeUndefined();
+			} finally {
+				await closeQuietly(driver);
+			}
+		});
+	}
+
+	test("古い別bodyの完了文言ではなく新たに一致したbodyの文言を保存する", async () => {
+		let activated = false;
+		const { driver } = await submissionDriver(
+			[
+				{
+					requestId: "post-success",
+					resourceType: "XHR",
+					frameId: "frame-1",
+					request: { url: "https://acme.co.jp/send", method: "POST" },
+				},
+			],
+			(connection) => {
+				const scripted = connection.respond;
+				connection.respond = (method, params) => {
+					if (method === "DOM.getDocument")
+						return {
+							root: {
+								...SUBMISSION_PAGE_DOCUMENT,
+								children: [
+									...SUBMISSION_PAGE_DOCUMENT.children,
+									{ backendNodeId: 88, nodeName: "BODY" },
+								],
+							},
+						};
+					if (
+						method === "Runtime.callFunctionOn" &&
+						params.functionDeclaration === READ_SUBMISSION_MESSAGES_FUNCTION
+					)
+						return {
+							result: {
+								value: {
+									confirmation:
+										params.objectId ===
+										`object-${SUBMISSION_BODY_BACKEND_NODE_ID}`
+											? "thank you"
+											: activated
+												? "お問い合わせを受け付けました"
+												: "",
+									failure: "",
+								},
+							},
+						};
+					if (
+						method === "Runtime.callFunctionOn" &&
+						params.functionDeclaration === ACTIVATE_SUBMIT_FUNCTION
+					)
+						activated = true;
+					return scripted(method, params);
+				};
+			},
+		);
+		try {
+			const result = await submitFixtureForm(driver);
+			expect(result).toMatchObject({
+				outcome: "sent",
+				evidence: {
+					confirmationText: "お問い合わせを受け付けました",
+					failureText: "",
+					formUrl: SUBMISSION_PAGE_URL,
+				},
+			});
+		} finally {
+			await closeQuietly(driver);
+		}
+	});
+});
+
+describe("追加の送信結果文言", () => {
+	const acknowledgement =
+		"ご連絡ありがとうございます。近いうちにご返信させていただきます。";
+	const validationFailure =
+		"1つ以上の項目にエラーがあります。確認してもう一度お試しください。";
+	test("新しい受付と返信予定の二文を完了として認識する", async () => {
+		expect(
+			await readsAsNewConfirmation("お問い合わせフォーム", acknowledgement),
+		).toBe(true);
+		expect(await readsAsNewConfirmation(acknowledgement, acknowledgement)).toBe(
+			false,
+		);
+		expect(
+			readsAsConfirmation(
+				"ヘッダー\nご連絡ありがとうございます。\n近いうちにご返信させていただきます。\nフッター",
+			),
+		).toBe(true);
+	});
+	test.each([
+		"ご連絡ありがとうございます。",
+		"近いうちにご返信させていただきます。",
+		"ご連絡ありがとうございます。近いうちにご返信させていただきますか？",
+		"ご連絡ありがとうございます。近いうちにご返信させていただきません。",
+		"FAQ: 「ご連絡ありがとうございます。近いうちにご返信させていただきます。」と表示されますか？",
+		"送信後はご連絡ありがとうございます。近いうちにご返信させていただきます。と表示します。",
+		"まだ送信していません。\nご連絡ありがとうございます。近いうちにご返信させていただきます。",
+	])("静的な説明や未送信・否定から完了を推測しない: %s", (text) => {
+		expect(readsAsConfirmation(text)).toBe(false);
+	});
+	test("受付二文が出ても送信リクエスト未観測なら成功にしない", async () => {
+		expect(
+			await readSubmissionConfirmation(
+				0,
+				false,
+				async () => (readsAsConfirmation(acknowledgement) ? 1 : 0),
+				async () => "https://example.com/contact",
+			),
+		).toBeNull();
+	});
+	test("項目エラーの実例二文を本文から切り離して検出する", () => {
+		const read = runInNewContext(`(${READ_SUBMISSION_MESSAGES_FUNCTION})`);
+		const get = (text: string) =>
+			read.call(
+				{ innerText: text },
+				SUBMISSION_CONFIRMATION_PATTERN,
+				SUBMISSION_PENDING_PATTERN,
+				SUBMISSION_FAILURE_PATTERN,
+			);
+		expect(
+			get(`お問い合わせ\n${validationFailure}\nother@example.com`),
+		).toMatchObject({ confirmation: "", failure: validationFailure });
+		for (const text of [
+			"1つ以上の項目にエラーがありますか？",
+			"1つ以上の項目にエラーがありません。",
+			`FAQ: 「${validationFailure}」は何ですか？`,
+		])
+			expect(get(text).failure).toBe("");
+	});
+});
+
+describe("batch8送信後の実例文言", () => {
+	const followup =
+		"お問い合わせありがとうございます。追ってご連絡させていただきます。";
+	const complete =
+		"問い合わせ完了\nこのたびはお問い合わせありがとうございました。";
+	test.each([followup, complete])(
+		"新規表示された組の文言を認識する: %s",
+		async (text) => {
+			expect(await readsAsNewConfirmation("お問い合わせフォーム", text)).toBe(
+				true,
+			);
+			expect(await readsAsNewConfirmation(text, text)).toBe(false);
+			expect(
+				await readSubmissionConfirmation(
+					0,
+					false,
+					async () => (readsAsConfirmation(text) ? 1 : 0),
+					async () => "https://example.com/contact",
+				),
+			).toBeNull();
+		},
+	);
+	test.each([
+		"お問い合わせありがとうございます。",
+		"追ってご連絡させていただきます。",
+		"問い合わせ完了",
+		"このたびはお問い合わせありがとうございました。",
+		"お問い合わせありがとうございます。追ってご連絡させていただきますか？",
+		"お問い合わせありがとうございます。追ってご連絡させていただきません。",
+		"問い合わせ完了していません。\nこのたびはお問い合わせありがとうございました。",
+		"問い合わせ完了ですか？\nこのたびはお問い合わせありがとうございました。",
+		"FAQ: 「お問い合わせありがとうございます。追ってご連絡させていただきます。」と表示されますか？",
+		"完了時は問い合わせ完了\nこのたびはお問い合わせありがとうございました。と表示します。",
+		`確認画面\n${complete}\nこの内容で送信`,
+		`まだ送信していません。\n${followup}`,
+	])("単独・説明・確認画面を完了にしない: %s", (text) => {
+		expect(readsAsConfirmation(text)).toBe(false);
+	});
+	test("文字数エラーを本文から切り離して検出し制約を推測しない", () => {
+		const read = runInNewContext(`(${READ_SUBMISSION_MESSAGES_FUNCTION})`);
+		const get = (text: string) =>
+			read.call(
+				{ innerText: text },
+				SUBMISSION_CONFIRMATION_PATTERN,
+				SUBMISSION_PENDING_PATTERN,
+				SUBMISSION_FAILURE_PATTERN,
+			);
+		expect(
+			get("お問い合わせ内容\n文字数が正しくありません。\nother@example.com"),
+		).toMatchObject({
+			confirmation: "",
+			failure: "文字数が正しくありません。",
+		});
+		for (const text of [
+			"文字数が正しくありませんか？",
+			"文字数は正しいです。",
+			"FAQ: 「文字数が正しくありません。」は何ですか？",
+			"入力時に文字数が正しくありません。と表示される場合があります。",
+		])
+			expect(get(text).failure).toBe("");
+	});
+});
+
+describe("post-submit read timeout recovery", () => {
+	test("reads a completion once more after a timed-out CDP read without activating submit again", async () => {
+		let now = 0;
+		let reads = 0;
+		const result = await waitForSubmissionConfirmation(
+			() =>
+				readSubmissionConfirmation(
+					0,
+					true,
+					async () => {
+						reads += 1;
+						if (reads === 1) {
+							now += 15_000;
+							throw new Error("Browser Use CDP command timed out");
+						}
+						return 1;
+					},
+					async () => "https://example.com/complete",
+				),
+			async (ms) => {
+				now += ms;
+			},
+			15_000,
+			() => now,
+		);
+		expect(result).toEqual({
+			outcome: "sent",
+			formUrl: "https://example.com/complete",
+		});
+		expect(reads).toBe(2);
+	});
+	test("keeps persistent read timeouts uncertain after the final bounded read", async () => {
+		let now = 0;
+		let reads = 0;
+		const result = waitForSubmissionConfirmation(
+			() =>
+				readSubmissionConfirmation(
+					0,
+					true,
+					async () => {
+						reads += 1;
+						now += 15_000;
+						throw new Error("Browser Use CDP command timed out");
+					},
+					async () => "https://example.com/complete",
+				),
+			async (ms) => {
+				now += ms;
+			},
+			15_000,
+			() => now,
+		);
+		await expect(result).rejects.toMatchObject({
+			stage: "SUBMIT_READ_AFTER_TEXT",
+			diagnosticCode: "CDP_COMMAND_TIMEOUT",
+		});
+		expect(reads).toBe(2);
+	});
+});
+
+test("driver claims only one completion navigation after its POST was continued", async () => {
+	let activated = false;
+	let dispatched = false;
+	let completed = false;
+	const { driver, connection } = await submissionDriver(
+		[
+			{
+				requestId: "post-1",
+				resourceType: "XHR",
+				frameId: "frame-1",
+				request: { url: "https://acme.co.jp/send", method: "POST" },
+			},
+		],
+		(scripted) => {
+			const fixture = scripted.respond;
+			scripted.respond = (method, params) => {
+				if (
+					method === "Runtime.callFunctionOn" &&
+					params.functionDeclaration === ACTIVATE_SUBMIT_FUNCTION
+				)
+					activated = true;
+				if (method === "DOM.getDocument") {
+					if (activated && !dispatched) {
+						dispatched = true;
+						for (const requestId of ["completion-1", "completion-2"])
+							scripted.emit("Fetch.requestPaused", {
+								requestId,
+								resourceType: "Document",
+								frameId: "frame-1",
+								request: {
+									url: "https://acme.co.jp/contact-success",
+									method: "GET",
+								},
+							});
+					}
+					return { root: SUBMISSION_PAGE_DOCUMENT };
+				}
+				if (
+					method === "Fetch.continueRequest" &&
+					params.requestId === "completion-1"
+				)
+					completed = true;
+				if (
+					method === "Runtime.callFunctionOn" &&
+					params.functionDeclaration === READ_SUBMISSION_MESSAGES_FUNCTION
+				)
+					return {
+						result: {
+							value: {
+								confirmation: completed ? "お問い合わせを受け付けました" : "",
+								failure: "",
+							},
+						},
+					};
+				return fixture(method, params);
+			};
+		},
+	);
+	try {
+		const result = await submitFixtureForm(driver);
+		expect(result.outcome).toBe("sent");
+		expect(failedRequestIds(connection)).toEqual(["completion-2"]);
+		expect(
+			connection.sent
+				.filter((call) => call.method === "Fetch.continueRequest")
+				.map((call) => call.params.requestId),
+		).toEqual(["post-1", "completion-1"]);
+	} finally {
+		await closeQuietly(driver);
+	}
+});
+
+describe("CSS-hidden native choices with visible associated labels", () => {
+	const inspect = runInNewContext(`(${INSPECT_ELEMENT_FUNCTION})`, {
+		getComputedStyle: (element: { style: object }) => element.style,
+	}) as (this: object) => { visible: boolean };
+	const makeChoice = (type = "radio") => {
+		const label: Record<string, unknown> = {
+			textContent: "その他",
+			style: { display: "inline", visibility: "visible", opacity: "1" },
+			getBoundingClientRect: () => ({ width: 100, height: 20 }),
+			parentElement: null,
+			closest: () => null,
+		};
+		const element = {
+			tagName: "INPUT",
+			type,
+			isConnected: true,
+			style: { display: "none", visibility: "visible", opacity: "1" },
+			getBoundingClientRect: () => ({ width: 0, height: 0 }),
+			labels: [label],
+			getAttribute: () => null,
+			hasAttribute: () => false,
+			closest: () => null,
+			parentElement: null,
+		};
+		label.control = element;
+		return { element, label };
+	};
+
+	test.each(["hidden", "inert", 'aria-hidden="true"'])(
+		"does not observe rect-visible native text inside %s",
+		(attribute) => {
+			const { element } = makeChoice("text");
+			element.style = { display: "block", visibility: "visible", opacity: "1" };
+			element.getBoundingClientRect = () => ({ width: 150, height: 25 });
+			Object.assign(element, {
+				closest: (selector: string) =>
+					selector.includes(`[${attribute}]`) ? {} : null,
+			});
+			expect(inspect.call(element).visible).toBe(false);
+		},
+	);
+	test("observes display-none radios and transparent checkboxes through their visible labels", () => {
+		for (const type of ["radio", "checkbox"]) {
+			const { element } = makeChoice(type);
+			expect(inspect.call(element).visible).toBe(true);
+			element.style = { display: "block", visibility: "hidden", opacity: "0" };
+			expect(inspect.call(element).visible).toBe(true);
+		}
+	});
+	test("does not expose controls inside CSS-hidden ancestors through an external label", () => {
+		for (const style of [
+			{ display: "none" },
+			{ visibility: "hidden" },
+			{ opacity: "0" },
+		]) {
+			const { element } = makeChoice();
+			Object.assign(element, { parentElement: { style, parentElement: null } });
+			expect(inspect.call(element).visible).toBe(false);
+		}
+	});
+	test("does not expose hidden text inputs, unassociated labels, or invisible label ancestors", () => {
+		expect(inspect.call(makeChoice("text").element).visible).toBe(false);
+		const { element, label } = makeChoice();
+		label.control = null;
+		expect(inspect.call(element).visible).toBe(false);
+		label.control = element;
+		label.parentElement = {
+			style: { display: "block", visibility: "visible", opacity: "0" },
+			parentElement: null,
+		};
+		expect(inspect.call(element).visible).toBe(false);
+		label.parentElement = null;
+		label.style = { display: "none", visibility: "visible", opacity: "1" };
+		expect(inspect.call(element).visible).toBe(false);
+	});
+});
+
+test("その他問い合わせは既定候補で選べるが資料請求は選ばない", () => {
+	const element = fakeSelect([
+		{ value: "request", text: "資料請求" },
+		{ value: "other", text: "その他問い合わせ" },
+	]);
+	expect(
+		selectOptionByCandidate().call(
+			element,
+			DEFAULT_CHOICE_CANDIDATES.inquiryType ?? [],
+		),
+	).toBe(true);
+	expect(element.options.find((option) => option.selected)?.value).toBe(
+		"other",
+	);
+});
+
+test("ARIA listbox controls are exposed as choices with their selected display value", () => {
+	const inspect = runInNewContext(`(${INSPECT_ELEMENT_FUNCTION})`, {
+		getComputedStyle: () => ({
+			display: "block",
+			visibility: "visible",
+			opacity: "1",
+		}),
+	}) as (this: object) => { tag: string; value: string; options: unknown[] };
+	for (const tag of ["INPUT", "BUTTON"]) {
+		const attributes: Record<string, string> = {
+			"aria-haspopup": "listbox",
+			role: "combobox",
+		};
+		const element = {
+			tagName: tag,
+			type: tag === "INPUT" ? "text" : "button",
+			readOnly: true,
+			value: tag === "INPUT" ? "その他" : "",
+			textContent: "その他",
+			innerText: "その他",
+			getAttribute: (key: string) => attributes[key] ?? null,
+			hasAttribute: () => false,
+			getRootNode: () => ({ getElementById: () => null }),
+			closest: () => null,
+			getBoundingClientRect: () => ({ width: 150, height: 30 }),
+		};
+		expect(inspect.call(element)).toMatchObject({
+			tag: "select",
+			value: "その他",
+			options: [],
+		});
+	}
+});
+
+test("ARIA listboxes reject duplicate candidates beyond the observation limit", () => {
+	let clicks = 0;
+	const common = {
+		parentElement: null,
+		getBoundingClientRect: () => ({ width: 100, height: 20 }),
+	};
+	const listbox = {
+		...common,
+		getAttribute: () => "listbox",
+		closest: () => null,
+		querySelectorAll: () => options,
+	};
+	const options = Array.from({ length: 101 }, (_, i) => ({
+		...common,
+		innerText: i === 0 || i === 100 ? "その他" : `項目${i}`,
+		getAttribute: () => null,
+		closest: (selector: string) =>
+			selector === '[role="listbox"]' ? listbox : null,
+	}));
+	const attributes: Record<string, string> = {
+		"aria-haspopup": "listbox",
+		"aria-controls": "choices",
+	};
+	const control = {
+		...common,
+		tagName: "INPUT",
+		type: "text",
+		readOnly: true,
+		getAttribute: (key: string) => attributes[key] ?? null,
+		getRootNode: () => ({ getElementById: () => listbox }),
+		closest: () => null,
+	};
+	const select = runInNewContext(
+		`(${SELECT_ARIA_LISTBOX_BY_CANDIDATE_FUNCTION})`,
+		{
+			getComputedStyle: () => ({
+				display: "block",
+				visibility: "visible",
+				opacity: "1",
+			}),
+			HTMLElement: {
+				prototype: {
+					click: () => {
+						clicks++;
+					},
+				},
+			},
+		},
+	) as (this: object, candidates: string[]) => string | null;
+	expect(select.call(control, ["その他"])).toBeNull();
+	expect(clicks).toBe(0);
+});
+
+describe("来訪のお礼が新規問い合わせ受付を隠さない", () => {
+	const visit =
+		"Thank you for your visit to our site. Please fill out your inquiries below then let us respond you soon.";
+	const accepted =
+		"お問い合わせありがとうございます。追ってご連絡させていただきます。 thank you for your inquiries , let me contact you later";
+	test("来訪お礼を残した同一ページに受付二文が増えると完了する", async () => {
+		expect(await readsAsNewConfirmation(visit, `${visit}\n${accepted}`)).toBe(
+			true,
+		);
+	});
+	test.each([
+		visit,
+		"Thank you for visiting our website.",
+		"Thank you for your interest.",
+		"Thank you for your inquiry?",
+		"Thank you for your inquiry is displayed after sending.",
+		"Thank you",
+		"ありがとうございます。",
+		'FAQ: "Thank you for your inquiry" is displayed after sending.',
+	])("来訪・関心のお礼や単独お礼は新規出現でも完了としない: %s", (text) => {
+		expect(readsAsConfirmation(text)).toBe(false);
+	});
+	test.each([
+		"Thank you for your inquiry.",
+		"Thank you for your message.",
+		"Thank you for your submission.",
+		"Thank you for contacting us.",
+	])("問い合わせ受付の英語お礼は維持する: %s", (text) => {
+		expect(readsAsConfirmation(text)).toBe(true);
+	});
+	test("静的複合受付・未送信・確認画面・リクエスト未観測では送信成功にしない", async () => {
+		expect(
+			await readsAsNewConfirmation(
+				`${visit}\n${accepted}`,
+				`${visit}\n${accepted}`,
+			),
+		).toBe(false);
+		for (const prefix of [
+			"確認画面",
+			"まだ送信していません。",
+			"この内容で送信",
+		]) {
+			expect(readsAsConfirmation(`${prefix}\n${visit}\n${accepted}`)).toBe(
+				false,
+			);
+		}
+		expect(
+			await readSubmissionConfirmation(
+				0,
+				false,
+				async () => (readsAsConfirmation(accepted) ? 1 : 0),
+				async () => "https://example.com/contact",
+			),
+		).toBeNull();
+	});
+});
+
+describe("明確な英語受付を来訪お礼と区別して維持する", () => {
+	test.each([
+		"Thank you! Your message has been sent successfully.",
+		"Thank you for your inquiry, we will reply as soon as possible.",
+	])("送信済み・返信予定が明記された受付を認識する: %s", (text) => {
+		expect(readsAsConfirmation(text)).toBe(true);
+	});
+	test.each([
+		"Thank you! Your message has not been sent successfully.",
+		"Thank you! Your message has been sent successfully?",
+		"Thank you for your inquiry, please fill out the form below.",
+		"Thank you for your inquiry, we will reply as soon as possible?",
+		'FAQ: "Thank you! Your message has been sent successfully." is displayed after sending.',
+		'FAQ: "Thank you for your inquiry, we will reply as soon as possible." is displayed after sending.',
+	])("否定・疑問・未入力案内・引用は受付としない: %s", (text) => {
+		expect(readsAsConfirmation(text)).toBe(false);
+	});
+});
+
+describe("late native form visibility", () => {
+	test("does not add a visibility scan to a truly empty page", async () => {
+		const connection = new ScriptedCdpConnection();
+		connection.respond = (method, params) =>
+			method === "DOM.getDocument"
+				? { root: { ...ELEMENT_PAGE_DOCUMENT, children: [] } }
+				: scriptedCdpResponse(method, params);
+		const driver = await scriptedDriver(connection);
+		const observation = await driver.observe();
+		expect(observation.forms).toEqual([]);
+		// Existing DOM discovery budget is unchanged.
+		expect(countSent(connection, "DOM.getDocument")).toBe(5);
+		await driver.close();
+	});
+
+	test.each([
+		"reveals",
+		"permanently-hidden",
+		"hidden-inputs",
+		"inspection-fails",
+		"already-visible",
+	])("bounded observation: %s", async (mode) => {
+		const connection = new ScriptedCdpConnection();
+		let snapshots = 0;
+		connection.respond = (method, params) => {
+			if (method === "DOM.getDocument") snapshots += 1;
+			if (
+				method === "Runtime.callFunctionOn" &&
+				params.functionDeclaration === INSPECT_ELEMENT_FUNCTION
+			) {
+				if (mode === "inspection-fails") throw new Error("unavailable");
+				const id = Number(String(params.objectId).replace("object-", ""));
+				return {
+					result: {
+						value: {
+							...elementFixtureState(id),
+							...(mode === "hidden-inputs"
+								? { tag: "input", type: "hidden" }
+								: {}),
+							visible:
+								mode === "already-visible" ||
+								(mode === "reveals" && snapshots > 1),
+						},
+					},
+				};
+			}
+			return scriptedCdpResponse(method, params);
+		};
+		const driver = await scriptedDriver(connection);
+		const observation = await driver.observe();
+		expect(observation.forms.length).toBe(
+			mode === "reveals" || mode === "already-visible" ? 1 : 0,
+		);
+		expect(snapshots).toBe(
+			mode === "reveals" || mode === "permanently-hidden" ? 2 : 1,
+		);
+		expect(countSent(connection, "Input.dispatchMouseEvent")).toBe(0);
+		expect(countSent(connection, "Page.navigate")).toBe(0);
+		await driver.close();
+	});
+});
+
+test("native input buttons are observed but cannot send an unreviewed POST via click", async () => {
+	const connection = new ScriptedCdpConnection();
+	connection.respond = (method, params) => {
+		if (
+			method === "Runtime.callFunctionOn" &&
+			params.functionDeclaration === INSPECT_ELEMENT_FUNCTION &&
+			params.objectId === `object-${BUTTON_BACKEND_NODE_ID}`
+		) {
+			return {
+				result: {
+					value: {
+						...elementFixtureState(BUTTON_BACKEND_NODE_ID),
+						tag: "input",
+						type: "button",
+						value: "確認画面へ",
+						submitLike: false,
+					},
+				},
+			};
+		}
+		if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed")
+			connection.emit("Fetch.requestPaused", {
+				requestId: "unreviewed-input-button",
+				resourceType: "XHR",
+				frameId: "frame-1",
+				request: { url: "https://example.com/send", method: "POST" },
+			});
+		return scriptedCdpResponse(method, params);
+	};
+	const driver = await scriptedDriver(connection, false);
+	try {
+		const observation = await driver.observe();
+		expect(JSON.stringify(observation.forms)).toContain('"value":"確認画面へ"');
+		await driver.fill(TEXT_ELEMENT_ID, "Hello");
+		await expect(driver.clickNonSubmit("unobserved-id")).rejects.toBeInstanceOf(
+			BrowserElementError,
+		);
+		await driver.clickNonSubmit(BUTTON_ELEMENT_ID);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(
+			connection.sent.filter((x) => x.method === "Fetch.continueRequest"),
+		).toEqual([]);
+		expect(
+			connection.sent.filter((x) => x.method === "Fetch.failRequest"),
+		).toContainEqual({
+			method: "Fetch.failRequest",
+			params: {
+				requestId: "unreviewed-input-button",
+				errorReason: "BlockedByClient",
+			},
+		});
+		expect(
+			connection.sent.filter(
+				(x) =>
+					x.method === "Input.dispatchMouseEvent" &&
+					x.params.type === "mousePressed",
+			),
+		).toHaveLength(1);
+	} finally {
+		await closeQuietly(driver);
+	}
+});
+
+const COMPOUND_RECEIPTS = [
+	"お問い合わせ-完了画面\nシンビオス株式会社へのお問い合わせをありがとうございました。\n担当者より折り返し連絡いたします。",
+	"ご要望を頂戴いたしました。ありがとうございました。",
+	"この度はお問い合わせをいただき、誠にありがとうございます。\n後ほど、担当よりメールまたはお電話にて折り返しいたします。",
+	"お問い合わせ頂き誠にありがとうございました。\nお問い合わせ内容を確認させていただき、後ほど担当者よりご回答をさせていただきます。",
+];
+describe("compound receipt messages from completion pages", () => {
+	test.each(COMPOUND_RECEIPTS)(
+		"recognizes a new compound receipt: %s",
+		async (text) => {
+			expect(await readsAsNewConfirmation("お問い合わせフォーム", text)).toBe(
+				true,
+			);
+			expect(await readsAsNewConfirmation(text, text)).toBe(false);
+			expect(readsAsConfirmation(`確認画面\n${text}\nこの内容で送信`)).toBe(
+				false,
+			);
+			expect(
+				readsAsConfirmation(
+					`FAQ: 「${text.replaceAll("\n", " ")}」と表示されます。`,
+				),
+			).toBe(false);
+			expect(readsAsConfirmation(text.replace(/。$/u, "か？"))).toBe(false);
+			expect(
+				await readSubmissionConfirmation(
+					0,
+					false,
+					async () => 1,
+					async () => "https://acme.co.jp/complete",
+				),
+			).toBeNull();
+		},
+	);
+	test.each([
+		"ご記入ありがとうございました。",
+		"お問い合わせ頂き誠にありがとうございました。",
+		"この度はお問い合わせをいただき、誠にありがとうございます。",
+		"ご要望を頂戴していません。ありがとうございました。",
+		"お問い合わせ-確認画面\nシンビオス株式会社へのお問い合わせをありがとうございました。\n担当者より折り返し連絡いたします。",
+		"お問い合わせ頂き誠にありがとうございました。\nお問い合わせ内容を確認させていただき、後ほど担当者よりご回答をさせていただけません。",
+	])("rejects standalone thanks and non-receipts: %s", (text) => {
+		expect(readsAsConfirmation(text)).toBe(false);
+	});
+});
+
+describe("explicit rejection messages from response pages", () => {
+	const read = runInNewContext(`(${READ_SUBMISSION_MESSAGES_FUNCTION})`);
+	const get = (text: string) =>
+		read.call(
+			{ innerText: text },
+			SUBMISSION_CONFIRMATION_PATTERN,
+			SUBMISSION_PENDING_PATTERN,
+			SUBMISSION_FAILURE_PATTERN,
+		);
+	test.each([
+		"SPAM BLOCK",
+		"送信を受け付けられませんでした。",
+		"必須項目に記入もれがあります。\n入力内容に不備があります。確認してもう一度送信してください。",
+		"Too Many Requests",
+	])(
+		"reads a new explicit error without inferring successful delivery: %s",
+		(text) => {
+			expect(get(`お問い合わせ\n${text}\nフッター`)).toEqual({
+				confirmation: "",
+				failure: text,
+			});
+			expect(get(`FAQ: 「${text}」と表示されます。`).failure).toBe("");
+			expect(get(`${text}ですか？`).failure).toBe("");
+		},
+	);
+	test.each([
+		"SPAM BLOCK is not enabled",
+		"Too Many Requests?",
+		"送信を受け付けられませんでしたか？",
+		"必須項目に記入もれがありません。",
+		"入力内容に不備がありますか？",
+		"確認してもう一度送信してください。",
+		"確認画面\nこの内容で送信",
+	])(
+		"does not classify questions, explanations, or an instruction alone: %s",
+		(text) => {
+			expect(get(text).failure).toBe("");
+		},
+	);
+});
+
+describe("multiline receipt examples are not completed submissions", () => {
+	test.each(COMPOUND_RECEIPTS)(
+		"excludes an explicitly introduced example: %s",
+		async (receipt) => {
+			for (const introduction of [
+				"次のメッセージが表示された場合、受付済みです。",
+				"以下の文言が表示された場合、受付済みです。",
+				"表示例：",
+			]) {
+				const faq = `よくある質問\n受付の判定方法\n${introduction}\n${receipt}\n上の文言が出ない場合は再度お確かめください。`;
+				expect(readsAsConfirmation(faq)).toBe(false);
+				expect(await readsAsNewConfirmation("お問い合わせフォーム", faq)).toBe(
+					false,
+				);
+				// An example elsewhere must not mask a later actual receipt.
+				expect(
+					await readsAsNewConfirmation(
+						faq,
+						`${faq}\n今回の送信結果\n${receipt}`,
+					),
+				).toBe(true);
+			}
+			expect(readsAsConfirmation(`よくある質問はこちら\n${receipt}`)).toBe(
+				true,
+			);
+		},
+	);
+});
+
+describe("multiline failure examples are not response failures", () => {
+	test.each([
+		"送信に失敗しました",
+		"SPAM BLOCK",
+		"送信を受け付けられませんでした。",
+		"必須項目に記入もれがあります。\n入力内容に不備があります。確認してもう一度送信してください。",
+		"Too Many Requests",
+	])(
+		"excludes a failure example while retaining a later actual error: %s",
+		(failure) => {
+			const read = runInNewContext(`(${READ_SUBMISSION_MESSAGES_FUNCTION})`);
+			const get = (text: string) =>
+				read.call(
+					{ innerText: text },
+					SUBMISSION_CONFIRMATION_PATTERN,
+					SUBMISSION_PENDING_PATTERN,
+					SUBMISSION_FAILURE_PATTERN,
+				);
+			for (const introduction of [
+				"次のメッセージが表示された場合、受付されていません。",
+				"表示例：",
+			]) {
+				const faq = `よくある質問\n${introduction}\n${failure}\n上の文言は応答の例です。`;
+				expect(get(faq).failure).toBe("");
+				expect(get(`${faq}\n今回の送信結果\n${failure}`).failure).toBe(failure);
+			}
+		},
+	);
+});
+
+describe("explicit form-sent receipt", () => {
+	const receipt = "フォームを送信しました。";
+	test("recognizes only the new receipt after an observed request", async () => {
+		expect(await readsAsNewConfirmation("お問い合わせフォーム", receipt)).toBe(
+			true,
+		);
+		expect(await readsAsNewConfirmation(receipt, receipt)).toBe(false);
+		expect(
+			await readSubmissionConfirmation(
+				0,
+				false,
+				async () => (readsAsConfirmation(receipt) ? 1 : 0),
+				async () => "https://acme.co.jp/contact/",
+			),
+		).toBeNull();
+	});
+	test.each([
+		"フォームを送信しましたか？",
+		"フォームを送信していません。",
+		"まだ送信していません。\nフォームを送信しました。",
+		"確認画面\nフォームを送信しました。\nこの内容で送信",
+		"FAQ: 「フォームを送信しました。」と表示されます。",
+		"よくある質問\n次のメッセージが表示された場合、受付済みです。\nフォームを送信しました。\n文言をご確認ください。",
+		"表示例：\nフォームを送信しました。",
+		"ありがとうございました。",
+	])("does not infer receipt from instructions or examples: %s", (text) => {
+		expect(readsAsConfirmation(text)).toBe(false);
+	});
+	test("an earlier example does not mask a later real receipt", async () => {
+		const before = "表示例：\nフォームを送信しました。\nお問い合わせフォーム";
+		expect(
+			await readsAsNewConfirmation(
+				before,
+				`${before}\n今回の送信結果\n${receipt}`,
+			),
+		).toBe(true);
+	});
+});
+
+describe("explicit inquiry-completed receipt", () => {
+	const receipt = "お問合せが完了いたしました。";
+	test("recognizes only the new receipt after an observed request", async () => {
+		expect(await readsAsNewConfirmation("お問い合わせフォーム", receipt)).toBe(
+			true,
+		);
+		expect(await readsAsNewConfirmation(receipt, receipt)).toBe(false);
+		expect(
+			await readSubmissionConfirmation(
+				0,
+				false,
+				async () => (readsAsConfirmation(receipt) ? 1 : 0),
+				async () => "https://acme.co.jp/contact/",
+			),
+		).toBeNull();
+	});
+	test.each([
+		"お問合せが完了いたしましたか？",
+		"お問合せが完了していません。",
+		"まだ送信していません。\nお問合せが完了いたしました。",
+		"確認画面\nお問合せが完了いたしました。\nこの内容で送信",
+		"FAQ: 「お問合せが完了いたしました。」と表示されます。",
+		"よくある質問\n次のメッセージが表示された場合、受付済みです。\nお問合せが完了いたしました。\n文言をご確認ください。",
+		"表示例：\nお問合せが完了いたしました。",
+		"ありがとうございました。",
+	])("does not infer receipt from instructions or examples: %s", (text) => {
+		expect(readsAsConfirmation(text)).toBe(false);
+	});
+	test("an earlier example does not mask a later real receipt", async () => {
+		const before =
+			"表示例：\nお問合せが完了いたしました。\nお問い合わせフォーム";
+		expect(
+			await readsAsNewConfirmation(
+				before,
+				`${before}\n今回の送信結果\n${receipt}`,
+			),
+		).toBe(true);
+	});
+});
+
+describe("explicit server and verification failures", () => {
+	const read = runInNewContext(`(${READ_SUBMISSION_MESSAGES_FUNCTION})`);
+	const get = (text: string) =>
+		read.call(
+			{ innerText: text },
+			SUBMISSION_CONFIRMATION_PATTERN,
+			SUBMISSION_PENDING_PATTERN,
+			SUBMISSION_FAILURE_PATTERN,
+		);
+	test.each([
+		"Service Temporarily Unavailable\nThe server is temporarily unable to service your request due to maintenance downtime or capacity problems. Please try again later.",
+		"Invalid reCAPTCHA Secret key.",
+		"人間であることを確認してください。",
+	])("captures the exact failure without inferring delivery: %s", (failure) => {
+		expect(get(`お問い合わせ\n${failure}\nフッター`)).toEqual({
+			confirmation: "",
+			failure,
+		});
+		expect(get(`FAQ: 「${failure}」と表示されます。`).failure).toBe("");
+		expect(get(`表示例：\n${failure}\n通知の例です。`).failure).toBe("");
+		expect(get(failure.replace(/[。.]$/, "？")).failure).toBe("");
+	});
+	test.each([
+		"Service Temporarily Unavailable",
+		"Invalid reCAPTCHA Secret key?",
+		"reCAPTCHA Secret key is valid.",
+		"人間であることを確認しました。",
+		"再送してください。",
+	])(
+		"does not derive a failure from an incomplete explanation or instruction: %s",
+		(text) => expect(get(text).failure).toBe(""),
+	);
+});
+
+describe("static confirmation guidance after form removal", () => {
+	const guidance =
+		"必須項目を入力し、確認画面で内容を確認してから送信してください。";
+	const receipt = "送信が完了しました。ありがとうございました。";
+	const reader = runInNewContext(`(${READ_SUBMISSION_MESSAGES_FUNCTION})`);
+	const read = (text: string, controls: boolean, previous: object = {}) =>
+		reader.call(
+			{
+				innerText: text,
+				querySelector: () => (controls ? {} : null),
+				querySelectorAll: () => [],
+			},
+			SUBMISSION_CONFIRMATION_PATTERN,
+			SUBMISSION_PENDING_PATTERN,
+			SUBMISSION_FAILURE_PATTERN,
+			previous,
+		);
+	test("a pre-existing instruction cannot mask a new receipt once all controls disappear", () => {
+		const before = read(guidance, true);
+		expect(before.confirmation).toBe("");
+		const after = read(`${guidance}\n${receipt}`, false, before);
+		expect(after.confirmation).toContain("送信が完了");
+	});
+	test.each([
+		{
+			name: "form/control remains",
+			before: guidance,
+			after: `${guidance}\n${receipt}`,
+			controls: true,
+		},
+		{
+			name: "new confirmation screen",
+			before: guidance,
+			after: `${guidance}\n入力内容の確認\n${receipt}`,
+			controls: false,
+		},
+		{
+			name: "explicit incomplete",
+			before: `${guidance}\nまだ送信していません`,
+			after: `${guidance}\nまだ送信していません\n${receipt}`,
+			controls: false,
+		},
+		{
+			name: "old receipt was masked",
+			before: `${guidance}\n${receipt}`,
+			after: `${guidance}\n${receipt}`,
+			controls: false,
+		},
+		{
+			name: "second old receipt becomes first",
+			before: `${guidance}\nお問い合わせを受け付けました。\n${receipt}`,
+			after: `${guidance}\n${receipt}`,
+			controls: false,
+		},
+
+		{
+			name: "static FAQ example",
+			before: guidance,
+			after: `${guidance}\n表示例：\n${receipt}`,
+			controls: false,
+		},
+	])("keeps $name uncertain", ({ before, after, controls }) => {
+		expect(read(after, controls, read(before, true)).confirmation).toBe("");
+	});
+	test.each([
+		["\n", "\n\n"],
+		["\n", "\n  "],
+		["。", "。\n"],
+		["。\n", "。　\t"],
+	])(
+		"receipt whitespace reformatting stays uncertain: %s -> %s",
+		(from, to) => {
+			const original = "ご要望を頂戴いたしました。ありがとうございました。";
+			const before = from.startsWith("。")
+				? `${guidance}\n${original.replace("。", from)}`
+				: `${guidance}${from}${original}`;
+			const after = from.startsWith("。")
+				? `${guidance}\n${original.replace("。", to)}`
+				: `${guidance}${to}${original}`;
+			expect(read(after, false, read(before, true)).confirmation).toBe("");
+		},
+	);
+	test.each([
+		"必須項目を入力し、確認画面で変更点を確認してから送信してください。",
+		"必須項目を入力し、確認画面で\n内容を確認してから送信してください。",
+	])("changed pending instructions stay uncertain: %s", (afterGuidance) => {
+		expect(
+			read(`${afterGuidance}\n${receipt}`, false, read(guidance, true))
+				.confirmation,
+		).toBe("");
+	});
+
+	test.each([
+		{ href: "javascript:document.mail_form01.submit()" },
+		{ href: "  JaVaScRiPt:confirmSend()" },
+		{ href: "java\tscript:confirmSend()" },
+		{ href: "#" },
+		{ href: "/home" },
+		{ tabindex: "0" },
+		{ contenteditable: "" },
+		{ contenteditable: "plaintext-only" },
+	])("remaining explicit action stays uncertain: %j", (attributes) => {
+		const control = {
+			hasAttribute: (key: string) => key in attributes,
+			getAttribute: (key: string) =>
+				(attributes as Record<string, string>)[key] ?? null,
+		};
+		const after = reader.call(
+			{
+				innerText: `${guidance}\n${receipt}`,
+				querySelector: (selector: string) =>
+					selector
+						.split(", ")
+						.some(
+							(part) =>
+								(part === "a[href]" && "href" in attributes) ||
+								(part === "[tabindex]" && "tabindex" in attributes),
+						)
+						? control
+						: null,
+				querySelectorAll: (selector: string) =>
+					selector
+						.split(", ")
+						.some(
+							(part) =>
+								(part === "a[href]" && "href" in attributes) ||
+								(part === "[contenteditable]" &&
+									"contenteditable" in attributes),
+						)
+						? [control]
+						: [],
+			},
+			SUBMISSION_CONFIRMATION_PATTERN,
+			SUBMISSION_PENDING_PATTERN,
+			SUBMISSION_FAILURE_PATTERN,
+			read(guidance, true),
+		);
+		expect(after.confirmation).toBe("");
+	});
+	test("contenteditable=false alone does not create an action", () => {
+		const after = reader.call(
+			{
+				innerText: `${guidance}\n${receipt}`,
+				querySelector: () => null,
+				querySelectorAll: () => [
+					{
+						hasAttribute: (key: string) => key === "contenteditable",
+						getAttribute: (key: string) =>
+							key === "contenteditable" ? "false" : null,
+					},
+				],
+			},
+			SUBMISSION_CONFIRMATION_PATTERN,
+			SUBMISSION_PENDING_PATTERN,
+			SUBMISSION_FAILURE_PATTERN,
+			read(guidance, true),
+		);
+		expect(after.confirmation).toContain("送信が完了");
+	});
+	test("English receipt case-only changes stay uncertain", () => {
+		const original = "Thank you for your inquiry.";
+		expect(
+			read(
+				`${guidance}\n${original.toUpperCase()}`,
+				false,
+				read(`${guidance}\n${original}`, true),
+			).confirmation,
+		).toBe("");
+	});
+
+	test("a missing DOM inspection or unknown earlier body cannot waive pending text", () => {
+		expect(
+			reader.call(
+				{ innerText: `${guidance}\n${receipt}` },
+				SUBMISSION_CONFIRMATION_PATTERN,
+				SUBMISSION_PENDING_PATTERN,
+				SUBMISSION_FAILURE_PATTERN,
+				read(guidance, true),
+			).confirmation,
+		).toBe("");
+		expect(read(`${guidance}\n${receipt}`, false, {}).confirmation).toBe("");
+	});
+	test.each([
+		{
+			name: "same body and POST",
+			request: true,
+			newBody: false,
+			opaque: false,
+			controls: false,
+			expected: "sent",
+		},
+		{
+			name: "no POST",
+			request: false,
+			newBody: false,
+			opaque: false,
+			controls: false,
+			expected: "uncertain",
+		},
+		{
+			name: "different body",
+			request: true,
+			newBody: true,
+			opaque: false,
+			controls: false,
+			expected: "uncertain",
+		},
+		{
+			name: "form remains",
+			request: true,
+			newBody: false,
+			opaque: false,
+			controls: true,
+			expected: "uncertain",
+		},
+		{
+			name: "closed shadow tree remains",
+			request: true,
+			newBody: false,
+			controls: false,
+			opaque: true,
+			expected: "uncertain",
+		},
+	])(
+		"driver: $name",
+		async ({ request, newBody, controls, opaque, expected }) => {
+			let activated = false;
+			const { driver } = await submissionDriver(
+				request
+					? [
+							{
+								requestId: "static-guidance-post",
+								resourceType: "XHR",
+								frameId: "frame-1",
+								request: { url: "https://acme.co.jp/send", method: "POST" },
+							},
+						]
+					: [],
+				(connection) => {
+					const original = connection.respond;
+					connection.respond = (method, params) => {
+						if (method === "DOM.getDocument")
+							return {
+								root: {
+									...SUBMISSION_PAGE_DOCUMENT,
+									children: [
+										{
+											...SUBMISSION_PAGE_DOCUMENT.children[0],
+											...(activated && opaque
+												? {
+														shadowRoots: [
+															{
+																nodeName: "#document-fragment",
+																backendNodeId: 99,
+																shadowRootType: "closed",
+															},
+														],
+													}
+												: {}),
+											backendNodeId:
+												activated && newBody
+													? 88
+													: SUBMISSION_BODY_BACKEND_NODE_ID,
+										},
+									],
+								},
+							};
+						if (
+							method === "Runtime.callFunctionOn" &&
+							params.functionDeclaration === READ_SUBMISSION_MESSAGES_FUNCTION
+						)
+							return {
+								result: {
+									value: reader.call(
+										{
+											innerText: activated
+												? `${guidance}\n${receipt}`
+												: guidance,
+											querySelector: () => (!activated || controls ? {} : null),
+											querySelectorAll: () => [],
+										},
+										...(params.arguments as Array<{ value: unknown }>).map(
+											(arg) => arg.value,
+										),
+									),
+								},
+							};
+						if (
+							method === "Runtime.callFunctionOn" &&
+							params.functionDeclaration === ACTIVATE_SUBMIT_FUNCTION
+						)
+							activated = true;
+						return original(method, params);
+					};
+				},
+			);
+			try {
+				expect((await submitFixtureForm(driver)).outcome).toBe(expected);
+			} finally {
+				await closeQuietly(driver);
+			}
+		},
+	);
+});
+
+const AUDIT_RECEIPTS = [
+	[132, "お問い合わせ完了\nお問い合わせ受付完了"],
+	[
+		173,
+		"お問い合わせありがとうございます。内容確認後、追ってご連絡させていただきます。",
+	],
+	[176, "お問い合わせが送信されました。"],
+	[
+		304,
+		"お問い合わせありがとうございます。担当者から返信いたしますので、今しばらくお待ちください。",
+	],
+	[355, "お問い合わせ完了\nお問い合わせ内容を送信いたしました。"],
+	[
+		638,
+		"この度は、お問合せ頂き誠にありがとうございました。担当の者より2～3日以内に御連絡差し上げます。",
+	],
+] as const;
+
+describe("audited receipt coverage", () => {
+	test.each(AUDIT_RECEIPTS)(
+		"row %s recognizes a new receipt",
+		async (_row, text) => {
+			expect(await readsAsNewConfirmation("お問い合わせフォーム", text)).toBe(
+				true,
+			);
+		},
+	);
+	test.each(AUDIT_RECEIPTS)(
+		"row %s preserves receipt boundaries",
+		async (_row, text) => {
+			expect(await readsAsNewConfirmation(text, text)).toBe(false);
+			for (const after of [
+				`確認画面\n${text}\nこの内容で送信`,
+				`まだ送信していません。\n${text}`,
+				`FAQ: 「${text.replaceAll("\n", " ")}」と表示されます。`,
+				`よくある質問\n次のメッセージが表示された場合、受付済みです。\n${text}\n上記は表示例です。`,
+				`表示例：\n${text}`,
+				text.replace(/[。]$/, "か？") + (text.endsWith("。") ? "" : "ですか？"),
+			])
+				expect(readsAsConfirmation(after)).toBe(false);
+			expect(
+				await readSubmissionConfirmation(
+					0,
+					false,
+					async () => (readsAsConfirmation(text) ? 1 : 0),
+					async () => "https://acme.co.jp/contact",
+				),
+			).toBeNull();
+		},
+	);
+	test.each([
+		"お問い合わせ完了",
+		"お問い合わせありがとうございます。",
+		"この度は、お問合せ頂き誠にありがとうございました。",
+		"お問い合わせが送信されていません。",
+		"お問い合わせ内容を送信していません。",
+		"お問い合わせありがとうございます。内容確認後、追ってご連絡させていただけません。",
+		"お問い合わせありがとうございます。担当者から返信いたしません。",
+	])("does not expand to standalone thanks or negation: %s", (text) =>
+		expect(readsAsConfirmation(text)).toBe(false),
+	);
+
+	test("row 371 keeps pending when a reset form remains despite a known receipt", () => {
+		const read = runInNewContext(`(${READ_SUBMISSION_MESSAGES_FUNCTION})`);
+		const guidance =
+			"確認画面は表示されません。上記内容にて送信しますがよろしいですか？";
+		const args = [
+			SUBMISSION_CONFIRMATION_PATTERN,
+			SUBMISSION_PENDING_PATTERN,
+			SUBMISSION_FAILURE_PATTERN,
+		];
+		const body = {
+			innerText: guidance,
+			querySelector: () => ({}),
+			querySelectorAll: () => [],
+		};
+		const before = read.call(body, ...args, {});
+		const after = read.call(
+			{
+				...body,
+				innerText: `${guidance}\nあなたのメッセージは送信されました。ありがとうございました。`,
+			},
+			...args,
+			before,
+		);
+		expect(
+			after.confirmationCandidates.some((candidate: string) =>
+				candidate.includes("メッセージは送信されました"),
+			),
+		).toBe(true);
+		expect(after.confirmation).toBe("");
+	});
+});
+
+const AUDIT_FAILURES = [
+	[161, "Not Found\nThe requested URL was not found on this server."],
+	[170, "スパム防止のチェックを入れてください。"],
+	[171, "入力内容に問題があります。確認して再度お試しください。"],
+	[175, "スパム送信の可能性があります。"],
+	[
+		185,
+		"カタカナで入力してください。\n入力内容に問題があります。確認して再度お試しください。",
+	],
+	[
+		213,
+		"カタカナで入力してください。\n入力内容に問題があります。確認して再度お試しください。",
+	],
+	[367, "入力内容に問題があります。確認して再度お試しください。"],
+	[614, "認証に失敗しました。お手数ですが、もう一度お試しください。"],
+	[653, "スパム送信の可能性があります。"],
+] as const;
+
+describe("audited failure coverage", () => {
+	const read = runInNewContext(`(${READ_SUBMISSION_MESSAGES_FUNCTION})`);
+	const get = (text: string) =>
+		read.call(
+			{ innerText: text },
+			SUBMISSION_CONFIRMATION_PATTERN,
+			SUBMISSION_PENDING_PATTERN,
+			SUBMISSION_FAILURE_PATTERN,
+		);
+	test.each(AUDIT_FAILURES)(
+		"row %s detects the failure without success",
+		(_row, text) => {
+			expect(get(text).failure).not.toBe("");
+			expect(get(text).confirmation).toBe("");
+		},
+	);
+	test.each(AUDIT_FAILURES)(
+		"row %s does not treat an example as a failure",
+		(_row, text) => {
+			expect(
+				get(`FAQ: 「${text.replaceAll("\n", " ")}」と表示されます。`).failure,
+			).toBe("");
+			expect(get(`表示例：\n${text}`).failure).toBe("");
+			expect(
+				get(
+					`よくある質問\n次のメッセージが表示された場合、受付されていません。\n${text}`,
+				).failure,
+			).toBe("");
+		},
+	);
+	test.each([
+		"Not Found?",
+		"Not Found",
+		"The requested URL was not found on this server?",
+		"スパム防止のチェックを入れてくださいか？",
+		"スパム送信の可能性がありますか？",
+		"スパム送信の可能性はありません。",
+		"入力内容に問題はありません。",
+		"入力内容に問題がありますか？",
+		"認証に失敗しましたか？",
+		"もう一度お試しください。",
+		"確認して再度お試しください。",
+	])("ignores questions, negations, and instruction alone: %s", (text) =>
+		expect(get(text).failure).toBe(""),
+	);
+});
+
+// A CF7 5.x response remains inside the same reset form as its static consent text.
+// All request/activation code still runs through the actual driver fixture.
+describe("same-form CF7 receipt with static guidance", () => {
+	for (const condition of [
+		"success",
+		"native UA roots",
+		"native plus open",
+		"native plus closed",
+		"native plus frame",
+		"old formatted body receipt",
+		"no request",
+		"no markers",
+		"old receipt",
+		"new guidance",
+		"not reset",
+		"hidden result",
+		"foreign result",
+		"multiple results",
+		"detached form",
+		"opaque subtree",
+		"failed marker",
+		"FAQ example",
+		"incomplete",
+		"unknown message",
+		"not CF7",
+		"ancestor opacity",
+		"ancestor hidden",
+		"ancestor inert",
+		"only form marker",
+		"only response marker",
+		"old body receipt",
+		"initially empty",
+		"snapshot error",
+	]) {
+		test(condition, async () => {
+			let activated = false;
+			const guidance =
+				"確認画面は表示されません。上記内容にて送信しますがよろしいですか？";
+			const receipt =
+				condition === "old formatted body receipt"
+					? "Thank you for your message."
+					: "あなたのメッセージは送信されました。ありがとうございました。";
+			const doc = {};
+			const response = {
+				get innerText() {
+					return activated || condition === "old receipt"
+						? condition === "unknown message"
+							? "ありがとうございました。"
+							: receipt
+						: "";
+				},
+				closest: (): unknown => (condition === "foreign result" ? {} : form),
+				get parentElement(): unknown {
+					return form;
+				},
+				classList: {
+					contains: (name: string) =>
+						name === "wpcf7-mail-sent-ok" &&
+						(activated || condition === "old receipt") &&
+						condition !== "no markers" &&
+						condition !== "only form marker",
+				},
+				getBoundingClientRect: () => ({
+					width: condition === "hidden result" ? 0 : 100,
+					height: 20,
+				}),
+			};
+			const input = {
+				tagName: "INPUT",
+				type: "text",
+				get value() {
+					return condition === "initially empty" ||
+						(activated && condition !== "not reset")
+						? ""
+						: "entered";
+				},
+			};
+			const form = {
+				tagName: "FORM",
+				ownerDocument: doc,
+				hidden: condition === "ancestor hidden",
+				inert: condition === "ancestor inert",
+				get isConnected() {
+					return !activated || condition !== "detached form";
+				},
+				getRootNode: () => doc,
+				matches: (selector: string) =>
+					selector === "form.wpcf7-form" && condition !== "not CF7",
+				classList: {
+					contains: (name: string) =>
+						name === "sent"
+							? (activated || condition === "old receipt") &&
+								condition !== "no markers" &&
+								condition !== "only response marker"
+							: name === "failed" && condition === "failed marker",
+				},
+				getAttribute: () => null,
+				querySelectorAll: (selector: string): unknown[] =>
+					selector === ".wpcf7-response-output"
+						? condition === "multiple results"
+							? [response, response]
+							: [response]
+						: [input],
+			};
+			const body = {
+				get innerText() {
+					return `${guidance}${!activated && condition === "old body receipt" ? `\n${receipt}` : ""}${!activated && condition === "old formatted body receipt" ? `\n${receipt.toUpperCase().replaceAll(" ", "  ")}` : ""}${activated && condition === "new guidance" ? "\n入力内容をご確認ください" : ""}${condition === "incomplete" ? "\nまだ送信していません。" : ""}${activated && condition === "FAQ example" ? "\n表示例：" : ""}\n${response.innerText}`;
+				},
+				querySelector: () => form,
+				querySelectorAll: () => [],
+			};
+			Object.assign(doc, { body });
+			const { driver, connection } = await submissionDriver(
+				condition === "no request"
+					? []
+					: [
+							{
+								requestId: "cf7-post",
+								resourceType: "XHR",
+								frameId: "frame-1",
+								request: { url: "https://acme.co.jp/send", method: "POST" },
+							},
+						],
+				(connection) => {
+					const original = connection.respond;
+					connection.respond = (method, params) => {
+						if (method === "DOM.getDocument")
+							return {
+								root: {
+									...SUBMISSION_PAGE_DOCUMENT,
+									...(condition.startsWith("native")
+										? {
+												children: [
+													...(SUBMISSION_PAGE_DOCUMENT.children ?? []),
+													{
+														nodeName: "INPUT",
+														backendNodeId: 97,
+														shadowRoots: [
+															{
+																nodeName: "#document-fragment",
+																backendNodeId: 98,
+																shadowRootType: "user-agent",
+															},
+														],
+													},
+												],
+												...(condition === "native plus open" ||
+												condition === "native plus closed"
+													? {
+															shadowRoots: [
+																{
+																	nodeName: "#document-fragment",
+																	backendNodeId: 99,
+																	shadowRootType: condition.endsWith("open")
+																		? "open"
+																		: "closed",
+																},
+															],
+														}
+													: {}),
+												...(condition === "native plus frame"
+													? {
+															contentDocument: {
+																nodeName: "#document",
+																backendNodeId: 100,
+															},
+														}
+													: {}),
+											}
+										: {}),
+									...(condition === "opaque subtree"
+										? {
+												shadowRoots: [
+													{
+														nodeName: "#document-fragment",
+														backendNodeId: 99,
+														shadowRootType: "closed",
+													},
+												],
+											}
+										: {}),
+								},
+							};
+						if (method === "DOM.describeNode" && params.objectId === "cf7-form")
+							return { node: { nodeName: "FORM", backendNodeId: 82 } };
+						if (method === "Runtime.callFunctionOn") {
+							const fn = String(params.functionDeclaration);
+							const args = (
+								(params.arguments as Array<{ value: unknown }>) ?? []
+							).map((arg) => arg.value);
+							if (fn.includes("CF7_SUBMITTED_FORM")) {
+								const result = runInNewContext(`(${fn})`).call({ form });
+								return {
+									result: result ? { objectId: "cf7-form" } : { value: null },
+								};
+							}
+							if (
+								fn.includes("CF7_SCOPED_RECEIPT") &&
+								condition === "snapshot error"
+							)
+								return {
+									result: {},
+									exceptionDetails: { text: "stale fixture node" },
+								};
+							if (fn.includes("CF7_SCOPED_RECEIPT"))
+								return {
+									result: {
+										value: runInNewContext(`(${fn})`, {
+											getComputedStyle: (element: unknown) => ({
+												display: "block",
+												visibility: "visible",
+												opacity:
+													element === form && condition === "ancestor opacity"
+														? "0"
+														: "1",
+											}),
+										}).call(form, ...args),
+									},
+								};
+							if (fn === READ_SUBMISSION_MESSAGES_FUNCTION)
+								return {
+									result: {
+										value: runInNewContext(`(${fn})`).call(body, ...args),
+									},
+								};
+							if (fn === ACTIVATE_SUBMIT_FUNCTION) activated = true;
+						}
+						return original(method, params);
+					};
+				},
+			);
+			try {
+				const result = await submitFixtureForm(driver);
+				expect(result.outcome).toBe(
+					condition === "success" || condition === "native UA roots"
+						? "sent"
+						: "uncertain",
+				);
+				if (condition === "success")
+					expect(result.evidence?.confirmationText).toContain(
+						"メッセージは送信されました",
+					);
+				expect(
+					connection.sent.filter(
+						(call) =>
+							call.method === "Runtime.callFunctionOn" &&
+							call.params.functionDeclaration === ACTIVATE_SUBMIT_FUNCTION,
+					),
+				).toHaveLength(1);
+			} finally {
+				await closeQuietly(driver);
+			}
+		});
+	}
+});

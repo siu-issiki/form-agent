@@ -28,7 +28,8 @@ export interface DryRunRecord {
 export type RealSendRefusal =
 	| "SEND_APPROVAL_REQUIRED"
 	| "DRY_RUN_NOT_COMPLETED"
-	| "DRY_RUN_CONTENT_MISMATCH";
+	| "DRY_RUN_CONTENT_MISMATCH"
+	| "SEND_APPROVAL_CONTENT_MISMATCH";
 
 export type RealSendDecision =
 	| { allowed: true }
@@ -76,8 +77,8 @@ export async function matchesDryRunContent(
 }
 
 /**
- * Gate every real submission on a human approval record and a completed
- * dry-run carrying the same content. Registration has no daily volume limit.
+ * Gate every real submission on an approval bound to the submitted content,
+ * either directly or through a completed dry-run. There is no daily limit.
  */
 export async function checkRealSendGuard(
 	input: JobInput,
@@ -93,6 +94,17 @@ export async function checkRealSendGuard(
 	const approval = input.payload[SEND_APPROVAL_KEY];
 	if (!isSendApproval(approval)) {
 		return { allowed: false, refusal: "SEND_APPROVAL_REQUIRED" };
+	}
+
+	if (approval.mode === "direct") {
+		const requested = await jobContentFingerprint(
+			input.targetUrl,
+			input.companyId,
+			input.payload,
+		);
+		return requested === approval.contentFingerprint
+			? { allowed: true }
+			: { allowed: false, refusal: "SEND_APPROVAL_CONTENT_MISMATCH" };
 	}
 
 	const dryRun = await store.find(approval.dryRunJobId);

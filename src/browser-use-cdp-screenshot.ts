@@ -79,6 +79,7 @@ export const FULL_PAGE_SCREENSHOT_BASE_PARAMS = {
 
 export interface CdpLayoutMetricsResult {
 	cssContentSize?: { width?: number; height?: number };
+	cssLayoutViewport?: { pageX: number; pageY: number };
 }
 
 export interface FullPageScreenshotClip {

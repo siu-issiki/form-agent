@@ -1,6 +1,7 @@
 import { BROWSER_ERROR } from "./browser-error-messages";
 import {
 	SUBMISSION_CONFIRMATION_PATTERN,
+	SUBMISSION_FAILURE_PATTERN,
 	SUBMISSION_PENDING_PATTERN,
 } from "./browser-submit-confirmation";
 import {
@@ -23,7 +24,7 @@ import {
 	ACTIVATE_SUBMIT_FUNCTION,
 	BLOCK_BROWSER_ESCAPE_EXPRESSION,
 	CHECK_FORM_VALIDITY_FUNCTION,
-	HAS_CONFIRMATION_TEXT_FUNCTION,
+	COMMIT_TEXT_INPUT_FUNCTION,
 	HAS_SAME_FORM_OWNER_FUNCTION,
 	INSPECT_ELEMENT_FUNCTION,
 	IS_COMPOSED_DESCENDANT_FUNCTION,
@@ -31,6 +32,8 @@ import {
 	IS_SUBMIT_UNOBSCURED_FUNCTION,
 	MATCHES_CHOICE_CANDIDATE_FUNCTION,
 	READ_FORM_PROHIBITION_REASON_CODES_FUNCTION,
+	READ_SUBMISSION_MESSAGES_FUNCTION,
+	SELECT_ARIA_LISTBOX_BY_CANDIDATE_FUNCTION,
 	SELECT_OPTION_BY_CANDIDATE_FUNCTION,
 	SELECT_RADIO_BY_CANDIDATE_FUNCTION,
 	SET_CHECKED_VALUE_FUNCTION,
@@ -39,6 +42,12 @@ import {
 	denyRelatedBrowserTargets,
 	type TargetInfo,
 } from "./browser-use-cdp-related-targets";
+import {
+	type Cf7ReceiptSnapshot,
+	canInspectCf7ReceiptDocument,
+	GET_SUBMITTED_CF7_FORM_FUNCTION,
+	READ_CF7_SCOPED_RECEIPT_FUNCTION,
+} from "./browser-use-cdp-scoped-receipt";
 import {
 	type CdpLayoutMetricsResult,
 	type CdpScreenshotResult,
@@ -282,6 +291,7 @@ export type SubmitActivationStage =
 	| "render_before_check"
 	| "box_model"
 	| "pointer_move"
+	| "layout_metrics"
 	| "hit_test"
 	| "retry_wait"
 	| "unobscured_before_focus"
@@ -633,11 +643,36 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 
 	async #captureFullPageScreenshot(): Promise<Uint8Array> {
 		try {
-			return await captureCdpFullPageScreenshot(
-				() => this.#send<CdpLayoutMetricsResult>("Page.getLayoutMetrics", {}),
-				(params) =>
-					this.#send<CdpScreenshotResult>("Page.captureScreenshot", params),
+			const metrics = await this.#send<CdpLayoutMetricsResult>(
+				"Page.getLayoutMetrics",
+				{},
 			);
+			const viewport = metrics.cssLayoutViewport;
+			if (
+				!viewport ||
+				!Number.isFinite(viewport.pageX) ||
+				!Number.isFinite(viewport.pageY)
+			) {
+				throw new Error(BROWSER_ERROR.SCREENSHOT_FAILED);
+			}
+			const scrolled = viewport.pageX !== 0 || viewport.pageY !== 0;
+			try {
+				// CDP clips from document origin but composites fixed/sticky layers
+				// at the current scroll offset. Normalize without hiding evidence.
+				if (scrolled) await this.#scrollScreenshotViewport(0, 0);
+				return await captureCdpFullPageScreenshot(
+					() =>
+						scrolled
+							? this.#send<CdpLayoutMetricsResult>("Page.getLayoutMetrics", {})
+							: Promise.resolve(metrics),
+					(params) =>
+						this.#send<CdpScreenshotResult>("Page.captureScreenshot", params),
+				);
+			} finally {
+				if (scrolled && !this.connection.closed) {
+					await this.#scrollScreenshotViewport(viewport.pageX, viewport.pageY);
+				}
+			}
 		} catch (error) {
 			// A payload over the CDP message limit closes the connection, so a
 			// second capture has nothing left to run against.
@@ -647,6 +682,18 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			);
 			return this.#captureViewportScreenshot();
 		}
+	}
+
+	async #scrollScreenshotViewport(x: number, y: number): Promise<void> {
+		await this.#evaluate(`new Promise((resolve) => {
+			window.scrollTo({ left: ${x}, top: ${y}, behavior: "instant" });
+			// Wait for sticky layout/compositing; bound the wait in background tabs.
+			const timer = setTimeout(resolve, 250);
+			requestAnimationFrame(() => requestAnimationFrame(() => {
+				clearTimeout(timer);
+				resolve();
+			}));
+		})`);
 	}
 
 	async navigate(url: string): Promise<void> {
@@ -694,7 +741,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async observe(): Promise<BrowserObservation> {
-		const startedAt = Date.now();
+		return this.#observe(false, Date.now());
+	}
+
+	async #observe(
+		recheckedVisibility: boolean,
+		startedAt: number,
+	): Promise<BrowserObservation> {
 		const url = await this.currentUrl();
 		const {
 			discovery,
@@ -712,6 +765,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}> = [];
 		let fieldIndex = 0;
 		let skippedThirdPartyForms = 0;
+		let hasInvisibleControl = false;
 
 		for (const candidateForm of discovery.forms) {
 			if (
@@ -732,7 +786,11 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				const state = await this.#inspectElement(candidate.backendNodeId).catch(
 					() => null,
 				);
-				if (!state?.ok || !state.visible) continue;
+				if (!state?.ok) continue;
+				if (!state.visible) {
+					if (state.type !== "hidden") hasInvisibleControl = true;
+					continue;
+				}
 				const accessible = await this.#accessibleElement(
 					candidate.backendNodeId,
 				).catch(() => null);
@@ -801,6 +859,13 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 
 		this.#elements = elements;
+		// Native controls can exist before their containing form is revealed.
+		// Only an empty observation with successfully inspected controls warrants
+		// one fresh scan; permanently hidden controls remain excluded.
+		if (forms.length === 0 && hasInvisibleControl && !recheckedVisibility) {
+			await delay(DOM_DISCOVERY_RETRY_DELAY_MS);
+			return this.#observe(true, startedAt);
+		}
 		const pageText = await this.#bodyText();
 		const navigationLinks = discoverCdpNavigationLinks(root, url, (linkUrl) => {
 			if (!this.#targetDomain) return false;
@@ -823,6 +888,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				observedFieldCount: elements.size,
 				skippedThirdPartyForms,
 				discoveryAttempts,
+				visibilityRechecked: recheckedVisibility,
 				durationMs: Date.now() - startedAt,
 			}),
 		);
@@ -889,6 +955,11 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	}
 
 	async clickNonSubmit(elementId: string): Promise<void> {
+		if (!this.#elements.has(elementId)) {
+			console.log(
+				JSON.stringify({ event: "browser_click_rejected", stage: "lookup" }),
+			);
+		}
 		const reference = this.#element(elementId);
 		// The press is the last step a CDP failure may be reported as an element
 		// error for. Once it is sent the click may already have reached the page,
@@ -902,6 +973,18 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				state.submitLike ||
 				!isPayloadIndependentClickTarget(state.tag, state.type)
 			) {
+				console.log(
+					JSON.stringify({
+						event: "browser_click_rejected",
+						stage: "state",
+						ok: state.ok,
+						visible: state.visible,
+						disabled: state.disabled,
+						submitLike: state.submitLike,
+						tag: state.tag,
+						type: state.type,
+					}),
+				);
 				throw new BrowserElementError();
 			}
 			this.#interactionStarted = true;
@@ -938,6 +1021,10 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				backendNodeId: reference.backendNodeId,
 			});
 			await this.#replaceFocusedText(value);
+			await this.#callFunctionOnElement(
+				reference.backendNodeId,
+				COMMIT_TEXT_INPUT_FUNCTION,
+			);
 			this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
 		});
 	}
@@ -946,7 +1033,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 	 * Applies the first of `candidates` that the control actually offers. The
 	 * candidates are payload values the registrant allowed, so the page decides
 	 * only which one fits; it never contributes a value of its own. Page
-	 * functions therefore return fixed tokens, never page text.
+	 * functions return fixed tokens, or a matched label checked against a fresh
+	 * readback for custom choices; neither is returned to the model.
 	 */
 	async select(
 		elementId: string,
@@ -967,6 +1055,20 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			this.#interactionStarted = true;
 			this.#formDataEntered = true;
 			this.#blockNonSubmitRequests = true;
+			if (state.tag === "select" && state.type === "aria-listbox") {
+				const selectedLabel = await this.#callFunctionOnElement<unknown>(
+					reference.backendNodeId,
+					SELECT_ARIA_LISTBOX_BY_CANDIDATE_FUNCTION,
+					[candidateList],
+				);
+				if (typeof selectedLabel !== "string" || !selectedLabel)
+					throw new BrowserElementError();
+				const after = await this.#inspectElement(reference.backendNodeId);
+				if (!after.ok || after.value.trim() !== selectedLabel)
+					throw new BrowserElementError();
+				this.#successfulInputBackendNodeIds.add(reference.backendNodeId);
+				return;
+			}
 			if (state.tag === "select") {
 				const selected = await this.#callFunctionOnElement<unknown>(
 					reference.backendNodeId,
@@ -1067,7 +1169,10 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 			!state.ok ||
 			!state.visible ||
 			state.disabled ||
-			!state.submitLike ||
+			(!state.submitLike &&
+				!(
+					["button", "input"].includes(state.tag) && state.type === "button"
+				)) ||
 			(state.target !== "" && state.target !== "_self")
 		) {
 			throw new BrowserElementError();
@@ -1126,6 +1231,33 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				error,
 			);
 		}
+		const scopedReceipt =
+			requireEnteredInput &&
+			this.#canInspectScopedReceipt &&
+			this.#submissionPolicy.expectedRequest?.method === "POST" &&
+			this.#submissionMessages.some(
+				(message) => message.pendingGuidance?.length,
+			)
+				? await this.#captureCf7Receipt(this.#element(elementId).backendNodeId)
+				: null;
+		const beforeConfirmations = new Map(
+			this.#submissionMessages.map((message) => [
+				message.backendNodeId,
+				message.confirmation,
+			]),
+		);
+		const beforeGuidance = new Map(
+			this.#submissionMessages.map((message) => [
+				message.backendNodeId,
+				{
+					pendingGuidance: message.pendingGuidance ?? [],
+					confirmationCandidates: message.confirmationCandidates ?? [],
+				},
+			]),
+		);
+		const beforeFailures = new Set(
+			this.#submissionMessages.map((message) => message.failure),
+		);
 		const frameNavigationRevisionBeforeActivation = expectedDocumentGetFrameId
 			? (this.#frameNavigationRevisions.get(expectedDocumentGetFrameId) ?? 0)
 			: 0;
@@ -1140,18 +1272,87 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				throw createBrowserSubmitDiagnosticError("SUBMIT_ACTIVATE", error);
 			}
 			const confirmation = await waitForSubmissionConfirmation(
-				() =>
-					readSubmissionConfirmation(
+				async () => {
+					const result = await readSubmissionConfirmation(
 						beforeConfirmationCount,
 						this.#submissionPolicy.requestCount > 0,
-						() => this.#confirmationBodyCount(expectedDocumentGetFrameId),
+						() =>
+							this.#confirmationBodyCount(
+								expectedDocumentGetFrameId,
+								beforeGuidance,
+							),
 						() => this.currentUrl(),
 						hasExpectedFrameNavigated(
 							expectedDocumentGetFrameId,
 							frameNavigationRevisionBeforeActivation,
 							this.#frameNavigationRevisions,
 						),
-					),
+					);
+					const failure =
+						this.#submissionMessages.find(
+							(message) =>
+								message.failure && !beforeFailures.has(message.failure),
+						)?.failure ?? "";
+					if (this.#submissionPolicy.requestCount > 0 && failure) {
+						return {
+							outcome: "uncertain",
+							reasonCode: "SUBMIT_PAGE_REPORTED_FAILURE",
+							reason:
+								"The page explicitly reported that submission failed. The request may still have reached the receiver; do not retry automatically.",
+							evidence: {
+								capturedAt: new Date().toISOString(),
+								formUrl: await this.currentUrl(),
+								confirmationText: "",
+								failureText: failure,
+							},
+						};
+					}
+					if (result?.outcome === "sent")
+						return {
+							...result,
+							evidence: {
+								capturedAt: new Date().toISOString(),
+								formUrl: result.formUrl,
+								confirmationText:
+									this.#submissionMessages.find(
+										(message) =>
+											message.confirmation &&
+											beforeConfirmations.get(message.backendNodeId) !==
+												message.confirmation,
+									)?.confirmation ??
+									this.#submissionMessages.find(
+										(message) => message.confirmation,
+									)?.confirmation ??
+									"",
+								failureText: "",
+							},
+						};
+					if (
+						!result &&
+						scopedReceipt &&
+						this.#canInspectScopedReceipt &&
+						this.#submissionPolicy.requestCount > 0
+					) {
+						const snapshot = await this.#readCf7Receipt(
+							scopedReceipt.backendNodeId,
+							scopedReceipt.before,
+						);
+						if (snapshot?.confirmation) {
+							const formUrl = await this.currentUrl();
+							return {
+								outcome: "sent",
+								formUrl,
+								evidence: {
+									capturedAt: new Date().toISOString(),
+									formUrl,
+									confirmationText: snapshot.confirmation,
+									failureText: "",
+								},
+							};
+						}
+					}
+					return result;
+				},
 				(milliseconds) => this.#waitForPageChange(milliseconds),
 				this.submissionConfirmationTimeoutMs,
 			);
@@ -1167,7 +1368,14 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		return {
 			outcome: "uncertain",
 			reasonCode,
-			reason: "The page did not provide a reliable submission confirmation.",
+			reason: [
+				reasonCode === "SUBMIT_REQUEST_CONTINUE_FAILED"
+					? "The browser could not confirm continuation of an allowed request. Delivery remains uncertain; do not retry automatically."
+					: "The page did not provide a reliable submission confirmation.",
+				this.#submissionPolicy.blockDiagnostic,
+			]
+				.filter(Boolean)
+				.join(" "),
 		};
 	}
 
@@ -1288,7 +1496,7 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		}
 		if (decision.action === "fail") {
 			if (decision.submissionRelated) {
-				this.#submissionPolicy.noteBlocked(decision.blockStage);
+				this.#submissionPolicy.noteBlocked(decision.blockStage, paused);
 			}
 			await this.#failPausedRequest(paused);
 			return;
@@ -1298,6 +1506,8 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		// requests pause at once.
 		if (decision.claimSubmission) {
 			this.#submissionPolicy.claim(paused.requestId);
+		} else if (decision.claimCompletionNavigation) {
+			this.#submissionPolicy.claimCompletionNavigation();
 		} else if (decision.continueRedirect) {
 			this.#submissionPolicy.continueRedirect(paused.requestId);
 		}
@@ -1312,12 +1522,14 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 						this.#verificationProviderRequestCount += 1;
 					}
 					if (!decision.claimSubmission) return;
-					this.#submissionPolicy.recordContinued();
+					this.#submissionPolicy.recordContinued(paused);
 				},
 			);
 		} catch {
 			if (decision.submissionRelated) {
-				this.#submissionPolicy.noteBlocked(decision.blockStage);
+				// Policy allowed this request. A failed CDP continuation is not
+				// a policy refusal and does not prove that delivery never happened.
+				this.#submissionPolicy.noteBlocked("continue_request", paused);
 			}
 			await this.#failPausedRequest(paused);
 		} finally {
@@ -1360,33 +1572,129 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		);
 	}
 
-	async #confirmationBodyCount(frameId?: string): Promise<number> {
+	// Optional corroboration: failures leave the ordinary confirmation decision unchanged.
+	async #captureCf7Receipt(
+		submitBackendNodeId: number,
+	): Promise<{ backendNodeId: number; before: Cf7ReceiptSnapshot } | null> {
+		try {
+			return await this.#withResolvedObjects(
+				[{ backendNodeId: submitBackendNodeId }],
+				async ([objectId]) => {
+					const result = await this.#send<EvaluateResult>(
+						"Runtime.callFunctionOn",
+						{
+							objectId,
+							functionDeclaration: GET_SUBMITTED_CF7_FORM_FUNCTION,
+							returnByValue: false,
+						},
+					);
+					const formObjectId = result.result.objectId;
+					if (!formObjectId) return null;
+					try {
+						if (result.exceptionDetails) return null;
+						const { node } = await this.#send<{ node: CdpDomNode }>(
+							"DOM.describeNode",
+							{ objectId: formObjectId },
+						);
+						if (!node.backendNodeId) return null;
+						const before = await this.#readCf7Receipt(node.backendNodeId);
+						return before
+							? { backendNodeId: node.backendNodeId, before }
+							: null;
+					} finally {
+						await this.#releaseObjects([formObjectId]);
+					}
+				},
+			);
+		} catch {
+			return null;
+		}
+	}
+
+	async #readCf7Receipt(
+		backendNodeId: number,
+		previous?: Cf7ReceiptSnapshot,
+	): Promise<Cf7ReceiptSnapshot | null> {
+		try {
+			return await this.#callFunctionOnElement<Cf7ReceiptSnapshot | null>(
+				backendNodeId,
+				READ_CF7_SCOPED_RECEIPT_FUNCTION,
+				[
+					SUBMISSION_CONFIRMATION_PATTERN,
+					SUBMISSION_PENDING_PATTERN,
+					SUBMISSION_FAILURE_PATTERN,
+					previous ?? null,
+				],
+			);
+		} catch {
+			return null;
+		}
+	}
+
+	#canInspectScopedReceipt = false;
+
+	#submissionMessages: Array<{
+		backendNodeId: number;
+		confirmation: string;
+		failure: string;
+		pendingGuidance?: string[];
+		confirmationCandidates?: string[];
+	}> = [];
+
+	async #confirmationBodyCount(
+		frameId?: string,
+		beforeGuidance?: ReadonlyMap<
+			number,
+			{ pendingGuidance: string[]; confirmationCandidates: string[] }
+		>,
+	): Promise<number> {
 		const { root } = await this.#send<{ root: CdpDomNode }>("DOM.getDocument", {
 			depth: -1,
 			pierce: true,
 		});
+		// The page selector cannot prove controls are gone inside closed shadow
+		// roots or child frames. Keep the pending veto for those documents.
+		const hasOpaqueSubtree = (node: CdpDomNode): boolean =>
+			Boolean(node.shadowRoots?.length || node.contentDocument) ||
+			["IFRAME", "FRAME"].includes(node.nodeName.toUpperCase()) ||
+			(node.children ?? []).some(hasOpaqueSubtree);
+		const canInspectRemovedControls = !hasOpaqueSubtree(root);
+		this.#canInspectScopedReceipt = canInspectCf7ReceiptDocument(root);
+
 		let staleBodyCount = 0;
 		const matches = await Promise.all(
 			discoverCdpBodyBackendNodeIds(root, 20, frameId, this.#topFrameId).map(
 				async (backendNodeId) => {
 					try {
-						return await this.#callFunctionOnElement<boolean>(
-							backendNodeId,
-							HAS_CONFIRMATION_TEXT_FUNCTION,
-							[SUBMISSION_CONFIRMATION_PATTERN, SUBMISSION_PENDING_PATTERN],
-						);
+						const message = await this.#callFunctionOnElement<{
+							confirmation: string;
+							failure: string;
+							pendingGuidance?: string[];
+							confirmationCandidates?: string[];
+						}>(backendNodeId, READ_SUBMISSION_MESSAGES_FUNCTION, [
+							SUBMISSION_CONFIRMATION_PATTERN,
+							SUBMISSION_PENDING_PATTERN,
+							SUBMISSION_FAILURE_PATTERN,
+							canInspectRemovedControls
+								? (beforeGuidance?.get(backendNodeId) ?? {})
+								: {},
+						]);
+						return { backendNodeId, ...message };
 					} catch (error) {
 						// A body discovered a moment ago can already be gone while the
 						// page navigates. Counting it as non-matching keeps the bodies
 						// that are still readable from failing the whole snapshot.
 						if (!isTransientConfirmationReadError(error)) throw error;
 						staleBodyCount += 1;
-						return false;
+						return { backendNodeId, confirmation: "", failure: "" };
 					}
 				},
 			),
 		);
-		const matchingBodyCount = matches.filter(Boolean).length;
+		this.#submissionMessages = matches;
+		const matchingBodyCount = matches.filter(
+			(message) => message.confirmation !== "",
+		).length;
 		console.log(
 			JSON.stringify({
 				event: "browser_confirmation_snapshot",
@@ -1720,6 +2028,10 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		onAttempt?: (attempt: number) => void,
 	): Promise<{ x: number; y: number }> {
 		let stage: SubmitActivationStage = "scroll";
+		let lastPoint: { x: number; y: number } | undefined;
+		let documentPoint: { x: number; y: number } | undefined;
+		let hitBackendNodeId: number | undefined;
+		let attempt = 0;
 		const scrollIntoView = async () => {
 			stage = "scroll";
 			await this.#send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
@@ -1730,27 +2042,50 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 		};
 		try {
 			const prepare = async () => {
+				attempt += 1;
+				lastPoint = undefined;
+				documentPoint = undefined;
+				hitBackendNodeId = undefined;
 				stage = "box_model";
 				const { model } = await this.#send<{
 					model: { border: number[] };
 				}>("DOM.getBoxModel", { backendNodeId });
 				const point = centerOfQuad(model.border);
 				if (!point) throw new BrowserElementError();
+				lastPoint = point;
 				stage = "pointer_move";
 				await this.#send("Input.dispatchMouseEvent", {
 					type: "mouseMoved",
 					x: point.x,
 					y: point.y,
 				});
+				stage = "layout_metrics";
+				const { cssLayoutViewport } = await this.#send<{
+					cssLayoutViewport?: { pageX: number; pageY: number };
+				}>("Page.getLayoutMetrics");
+				if (
+					!cssLayoutViewport ||
+					!Number.isFinite(cssLayoutViewport.pageX) ||
+					!Number.isFinite(cssLayoutViewport.pageY)
+				) {
+					throw new BrowserElementError();
+				}
+				// Hit testing uses document CSS coordinates; pointer events use
+				// viewport coordinates, so only the hit-test point gains the scroll.
+				documentPoint = {
+					x: Math.round(point.x + cssLayoutViewport.pageX),
+					y: Math.round(point.y + cssLayoutViewport.pageY),
+				};
 				stage = "hit_test";
 				const hit = await this.#send<{ backendNodeId?: number }>(
 					"DOM.getNodeForLocation",
 					{
-						x: point.x,
-						y: point.y,
+						x: documentPoint.x,
+						y: documentPoint.y,
 						includeUserAgentShadowDOM: true,
 					},
 				);
+				hitBackendNodeId = hit.backendNodeId;
 				if (
 					!hit.backendNodeId ||
 					!(await this.#isComposedDescendant(backendNodeId, hit.backendNodeId))
@@ -1785,6 +2120,20 @@ export class BrowserUseCdpDriver implements RestrictedBrowserDriver {
 				onAttempt,
 			);
 		} catch (error) {
+			if (!activationStrategy) {
+				console.log(
+					JSON.stringify({
+						event: "browser_click_preparation_failed",
+						stage,
+						attempt,
+						backendNodeId,
+						hitBackendNodeId,
+						point: lastPoint,
+						documentPoint,
+						kind: clickPreparationRetryKind(error),
+					}),
+				);
+			}
 			if (activationStrategy) {
 				console.log(
 					createSubmitActivationFailureLog(activationStrategy, stage),
@@ -2194,13 +2543,15 @@ export function isTransientConfirmationReadError(
  */
 export class ConfirmationReadPendingError extends Error {
 	readonly cdpMethod: string;
-	readonly cdpKind: CdpCommandErrorKind;
+	readonly cdpKind: CdpCommandErrorKind | "TIMEOUT";
 
-	constructor(readonly cause: BrowserUseCdpCommandError) {
+	constructor(readonly cause: Error) {
 		super("The submission confirmation could not be read yet");
 		this.name = "ConfirmationReadPendingError";
-		this.cdpMethod = cause.method;
-		this.cdpKind = cause.kind;
+		this.cdpMethod =
+			cause instanceof BrowserUseCdpCommandError ? cause.method : "unknown";
+		this.cdpKind =
+			cause instanceof BrowserUseCdpCommandError ? cause.kind : "TIMEOUT";
 	}
 }
 
@@ -2221,7 +2572,13 @@ export async function readSubmissionConfirmation(
 	try {
 		afterCount = await readAfterCount();
 	} catch (error) {
-		if (isTransientConfirmationReadError(error))
+		// A timed-out read has no side effects. Poll the DOM once more within the
+		// existing deadline/final-read bound; never repeat the activation.
+		if (
+			isTransientConfirmationReadError(error) ||
+			(error instanceof Error &&
+				error.message === BROWSER_ERROR.CDP_COMMAND_TIMED_OUT)
+		)
 			throw new ConfirmationReadPendingError(error);
 		throw createBrowserSubmitDiagnosticError("SUBMIT_READ_AFTER_TEXT", error);
 	}
@@ -2450,6 +2807,9 @@ export function submitUncertainReasonCode(
 	if (blockStage === "network_policy") {
 		return "SUBMIT_NETWORK_POLICY_BLOCKED";
 	}
+	if (blockStage === "continue_request") {
+		return "SUBMIT_REQUEST_CONTINUE_FAILED";
+	}
 	if (activationStrategy === "dom") return "SUBMIT_DOM_REQUEST_NOT_OBSERVED";
 	if (activationStrategy === "mouse")
 		return "SUBMIT_MOUSE_REQUEST_NOT_OBSERVED";
@@ -2498,7 +2858,10 @@ export function isPayloadIndependentClickTarget(
 	tag: string,
 	type: string,
 ): boolean {
-	return tag === "button" && type === "button";
+	return (
+		((tag === "button" || tag === "input") && type === "button") ||
+		(tag === "select" && type === "aria-listbox")
+	);
 }
 
 function delay(milliseconds: number): Promise<void> {

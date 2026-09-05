@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Fixed and sticky header evidence regression</title>
+<style>
+  html { scroll-behavior: smooth; }
+  body { margin: 0; font: 24px sans-serif; background: white; }
+  header { position: fixed; top: 0; left: 0; right: 0; height: 80px; z-index: 10; background: #e02020; color: white; }
+  nav { position: sticky; top: 80px; height: 60px; background: #2040e0; color: white; }
+  main { padding: 40px; }
+  .intro { height: 320px; padding-top: 80px; box-sizing: border-box; }
+  form { margin-top: 450px; padding: 30px; border: 3px solid #222; }
+  input, textarea { display: block; font: inherit; margin: 20px 0; }
+  .tail { height: 1400px; }
+</style>
+<header>FIXED HEADER — document top</header>
+<div class="intro">Evidence screenshot fixture</div>
+<nav>STICKY HEADER — document y=320</nav>
+<main>
+  <form onsubmit="event.preventDefault()">
+    <label>Name<input name="name" value="Screenshot Test"></label>
+    <label>Message<textarea name="message">Keep these values intact.</textarea></label>
+    <p>Submission accepted. This message must remain visible in evidence.</p>
+    <button type="button">Confirm</button>
+  </form>
+  <div class="tail">End of form</div>
+</main>
+</html>

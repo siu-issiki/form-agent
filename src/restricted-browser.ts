@@ -36,7 +36,7 @@ const MAX_SUBMIT_REVIEW_DENIALS = 2;
  * submission. The pre-submit review runs on the first stage only; every later
  * stage has to prove that the page still carries the reviewed values.
  */
-export const MAX_SUBMIT_STAGES = 3;
+export const MAX_SUBMIT_STAGES = 2;
 /** How much of the entered message a confirmation screen has to repeat. */
 const SUBMIT_STAGE_BODY_PREFIX_LENGTH = 40;
 /** Matches a single address, so the entered email can be told from other text. */
@@ -193,7 +193,11 @@ export function observationFingerprint(
  */
 export function isReviewComparableField(tag: unknown, type: unknown): boolean {
 	if (tag === "button") return false;
-	if (tag === "input" && (type === "submit" || type === "image")) return false;
+	if (
+		tag === "input" &&
+		(type === "submit" || type === "image" || type === "button")
+	)
+		return false;
 	return true;
 }
 
@@ -292,13 +296,21 @@ export function readTrustedFormValues(
 	return trusted;
 }
 
-export type BrowserSubmitResult =
+export type BrowserSubmitResult = (
 	| { outcome: "sent"; formUrl: string }
 	| {
 			outcome: "uncertain";
 			reasonCode: string;
 			reason: string;
-	  };
+	  }
+) & {
+	evidence?: {
+		capturedAt: string;
+		formUrl: string;
+		confirmationText: string;
+		failureText: string;
+	};
+};
 
 /**
  * The driver's code for "the submission request went out, but the page never
@@ -309,7 +321,8 @@ export const SUBMIT_CONFIRMATION_NOT_OBSERVED =
 
 /**
  * One stage was activated and the page has not confirmed a completed send.
- * The model may observe and call `submit` again; nothing has been recorded.
+ * An observed confirmation control was activated. The model may observe
+ * and activate the final send control once; nothing has been recorded.
  */
 export interface SubmitStagePending {
 	pendingStage: number;
@@ -329,7 +342,8 @@ export function isSubmitStagePending(
 export function submitRequestObserved(result: BrowserSubmitResult): boolean {
 	return (
 		result.outcome === "sent" ||
-		result.reasonCode === SUBMIT_CONFIRMATION_NOT_OBSERVED
+		result.reasonCode === SUBMIT_CONFIRMATION_NOT_OBSERVED ||
+		result.reasonCode === "SUBMIT_PAGE_REPORTED_FAILURE"
 	);
 }
 
@@ -616,7 +630,9 @@ export class RestrictedBrowserTools {
 		this.#allowedHosts = normalizeAllowedHosts(allowedHosts);
 		this.#targetUrl = targetUrl;
 		this.#formValues = formValues;
-		this.#allowedNavigationUrls.add(canonicalNavigationUrl(targetUrl));
+		this.#allowedNavigationUrls.add(
+			canonicalNavigationPermissionUrl(targetUrl),
+		);
 	}
 
 	static async create(
@@ -1024,6 +1040,9 @@ export class RestrictedBrowserTools {
 		}
 		const firstStage = stage === 1;
 		await this.validateSubmit(elementId, firstStage);
+		if (!firstStage && this.#isConfirmationStepControl(elementId)) {
+			throw new SubmitStageUnverifiedError();
+		}
 
 		// The denial budget is read from D1 before anything else happens, so a
 		// failed uncertain write cannot leave a spent job open to another
@@ -1136,13 +1155,19 @@ export class RestrictedBrowserTools {
 		elementId: string,
 		activationStrategy: SubmitActivationStrategy,
 	): Promise<Job | SubmitStagePending> {
+		// Only an observed confirmation/preview operation can lead to a final
+		// submit stage. Retained values alone also occur after a completed POST.
+		const confirmationStep =
+			stage === 1 && this.#isConfirmationStepControl(elementId);
 		const activation = await this.#activateSubmitControl(
 			stage,
 			elementId,
 			activationStrategy,
 		);
 		const result = await this.#validatePostSubmitUrl(activation);
-		const pending = await this.#offerFurtherStage(stage, result);
+		const pending = confirmationStep
+			? await this.#offerFurtherStage(stage, result)
+			: undefined;
 		if (pending) return pending;
 		return await this.#persistSubmitResult(result);
 	}
@@ -1247,7 +1272,38 @@ export class RestrictedBrowserTools {
 			);
 			throw new SubmissionResultUncertainError();
 		}
+		if (result.evidence) {
+			await this.recorder.captureJson("submission_result", {
+				outcome: result.outcome,
+				...result.evidence,
+			});
+		}
 		return result;
+	}
+
+	/** Read the actual observed control, never a model-supplied stage claim. */
+	#isConfirmationStepControl(elementId: string): boolean {
+		const field = this.#latestObservedForms
+			.flatMap((form) => form.fields ?? [])
+			.find((candidate) => candidate.elementId === elementId);
+		if (!field) return false;
+		const labels = [field.label, field.value]
+			.filter((label): label is string => typeof label === "string")
+			.map((label) =>
+				label.normalize("NFKC").replace(/\s+/g, "").toLowerCase(),
+			);
+		// A combined "confirm and send" control is already the final send.
+		if (
+			labels.some((label) =>
+				/送信|send|submit|申込|申し込|購入|注文|登録/.test(label),
+			)
+		)
+			return false;
+		return labels.some((label) =>
+			/^(?:確認(?:する)?|確認画面(?:へ|に)(?:進む|すすむ)?|(?:入力)?内容(?:を)?確認(?:する)?|confirm|preview|review)$/.test(
+				label,
+			),
+		);
 	}
 
 	/**
@@ -1266,9 +1322,8 @@ export class RestrictedBrowserTools {
 		) {
 			return undefined;
 		}
-		// The activation reached the page and a submission request went out,
-		// but nothing confirmed a completed send. A two-step form answers
-		// exactly like this, and its confirmation screen repeats the entered
+		// An explicitly observed confirmation operation sent a request, but
+		// nothing confirmed a completed send. Its confirmation screen repeats the entered
 		// email and the start of the entered body, so the next stage is
 		// offered only when the page right after the activation still shows
 		// them. Nothing is recorded yet and the job stays `submitting`.

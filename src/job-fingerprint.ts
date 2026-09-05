@@ -7,9 +7,8 @@ import { isSendApproval, SEND_APPROVAL_KEY } from "./send-approval";
  * every `formValues` entry, with candidate lists compared in order. Only the
  * digest is compared or logged, so no registrant value leaves this function.
  *
- * This is the content an approval is bound to. A dry-run and the real send
- * approved against it must agree on all of it, otherwise the approval would
- * stand for content nobody reviewed.
+ * This is the content an approval is bound to, directly or through a dry-run.
+ * The requested send must agree with the approved content on all of it.
  */
 export async function jobContentFingerprint(
 	targetUrl: unknown,
@@ -55,7 +54,12 @@ export async function jobInputFingerprint(
 					? {
 							approvedBy: approval.approvedBy,
 							approvedAt: approval.approvedAt,
-							dryRunJobId: approval.dryRunJobId,
+							...(approval.mode === "direct"
+								? {
+										mode: approval.mode,
+										contentFingerprint: approval.contentFingerprint,
+									}
+								: { dryRunJobId: approval.dryRunJobId }),
 						}
 					: null,
 		}),

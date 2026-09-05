@@ -1,0 +1,18 @@
+<!doctype html><html lang="ja"><meta charset="utf-8"><title>ARIA listbox choices</title>
+<style>body{font:16px sans-serif;margin:40px}label,button,input,[role=option]{display:block;margin:12px;padding:8px}[hidden]{display:none}</style>
+<form onsubmit="event.preventDefault()">
+<label for="input-choice">お問い合わせ種別</label><input id="input-choice" readonly aria-haspopup="listbox" aria-controls="input-options" value=""><input type="hidden" name="inputCategory">
+<div id="input-options" role="listbox" hidden><div role="option" tabindex="-1">資料請求</div><div role="option" tabindex="-1">その他</div></div>
+<label id="button-label" for="button-choice">ご用件</label><button id="button-choice" type="button" role="combobox" aria-labelledby="button-label" aria-haspopup="listbox" aria-controls="button-options" aria-expanded="false">選択してください</button><input type="hidden" name="buttonCategory">
+<div id="button-options" role="listbox" hidden><div role="option" tabindex="-1">資料請求</div><div role="option" tabindex="-1">その他問い合わせ</div></div>
+<div role="listbox"><div role="option" tabindex="-1" id="unrelated">その他</div></div>
+<button type="submit">送信</button>
+</form>
+<script>
+for(const prefix of ['input','button']){
+ const control=document.getElementById(`${prefix}-choice`),list=document.getElementById(`${prefix}-options`);
+ control.addEventListener('click',()=>{list.hidden=!list.hidden;control.setAttribute('aria-expanded',String(!list.hidden));});
+ list.addEventListener('click',event=>{if(event.target.getAttribute('role')!=='option')return;const label=event.target.textContent;if(prefix==='input')control.value=label;else control.textContent=label;document.querySelector(`[name="${prefix}Category"]`).value=label;list.hidden=true;control.setAttribute('aria-expanded','false');});
+}
+document.getElementById('unrelated').addEventListener('click',()=>{throw new Error('Unrelated list must not be clicked');});
+</script></html>
